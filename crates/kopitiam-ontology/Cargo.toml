@@ -1,0 +1,13 @@
+[package]
+name = "kopitiam-ontology"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared entity/relationship vocabulary (the Common Semantic Model) for KOPITIAM's Semantic Runtime."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+uuid.workspace = true

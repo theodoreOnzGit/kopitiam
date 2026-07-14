@@ -1,0 +1,65 @@
+[package]
+name = "kopitiam-neovim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "kvim: a Rust-native, Android-capable modal editor with Vim keybindings and plugin behaviour built in — no Lua plugins, no Mason. Unrelated to KDE/Plasma."
+readme = "README.md"
+keywords = ["vim", "neovim", "editor", "modal", "tui"]
+categories = ["text-editors", "command-line-utilities"]
+
+# The maintainer explicitly asked that `cargo install kopitiam-neovim` yield a
+# `kvim` binary, which is why the binary lives in this engine crate rather than
+# under apps/ like KOPITIAM's other clients. See
+# docs/ai-decisions/AID-0003-kopitiam-neovim-architecture.md, decision 4.
+[[bin]]
+name = "kvim"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+regex.workspace = true
+
+# The LSP client. KOPITIAM already drives a live rust-analyzer over stdio for
+# `kopitiam rename` / `kopitiam code-actions`, so kvim reuses that client rather
+# than growing a second one.
+kopitiam-semantic.workspace = true
+
+# Pure-Rust, line-oriented syntax highlighting (Rust/TOML/Lua/LaTeX/Markdown/
+# Python). Hand-written lexers, NOT tree-sitter — tree-sitter's core and every
+# grammar pull in `cc`, which would break the Pure Rust Core promise on Android.
+# See docs/ai-decisions/AID-0009-syntax-highlighting.md.
+kopitiam-syntax.workspace = true
+kopitiam-snippet.workspace = true
+
+# The ~/.kopitiam per-user directory convention, shared with every other
+# KOPITIAM app.
+kopitiam-config.workspace = true
+
+# Text engine. `ropey` is pure Rust, is the rope behind Helix, and is O(log n)
+# for the index/edit operations an editor performs constantly.
+ropey = "1.6"
+
+# Terminal I/O and rendering. Both are pure Rust and both build for
+# aarch64-linux-android, which is the entire point of this crate.
+crossterm = "0.29"
+ratatui = "0.29"
+
+# Correct cursor movement over CJK/emoji/combining marks. A byte- or
+# char-indexed editor gets this wrong; a grapheme-indexed one does not.
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+# Fuzzy matching for the telescope replacement. Pure Rust, by the Helix authors.
+nucleo = "0.5"
+
+# Directory walking that honours .gitignore, for the file tree and file picker.
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

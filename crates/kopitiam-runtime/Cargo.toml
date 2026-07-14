@@ -1,0 +1,21 @@
+[package]
+name = "kopitiam-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kopitiam Runtime: the Qwen transformer forward pass (embedding, RoPE, grouped-query attention, SwiGLU MLP, KV cache, greedy sampling) running entirely in Rust on CPU."
+
+[dependencies]
+kopitiam-core.workspace = true
+kopitiam-tensor.workspace = true
+kopitiam-loader.workspace = true
+kopitiam-tokenizer.workspace = true
+
+# Test-only: unique-by-construction temp file names for synthetic GGUF
+# fixtures (see src/test_support/synthetic_gguf.rs). Already a workspace
+# dependency (kopitiam-loader's own tests use it the same way); not part of
+# the release build.
+[dev-dependencies]
+tempfile.workspace = true

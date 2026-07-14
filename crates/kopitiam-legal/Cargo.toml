@@ -1,0 +1,21 @@
+[package]
+name = "kopitiam-legal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM legal engine: turns legal documents into structured, provenance-carrying knowledge. Does not give legal advice."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+regex.workspace = true
+kopitiam-ontology.workspace = true
+kopitiam-pdf.workspace = true
+kopitiam-document.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,405 @@
+use rmux_proto::{Request, RmuxError, SendKeysRequest};
+
+use super::parse_pane_target;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
+use super::values::{missing_argument, parse_usize, unsupported_flag};
+
+pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
+    let mut target = None;
+    let mut target_client = None;
+    let mut expand_formats = false;
+    let mut hex = false;
+    let mut literal = false;
+    let mut dispatch_key_table = false;
+    let mut copy_mode_command = false;
+    let mut forward_mouse_event = false;
+    let mut reset_terminal = false;
+    let mut repeat_count = None;
+
+    while let Some(token) = args.peek().map(str::to_owned) {
+        if let Some(cluster) = parse_compact_flag_cluster(&token, "FHlKMRX", "ct") {
+            let _ = args.optional();
+            for flag in cluster {
+                match flag {
+                    CompactFlag::Bare(flag) => match flag {
+                        'F' => expand_formats = true,
+                        'H' => hex = true,
+                        'l' => literal = true,
+                        'K' => dispatch_key_table = true,
+                        'M' => forward_mouse_event = true,
+                        'R' => reset_terminal = true,
+                        'X' => copy_mode_command = true,
+                        _ => unreachable!("compact send-keys flags are prevalidated"),
+                    },
+                    compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                        target_client =
+                            Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
+                    }
+                    compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                        target = Some(parse_pane_target(
+                            "send-keys",
+                            compact_flag.value_or_next(&mut args, "-t target")?,
+                        )?);
+                    }
+                    CompactFlag::Value { flag, .. } => {
+                        return Err(unsupported_flag("send-keys", &format!("-{flag}")));
+                    }
+                };
+            }
+            continue;
+        }
+        match token.as_str() {
+            "--" => {
+                let _ = args.optional();
+                break;
+            }
+            "-F" => {
+                let _ = args.optional();
+                expand_formats = true;
+            }
+            "-H" => {
+                let _ = args.optional();
+                hex = true;
+            }
+            "-l" => {
+                let _ = args.optional();
+                literal = true;
+            }
+            "-K" => {
+                let _ = args.optional();
+                dispatch_key_table = true;
+            }
+            "-M" => {
+                let _ = args.optional();
+                forward_mouse_event = true;
+            }
+            "-N" => {
+                let _ = args.optional();
+                repeat_count = Some(parse_send_keys_repeat_count(&args.required("-N count")?)?);
+            }
+            "-p" => return Err(unsupported_flag("send-keys", "-p")),
+            value if value.starts_with("-N") && value.len() > 2 => {
+                let count = value[2..].to_owned();
+                let _ = args.optional();
+                repeat_count = Some(parse_send_keys_repeat_count(&count)?);
+            }
+            "-R" => {
+                let _ = args.optional();
+                reset_terminal = true;
+            }
+            "-X" => {
+                let _ = args.optional();
+                copy_mode_command = true;
+            }
+            "-c" => {
+                let _ = args.optional();
+                target_client = Some(args.required("-c target-client")?);
+            }
+            "-t" => {
+                let _ = args.optional();
+                target = Some(parse_pane_target("send-keys", args.required("-t target")?)?);
+            }
+            _ => break,
+        }
+    }
+
+    let keys = args.remaining();
+    if target.is_some()
+        && !expand_formats
+        && !hex
+        && !literal
+        && !dispatch_key_table
+        && !copy_mode_command
+        && !forward_mouse_event
+        && !reset_terminal
+        && repeat_count.is_none()
+        && target_client.is_none()
+    {
+        return Ok(Request::SendKeys(SendKeysRequest {
+            target: target.ok_or_else(|| missing_argument("send-keys", "-t target"))?,
+            keys,
+        }));
+    }
+
+    if target_client.is_some() {
+        return Ok(Request::SendKeysExt2(Box::new(
+            rmux_proto::SendKeysExt2Request {
+                target,
+                keys,
+                expand_formats,
+                hex,
+                literal,
+                dispatch_key_table,
+                copy_mode_command,
+                forward_mouse_event,
+                reset_terminal,
+                repeat_count,
+                target_client,
+            },
+        )));
+    }
+
+    Ok(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
+        target,
+        keys,
+        expand_formats,
+        hex,
+        literal,
+        dispatch_key_table,
+        copy_mode_command,
+        forward_mouse_event,
+        reset_terminal,
+        repeat_count,
+    }))
+}
+
+fn parse_send_keys_repeat_count(value: &str) -> Result<usize, RmuxError> {
+    let count = parse_usize("send-keys", "-N", value)?;
+    if count == 0 {
+        return Err(RmuxError::Message("repeat count too small".to_owned()));
+    }
+    Ok(count)
+}
+
+pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxError> {
+    let mut table_name = None;
+    let mut note = None;
+    let mut repeat = false;
+
+    while let Some(token) = args.peek() {
+        match token {
+            "--" => {
+                let _ = args.optional();
+                break;
+            }
+            "-n" => {
+                let _ = args.optional();
+                table_name = Some("root".to_owned());
+            }
+            "-r" => {
+                let _ = args.optional();
+                repeat = true;
+            }
+            "-N" => {
+                let _ = args.optional();
+                note = Some(args.required("-N note")?);
+            }
+            "-T" => {
+                let _ = args.optional();
+                table_name = Some(args.required("-T key-table")?);
+            }
+            _ => break,
+        }
+    }
+
+    let key = args.required("key")?;
+    Ok(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
+        table_name: table_name.unwrap_or_else(|| "prefix".to_owned()),
+        key,
+        note,
+        repeat,
+        command: (!args.is_empty()).then_some(args.remaining()),
+    })))
+}
+
+pub(super) fn parse_unbind_key(mut args: CommandTokens) -> Result<Request, RmuxError> {
+    let mut table_name = None;
+    let mut all = false;
+    let mut quiet = false;
+
+    while let Some(token) = args.peek() {
+        match token {
+            "--" => {
+                let _ = args.optional();
+                break;
+            }
+            "-a" => {
+                let _ = args.optional();
+                all = true;
+            }
+            "-n" => {
+                let _ = args.optional();
+                table_name = Some("root".to_owned());
+            }
+            "-q" => {
+                let _ = args.optional();
+                quiet = true;
+            }
+            "-T" => {
+                let _ = args.optional();
+                table_name = Some(args.required("-T key-table")?);
+            }
+            _ => break,
+        }
+    }
+
+    let key = args.optional();
+    args.no_extra("unbind-key")?;
+    Ok(Request::UnbindKey(rmux_proto::UnbindKeyRequest {
+        table_name: table_name.unwrap_or_else(|| "prefix".to_owned()),
+        all,
+        key,
+        quiet,
+    }))
+}
+
+pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
+    let mut table_name = None;
+    let mut first_only = false;
+    let mut include_unnoted = false;
+    let mut notes = false;
+    let reversed = false;
+    let format = None;
+    let sort_order = None;
+    let mut prefix = None;
+
+    while let Some(token) = args.peek() {
+        match token {
+            "--" => {
+                let _ = args.optional();
+                break;
+            }
+            "-1" => {
+                let _ = args.optional();
+                first_only = true;
+            }
+            "-a" => {
+                let _ = args.optional();
+                include_unnoted = true;
+            }
+            "-N" => {
+                let _ = args.optional();
+                notes = true;
+            }
+            "-r" => {
+                return Err(unsupported_flag("list-keys", "-r"));
+            }
+            "-F" => {
+                return Err(unsupported_flag("list-keys", "-F"));
+            }
+            flag if flag.starts_with("-F") => return Err(unsupported_flag("list-keys", "-F")),
+            "-O" | "-Oname" => {
+                return Err(unsupported_flag("list-keys", "-O"));
+            }
+            flag if flag.starts_with("-O") => return Err(unsupported_flag("list-keys", "-O")),
+            "-P" => {
+                let _ = args.optional();
+                prefix = Some(args.required("-P prefix")?);
+            }
+            "-T" => {
+                let _ = args.optional();
+                table_name = Some(args.required("-T key-table")?);
+            }
+            _ => break,
+        }
+    }
+
+    let key = args.optional();
+    args.no_extra("list-keys")?;
+    Ok(Request::ListKeys(Box::new(rmux_proto::ListKeysRequest {
+        table_name,
+        first_only,
+        notes,
+        include_unnoted,
+        reversed,
+        format,
+        sort_order,
+        prefix,
+        key,
+    })))
+}
+
+pub(super) fn parse_send_prefix(mut args: CommandTokens) -> Result<Request, RmuxError> {
+    let mut secondary = false;
+    let mut target = None;
+
+    while let Some(token) = args.peek() {
+        match token {
+            "--" => {
+                let _ = args.optional();
+                break;
+            }
+            "-2" => {
+                let _ = args.optional();
+                secondary = true;
+            }
+            "-t" => {
+                let _ = args.optional();
+                target = Some(parse_pane_target(
+                    "send-prefix",
+                    args.required("-t target")?,
+                )?);
+            }
+            _ => break,
+        }
+    }
+    args.no_extra("send-prefix")?;
+    Ok(Request::SendPrefix(rmux_proto::SendPrefixRequest {
+        target,
+        secondary,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(value: &str) -> String {
+        value.to_owned()
+    }
+
+    #[test]
+    fn parse_send_keys_accepts_tmux_compact_repeat_count() {
+        let request = parse_send_keys(CommandTokens::new(vec![
+            token("-N5"),
+            token("-X"),
+            token("scroll-up"),
+        ]))
+        .expect("compact repeat send-keys parses");
+
+        let Request::SendKeysExt(request) = request else {
+            panic!("compact repeat must use extended send-keys request");
+        };
+        assert_eq!(request.repeat_count, Some(5));
+        assert!(request.copy_mode_command);
+        assert_eq!(request.keys, vec!["scroll-up"]);
+    }
+
+    #[test]
+    fn parse_send_keys_accepts_tmux_compact_copy_mode_target() {
+        let request = parse_send_keys(CommandTokens::new(vec![
+            token("-Xt="),
+            token("select-word"),
+        ]))
+        .expect("compact copy-mode target parses");
+
+        let Request::SendKeysExt(request) = request else {
+            panic!("compact copy-mode target must use extended send-keys request");
+        };
+        assert!(request.copy_mode_command);
+        assert_eq!(
+            request.target,
+            Some(parse_pane_target("send-keys", "=".to_owned()).unwrap())
+        );
+        assert_eq!(request.keys, vec!["select-word"]);
+    }
+
+    #[test]
+    fn parse_send_keys_rejects_zero_repeat_count() {
+        let error = parse_send_keys(CommandTokens::new(vec![token("-N0"), token("A")]))
+            .expect_err("send-keys -N0 must reject zero repeats");
+
+        assert_eq!(error.to_string(), "repeat count too small");
+    }
+
+    #[test]
+    fn parse_send_keys_rejects_unknown_prefix_flag() {
+        let error = parse_send_keys(CommandTokens::new(vec![token("-p"), token("abc")]))
+            .expect_err("send-keys -p should be rejected before keys");
+
+        assert_eq!(
+            error,
+            RmuxError::Server("command send-keys: unknown flag -p".to_owned())
+        );
+    }
+}

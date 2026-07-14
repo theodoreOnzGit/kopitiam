@@ -1,0 +1,51 @@
+kopitiam-mux (kmux)
+===================
+
+This crate, and every crate nested beneath it under `crates/` (rmux-core,
+rmux-os, rmux-pty, rmux-ipc, rmux-proto, rmux-types, rmux-client, rmux-server,
+rmux-sdk, rmux-render-core, rmux-web-crypto, ratatui-rmux), is a FORK of:
+
+    rmux — https://github.com/helvesec/rmux
+    Copyright (c) The RMUX Authors
+    Licensed under MIT OR Apache-2.0
+
+The overwhelming majority of this code was written by The RMUX Authors. It is
+reused here directly — this is a fork, not a clean-room reimplementation.
+
+The upstream license texts are included, unmodified, alongside this file:
+
+    LICENSE-MIT
+    LICENSE-APACHE
+
+As permitted by both licenses, this fork is distributed as part of KOPITIAM
+under the GNU Affero General Public License, version 3 only (AGPL-3.0-only).
+See the repository root LICENSE.
+
+Relicensing this fork does not relicense upstream rmux. rmux remains available
+from its authors under MIT OR Apache-2.0.
+
+
+What was changed
+----------------
+
+  * Android/Termux support (the reason for the fork):
+      - `target_os = "linux"` cfg gates widened to
+        `any(target_os = "linux", target_os = "android")` where the underlying
+        facility exists on Bionic.
+      - A new runtime-directory resolver, `rmux_os::runtime_dir`, replacing
+        hardcoded `/tmp` — Termux is not FHS.
+      - `rmux-pty` uses the `ptsname` path on Android (rustix exposes no
+        `TIOCGPTPEER` binding there).
+      - `rmux-client`'s SIGWINCH watcher uses the `signal-hook` backend on
+        Android (`rustix::runtime` does not exist on rustix's libc backend).
+      - `nl_langinfo` replaced with a constant on Android (Bionic is UTF-8 only
+        and `libc` binds neither `nl_langinfo` nor `CODESET` there).
+
+  * The binaries are renamed `kmux` and `kmux-daemon`. Executable names are now
+    sourced from `rmux_os::host` rather than being spelled inline.
+
+  * Sub-crates keep their upstream names, carry a `-kopitiam` version suffix,
+    and are `publish = false`.
+
+Upstream's own release/packaging/CI scripts, benchmarks, `xtask`, and
+contributor documentation were not carried into the fork.

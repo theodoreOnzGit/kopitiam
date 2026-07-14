@@ -1,0 +1,11 @@
+[package]
+name = "kopitiam-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core primitives (dtypes, shapes, devices, errors) for the Kopitiam Runtime, KOPITIAM's CPU-first local inference engine."
+
+[dependencies]
+thiserror.workspace = true

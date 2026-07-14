@@ -1,0 +1,10 @@
+[package]
+name = "kopitiam-syntax"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust, line-oriented incremental syntax highlighting for KOPITIAM's editor. No tree-sitter, no C: see docs/ai-decisions for why."
+
+[dependencies]

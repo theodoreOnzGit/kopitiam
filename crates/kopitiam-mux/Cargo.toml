@@ -1,0 +1,62 @@
+[package]
+name = "kopitiam-mux"
+version = "0.1.0"
+# NOT `edition.workspace = true`. KOPITIAM's root workspace is edition 2024;
+# this crate and its nested sub-crates are a fork of rmux, which is edition
+# 2021. Silently pulling 325k lines of upstream code into a newer edition is a
+# behavioural change nobody asked for, and makes every future upstream merge
+# harder. The edition is pinned here deliberately; moving it is its own task.
+edition = "2021"
+publish = false
+license = "AGPL-3.0-only"
+repository = "https://github.com/theodoreOnzGit/kopitiam"
+description = "kmux: a terminal multiplexer for KOPITIAM. A fork of rmux (MIT OR Apache-2.0) with Android/Termux support, relicensed AGPL-3.0-only."
+readme = "README.md"
+
+[dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
+clap = { version = "=4.5.39", features = ["derive"] }
+libc = "0.2"
+qrcode = { version = "0.14", default-features = false }
+ratatui = { version = "=0.29.0", default-features = false }
+rmux-client = { path = "crates/rmux-client" }
+rmux-core = { path = "crates/rmux-core" }
+rmux-os = { path = "crates/rmux-os" }
+rmux-proto = { path = "crates/rmux-proto" }
+# The root binary owns the hidden internal daemon mode, so it links the server
+# and Tokio runtime directly for that top-level re-exec path.
+rmux-server = { path = "crates/rmux-server", default-features = false }
+serde_json = "1.0"
+tokio = { version = "1.48.0", features = ["net", "rt", "rt-multi-thread", "time"] }
+
+[features]
+default = ["web"]
+perf-instrument = ["rmux-server/perf-instrument"]
+tiny-cli = []
+web = ["rmux-server/web"]
+
+[dev-dependencies]
+libc = "0.2"
+rmux-core = { path = "crates/rmux-core" }
+rmux-pty = { path = "crates/rmux-pty" }
+rmux-proto = { path = "crates/rmux-proto" }
+rmux-sdk = { path = "crates/rmux-sdk" }
+rustix = { version = "1.1.4", features = ["event", "termios"] }
+
+[build-dependencies]
+embed-manifest = "=1.4.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes"] }
+
+# The binaries are renamed from upstream's `rmux` / `rmux-daemon`. KOPITIAM ships
+# `kmux`; the daemon is an internal re-exec target and is renamed in lockstep,
+# because the client discovers it *by file name* next to the client binary
+# (see crates/rmux-client/src/auto_start.rs).
+[[bin]]
+name = "kmux"
+path = "src/main.rs"
+
+[[bin]]
+name = "kmux-daemon"
+path = "src/daemon_main.rs"

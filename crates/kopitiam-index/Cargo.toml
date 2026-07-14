@@ -1,0 +1,17 @@
+[package]
+name = "kopitiam-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust (redb-backed) embedded persistence for KOPITIAM's .kopitiam project state directory."
+
+[dependencies]
+anyhow.workspace = true
+redb.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,10 @@
+[package]
+name = "kopitiam-snippet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust LSP-syntax snippet engine (parse, expand, tabstops) for KOPITIAM's editor. Clean-room implementation of the LSP snippet grammar; not a fork of LuaSnip."
+
+[dependencies]

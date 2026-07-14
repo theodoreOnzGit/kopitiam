@@ -1,0 +1,25 @@
+[package]
+name = "kopitiam"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local-first Semantic Runtime CLI for scientific Rust projects: real cargo/rust-analyzer/rustdoc facts, rust-analyzer-backed rename and code actions, and a PDF-to-Markdown document engine."
+readme = "README.md"
+keywords = ["rust-analyzer", "semantic", "lsp", "scientific-computing"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+kopitiam-pdf = { workspace = true }
+kopitiam-document = { workspace = true }
+kopitiam-markdown = { workspace = true }
+kopitiam-ontology = { workspace = true }
+kopitiam-semantic = { workspace = true }
+kopitiam-knowledge = { workspace = true }
+kopitiam-index = { workspace = true }
+kopitiam-workspace = { workspace = true }
+kopitiam-workflow = { workspace = true }
+kopitiam-ai = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

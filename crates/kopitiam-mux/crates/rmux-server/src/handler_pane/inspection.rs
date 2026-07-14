@@ -1,0 +1,715 @@
+use rmux_core::formats::{
+    render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
+    DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
+};
+use rmux_proto::{
+    CommandOutput, DisplayMessageResponse, ErrorResponse, ListPanesResponse, Response, RmuxError,
+    Target, TerminalSize,
+};
+
+use super::super::{format_client_uid, format_client_user, ListClientSnapshot, RequestHandler};
+use crate::control_notifications::format_control_message_line;
+use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::pane_terminals::{session_not_found, HandlerState};
+use crate::renderer;
+
+#[path = "inspection/list_panes_default.rs"]
+mod list_panes_default;
+
+use list_panes_default::{
+    push_default_list_panes_line, DefaultListPanesFormat, DefaultListPanesLineContext,
+};
+
+impl RequestHandler {
+    pub(in crate::handler) async fn handle_display_message(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::DisplayMessageRequest,
+    ) -> Response {
+        self.handle_display_message_inner(
+            requester_pid,
+            request.target,
+            request.print,
+            request.message,
+            None,
+            request.empty_target_context,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn handle_display_message_ext(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::DisplayMessageExtRequest,
+    ) -> Response {
+        self.handle_display_message_inner(
+            requester_pid,
+            request.target,
+            request.print,
+            request.message,
+            request.target_client,
+            request.empty_target_context,
+        )
+        .await
+    }
+
+    async fn handle_display_message_inner(
+        &self,
+        requester_pid: u32,
+        target: Option<Target>,
+        print: bool,
+        message: Option<String>,
+        target_client: Option<String>,
+        empty_target_context: bool,
+    ) -> Response {
+        let target_attach_pid = match target_client.as_deref() {
+            Some(target_client) => match self
+                .find_target_attach_client_pid(requester_pid, target_client, "display-message")
+                .await
+            {
+                Ok(Some(attach_pid)) => Some(attach_pid),
+                Ok(None) if print => None,
+                Ok(None) => {
+                    return Response::DisplayMessage(DisplayMessageResponse::no_output());
+                }
+                Err(error) if print && display_message_client_is_control_only(&error) => None,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            },
+            None => None,
+        };
+        let requester_is_control = self.is_control_client(requester_pid).await;
+        let format_client_pid = match target_attach_pid {
+            Some(attach_pid) => Some(attach_pid),
+            None => self
+                .resolve_target_attach_client_pid(requester_pid, None, "display-message")
+                .await
+                .ok(),
+        };
+        let requester_client = match format_client_pid {
+            Some(attach_pid) => self
+                .list_clients_snapshot()
+                .await
+                .into_iter()
+                .find(|client| !client.control && client.pid == attach_pid),
+            None => None,
+        };
+        let session_client_pid = target_attach_pid.unwrap_or(requester_pid);
+        let attached_session_name = if target.is_none() && print {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .session_for_attached_client(session_client_pid, "display-message")
+                .ok()
+                .flatten()
+        } else if target.is_none() {
+            let active_attach = self.active_attach.lock().await;
+            match active_attach.session_for_attached_client(session_client_pid, "display-message") {
+                Ok(session_name) => session_name,
+                Err(_error) if requester_is_control => None,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
+        } else {
+            None
+        };
+        let fallback_session_name = if attached_session_name.is_some() {
+            attached_session_name
+        } else if requester_is_control {
+            self.control_session_name(requester_pid).await
+        } else {
+            None
+        };
+
+        if target.is_none() && fallback_session_name.is_none() && !print && !requester_is_control {
+            return Response::DisplayMessage(DisplayMessageResponse::no_output());
+        }
+
+        let mut session_name = target
+            .as_ref()
+            .map(|target| target.session_name().clone())
+            .or(fallback_session_name);
+        let template = message.as_deref().unwrap_or(DEFAULT_DISPLAY_MESSAGE_FORMAT);
+        let mut uses_lone_session_print_context = false;
+
+        if empty_target_context {
+            if !print {
+                return Response::DisplayMessage(DisplayMessageResponse::no_output());
+            }
+            let expanded = {
+                let state = self.state.lock().await;
+                let mut runtime =
+                    RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
+                if let Some(client) = requester_client.as_ref() {
+                    runtime = with_runtime_client_values(runtime, client);
+                }
+                render_runtime_template(template, &runtime, true)
+            };
+            return Response::DisplayMessage(DisplayMessageResponse::from_output(
+                CommandOutput::from_stdout(format!("{expanded}\n").into_bytes()),
+            ));
+        }
+
+        if print && session_name.is_none() {
+            session_name = {
+                let state = self.state.lock().await;
+                lone_session_name(&state.sessions)
+            };
+            uses_lone_session_print_context = session_name.is_some();
+        }
+        if print && session_name.is_none() {
+            session_name = self.preferred_session_name().await.ok();
+        }
+
+        if print && session_name.is_none() {
+            let expanded = {
+                let state = self.state.lock().await;
+                let mut runtime =
+                    RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
+                if let Some(client) = requester_client.as_ref() {
+                    runtime = with_runtime_client_values(runtime, client);
+                }
+                render_runtime_template(template, &runtime, true)
+            };
+            return Response::DisplayMessage(DisplayMessageResponse::from_output(
+                CommandOutput::from_stdout(format!("{expanded}\n").into_bytes()),
+            ));
+        }
+
+        let Some(session_name) = session_name else {
+            let expanded = {
+                let state = self.state.lock().await;
+                let mut runtime =
+                    RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
+                if let Some(client) = requester_client.as_ref() {
+                    runtime = with_runtime_client_values(runtime, client);
+                }
+                render_runtime_template(template, &runtime, true)
+            };
+            self.send_control_notification_to(
+                requester_pid,
+                format_control_message_line(&expanded),
+            )
+            .await;
+            return Response::DisplayMessage(DisplayMessageResponse::no_output());
+        };
+        let context_target = target.unwrap_or_else(|| Target::Session(session_name.clone()));
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(template)) {
+            self.wait_for_windows_deferred_target_pane_pids(&context_target)
+                .await;
+        }
+        let attached_count = self.attached_count(&session_name).await;
+
+        let (expanded, overlay_frame, clear_frame, duration) = {
+            let mut state = self.state.lock().await;
+            if let Err(error) = state.refresh_format_target_exit_status(&context_target) {
+                return Response::Error(ErrorResponse { error });
+            }
+            let (session, mut context) =
+                match display_message_context(&state, &context_target, attached_count) {
+                    Ok(context) => context,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+            if let Some(client) = requester_client.as_ref() {
+                context = with_runtime_client_values(context, client);
+            }
+            if uses_lone_session_print_context {
+                context = context.without_session_size();
+                if requester_client.is_none() {
+                    context = context.with_unclipped_geometry();
+                }
+            }
+            context = context.with_named_value(
+                "socket_path",
+                self.socket_path().to_string_lossy().into_owned(),
+            );
+            let expanded = render_runtime_template(template, &context, true);
+
+            if print {
+                return Response::DisplayMessage(DisplayMessageResponse::from_output(
+                    CommandOutput::from_stdout(format!("{expanded}\n").into_bytes()),
+                ));
+            }
+
+            let mut overlay_frame = renderer::render_display_panes_clear(session, &state.options);
+            overlay_frame.extend_from_slice(
+                renderer::render_status_message(session, &state.options, &expanded).as_slice(),
+            );
+            let clear_frame = renderer::render_display_panes_clear(session, &state.options);
+            (
+                expanded,
+                overlay_frame,
+                clear_frame,
+                display_time(&state.options, &session_name),
+            )
+        };
+
+        if requester_is_control && target_attach_pid.is_none() {
+            self.send_control_notification_to(
+                requester_pid,
+                format_control_message_line(&expanded),
+            )
+            .await;
+            return Response::DisplayMessage(DisplayMessageResponse::no_output());
+        }
+
+        let delivered = match target_attach_pid {
+            Some(attach_pid) => {
+                self.send_attached_overlay_to_client(
+                    attach_pid,
+                    overlay_frame,
+                    clear_frame,
+                    duration,
+                )
+                .await
+            }
+            None => {
+                self.send_attached_overlay(&session_name, overlay_frame, clear_frame, duration)
+                    .await
+            }
+        };
+        if delivered {
+            let mut state = self.state.lock().await;
+            state.add_message(expanded);
+        }
+
+        Response::DisplayMessage(DisplayMessageResponse::no_output())
+    }
+
+    pub(in crate::handler) async fn handle_list_panes(
+        &self,
+        request: rmux_proto::ListPanesRequest,
+    ) -> Response {
+        let attached_count = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach.attached_count(&request.target)
+        };
+        #[cfg(windows)]
+        if format_references_pane_pid(request.format.as_deref()) {
+            self.wait_for_windows_deferred_list_pane_pids(
+                &request.target,
+                request.target_window_index,
+            )
+            .await;
+        }
+        let mut state = self.state.lock().await;
+        if let Err(error) =
+            state.refresh_list_panes_exit_statuses(&request.target, request.target_window_index)
+        {
+            return Response::Error(ErrorResponse { error });
+        }
+        let Some(session) = state.sessions.session(&request.target) else {
+            return Response::Error(ErrorResponse {
+                error: session_not_found(&request.target),
+            });
+        };
+        if let Some(window_index) = request.target_window_index {
+            if session.window_at(window_index).is_none() {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::invalid_target(
+                        format!("{}:{window_index}", request.target),
+                        "window index does not exist in session",
+                    ),
+                });
+            }
+        }
+
+        Response::ListPanes(ListPanesResponse {
+            output: collect_list_pane_output(
+                &state,
+                session,
+                attached_count,
+                request.target_window_index,
+                request.format.as_deref(),
+            ),
+        })
+    }
+}
+
+#[cfg(windows)]
+const DEFERRED_PANE_PID_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(windows)]
+const DEFERRED_PANE_PID_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+#[cfg(windows)]
+impl RequestHandler {
+    pub(in crate::handler) async fn wait_for_windows_deferred_list_pane_pids(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        target_window_index: Option<u32>,
+    ) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            list_pane_scope_has_starting_pane(&state, session_name, target_window_index)
+        })
+        .await;
+    }
+
+    pub(in crate::handler) async fn wait_for_windows_deferred_list_session_pane_pids(&self) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            list_session_scope_has_starting_active_pane(&state)
+        })
+        .await;
+    }
+
+    pub(in crate::handler) async fn wait_for_windows_deferred_all_pane_pids(&self) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            state_has_starting_pane(&state)
+        })
+        .await;
+    }
+
+    async fn wait_for_windows_deferred_target_pane_pids(&self, target: &Target) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            target_has_starting_pane(&state, target)
+        })
+        .await;
+    }
+
+    async fn wait_for_windows_deferred_pane_pids_until<F, Fut>(&self, mut has_starting: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + DEFERRED_PANE_PID_WAIT;
+        while has_starting().await {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(DEFERRED_PANE_PID_POLL.min(deadline - now)).await;
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(in crate::handler) fn format_references_pane_pid(format: Option<&str>) -> bool {
+    format.is_some_and(|format| format.contains("pane_pid"))
+}
+
+#[cfg(windows)]
+fn target_has_starting_pane(state: &HandlerState, target: &Target) -> bool {
+    match target {
+        Target::Session(session_name) => {
+            list_pane_scope_has_starting_pane(state, session_name, None)
+        }
+        Target::Window(target) => list_pane_scope_has_starting_pane(
+            state,
+            target.session_name(),
+            Some(target.window_index()),
+        ),
+        Target::Pane(target) => state.pane_is_starting_in_window(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn list_session_scope_has_starting_active_pane(state: &HandlerState) -> bool {
+    state.sessions.iter().any(|(session_name, session)| {
+        let window_index = session.active_window_index();
+        session.window().active_pane().is_some_and(|pane| {
+            state.pane_is_starting_in_window(session_name, window_index, pane.index())
+        })
+    })
+}
+
+#[cfg(windows)]
+fn state_has_starting_pane(state: &HandlerState) -> bool {
+    state.sessions.iter().any(|(session_name, session)| {
+        session.windows().iter().any(|(window_index, window)| {
+            window.panes().iter().any(|pane| {
+                state.pane_is_starting_in_window(session_name, *window_index, pane.index())
+            })
+        })
+    })
+}
+
+#[cfg(windows)]
+fn list_pane_scope_has_starting_pane(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    target_window_index: Option<u32>,
+) -> bool {
+    let Some(session) = state.sessions.session(session_name) else {
+        return false;
+    };
+    session
+        .windows()
+        .iter()
+        .filter(|(window_index, _)| {
+            target_window_index.is_none_or(|target| target == **window_index)
+        })
+        .any(|(window_index, window)| {
+            window.panes().iter().any(|pane| {
+                state.pane_is_starting_in_window(session_name, *window_index, pane.index())
+            })
+        })
+}
+
+fn display_message_client_is_control_only(error: &RmuxError) -> bool {
+    matches!(
+        error,
+        RmuxError::Server(message) if message == "display-message requires an attached client"
+    )
+}
+
+pub(in crate::handler) fn display_message_context<'a>(
+    state: &'a HandlerState,
+    target: &Target,
+    attached_count: usize,
+) -> Result<(&'a rmux_core::Session, RuntimeFormatContext<'a>), RmuxError> {
+    let session_name = target.session_name();
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let active_window = session.active_window_index();
+    let last_window = session.last_window_index();
+
+    match target {
+        Target::Session(_) => {
+            let window = session.window();
+            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
+            let mut context = FormatContext::from_session(session)
+                .with_session_attached(attached_count)
+                .with_window(active_window, window, true, false);
+            if let Some(pane) = window.active_pane() {
+                context = context.with_window_pane(window, pane);
+            }
+            let mut runtime = RuntimeFormatContext::new(context)
+                .with_state(state)
+                .with_session(session)
+                .with_window(active_window, window);
+            if let Some(pane) = window.active_pane() {
+                runtime = runtime.with_pane(pane);
+            }
+            if use_unclipped_geometry {
+                runtime = runtime.with_unclipped_geometry();
+            }
+            Ok((session, runtime))
+        }
+        Target::Window(target) => {
+            let window_index = target.window_index();
+            let window = session.window_at(window_index).ok_or_else(|| {
+                RmuxError::invalid_target(
+                    target.to_string(),
+                    "window index does not exist in session",
+                )
+            })?;
+            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
+            let mut context = FormatContext::from_session(session)
+                .with_session_attached(attached_count)
+                .with_window(
+                    window_index,
+                    window,
+                    window_index == active_window,
+                    Some(window_index) == last_window,
+                );
+            if let Some(pane) = window.active_pane() {
+                context = context.with_window_pane(window, pane);
+            }
+            let mut runtime = RuntimeFormatContext::new(context)
+                .with_state(state)
+                .with_session(session)
+                .with_window(window_index, window);
+            if let Some(pane) = window.active_pane() {
+                runtime = runtime.with_pane(pane);
+            }
+            if use_unclipped_geometry {
+                runtime = runtime.with_unclipped_geometry();
+            }
+            Ok((session, runtime))
+        }
+        Target::Pane(target) => {
+            let window_index = target.window_index();
+            let pane_index = target.pane_index();
+            let window = session.window_at(window_index).ok_or_else(|| {
+                RmuxError::invalid_target(
+                    format!("{}:{window_index}", target.session_name()),
+                    "window index does not exist in session",
+                )
+            })?;
+            let pane = window.pane(pane_index).ok_or_else(|| {
+                RmuxError::invalid_target(
+                    target.to_string(),
+                    "pane index does not exist in session",
+                )
+            })?;
+            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
+            let context = FormatContext::from_session(session)
+                .with_session_attached(attached_count)
+                .with_window(
+                    window_index,
+                    window,
+                    window_index == active_window,
+                    Some(window_index) == last_window,
+                )
+                .with_pane(pane, pane_index == window.active_pane_index());
+            let mut runtime = RuntimeFormatContext::new(context)
+                .with_state(state)
+                .with_session(session)
+                .with_window(window_index, window)
+                .with_pane(pane);
+            if use_unclipped_geometry {
+                runtime = runtime.with_unclipped_geometry();
+            }
+            Ok((session, runtime))
+        }
+    }
+}
+
+fn with_runtime_client_values<'a>(
+    runtime: RuntimeFormatContext<'a>,
+    client: &ListClientSnapshot,
+) -> RuntimeFormatContext<'a> {
+    runtime
+        .with_client_size(TerminalSize {
+            cols: client.width,
+            rows: client.height,
+        })
+        .with_named_value("client_name", client.name.clone())
+        .with_named_value("client_pid", client.pid.to_string())
+        .with_named_value("client_tty", client.tty.clone())
+        .with_named_value("client_width", client.width.to_string())
+        .with_named_value("client_height", client.height.to_string())
+        .with_named_value("client_termfeatures", client.termfeatures.clone())
+        .with_named_value("client_termname", client.termname.clone())
+        .with_named_value("client_termtype", client.termtype.clone())
+        .with_named_value("client_key_table", client.key_table_name())
+        .with_named_value("client_prefix", client.prefix_value())
+        .with_named_value("client_uid", format_client_uid(client.uid))
+        .with_named_value("client_user", format_client_user(client.uid, &client.user))
+        .with_named_value("client_utf8", if client.utf8 { "1" } else { "0" })
+        .with_named_value(
+            "client_control_mode",
+            if client.control { "1" } else { "0" },
+        )
+        .with_named_value("client_flags", client.flags.clone())
+}
+
+fn lone_session_name(sessions: &rmux_core::SessionStore) -> Option<rmux_proto::SessionName> {
+    (sessions.len() == 1)
+        .then(|| {
+            sessions
+                .iter()
+                .next()
+                .map(|(session_name, _)| session_name.clone())
+        })
+        .flatten()
+}
+
+pub(in crate::handler) fn display_time(
+    options: &rmux_core::OptionStore,
+    session_name: &rmux_proto::SessionName,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        options
+            .resolve(Some(session_name), rmux_proto::OptionName::DisplayTime)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(750)
+            .max(1),
+    )
+}
+
+pub(in crate::handler) fn attached_status_message_for_error(error: &RmuxError) -> String {
+    let message = error.to_string();
+    match message.as_str() {
+        // tmux keeps these errors lower-case for detached commands, but renders
+        // them sentence-cased in the attached status row.
+        "no next window" => "No next window".to_owned(),
+        "no previous window" => "No previous window".to_owned(),
+        "no space for new pane" => "No space for new pane".to_owned(),
+        _ => message,
+    }
+}
+
+fn collect_list_pane_output(
+    state: &HandlerState,
+    session: &rmux_core::Session,
+    attached_count: usize,
+    target_window_index: Option<u32>,
+    format: Option<&str>,
+) -> CommandOutput {
+    let active_window = session.active_window_index();
+    let last_window = session.last_window_index();
+    let session_context =
+        FormatContext::from_session(session).with_session_attached(attached_count);
+    let format = format.or(Some(if target_window_index.is_some() {
+        DEFAULT_LIST_PANES_WINDOW_FORMAT
+    } else {
+        DEFAULT_LIST_PANES_SESSION_FORMAT
+    }));
+    let fast_format = if attached_count == 0 {
+        format.and_then(DefaultListPanesFormat::from_format)
+    } else {
+        None
+    };
+
+    let mut stdout = Vec::new();
+    for (window_index, window) in session.windows() {
+        if target_window_index.is_some_and(|target| *window_index != target) {
+            continue;
+        }
+
+        let active = *window_index == active_window;
+        let last = Some(*window_index) == last_window;
+        let window_context =
+            session_context
+                .clone()
+                .with_window(*window_index, window, active, last);
+
+        for pane in window.panes() {
+            let pane_active = pane.index() == window.active_pane_index();
+            if let Some(fast_format) = fast_format {
+                if !stdout.is_empty() {
+                    stdout.push(b'\n');
+                }
+                if push_default_list_panes_line(
+                    &mut stdout,
+                    DefaultListPanesLineContext {
+                        format: fast_format,
+                        state,
+                        session,
+                        attached_count,
+                        window_index: *window_index,
+                        pane,
+                        pane_active,
+                    },
+                ) {
+                    continue;
+                }
+                stdout.pop();
+            }
+            let context = window_context.clone().with_pane(pane, pane_active);
+            let mut runtime = RuntimeFormatContext::new(context)
+                .with_state(state)
+                .with_session(session)
+                .with_window(*window_index, window)
+                .with_pane(pane);
+            if attached_count == 0 {
+                runtime = runtime.with_unclipped_geometry();
+            }
+            if !stdout.is_empty() {
+                stdout.push(b'\n');
+            }
+            stdout.extend_from_slice(render_list_panes_line(&runtime, format).as_bytes());
+        }
+    }
+
+    if !stdout.is_empty() {
+        stdout.push(b'\n');
+    }
+    CommandOutput::from_stdout(stdout)
+}
+
+pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> CommandOutput {
+    if lines.is_empty() {
+        return CommandOutput::from_stdout(Vec::new());
+    }
+
+    CommandOutput::from_stdout(format!("{}\n", lines.join("\n")).into_bytes())
+}

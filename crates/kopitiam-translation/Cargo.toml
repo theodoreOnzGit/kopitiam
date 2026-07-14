@@ -1,0 +1,18 @@
+[package]
+name = "kopitiam-translation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Translation-specific state (mappings, progress, verification) for KOPITIAM's C/C++/Fortran-to-Rust translation platform."
+
+[dependencies]
+anyhow.workspace = true
+indexmap = { workspace = true, features = ["serde"] }
+kopitiam-index.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

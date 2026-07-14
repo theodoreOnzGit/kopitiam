@@ -1,0 +1,17 @@
+[package]
+name = "rmux-types"
+version = "0.8.0-kopitiam.1"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-only"
+repository = "https://github.com/theodoreOnzGit/kopitiam"
+description = "Shared platform-neutral value types for the RMUX terminal multiplexer workspace."
+keywords = ["terminal", "multiplexer", "types"]
+categories = ["command-line-interface"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

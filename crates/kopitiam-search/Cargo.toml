@@ -1,0 +1,18 @@
+[package]
+name = "kopitiam-search"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tantivy-backed full-text/symbol search over kopitiam-ontology entities."
+
+[dependencies]
+anyhow.workspace = true
+kopitiam-ontology.workspace = true
+serde_json.workspace = true
+tantivy.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

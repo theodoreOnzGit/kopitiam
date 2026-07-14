@@ -1,0 +1,12 @@
+[package]
+name = "kopitiam-document"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Structural document reconstruction (paragraphs, headings, tables, columns) for KOPITIAM's Document Engine."
+
+[dependencies]
+kopitiam-pdf = { workspace = true }
+regex = { workspace = true }

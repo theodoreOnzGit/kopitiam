@@ -1,0 +1,32 @@
+[package]
+name = "kopitiam-insurance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM insurance domain engine: turns policy and scheme documents into structured, provenance-carrying knowledge."
+
+# NOTE ON DEPENDENCIES
+#
+# `anyhow` and the `tempfile` dev-dependency were in this crate's scaffolded
+# manifest and have been removed:
+#
+# * `anyhow` — a library must not put an opaque error type in its public API.
+#   A caller of an insurance engine needs to *match* on what went wrong (a PDF
+#   that will not open is a different problem from a citation that cannot be
+#   traced back to its clause), so `kopitiam_insurance::Error` is a `thiserror`
+#   enum. `anyhow` belongs in the binaries that consume this, not here.
+# * `tempfile` — the test suite builds synthetic policies as in-memory
+#   `kopitiam_pdf::Page` values rather than by writing PDF files to disk, so
+#   nothing needs a temporary directory.
+#
+# Neither removal changes the workspace lockfile: both crates remain in the
+# dependency tree via other members.
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+kopitiam-ontology.workspace = true
+kopitiam-pdf.workspace = true
+kopitiam-document.workspace = true

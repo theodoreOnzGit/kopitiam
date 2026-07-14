@@ -1,0 +1,18 @@
+[package]
+name = "kopitiam-loader"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kopitiam Runtime: native GGUF and SafeTensors model loaders."
+
+[dependencies]
+kopitiam-core.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

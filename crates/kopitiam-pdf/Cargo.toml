@@ -1,0 +1,17 @@
+[package]
+name = "kopitiam-pdf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust PDF text extraction for KOPITIAM's Document Engine."
+
+[dependencies]
+pdf-extract = { workspace = true }
+# See the workspace Cargo.toml comment next to `lopdf`: this is already a
+# transitive dependency of pdf-extract, promoted to direct so
+# `font_resources.rs` can walk font resource dictionaries and content
+# streams for font style recovery (kopitiam-q4f).
+lopdf = { workspace = true }
+thiserror = { workspace = true }

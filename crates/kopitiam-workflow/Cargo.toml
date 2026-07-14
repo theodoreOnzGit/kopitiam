@@ -1,0 +1,18 @@
+[package]
+name = "kopitiam-workflow"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Context Builder + Workflow Engine: the only KOPITIAM crate allowed to invoke a model."
+
+[dependencies]
+anyhow.workspace = true
+kopitiam-ai.workspace = true
+kopitiam-knowledge.workspace = true
+kopitiam-ontology.workspace = true
+kopitiam-workspace.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

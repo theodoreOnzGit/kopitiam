@@ -1,0 +1,130 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "apps/*",
+    "crates/*",
+    # kopitiam-mux is a fork of rmux and nests its twelve forked sub-crates under
+    # its own `crates/` (see crates/kopitiam-mux/README.md). They are listed
+    # explicitly rather than being left to arrive as path dependencies of
+    # `kopitiam-mux`, because two of them (`ratatui-rmux`, `rmux-render-core`)
+    # are integration crates nothing else depends on -- without this line they
+    # would sit on disk in no build graph at all, never compiled, never tested,
+    # silently rotting. Membership is what keeps `--workspace` honest.
+    "crates/kopitiam-mux/crates/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Theodore Kay Chen Ong"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/theodoreOnzGit/kopitiam"
+
+[workspace.dependencies]
+uom = { version = "0.38", features = ["f64", "si"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Scientific
+nalgebra = "0.34"
+ndarray = "0.16"
+
+# Utilities
+itertools = "0.14"
+indexmap = "2"
+regex = "1"
+camino = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# PDF extraction (pure Rust: pdf-extract wraps lopdf)
+pdf-extract = "0.12"
+# `lopdf` is already pulled in transitively by `pdf-extract` (pinned to the
+# same "0.42" line here so Cargo unifies to the one copy already present,
+# adding no new crate to the dependency tree). kopitiam-pdf depends on it
+# directly to walk font resource dictionaries and content streams for font
+# style recovery (see crates/kopitiam-pdf/src/font_resources.rs) -- work
+# `pdf-extract`'s own `OutputDev` callback API does not expose. Pure Rust,
+# no new C/C++ surface.
+lopdf = "0.42"
+
+# Semantic Runtime knowledge providers
+cargo_metadata = "0.23"
+rustdoc-types = "0.60"
+url = "2"
+similar = "3"
+redb = "4"
+tantivy = "0.26"
+tempfile = "3.27.0"
+
+# Kopitiam Runtime: memory-mapping for model weight files. Pure Rust (a thin
+# safe wrapper over OS mmap syscalls, no C compiler or build step involved)
+# and already present in Cargo.lock as a transitive dependency of tantivy,
+# so promoting it to a workspace dependency for kopitiam-loader adds no new
+# supply-chain surface.
+memmap2 = "0.9"
+
+# Internal crates. `version` is required alongside `path` so that
+# `cargo publish` can strip the (registry-meaningless) local path and embed
+# a real dependency version in the published manifest -- see
+# scripts/publish.sh for the required publish order.
+kopitiam-pdf = { path = "crates/kopitiam-pdf", version = "0.1.0" }
+kopitiam-plot = { path = "crates/kopitiam-plot", version = "0.1.0" }
+kopitiam-document = { path = "crates/kopitiam-document", version = "0.1.0" }
+kopitiam-markdown = { path = "crates/kopitiam-markdown", version = "0.1.0" }
+kopitiam-ontology = { path = "crates/kopitiam-ontology", version = "0.1.0" }
+kopitiam-semantic = { path = "crates/kopitiam-semantic", version = "0.1.0" }
+kopitiam-knowledge = { path = "crates/kopitiam-knowledge", version = "0.1.0" }
+kopitiam-index = { path = "crates/kopitiam-index", version = "0.1.0" }
+kopitiam-search = { path = "crates/kopitiam-search", version = "0.1.0" }
+kopitiam-workspace = { path = "crates/kopitiam-workspace", version = "0.1.0" }
+kopitiam-workflow = { path = "crates/kopitiam-workflow", version = "0.1.0" }
+kopitiam-translation = { path = "crates/kopitiam-translation", version = "0.1.0" }
+kopitiam-ai = { path = "crates/kopitiam-ai", version = "0.1.0" }
+kopitiam-config = { path = "crates/kopitiam-config", version = "0.1.0" }
+
+# A pure-Rust Lua 5.1 interpreter (no C, no mlua -- see AID-0003 and AID-0007).
+# kvim consumes it to execute the user's Lua config, which it can already
+# discover but not run.
+kopitiam-lua = { path = "crates/kopitiam-lua", version = "0.1.0" }
+kopitiam-syntax = { path = "crates/kopitiam-syntax", version = "0.1.0" }
+kopitiam-snippet = { path = "crates/kopitiam-snippet", version = "0.1.0" }
+
+# Domain engines: policy/scheme documents -> provenance-carrying knowledge.
+kopitiam-finance = { path = "crates/kopitiam-finance", version = "0.1.0" }
+kopitiam-health = { path = "crates/kopitiam-health", version = "0.1.0" }
+kopitiam-insurance = { path = "crates/kopitiam-insurance", version = "0.1.0" }
+kopitiam-legal = { path = "crates/kopitiam-legal", version = "0.1.0" }
+kopitiam-web = { path = "crates/kopitiam-web", version = "0.1.0" }
+
+# Literature Engine: references, citations, BibTeX/BibLaTeX/Hayagriva, and the
+# citation graph. Depends only on ontology + the Document Engine -- deliberately
+# NOT on kopitiam-web, so a bibliography model can never grow a network
+# dependency by accident (see docs/ai-decisions/AID-0018).
+kopitiam-bibliography = { path = "crates/kopitiam-bibliography", version = "0.1.0" }
+
+# Kopitiam Runtime: the CPU-first, local-first inference engine that will sit
+# behind kopitiam-ai's ModelAdapter. Layered core -> tensor -> {loader,
+# tokenizer} -> runtime; see docs/ai-decisions/AID-0001 for why these are
+# engines under crates/ with no CLI/TUI crate of their own.
+kopitiam-core = { path = "crates/kopitiam-core", version = "0.1.0" }
+kopitiam-tensor = { path = "crates/kopitiam-tensor", version = "0.1.0" }
+kopitiam-loader = { path = "crates/kopitiam-loader", version = "0.1.0" }
+kopitiam-tokenizer = { path = "crates/kopitiam-tokenizer", version = "0.1.0" }
+kopitiam-runtime = { path = "crates/kopitiam-runtime", version = "0.1.0" }

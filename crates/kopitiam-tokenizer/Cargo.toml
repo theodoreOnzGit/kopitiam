@@ -1,0 +1,13 @@
+[package]
+name = "kopitiam-tokenizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kopitiam Runtime: tokenizer (work in progress)."
+
+[dependencies]
+kopitiam-core.workspace = true
+regex.workspace = true
+serde_json.workspace = true

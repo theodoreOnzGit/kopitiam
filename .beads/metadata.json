@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "kopitiam",
+  "project_id": "0eaa6873-091e-47e4-be8a-68554bd7b888"
+}

@@ -1,0 +1,42 @@
+[package]
+name = "kopitiam-bibliography"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM bibliography engine: references, citations, BibTeX/BibLaTeX/Hayagriva, and the citation graph."
+
+# NOTE ON DEPENDENCIES
+#
+# Three internal crates and five external ones. What is *absent* is as
+# deliberate as what is present:
+#
+# * No `kopitiam-web`. This crate has no network and must not acquire the
+#   ability to grow one by accident. The resolution seam (`ReferenceResolver`)
+#   is a trait plus a `search_text()` string, so a future `kopitiam-literature`
+#   can wire `kopitiam-web` to it in one line without a bibliography *model*
+#   depending on an HTTP client. See docs/ai-decisions/AID-0018.
+# * No YAML crate. Hayagriva (Typst's native bibliography format) is emitted by
+#   hand -- the subset of YAML it needs is small, and hand-emission lets us
+#   guarantee byte-determinism rather than inherit whatever key order a
+#   serializer felt like today.
+# * No date/time crate. A bibliographic year is an integer, not an instant.
+# * No proptest/quickcheck. The BibTeX round-trip property test drives a
+#   *seeded* generator (see tests/roundtrip.rs), because CLAUDE.md demands
+#   deterministic behaviour, and a randomised test that fails only on Tuesdays
+#   is worse than no test at all.
+#
+# `url` is used rather than a hand-rolled URL regex: a reference's URL is a
+# claim about where something lives, and getting it subtly wrong is the same
+# class of harm as getting a DOI wrong.
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+regex.workspace = true
+url.workspace = true
+
+kopitiam-ontology.workspace = true
+kopitiam-pdf.workspace = true
+kopitiam-document.workspace = true

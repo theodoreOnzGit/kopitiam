@@ -1,0 +1,25 @@
+[package]
+name = "kopitiam-health"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM health domain engine: turns policy and scheme documents into structured, provenance-carrying knowledge."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+kopitiam-ontology.workspace = true
+kopitiam-pdf.workspace = true
+kopitiam-document.workspace = true
+# The generic insurance-document engine. `kopitiam-health` is a specialisation
+# of it, not a parallel universe: provenance, clause segmentation, definitions,
+# schedules and the money/percentage types all live there, and this crate adds
+# the health domain on top. See the crate rustdoc.
+kopitiam-insurance.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

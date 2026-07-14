@@ -1,0 +1,418 @@
+//! The [`run`] entry point `main.rs` calls, and the small amount of glue
+//! needed to actually start an [`App`].
+//!
+//! # `impl BufferView for text::Buffer` lives here, permanently
+//!
+//! [`crate::text::Buffer`]'s read API is the "frozen" contract this UI is
+//! allowed to depend on (`line_count`, `line`, `line_len`, `is_modified`,
+//! `path`), and it is *exactly* [`BufferView`]'s shape. This impl is not a
+//! stopgap — `editor::Editor::buffer()` is specified to return `&text::Buffer`
+//! (see the architecture note this crate was built against), so once
+//! `editor::Editor` exists, its own `EditorHost::Buffer` associated type is
+//! simply `text::Buffer`, and it reuses this same impl.
+//!
+//! # `PlaceholderHost`, unlike the impl above, is temporary
+//!
+//! `crate::editor::Editor` — the real modal state machine — did not exist
+//! yet when this file was written (see `ui/mod.rs` and `ui/event.rs` for the
+//! full explanation of the seam this crate builds against). [`main`][crate]
+//! still needs `kvim` to open a file and put something on screen, so
+//! [`PlaceholderHost`] is the smallest possible [`EditorHost`] that makes
+//! that true: it moves a cursor around a buffer and quits on `q`. It
+//! deliberately implements **no modes, no operators, no registers, no ex
+//! commands** — adding any of those here would be exactly the "business
+//! logic inside the UI" `CLAUDE.md` prohibits. The moment `editor::Editor`
+//! exists, this struct should be deleted and [`run`] should construct
+//! `App::new(editor::Editor::open(files)?, ...)` instead — a one-function
+//! change, which is the entire point of building against [`EditorHost`]
+//! rather than a concrete type.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use ratatui::{backend::CrosstermBackend, Terminal};
+
+use crate::config::Config;
+use crate::core::{Mode, Position};
+use crate::editor::{EditorResponse, Key as EditorKey};
+use crate::text::Buffer;
+use crate::ui::app::App;
+use crate::ui::event::{BufferView, EditorHost, HostResponse, Key, KeyPress};
+use crate::ui::terminal::TerminalGuard;
+use crate::ui::theme::Theme;
+
+/// Performs the write that [`EditorResponse::Write`] only *asks* for.
+///
+/// The editor deliberately returns the intent rather than touching the disk
+/// itself (see `editor::ex`'s docs) — so that `:w` is testable without a
+/// filesystem, and so the decision of *whether* to write stays with the caller.
+/// This is that caller, and this is where the I/O actually happens.
+fn write_buffer(editor: &mut crate::editor::Editor, path: Option<&Path>) -> crate::Result<String> {
+    let buffer = editor.buffer_mut();
+    match path {
+        Some(path) => {
+            buffer.save_as(path)?;
+            Ok(format!("\"{}\" written", path.display()))
+        }
+        None => {
+            buffer.save()?;
+            let name = buffer.path().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".to_string());
+            Ok(format!("\"{name}\" written"))
+        }
+    }
+}
+
+impl BufferView for Buffer {
+    fn line_count(&self) -> usize {
+        Buffer::line_count(self)
+    }
+
+    fn line(&self, n: usize) -> Option<String> {
+        Buffer::line(self, n)
+    }
+
+    fn line_len(&self, n: usize) -> usize {
+        Buffer::line_len(self, n)
+    }
+
+    fn is_modified(&self) -> bool {
+        Buffer::is_modified(self)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        Buffer::path(self)
+    }
+}
+
+/// Joins the real modal engine to the UI's [`EditorHost`] seam.
+///
+/// The two halves of kvim were built against this trait precisely so they could
+/// be written independently and meet here. The only real work is translating
+/// key types: the UI speaks [`KeyPress`] (its own, so it can be tested with no
+/// terminal) and the editor speaks [`crate::editor::Key`] (its own, so it can be
+/// tested with no UI). Neither depends on the other, and neither depends on
+/// crossterm — which is why this adapter is the *only* place the mapping lives.
+impl EditorHost for crate::editor::Editor {
+    type Buffer = Buffer;
+
+    fn handle_key(&mut self, key: KeyPress) -> HostResponse {
+        let Some(editor_key) = to_editor_key(key) else {
+            return HostResponse::Unchanged;
+        };
+
+        match crate::editor::Editor::handle_key(self, editor_key) {
+            Ok(response) => match response {
+                EditorResponse::Continue => HostResponse::Changed,
+                // `:q` closes the active *window* and only quits the editor on
+                // the last one — a distinction only the UI can make, since the
+                // editor has no window tree. The unsaved-changes check has
+                // already run inside `execute_ex`, so reaching here means the
+                // close is allowed.
+                EditorResponse::Quit => HostResponse::QuitWindow,
+                EditorResponse::Message(msg) => HostResponse::Message(msg),
+
+                // `:w` and `:wq` deliberately do not write from inside the
+                // editor — it returns the intent and lets the caller perform the
+                // I/O (see `editor::ex`'s docs). This is that caller.
+                EditorResponse::Write { path } => match write_buffer(self, path.as_deref()) {
+                    Ok(msg) => HostResponse::Message(msg),
+                    Err(e) => HostResponse::Error(e.to_string()),
+                },
+                EditorResponse::WriteThenQuit { path } => match write_buffer(self, path.as_deref()) {
+                    Ok(_) => HostResponse::QuitWindow,
+                    Err(e) => HostResponse::Error(e.to_string()),
+                },
+
+                // Window and viewport commands the editor recognised but the UI
+                // must carry out (it owns the window tree and the scroll
+                // offsets — see `EditorResponse::Window`/`Scroll`).
+                EditorResponse::Window(cmd) => HostResponse::Window(cmd),
+                EditorResponse::Scroll(req) => HostResponse::Scroll(req),
+
+                // A keymap resolved to one of the maintainer's configured
+                // actions (`<leader>e` → file tree, `f` → hop, `\ff` → find
+                // files, ...). The editor cannot perform these itself — it must
+                // not depend on `plugins` or `ui` (see `EditorResponse::Action`)
+                // — so they are forwarded one more hop, to `ui::app::App`, which
+                // is the layer that owns overlays and focus. `App::handle_action`
+                // decides what each one does, and still answers honestly for the
+                // ones with no UI yet.
+                EditorResponse::Action(action) => HostResponse::Action(action),
+            },
+            Err(e) => HostResponse::Error(e.to_string()),
+        }
+    }
+
+    fn mode(&self) -> Mode {
+        crate::editor::Editor::mode(self)
+    }
+
+    fn cursor(&self) -> Position {
+        crate::editor::Editor::cursor(self)
+    }
+
+    fn buffer(&self) -> &Buffer {
+        crate::editor::Editor::buffer(self)
+    }
+
+    fn open(&mut self, path: &Path) -> Result<(), String> {
+        crate::editor::Editor::open(self, path).map(|_| ()).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    fn replace_range(&mut self, range: crate::core::Range, text: &str) -> Position {
+        crate::editor::Editor::replace_range(self, range, text)
+    }
+
+    fn move_cursor(&mut self, pos: Position) {
+        crate::editor::Editor::move_cursor(self, pos);
+    }
+
+    // The two accessors below are the whole fix for "`:` commands were invisible
+    // while you typed them" and "visual mode highlighted nothing". The editor had
+    // both pieces of state all along; this seam simply had no way to ask for
+    // them. Delegation, nothing more — which is exactly how much code the bug was
+    // worth, and exactly why it was so easy to leave out.
+
+    fn command_line(&self) -> Option<&str> {
+        crate::editor::Editor::command_line(self)
+    }
+
+    fn selection(&self) -> Option<(Position, Position)> {
+        crate::editor::Editor::selection(self)
+    }
+
+    /// Maps the editor's [`crate::editor::WhichKeyItem`]s to the UI's
+    /// [`crate::ui::whichkey::WhichKeyRow`] — the one place these two
+    /// vocabularies meet, kept in this adapter so neither `editor` nor the
+    /// `whichkey` widget depends on the other's type.
+    fn which_key(&self) -> Vec<crate::ui::whichkey::WhichKeyRow> {
+        crate::editor::Editor::which_key(self)
+            .into_iter()
+            .map(|item| crate::ui::whichkey::WhichKeyRow {
+                keys: item.keys,
+                desc: item.desc,
+                is_group: item.is_group,
+            })
+            .collect()
+    }
+
+    fn active_buffer_id(&self) -> crate::core::BufferId {
+        crate::editor::Editor::buffer_id(self)
+    }
+
+    fn buffer_by_id(&self, id: crate::core::BufferId) -> Option<&Buffer> {
+        crate::editor::Editor::buffer_by_id(self, id)
+    }
+
+    fn set_active(&mut self, buffer: crate::core::BufferId, cursor: Position) {
+        crate::editor::Editor::set_active(self, buffer, cursor);
+    }
+
+    fn new_buffer(&mut self) -> crate::core::BufferId {
+        crate::editor::Editor::new_buffer(self)
+    }
+
+    fn set_viewport_height(&mut self, lines: usize) {
+        crate::editor::Editor::set_viewport_height(self, lines);
+    }
+
+    /// Translates the editor's own [`crate::editor::CommandKind`] into the
+    /// UI's [`PromptKind`] — the one place these two vocabularies meet, kept
+    /// here (in the adapter) so neither `editor` nor the `ui` widgets depend on
+    /// the other's enum.
+    fn command_prompt(&self) -> crate::ui::cmdline::PromptKind {
+        use crate::editor::CommandKind;
+        use crate::ui::cmdline::PromptKind;
+        match crate::editor::Editor::command_line_kind(self) {
+            Some(CommandKind::Ex) => PromptKind::Command,
+            Some(CommandKind::SearchForward) => PromptKind::SearchForward,
+            Some(CommandKind::SearchBackward) => PromptKind::SearchBackward,
+            None => PromptKind::None,
+        }
+    }
+}
+
+/// Translates a UI [`KeyPress`] into the editor's own key type.
+///
+/// Returns `None` for keys the editor has no code for, which the caller treats
+/// as "nothing changed" rather than as an error — an unmapped key in vi is a
+/// no-op, not a failure.
+fn to_editor_key(key: KeyPress) -> Option<EditorKey> {
+    use crate::editor::key::KeyCode as E;
+
+    let code = match key.key {
+        Key::Char(c) => E::Char(c),
+        Key::Enter => E::Enter,
+        Key::Escape => E::Esc,
+        Key::Backspace => E::Backspace,
+        Key::Tab => E::Tab,
+        Key::Delete => E::Delete,
+        Key::Up => E::Up,
+        Key::Down => E::Down,
+        Key::Left => E::Left,
+        Key::Right => E::Right,
+        Key::Home => E::Home,
+        Key::End => E::End,
+        Key::PageUp => E::PageUp,
+        Key::PageDown => E::PageDown,
+        Key::F(n) => E::F(n),
+        // The editor models Shift-Tab as plain Tab plus the shift modifier
+        // rather than as a distinct code, so map it that way instead of
+        // dropping it.
+        Key::BackTab => E::Tab,
+        Key::Insert => return None,
+    };
+
+    let shift = key.mods.shift || matches!(key.key, Key::BackTab);
+    Some(EditorKey {
+        code,
+        mods: crate::editor::key::Modifiers { ctrl: key.mods.ctrl, alt: key.mods.alt, shift },
+    })
+}
+
+/// See the module docs: a temporary stand-in for `editor::Editor`, kept
+/// intentionally incapable of anything beyond "look at a file and quit".
+///
+/// Retained only because its tests pin the [`EditorHost`] seam itself,
+/// independently of the real engine. The binary no longer uses it — see
+/// [`run`].
+#[allow(dead_code)]
+struct PlaceholderHost {
+    buffer: Buffer,
+    cursor: Position,
+}
+
+impl EditorHost for PlaceholderHost {
+    type Buffer = Buffer;
+
+    fn handle_key(&mut self, key: KeyPress) -> HostResponse {
+        let mut target = self.cursor;
+        match key.key {
+            Key::Char('q') => return HostResponse::Quit,
+            Key::Char('h') | Key::Left => target.col = target.col.saturating_sub(1),
+            Key::Char('l') | Key::Right => target.col = target.col.saturating_add(1),
+            Key::Char('k') | Key::Up => target.line = target.line.saturating_sub(1),
+            Key::Char('j') | Key::Down => target.line = target.line.saturating_add(1),
+            _ => return HostResponse::Unchanged,
+        }
+        // Bounds-checking a cursor move is the buffer's own job (it already
+        // knows its line count and each line's grapheme length) — delegated
+        // via `Buffer::clamp` rather than re-implemented here, which is
+        // exactly the kind of motion *policy* (does moving past the buffer
+        // end wrap, clamp, or error?) that belongs to whichever module owns
+        // "what a valid cursor position is," not to this placeholder.
+        let clamped = self.buffer.clamp(target);
+        if clamped == self.cursor {
+            return HostResponse::Unchanged;
+        }
+        self.cursor = clamped;
+        HostResponse::Changed
+    }
+
+    fn mode(&self) -> Mode {
+        // No modal state machine exists yet to report; every real editor
+        // key handler downstream of this placeholder should treat "always
+        // Normal" as exactly as capable as this host actually is.
+        Mode::Normal
+    }
+
+    fn cursor(&self) -> Position {
+        self.cursor
+    }
+
+    fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    fn open(&mut self, _path: &Path) -> Result<(), String> {
+        // Deliberately incapable, like everything else on this placeholder: it
+        // has one buffer and no way to acquire a second. See the module docs.
+        Err("the placeholder host cannot open files".to_string())
+    }
+}
+
+/// Opens `files` (or an empty scratch buffer, if none were given) and runs
+/// the editor until it quits.
+///
+/// This is the function `main.rs` hands control to after parsing CLI
+/// arguments and loading [`Config`]. It owns the terminal for the process's
+/// entire interactive lifetime: entering [`TerminalGuard`] here, rather
+/// than in `main`, keeps the raw-mode/alternate-screen invariant scoped to
+/// exactly "while `run` is on the stack," which is also exactly "while
+/// there is a UI to draw."
+pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
+    let theme = Theme::from_name(&config.theme);
+    let options = config.options.clone();
+    let leader = config.leader;
+
+    // Detected once, here, and threaded down: the statusline needs to know
+    // whether Powerline separators are safe (a bar full of tofu boxes is worse
+    // than one with plain separators) and the file tree needs the same answer for
+    // its devicons. `IconSet::detect` defaults to the timid tier when it cannot
+    // tell — see `crate::icons`.
+    let icons = crate::icons::IconSet::detect();
+
+    let mut editor = crate::editor::Editor::with_config(config);
+    for path in files {
+        editor.open(path)?;
+    }
+
+    let mut app = App::new(editor, options, theme, icons, leader);
+
+    let mut guard = TerminalGuard::new()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let result = app.run(&mut terminal);
+    // Stop any language servers before restoring the terminal, so kvim leaves
+    // no orphaned rust-analyzer/texlab processes behind.
+    app.shutdown_lsp();
+    // Explicit rather than relying solely on `guard`'s `Drop`: restoring
+    // before returning means a startup/runtime error prints to a terminal
+    // that is back in its normal (non-raw, non-alternate-screen) state,
+    // instead of being swallowed by the alternate screen `Drop` is about to
+    // leave.
+    guard.restore();
+    result.map_err(anyhow::Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_host_moves_the_cursor_and_clamps_to_the_buffer() {
+        let buffer = Buffer::from_str("ab\ncd\n");
+        let mut host = PlaceholderHost { buffer, cursor: Position::ORIGIN };
+
+        assert_eq!(host.handle_key(KeyPress::plain(Key::Char('l'))), HostResponse::Changed);
+        assert_eq!(host.cursor(), Position::new(0, 1));
+
+        assert_eq!(host.handle_key(KeyPress::plain(Key::Char('j'))), HostResponse::Changed);
+        assert_eq!(host.cursor().line, 1);
+    }
+
+    #[test]
+    fn placeholder_host_reports_quit_on_q() {
+        let buffer = Buffer::new();
+        let mut host = PlaceholderHost { buffer, cursor: Position::ORIGIN };
+        assert_eq!(host.handle_key(KeyPress::plain(Key::Char('q'))), HostResponse::Quit);
+    }
+
+    #[test]
+    fn placeholder_host_reports_unchanged_at_the_buffer_edge() {
+        let buffer = Buffer::from_str("a");
+        let mut host = PlaceholderHost { buffer, cursor: Position::ORIGIN };
+        // Already at (0, 0); moving left/up must clamp to the same spot.
+        assert_eq!(host.handle_key(KeyPress::plain(Key::Char('h'))), HostResponse::Unchanged);
+        assert_eq!(host.handle_key(KeyPress::plain(Key::Char('k'))), HostResponse::Unchanged);
+    }
+
+    #[test]
+    fn text_buffer_implements_bufferview_matching_its_own_api() {
+        let buffer = Buffer::from_str("hello\nworld\n");
+        assert_eq!(BufferView::line_count(&buffer), 3); // trailing newline -> 3rd empty line.
+        assert_eq!(BufferView::line(&buffer, 0).as_deref(), Some("hello"));
+        assert!(!BufferView::is_modified(&buffer));
+        assert_eq!(BufferView::path(&buffer), None);
+    }
+}

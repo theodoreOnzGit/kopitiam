@@ -1,0 +1,13 @@
+[package]
+name = "kopitiam-knowledge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The unified semantic graph (SemanticGraph) for KOPITIAM's Semantic Runtime."
+
+[dependencies]
+kopitiam-ontology.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

@@ -1,0 +1,91 @@
+[package]
+name = "kopitiam-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM web search: pluggable search-API adapters. The LAST resort in the Offline First pipeline, never the first."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+kopitiam-ontology.workspace = true
+
+# The cache is persisted through kopitiam-index's redb-backed `Store` rather
+# than reinventing persistence here. redb is pure Rust with no C dependency,
+# so this costs the Pure Rust Core nothing, and it means a cached search lands
+# in the same `.kopitiam/` project directory as the rest of the runtime's
+# state -- one place to back up, one place to inspect.
+kopitiam-index.workspace = true
+
+# Provenance timestamps. A search result without a retrieval date is worthless
+# (the web changes underneath you), so this is a mandatory dependency, not an
+# optional one.
+#
+# `default-features = false` is deliberate and load-bearing: it excludes
+# chrono's `clock` feature, and with it `iana-time-zone`, which reaches for
+# platform time-zone APIs (Objective-C on Apple, a JNI/`getprop` path on
+# Android). We never want local time here anyway -- provenance is always
+# recorded in UTC, because a retrieval timestamp must mean the same thing to
+# every reader of the knowledge graph regardless of where they sit. The `now`
+# feature gives `Utc::now()` from `SystemTime` alone.
+#
+# chrono is already in this workspace's Cargo.lock (kopitiam-mux, lopdf), so
+# this adds no new crate to the dependency tree.
+chrono = { version = "0.4", default-features = false, features = ["std", "now", "serde"] }
+
+# Content hashing for provenance (SHA-256). RustCrypto's `sha2`: pure Rust, no
+# C, no build script compiling native code -- its `asm` feature is opt-in and
+# is NOT enabled here. Already in this workspace's Cargo.lock (lopdf, rmux),
+# so no new supply-chain surface.
+sha2 = "0.10"
+
+# ---------------------------------------------------------------------------
+# The network stack. NOT built by default -- see [features] below.
+# ---------------------------------------------------------------------------
+#
+# `default-features = false, features = ["rustls"]` selects ureq's rustls
+# backend and, critically, leaves ureq's `native-tls` feature OFF. `native-tls`
+# is what would drag in OpenSSL (`openssl-sys`, a C library, and the single
+# most reliable way to break an Android cross-build). Verify with:
+#
+#     cargo tree -p kopitiam-web --features brave,searxng | grep -iE 'openssl|native-tls'
+#
+# which must print nothing.
+#
+# Honest caveat, recorded because it is easy to get wrong: "rustls" does NOT
+# mean "no C". rustls is a pure-Rust TLS *protocol* implementation, but it
+# delegates cryptography to a provider, and every production-ready provider
+# today contains C or assembly -- ureq's `rustls` feature selects `ring`
+# (C + perlasm), and rustls' own default is `aws-lc-rs` (AWS-LC, more C still).
+# We accept `ring` deliberately: it cross-compiles cleanly to the targets
+# KOPITIAM cares about (including Android/aarch64, where OpenSSL notoriously
+# does not), and it is confined behind an off-by-default feature so the core
+# platform never compiles a byte of it. See docs/ai-decisions/AID-0013.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# The default build has NO network stack at all. This is the point of the
+# crate: 99% of KOPITIAM never searches the web, and must not pay for the
+# possibility -- not in compile time, not in dependency surface, and not in the
+# Pure Rust Core promise. `--no-default-features` and the default build are
+# therefore identical, and both are fully testable offline.
+default = []
+
+# Shared HTTP plumbing for the live adapters. Not useful on its own; enabled by
+# the individual provider features below.
+http = ["dep:ureq"]
+
+# SearXNG: a self-hosted metasearch instance. No API key, no vendor, no cost.
+# The recommended adapter -- see the crate docs for why.
+searxng = ["http"]
+
+# Brave Search API: an independent web index (not a Google reseller). Requires
+# an API key in KOPITIAM_BRAVE_API_KEY.
+brave = ["http"]

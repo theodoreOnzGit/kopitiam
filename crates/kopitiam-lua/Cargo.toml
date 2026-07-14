@@ -1,0 +1,29 @@
+[package]
+name = "kopitiam-lua"
+description = "A pure-Rust Lua 5.1 interpreter. No C, no bindings, no vendored Lua."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependencies are deliberately near-zero: this crate is the load-bearing
+# example of KOPITIAM's Pure Rust Core promise (see AID-0003), and a Lua
+# interpreter that dragged in a pile of crates would undercut the point of
+# writing one at all.
+#
+# `indexmap` is the single exception, and it earns its place twice over:
+#
+#  1. DETERMINISM. CLAUDE.md requires deterministic behaviour. `std::HashMap`
+#     seeds its hasher randomly per process, so `pairs()` would enumerate a
+#     table in a different order on every run -- the same config could produce
+#     different results on two runs of kvim. `indexmap` iterates in insertion
+#     order, so a deterministic program produces a deterministic traversal.
+#  2. `next()`. Lua's stateless `next(t, k)` must find k's successor. With an
+#     insertion-ordered map that is an index lookup; with a HashMap it would
+#     mean re-scanning the table on every step of every `pairs()` loop.
+#
+# It is pure Rust and already in the workspace's Cargo.lock, so it adds no new
+# supply-chain surface.
+[dependencies]
+indexmap = { workspace = true }

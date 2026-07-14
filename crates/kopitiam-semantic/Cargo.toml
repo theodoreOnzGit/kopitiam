@@ -1,0 +1,22 @@
+[package]
+name = "kopitiam-semantic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust knowledge providers (cargo metadata, rust-analyzer, rustdoc JSON) and LSP-backed rename/code-action write support for KOPITIAM's Semantic Runtime."
+
+[dependencies]
+anyhow.workspace = true
+cargo_metadata.workspace = true
+kopitiam-ontology.workspace = true
+rustdoc-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+similar.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

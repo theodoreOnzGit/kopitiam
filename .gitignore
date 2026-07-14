@@ -1,0 +1,21 @@
+
+# Rust
+./target/
+./target/*
+./target/flycheck/*
+**/target/
+Cargo.lock.bak
+*.pdb
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# KOPITIAM Semantic Runtime per-project state (local session memory)
+.kopitiam/
+
+# Vendored reference sources for translation (not part of the Pure Rust Core;
+# local-only, never committed — see README.md's "Scientific Translation" plan)
+crates/kopitiam-ai/vendor/

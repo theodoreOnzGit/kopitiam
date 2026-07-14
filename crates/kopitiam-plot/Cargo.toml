@@ -1,0 +1,37 @@
+[package]
+name = "kopitiam-plot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Plot digitisation: recovers (x, y) data series from vector plots printed in PDFs."
+
+[dependencies]
+# The whole crate rests on reading path geometry out of a PDF content stream.
+# `lopdf` is the only pure-Rust crate in the tree that hands us the raw
+# operator sequence, and it is already present (transitively via `pdf-extract`,
+# directly via `kopitiam-pdf`), so this adds no new dependency. See
+# `content.rs` for why we walk the stream ourselves rather than reusing
+# `pdf-extract`'s `OutputDev` stroke/fill callbacks.
+lopdf = { workspace = true }
+# Tick *labels* are text, and text extraction (font encodings, CID maps,
+# ligatures) is a solved problem inside `kopitiam-pdf`. We consume its
+# `TextSpan`s rather than re-deriving them. This is also the correct dependency
+# direction: kopitiam-plot is a knowledge provider layered on the PDF knowledge
+# provider.
+kopitiam-pdf = { workspace = true }
+# A digitised plot must end up as knowledge in the semantic graph, not as a
+# loose struct (CLAUDE.md, "Scientific Knowledge").
+kopitiam-ontology = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# Integration tests link only against this crate plus its dev-dependencies, so
+# the two crates the round-trip tests drive directly (they load the generated
+# PDF both ways, to prove path geometry and text land in one coordinate space)
+# have to be repeated here.
+[dev-dependencies]
+lopdf = { workspace = true }
+kopitiam-pdf = { workspace = true }

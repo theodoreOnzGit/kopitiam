@@ -1,0 +1,31 @@
+[package]
+name = "kopitiam-ai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pluggable model adapters (local Qwen, Claude, GPT, Gemini) for KOPITIAM's Semantic Runtime."
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+# The local-first Qwen inference stack (see src/local.rs for why depending
+# on it from here is a downward dependency, not a violation of the
+# Semantic Runtime's "nothing below kopitiam-workflow may depend on
+# kopitiam-ai" rule). Optional and gated behind the `local` feature so a
+# consumer that only wants the ModelAdapter trait + EchoAdapter (e.g. a
+# future cloud-only adapter crate) never has to compile a tensor engine.
+kopitiam-runtime = { workspace = true, optional = true }
+kopitiam-loader = { workspace = true, optional = true }
+kopitiam-tokenizer = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = ["local"]
+# LocalAdapter: a ModelAdapter backed by kopitiam-runtime's on-CPU Qwen
+# inference engine. See src/local.rs.
+local = ["dep:kopitiam-runtime", "dep:kopitiam-loader", "dep:kopitiam-tokenizer"]

@@ -1,0 +1,11 @@
+[package]
+name = "kopitiam-markdown"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Semantic Markdown rendering for KOPITIAM's Document Engine."
+
+[dependencies]
+kopitiam-document = { workspace = true }
