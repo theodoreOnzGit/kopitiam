@@ -21,6 +21,7 @@
 //! write-capable slice, driving a live rust-analyzer over LSP to rename
 //! symbols and apply refactorings (see [`rename`] and [`code_actions`]).
 
+mod adapter;
 mod code_actions;
 mod models;
 mod plan;
@@ -98,9 +99,12 @@ enum Command {
     Status(status::StatusArgs),
 
     /// Run the `plan` workflow: build context from a live scan plus
-    /// session memory, and invoke a model adapter (currently
-    /// `kopitiam_ai::EchoAdapter` — no production adapter is wired in
-    /// yet).
+    /// session memory, and invoke a model adapter.
+    ///
+    /// The adapter is chosen at runtime by `crate::adapter::select_adapter`:
+    /// a real on-CPU `kopitiam_ai::LocalAdapter` when a `.gguf` is present on
+    /// disk, otherwise `kopitiam_ai::EchoAdapter` (the deterministic stub)
+    /// with a note on how to get a real model. Either way it runs offline.
     ///
     /// See `apps/cli/src/plan.rs`: the first `kopitiam-workflow` command,
     /// proving the full `load state -> collect facts -> build context ->

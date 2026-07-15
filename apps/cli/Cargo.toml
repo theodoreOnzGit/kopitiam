@@ -24,3 +24,9 @@ kopitiam-ai = { workspace = true }
 kopitiam-models = { path = "../../crates/kopitiam-models" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+# Used by adapter-selection tests to build throwaway model stores in a
+# tempdir, so presence/absence decisions are exercised without touching the
+# user's real ~/.cache/kopitiam/models.
+tempfile = { workspace = true }
