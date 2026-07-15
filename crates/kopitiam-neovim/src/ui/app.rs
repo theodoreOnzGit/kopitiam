@@ -531,6 +531,7 @@ impl<H: EditorHost> App<H> {
                 let target = locs[0].clone();
                 self.jump_to_location(&target.file, target.range.anchor)
             }
+            Err(e) if e.is_not_ready() => self.info(format!("{ft} LSP is still starting — try again in a moment")),
             Err(e) => self.error(format!("LSP definition: {e}")),
         }
     }
@@ -549,6 +550,7 @@ impl<H: EditorHost> App<H> {
                 self.lsp_refs = Some(RefList { locations: locs, selected: 0 });
                 LoopAction::Redraw
             }
+            Err(e) if e.is_not_ready() => self.info(format!("{ft} LSP is still starting — try again in a moment")),
             Err(e) => self.error(format!("LSP references: {e}")),
         }
     }
@@ -567,6 +569,7 @@ impl<H: EditorHost> App<H> {
                 LoopAction::Redraw
             }
             Ok(None) => self.info("no hover information".to_string()),
+            Err(e) if e.is_not_ready() => self.info(format!("{ft} LSP is still starting — try again in a moment")),
             Err(e) => self.error(format!("LSP hover: {e}")),
         }
     }
@@ -620,6 +623,7 @@ impl<H: EditorHost> App<H> {
         }
         match self.lsp.rename(&r.filetype, &r.file, r.pos, &r.line_text, &r.input) {
             Ok(edits) if edits.is_empty() => self.info("rename produced no changes".to_string()),
+            Err(e) if e.is_not_ready() => self.info(format!("{} LSP is still starting — try again in a moment", r.filetype)),
             Ok(edits) => {
                 let count = edits.len();
                 for edit in &edits {
@@ -1025,10 +1029,25 @@ impl<H: EditorHost> App<H> {
                 return false;
             }
             let text = self.active_buffer_text();
-            if self.lsp.did_open(&ft, &file, &text).is_ok() {
-                self.lsp_opened.insert(file.clone());
-            } else {
-                return false;
+            match self.lsp.did_open(&ft, &file, &text) {
+                // Announced successfully: the server is up. Record it so we
+                // never re-announce (or re-spawn) on later idle ticks.
+                Ok(()) => {
+                    self.lsp_opened.insert(file.clone());
+                }
+                // Still starting: `did_open` fast-returned `NotReady` because
+                // the background connect is in flight. Do *not* mark the file
+                // opened — the next idle tick retries, and the UI stayed
+                // responsive because this call never blocked. This is the whole
+                // point of the async client (bead kopitiam-cj0.27 / AID-0028).
+                Err(e) if e.is_not_ready() => return false,
+                // Terminal failure (the server could not be spawned or exited
+                // during the handshake). Retrying every tick would hammer a
+                // dead server, so remember this file as server-less and stop.
+                Err(_) => {
+                    self.lsp_no_server.insert(file.clone());
+                    return false;
+                }
             }
         }
         match self.lsp.diagnostics(&ft, &file) {

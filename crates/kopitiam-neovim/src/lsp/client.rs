@@ -27,19 +27,43 @@
 //! point into a *different* file than the one queried). No caller ever sees a
 //! wire encoding.
 //!
-//! # What `RustAnalyzerSession` gives us, despite the name
+//! # What `AsyncRustAnalyzerSession` gives us, despite the name
 //!
-//! `connect_with_binary` spawns *any* executable and speaks generic LSP to it,
-//! so this same session type drives `lua-language-server`, `texlab`, and
+//! `spawn_async_with_binary` spawns *any* executable and speaks generic LSP to
+//! it, so this same session type drives `lua-language-server`, `texlab`, and
 //! rust-analyzer (for both `.rs` files and `Cargo.toml`) alike — nothing about
 //! it is rust-analyzer-specific once connected.
+//!
+//! # Non-blocking by construction: the UI thread never waits on a connect
+//!
+//! kvim attaches a language server the instant a served file is shown
+//! (`docs/ai-decisions/AID-0023`), and that attach lands on the editor's **UI
+//! thread**. The synchronous [`kopitiam_semantic::RustAnalyzerSession::connect`]
+//! blocks that thread through rust-analyzer's whole `initialize` +
+//! `cachePriming` handshake — ~3 s on a small crate, tens of seconds on a large
+//! workspace — so opening a Rust file *froze* the editor (bead
+//! `kopitiam-cj0.27`, AID-0028's "what remains").
+//!
+//! This client is built on [`AsyncRustAnalyzerSession`] instead: [`Self::session`]
+//! calls [`AsyncRustAnalyzerSession::spawn_async_with_binary`], which returns
+//! **immediately** with a handle in state [`LspState::Connecting`] while a
+//! background thread runs the blocking connect. Every request method here is
+//! therefore non-blocking on the connect: while the server is still coming up
+//! they surface [`LspError::NotReady`] (which the UI shows as a brief "still
+//! starting" note and retries on its idle tick), and once the handle flips to
+//! [`LspState::Ready`] they behave exactly like the old synchronous calls. The
+//! handle is inserted into the registry **at spawn time, not at ready time** —
+//! that is what makes the `(server, root)` dedup hold under the async model: a
+//! second file opened under the same root on the next idle tick finds the
+//! still-`Connecting` handle already in the map and reuses it, rather than
+//! spawning a second rust-analyzer (the "one kvim, three rust-analyzers"
+//! observation in AID-0028).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use kopitiam_semantic::RustAnalyzerSession;
 use kopitiam_semantic::edit::FileEdit;
-use kopitiam_semantic::{self as semantic};
+use kopitiam_semantic::{self as semantic, AsyncRustAnalyzerSession, LspState, RequestError};
 
 use crate::core::{Position, Range};
 
@@ -56,6 +80,19 @@ const WIRE: PositionEncoding = PositionEncoding::Utf32;
 pub enum LspError {
     #[error("no language server is registered for filetype {0:?}")]
     NoServerForFiletype(String),
+    /// The server for this buffer's language has been spawned but has not yet
+    /// finished connecting/indexing. **Not an error to surface loudly** — the
+    /// UI shows a brief "still starting" note and retries on its next idle
+    /// tick. Distinguished from [`Self::Failed`] (terminal) by
+    /// [`Self::is_not_ready`] so a caller can pick the right message without
+    /// matching the whole enum.
+    #[error("the {filetype} language server is still starting")]
+    NotReady { filetype: String },
+    /// The server could not be spawned, or exited during the handshake. Carries
+    /// the reason the background connect recorded. Terminal for this
+    /// `(server, root)`: retrying will not help until the buffer is reopened.
+    #[error("the {filetype} language server failed to start: {reason}")]
+    Failed { filetype: String, reason: String },
     #[error("failed to start `{executable}`: {source}")]
     Spawn {
         executable: String,
@@ -64,6 +101,41 @@ pub enum LspError {
     },
     #[error(transparent)]
     Semantic(#[from] anyhow::Error),
+}
+
+impl LspError {
+    /// Whether this is the transient [`Self::NotReady`] "server still starting"
+    /// case, which a caller should treat as "try again shortly" rather than as
+    /// a failure to report. Lets the UI branch on one predicate instead of
+    /// re-matching the enum at every call site.
+    pub fn is_not_ready(&self) -> bool {
+        matches!(self, LspError::NotReady { .. })
+    }
+}
+
+/// Maps a [`RequestError`] from the async session into this module's
+/// [`LspError`], reading the recorded failure reason off `session` when the
+/// connect has failed. Kept as a free function (rather than a `From`) because
+/// it needs both the `filetype` label and the session handle in hand.
+fn map_request_error(filetype: &str, session: &AsyncRustAnalyzerSession, err: RequestError) -> LspError {
+    match err {
+        // Still connecting: transient, the caller retries.
+        RequestError::NotReady(LspState::Connecting) => LspError::NotReady { filetype: filetype.to_string() },
+        // The connect failed outright; surface the recorded reason.
+        RequestError::NotReady(LspState::Failed) => LspError::Failed {
+            filetype: filetype.to_string(),
+            reason: session.error().unwrap_or_else(|| "unknown reason".to_string()),
+        },
+        // `NotReady(Ready)` cannot occur (a ready session serves the request),
+        // but the match must be total; treat it as transient.
+        RequestError::NotReady(LspState::Ready) => LspError::NotReady { filetype: filetype.to_string() },
+        RequestError::Disconnected => LspError::Failed {
+            filetype: filetype.to_string(),
+            reason: "the language server worker thread stopped".to_string(),
+        },
+        // A genuine request error against a ready server.
+        RequestError::Failed(e) => LspError::Semantic(e),
+    }
 }
 
 /// LSP's `DiagnosticSeverity` (1–4), spelled out so a non-exhaustive `match`
@@ -110,11 +182,11 @@ pub struct Diagnostic {
 /// The live language servers, one per `(server executable, workspace root)`.
 ///
 /// See the module doc comment for the keying rationale. Constructed empty; a
-/// server is spawned lazily on the first request for a file of its language
-/// under a not-yet-seen root.
+/// server is spawned lazily (and non-blockingly) on the first request for a
+/// file of its language under a not-yet-seen root.
 #[derive(Default)]
 pub struct LspClient {
-    sessions: HashMap<(String, PathBuf), RustAnalyzerSession>,
+    sessions: HashMap<(String, PathBuf), AsyncRustAnalyzerSession>,
 }
 
 impl LspClient {
@@ -122,10 +194,35 @@ impl LspClient {
         Self::default()
     }
 
-    /// Whether a server is already running for `filetype` rooted anywhere.
+    /// Whether a server for `filetype` (rooted anywhere) is spawned **and
+    /// finished connecting** — i.e. it will actually serve a request rather
+    /// than reject it with [`LspError::NotReady`].
+    ///
+    /// This is deliberately stricter than "a handle exists": completion is
+    /// refreshed on every keystroke and gates on this, so a session that is
+    /// still `Connecting` must read as *not* running, or every keystroke in a
+    /// just-opened buffer would issue a request that only bounces back
+    /// `NotReady`.
     pub fn is_running(&self, filetype: &str) -> bool {
         registry::for_filetype(filetype)
-            .map(|s| self.sessions.keys().any(|(exe, _)| *exe == s.executable))
+            .map(|s| {
+                self.sessions
+                    .iter()
+                    .any(|((exe, _), session)| *exe == s.executable && session.is_ready())
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether a server for `filetype` (rooted anywhere) exists at all,
+    /// regardless of readiness — including one still `Connecting`. Lets the UI
+    /// show a "LSP: starting…" hint while the background connect is in flight.
+    pub fn is_starting(&self, filetype: &str) -> bool {
+        registry::for_filetype(filetype)
+            .map(|s| {
+                self.sessions
+                    .iter()
+                    .any(|((exe, _), session)| *exe == s.executable && session.state() == LspState::Connecting)
+            })
             .unwrap_or(false)
     }
 
@@ -144,7 +241,9 @@ impl LspClient {
     pub fn definition(&mut self, filetype: &str, file: &Path, pos: Position, line_text: &str) -> Result<Vec<Location>, LspError> {
         let (line, character) = query_position(pos, line_text);
         let session = self.session(filetype, file)?;
-        let locs = session.definition(file, line, character)?;
+        let locs = session
+            .definition(file, line, character)
+            .map_err(|e| map_request_error(filetype, session, e))?;
         Ok(locs.into_iter().map(convert_location).collect())
     }
 
@@ -153,7 +252,9 @@ impl LspClient {
     pub fn references(&mut self, filetype: &str, file: &Path, pos: Position, line_text: &str) -> Result<Vec<Location>, LspError> {
         let (line, character) = query_position(pos, line_text);
         let session = self.session(filetype, file)?;
-        let locs = session.references(file, line, character, true)?;
+        let locs = session
+            .references(file, line, character, true)
+            .map_err(|e| map_request_error(filetype, session, e))?;
         Ok(locs.into_iter().map(convert_location).collect())
     }
 
@@ -162,7 +263,10 @@ impl LspClient {
     pub fn hover(&mut self, filetype: &str, file: &Path, pos: Position, line_text: &str) -> Result<Option<String>, LspError> {
         let (line, character) = query_position(pos, line_text);
         let session = self.session(filetype, file)?;
-        Ok(session.hover(file, line, character)?.map(|h| h.contents))
+        Ok(session
+            .hover(file, line, character)
+            .map_err(|e| map_request_error(filetype, session, e))?
+            .map(|h| h.contents))
     }
 
     /// Completion candidates at `pos` (typed, already JSON-parsed by the
@@ -170,7 +274,9 @@ impl LspClient {
     pub fn completion(&mut self, filetype: &str, file: &Path, pos: Position, line_text: &str) -> Result<Vec<semantic::CompletionItem>, LspError> {
         let (line, character) = query_position(pos, line_text);
         let session = self.session(filetype, file)?;
-        Ok(session.completion(file, line, character)?)
+        session
+            .completion(file, line, character)
+            .map_err(|e| map_request_error(filetype, session, e))
     }
 
     /// Computes (does not write) the edits that would rename the symbol at
@@ -178,7 +284,9 @@ impl LspClient {
     pub fn rename(&mut self, filetype: &str, file: &Path, pos: Position, line_text: &str, new_name: &str) -> Result<Vec<FileEdit>, LspError> {
         let (line, character) = query_position(pos, line_text);
         let session = self.session(filetype, file)?;
-        Ok(session.rename(file, line, character, new_name)?)
+        session
+            .rename(file, line, character, new_name)
+            .map_err(|e| map_request_error(filetype, session, e))
     }
 
     /// Announces `file`'s current buffer `text` to its server as an open
@@ -187,8 +295,9 @@ impl LspClient {
     /// calls it when a buffer of a served language is first shown.
     pub fn did_open(&mut self, filetype: &str, file: &Path, text: &str) -> Result<(), LspError> {
         let session = self.session(filetype, file)?;
-        session.did_open(file, text)?;
-        Ok(())
+        session
+            .did_open(file, text)
+            .map_err(|e| map_request_error(filetype, session, e))
     }
 
     /// Pushes the full new `text` of an already-open `file` (full-document
@@ -196,8 +305,9 @@ impl LspClient {
     /// just larger on the wire.
     pub fn did_change(&mut self, filetype: &str, file: &Path, text: &str) -> Result<(), LspError> {
         let session = self.session(filetype, file)?;
-        session.did_change(file, text)?;
-        Ok(())
+        session
+            .did_change(file, text)
+            .map_err(|e| map_request_error(filetype, session, e))
     }
 
     /// The diagnostics the server has most recently published for `file`,
@@ -206,7 +316,9 @@ impl LspClient {
     /// asynchronously after analysis — poll after [`Self::did_open`]).
     pub fn diagnostics(&mut self, filetype: &str, file: &Path) -> Result<Vec<Diagnostic>, LspError> {
         let session = self.session(filetype, file)?;
-        let diags = session.diagnostics(file)?;
+        let diags = session
+            .diagnostics(file)
+            .map_err(|e| map_request_error(filetype, session, e))?;
         let mut line_cache = LineCache::default();
         Ok(diags
             .into_iter()
@@ -220,27 +332,43 @@ impl LspClient {
     }
 
     /// Shuts down every running server, best-effort. Called on quit.
+    ///
+    /// Dropping an [`AsyncRustAnalyzerSession`] is itself non-blocking — it
+    /// closes the job channel and detaches the worker, whose owned session's
+    /// `Drop` kills the child process — so clearing the map is all that is
+    /// needed, and it will not stall quit even on a session still connecting.
     pub fn shutdown_all(&mut self) {
-        for (_, session) in self.sessions.drain() {
-            let _ = session.shutdown();
-        }
+        self.sessions.clear();
     }
 
     /// Finds or lazily spawns the server for `filetype` rooted at `file`'s
-    /// workspace root. Blocks on first spawn until the server finishes its
-    /// initial indexing pass (rust-analyzer: seconds to minutes on a large
-    /// workspace).
-    fn session(&mut self, filetype: &str, file: &Path) -> Result<&mut RustAnalyzerSession, LspError> {
+    /// workspace root, returning a **shared** handle to it.
+    ///
+    /// # This is the non-blocking, dedup-preserving heart of the client
+    ///
+    /// The spawn is [`AsyncRustAnalyzerSession::spawn_async_with_binary`], which
+    /// returns immediately in state [`LspState::Connecting`] — the connect and
+    /// rust-analyzer's `cachePriming` wait run on a background thread, never on
+    /// the caller's (UI) thread. The handle is inserted into the map at this
+    /// moment, *before* it is ready, so the `(server, root)` key dedups
+    /// correctly under the async model: a request for a second file under the
+    /// same root — arriving on the very next idle tick, while the first connect
+    /// is still in flight — finds the existing `Connecting` handle and reuses
+    /// it, instead of spawning a second rust-analyzer for the same workspace.
+    ///
+    /// Returns `&`, not `&mut`: the async handle's request methods take `&self`
+    /// (they hand work to the worker thread over a channel), so no unique borrow
+    /// is needed to issue a request.
+    fn session(&mut self, filetype: &str, file: &Path) -> Result<&AsyncRustAnalyzerSession, LspError> {
         let server: &LanguageServer =
             registry::for_filetype(filetype).ok_or_else(|| LspError::NoServerForFiletype(filetype.to_string()))?;
         let root = workspace_root(file);
         let key = (server.executable.to_string(), root.clone());
         if !self.sessions.contains_key(&key) {
-            let session = RustAnalyzerSession::connect_with_binary(server.executable, &root)
-                .map_err(|source| LspError::Spawn { executable: server.executable.to_string(), source })?;
+            let session = AsyncRustAnalyzerSession::spawn_async_with_binary(server.executable, &root);
             self.sessions.insert(key.clone(), session);
         }
-        Ok(self.sessions.get_mut(&key).expect("just inserted"))
+        Ok(self.sessions.get(&key).expect("just inserted"))
     }
 }
 
@@ -385,7 +513,25 @@ mod tests {
         let mut client = LspClient::new();
         // The call site `greet()` on line 5, grapheme column 4.
         let line5 = source.lines().nth(5).unwrap();
-        let locs = client.definition("rust", &lib, Position::new(5, 4), line5).expect("definition should resolve");
+
+        // The client is now non-blocking: the first request *spawns* the
+        // background connect and returns `NotReady` while it is in flight, so we
+        // poll (as kvim's idle tick does) until the server is ready rather than
+        // expecting the first call to block through indexing.
+        let start = std::time::Instant::now();
+        let locs = loop {
+            match client.definition("rust", &lib, Position::new(5, 4), line5) {
+                Ok(locs) => break locs,
+                Err(e) if e.is_not_ready() => {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(180),
+                        "server never became ready within 180s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("definition failed: {e}"),
+            }
+        };
         assert!(!locs.is_empty(), "the call to greet must resolve to its declaration");
         assert_eq!(locs[0].range.anchor.line, 0, "greet is declared on line 0");
         assert_eq!(locs[0].range.anchor.col, 7, "the identifier starts after `pub fn ` (7 graphemes)");
