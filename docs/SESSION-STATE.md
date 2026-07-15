@@ -1,8 +1,70 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-14 (end of the 15-agent batch)
+**Last updated:** 2026-07-16 (reconciled after two parallel sessions)
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
+
+> ## ⚠️ CURRENT STATE — read this first ah (2026-07-16, ~07:35 SGT)
+>
+> **Two Claude windows were running on this one repo. Now settled: THIS window
+> has full repo control; the other window is READ-ONLY.** So one writer only,
+> no more clobber. (This note itself was rewritten because the other window,
+> working from a stale picture, overwrote SESSION-STATE with an old kvim view.)
+>
+> **kvim is NOT frozen — it got heavy work this session, all committed + pushed:**
+> async LSP client so opening a Rust file no longer hangs (one rust-analyzer per
+> workspace now); window-focus `<C-h/j/k/l>` + tmux edge hand-off; visible split
+> borders; focusable file tree; `:qa`/`:qa!`/`:wa`/`:wqa`/`:xa`; completion menu
+> (LSP+buffer+snippet) + tabstops; syntax highlighting; which-key; hover/gd/gr/rn.
+> **442 tests**, reinstalled. In-flight (agents running): `:help` Singlish manual +
+> file-tree `<C-u>/<C-d>` scroll (cj0.32), and hover-at-cursor (cj0.29) + tmux
+> auto-config (cj0.31) still queued.
+>
+> **Model/AI side:** `kopitiam-models` acquisition layer landed + committed
+> (`kopitiam models` CLI). AI-loop agent running now: wire `LocalAdapter` into the
+> CLI (retire the `EchoAdapter` stub in `plan.rs`), Echo fallback when no model.
+>
+> **Hard rules added this session:** everything in **Singlish**; **no dev during
+> NUS hours** (Mon–Thu 08:30–18:00 / Fri 08:30–17:30 SGT, unless on leave — then
+> ask + stamp commits); **no dev during sleep hours** 23:30–06:00 (agents may run,
+> but the maintainer's prompts only get banked as beads). **Workspace bumped to
+> v0.1.1.** git history was purged to a single root commit; **no force-push** from
+> either window from now.
+>
+> The sections below still hold for enduring stuff (findings, known bugs, standing
+> constraints) — but ignore any "kvim frozen / 305 tests / publish 0.0.1" lines,
+> those are the stale picture this note corrects.
+
+---
+
+## Latest landing — model acquisition layer (2026-07-16, epic kopitiam-8v7)
+
+New crate **`kopitiam-models`** landed, plus a **`kopitiam models`** CLI group.
+This is the "how you actually get a `.gguf` onto disk" layer that was missing —
+the inference stack (`-loader`/`-tokenizer`/`-runtime`/`-ai`) already can *run* a
+model, but nothing could *fetch* one. Now got: a curated multi-family catalog
+(Qwen2 + Llama, model-agnostic on purpose, not Qwen-only), XDG cache resolution,
+streamed SHA-256 verification, and an **autofetch-first, BYO-fallback**
+`ensure_available`. Network sits behind a `Fetcher` trait (default-on `net`
+feature; `HttpFetcher` = ureq+rustls, same stack as `kopitiam-web`, so the
+`ring` C/asm caveat is AID-0013's, not a new decision). Built by 2 agents, one
+directory each (`crates/kopitiam-models/`, `apps/cli/`) against a frozen
+contract; integrator verified the **combined** `--workspace` tree in release
+(build + clippy `-D warnings` + 10 tests + 1 doctest all green).
+
+**Not usable end-to-end yet, on purpose:** the two catalog entries carry
+64-zero **placeholder** sha256 + `TODO(verify-url)`, so a real `models pull`
+fetches then deliberately fails the gate. Two follow-ups filed under the epic:
+(1) one real ~400MB pull to record true hashes + confirm exact URLs
+(maintainer-driven — needs network); (2) close the loop so a pulled/BYO model
+feeds `LocalAdapter` and `apps/cli/src/plan.rs` retires its `EchoAdapter` stub.
+BYO already works today: drop a verified file at the printed store path.
+
+Attribution note: did **not** add ureq/rustls/ring/sha2 to `ACKNOWLEDGEMENTS.md`
+— that file tracks forks/study/bundled assets, not the Cargo dependency tree
+(it lists none of the ~45 other deps either). The `ring`/Pure-Rust-Core caveat
+is recorded at the point of use + AID-0013. Flag if a dependency ledger is
+wanted instead.
 
 ---
 
@@ -11,8 +73,12 @@ without re-deriving anything.
 1. **Never publish to crates.io.** GitHub pushes only.
 2. **Judgment calls** get executed, recorded as an AID in `docs/ai-decisions/`,
    and filed as a bead. Don't stall waiting to ask.
-3. **kvim is frozen pending the maintainer's manual testing.** Do not touch
-   `crates/kopitiam-neovim/` until they report back.
+3. **kvim is NOT frozen anymore** — it is under active development this session
+   (see the CURRENT STATE note up top). Only one agent in `crates/kopitiam-neovim/`
+   at a time (one-directory-one-owner still holds).
+4. **Write everything in Singlish** (hard rule, see CLAUDE.md), technical
+   precision must survive.
+5. **Respect the NUS-hours and sleep-hours no-dev windows** (CLAUDE.md).
 4. Keep beads current continuously; keep this file accurate.
 
 ---
