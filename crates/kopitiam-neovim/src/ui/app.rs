@@ -61,7 +61,7 @@ use crate::ui::scrolling;
 use crate::ui::statusline::{Statusline, StatuslineData};
 use crate::ui::textarea::{Scroll, Selection, TextArea};
 use crate::ui::theme::Theme;
-use crate::ui::window::{SplitKind, WindowTree};
+use crate::ui::window::{Separator, SplitKind, WindowTree};
 
 use ratatui::style::{Modifier, Style};
 
@@ -179,6 +179,22 @@ pub struct App<H: EditorHost> {
     /// pass with no live `Frame` geometry of its own — the same between-frame
     /// trick as [`Self::last_windows_area`]).
     last_cursor_screen: Option<(u16, u16)>,
+    /// Whether kvim is running inside a tmux session, detected once at startup
+    /// from `$TMUX` (tmux sets it for every process in a pane). Governs the
+    /// edge hand-off in [`Self::tmux_select_pane`]: a `<C-h/j/k/l>` move that
+    /// runs off kvim's own layout crosses into the neighbouring tmux pane only
+    /// when this holds. Detected once, not re-read per keystroke, for the same
+    /// reason [`crate::icons`] is: the environment does not change under a
+    /// running process, and a syscall per focus key is waste.
+    in_tmux: bool,
+    /// Test-only record of the `tmux select-pane` hand-offs that
+    /// [`Self::tmux_select_pane`] *would* have spawned. A tmux hand-off is an
+    /// external side effect with no painted cells to assert on, so under
+    /// `cfg(test)` the direction is recorded here instead of shelling out — the
+    /// one seam that lets a unit test prove the edge-of-layout code path fires
+    /// when `$TMUX` is set. The real binary always spawns tmux.
+    #[cfg(test)]
+    tmux_calls: Vec<Direction>,
 }
 
 /// A navigable list of reference locations (`<leader>gr`).
@@ -263,6 +279,9 @@ impl<H: EditorHost> App<H> {
             completion: None,
             snippet: None,
             last_cursor_screen: None,
+            in_tmux: std::env::var_os("TMUX").is_some(),
+            #[cfg(test)]
+            tmux_calls: Vec::new(),
         }
     }
 
@@ -333,11 +352,34 @@ impl<H: EditorHost> App<H> {
                 let Some(kp) = map_crossterm_key(key_event) else {
                     return LoopAction::Continue;
                 };
+                // A `<C-w>` window command owns the *next* key no matter what
+                // currently has focus — that is how `<C-w>l` moves focus out of
+                // the file tree and `<C-w>h` moves it back in. Checked before the
+                // focus branch so the pending command is not swallowed by the
+                // tree's own key handling.
+                if self.awaiting_window_key {
+                    return self.handle_window_key(kp);
+                }
                 // The focus branch, and the reason `j` in the file tree does not
                 // also move the text cursor: when an overlay has focus the editor
                 // is not handed the key at all.
                 match self.focus() {
-                    Focus::Overlay => self.handle_overlay_key(kp),
+                    Focus::Overlay => {
+                        // Window navigation crosses the tree/editor boundary even
+                        // while the tree has focus: `<C-w>` begins a window
+                        // command, and bare `<C-h/j/k/l>` move focus — `<C-l>`
+                        // (right) returns to the editor, the others hand off to a
+                        // tmux pane at the tree's outer edge. The tree's own
+                        // bare `h`/`j`/`k`/`l` (no Ctrl) still reach it untouched.
+                        if kp.mods.ctrl && kp.key == Key::Char('w') {
+                            self.awaiting_window_key = true;
+                            return LoopAction::Continue;
+                        }
+                        if let Some(dir) = ctrl_hjkl_direction(kp) {
+                            return self.move_focus(dir, true);
+                        }
+                        self.handle_overlay_key(kp)
+                    }
                     Focus::Buffer => {
                         // An LSP prompt/list in flight owns the keyboard, like an
                         // overlay: rename input and reference navigation must not
@@ -366,13 +408,6 @@ impl<H: EditorHost> App<H> {
                         if self.hop.is_some() {
                             return self.handle_hop_key(kp);
                         }
-                        // `<C-w>` in Normal mode begins a window command; the
-                        // *next* key completes it. In Insert mode `<C-w>` is the
-                        // editor's (delete-word-back), so only intercept in
-                        // Normal.
-                        if self.awaiting_window_key {
-                            return self.handle_window_key(kp);
-                        }
                         // `]d`/`[d` diagnostic navigation: `]`/`[` in Normal mode
                         // arms the motion, `d` completes it. A following key that
                         // isn't `d` falls through to the editor (kvim has no other
@@ -399,6 +434,16 @@ impl<H: EditorHost> App<H> {
                         {
                             self.awaiting_window_key = true;
                             return LoopAction::Continue;
+                        }
+                        // Bare `<C-h/j/k/l>` move window focus (vim-tmux-navigator
+                        // style), handing off to an adjacent tmux pane at the edge.
+                        // Only in Normal mode: in Insert mode `<C-h>` is backspace
+                        // and `<C-w>` is delete-word-back, both the editor's, so
+                        // this must never shadow them.
+                        if self.host.mode() == Mode::Normal
+                            && let Some(dir) = ctrl_hjkl_direction(kp)
+                        {
+                            return self.move_focus(dir, true);
                         }
                         self.host_key_then_refresh_completion(kp)
                     }
@@ -1126,10 +1171,10 @@ impl<H: EditorHost> App<H> {
     /// open — including when the tree is open but the *buffer* has focus, which
     /// is where the tree ends up after you open a file from it.
     ///
-    /// (Neovim users get back to a visible-but-unfocused tree with `<C-w>h`.
-    /// kvim has no window-motion keys at all yet — see [`crate::ui::window`] —
-    /// so today the way back in is `<leader>e` twice. Adding `<C-w>` motions is
-    /// tracked separately; it is a window-tree feature, not a sidebar one.)
+    /// To get back into a visible-but-unfocused tree, use `<C-h>` (or `<C-w>h`)
+    /// from the leftmost editor window — [`Self::move_focus`] lands focus on the
+    /// tree — exactly as a Neovim + neo-tree user would. `<leader>e` twice still
+    /// works too (close then reopen), but is no longer the only way in.
     fn toggle_file_tree(&mut self) -> LoopAction {
         if matches!(self.overlay, Some(Overlay::FileTree(_))) {
             self.close_overlay();
@@ -1309,14 +1354,92 @@ impl<H: EditorHost> App<H> {
         }
     }
 
+    /// `<C-w>h/j/k/l`: focus the spatially adjacent window. Pure kvim — no tmux
+    /// edge hand-off (that belongs to the bare `<C-h/j/k/l>` bindings), matching
+    /// the split the maintainer expects between the two families.
     fn focus_dir(&mut self, dir: Direction) -> LoopAction {
+        self.move_focus(dir, false)
+    }
+
+    /// Moves window focus in `dir`, the shared engine behind both `<C-w>h/j/k/l`
+    /// (`tmux_ok == false`) and the bare `<C-h/j/k/l>` bindings (`tmux_ok ==
+    /// true`).
+    ///
+    /// It resolves three cases in order:
+    ///
+    /// 1. **From the file tree** (focus is on the sidebar overlay): a rightward
+    ///    move returns to the editor; any other direction is an outer edge, so
+    ///    it hands off to tmux when permitted, else does nothing. The tree is not
+    ///    a [`WindowTree`] leaf — see [`crate::ui::overlay`] and AID-0018/0020 —
+    ///    so it cannot participate in `WindowTree::focus_direction` and is
+    ///    special-cased here instead.
+    /// 2. **Into the file tree**: a leftward move from the leftmost editor window
+    ///    (no window lies further left) focuses the open tree, the mirror of
+    ///    case 1's `<C-l>`.
+    /// 3. **Between editor windows**: delegated to
+    ///    [`WindowTree::focus_direction`]; a move that runs off the edge of the
+    ///    layout hands off to tmux when permitted, exactly as
+    ///    vim-tmux-navigator does.
+    fn move_focus(&mut self, dir: Direction, tmux_ok: bool) -> LoopAction {
+        // Case 1: focus currently on the file tree overlay.
+        if self.focus() == Focus::Overlay {
+            if dir == Direction::Right {
+                self.focus = Focus::Buffer;
+                return LoopAction::Redraw;
+            }
+            if tmux_ok {
+                self.tmux_select_pane(dir);
+            }
+            return LoopAction::Continue;
+        }
+
         self.sync_active_window();
         let area = self.last_windows_area;
         if self.windows.focus_direction(area, dir).is_some() {
             self.load_active_window();
-            LoopAction::Redraw
-        } else {
-            LoopAction::Continue
+            return LoopAction::Redraw;
+        }
+
+        // Off the edge of the editor's own layout.
+        // Case 2: leftward into an open file tree.
+        if dir == Direction::Left && matches!(self.overlay, Some(Overlay::FileTree(_))) {
+            self.focus = Focus::Overlay;
+            return LoopAction::Redraw;
+        }
+        // Case 3: otherwise hand off to the adjacent tmux pane when inside tmux.
+        if tmux_ok {
+            self.tmux_select_pane(dir);
+        }
+        LoopAction::Continue
+    }
+
+    /// Hands focus to the adjacent tmux pane — kvim's half of the
+    /// vim-tmux-navigator edge contract (christoomey/vim-tmux-navigator, MIT;
+    /// studied for behaviour only, no code copied). Runs `tmux select-pane
+    /// -L/-D/-U/-R` so that a `<C-h/j/k/l>` move which ran off the edge of
+    /// kvim's own layout crosses seamlessly into the neighbouring tmux pane.
+    ///
+    /// A no-op when kvim is not inside tmux ([`Self::in_tmux`] is false), so an
+    /// edge move is simply a dead end, as in plain vim. Best-effort otherwise: a
+    /// failure to spawn tmux is swallowed, since there is nothing useful to
+    /// report from a focus key.
+    ///
+    /// Under `cfg(test)` the direction is recorded in [`Self::tmux_calls`]
+    /// instead of spawning a process — see that field.
+    fn tmux_select_pane(&mut self, dir: Direction) {
+        if !self.in_tmux {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.tmux_calls.push(dir);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = std::process::Command::new("tmux")
+                .arg("select-pane")
+                .arg(tmux_pane_flag(dir))
+                .status();
         }
     }
 
@@ -1542,6 +1665,19 @@ impl<H: EditorHost> App<H> {
         self.render_cmdline(frame, cmdline_area);
         if let Some(rect) = overlay_area {
             self.render_overlay(frame, rect);
+            // The `WinSeparator` between the sidebar and the editor lives in the
+            // column the sidebar split reserved (see `OverlayPlacement::split`):
+            // the gap between the sidebar's right edge and the windows' left. If
+            // the terminal was too narrow to spare it, there is no gap and this
+            // paints nothing.
+            let sidebar_right = rect.x + rect.width;
+            if windows_area.x > sidebar_right {
+                let border = Separator {
+                    rect: Rect { x: sidebar_right, y: rect.y, width: 1, height: rect.height },
+                    kind: SplitKind::Vertical,
+                };
+                self.paint_separator(frame, border);
+            }
         }
         // which-key sits on top of everything else: it is a heads-up display
         // that appears the moment a multi-key prefix is buffered. Suppressed
@@ -1780,7 +1916,37 @@ impl<H: EditorHost> App<H> {
             }
         }
 
+        // Divider lines between panes (Neovim's `WinSeparator`), painted after
+        // the buffers since the layout already reserved their cells — they never
+        // overpaint text. See [`WindowTree::separators`].
+        for sep in self.windows.separators(area) {
+            self.paint_separator(frame, sep);
+        }
+
         self.last_cursor_screen = cursor_screen;
+    }
+
+    /// Paints one pane divider with the gruvbox `WinSeparator` styling: box-
+    /// drawing glyphs (`│` for a side-by-side split, `─` for a stacked one) in
+    /// the palette's dim divider tone (`bg3`) over the editor background.
+    fn paint_separator(&self, frame: &mut Frame, sep: Separator) {
+        let glyph = match sep.kind {
+            SplitKind::Vertical => '│',
+            SplitKind::Horizontal => '─',
+        };
+        let style = Style::default().fg(self.theme.bg3).bg(self.theme.bg);
+        let r = sep.rect;
+        let buf = frame.buffer_mut();
+        // `cell_mut` returns `None` off-buffer, so no separate bounds check is
+        // needed for a rect that runs to the frame's edge.
+        for y in r.y..r.y.saturating_add(r.height) {
+            for x in r.x..r.x.saturating_add(r.width) {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(glyph);
+                    cell.set_style(style);
+                }
+            }
+        }
     }
 
     /// Paints the active hop's labels onto the buffer's word-starts, at the
@@ -1876,6 +2042,40 @@ impl<H: EditorHost> App<H> {
             frame.set_cursor_position((x, area.y));
         }
         frame.render_widget(cmdline, area);
+    }
+}
+
+/// Maps a Ctrl-modified `h`/`j`/`k`/`l` keypress to the window-focus direction
+/// it means, or `None` for anything else.
+///
+/// Kept separate from `<C-w>h/j/k/l` so the *bare* Ctrl bindings (the
+/// vim-tmux-navigator ones) share one definition between the two focus branches
+/// in [`App::handle_event`] — the buffer-focused case and the tree-focused case
+/// must agree on which key is which direction, and one function is how they do.
+fn ctrl_hjkl_direction(kp: KeyPress) -> Option<Direction> {
+    if !kp.mods.ctrl {
+        return None;
+    }
+    match kp.key {
+        Key::Char('h') => Some(Direction::Left),
+        Key::Char('j') => Some(Direction::Down),
+        Key::Char('k') => Some(Direction::Up),
+        Key::Char('l') => Some(Direction::Right),
+        _ => None,
+    }
+}
+
+/// The `tmux select-pane` flag for a directional focus move — `-L`/`-D`/`-U`/`-R`
+/// for left/down/up/right, tmux's own compass letters. Pure, so the mapping is
+/// unit-testable without spawning tmux (see [`App::tmux_select_pane`], which is
+/// the only caller in a non-test build).
+#[cfg_attr(test, allow(dead_code))]
+fn tmux_pane_flag(dir: Direction) -> &'static str {
+    match dir {
+        Direction::Left => "-L",
+        Direction::Down => "-D",
+        Direction::Up => "-U",
+        Direction::Right => "-R",
     }
 }
 
@@ -2724,9 +2924,12 @@ mod tests {
 
         let rows = real_screen(&mut app, 40, 6);
         // Left pane is the new (active) window showing b.txt; right pane still
-        // shows a.txt. The divider sits at the halfway column (~20).
+        // shows a.txt. The reserved divider column is 19, so the right pane
+        // begins at char column 20 (a byte slice would land inside the
+        // multibyte `│` glyph — index by chars).
         assert!(rows[0].starts_with("BBBBBBBB"), "left pane should show b.txt, got {:?}", rows[0]);
-        assert!(rows[0][20..].contains("AAAAAAAA"), "right pane should still show a.txt, got {:?}", &rows[0][20..]);
+        let right: String = rows[0].chars().skip(20).collect();
+        assert!(right.contains("AAAAAAAA"), "right pane should still show a.txt, got {right:?}");
         assert_eq!(app.windows.window_count(), 2);
     }
 
@@ -2748,8 +2951,9 @@ mod tests {
         app.handle_event(key_event('x'));
         let rows = real_screen(&mut app, 40, 6);
         assert!(rows[0].starts_with("BBBBBBBB"), "left pane untouched, got {:?}", rows[0]);
-        assert!(rows[0][20..].contains("AAAAAAA") && !rows[0][20..].contains("AAAAAAAA"),
-            "right pane should have lost one A, got {:?}", &rows[0][20..]);
+        let right: String = rows[0].chars().skip(20).collect();
+        assert!(right.contains("AAAAAAA") && !right.contains("AAAAAAAA"),
+            "right pane should have lost one A, got {right:?}");
     }
 
     #[test]
@@ -2791,6 +2995,165 @@ mod tests {
         // `:q` on the last window quits.
         feed_str(&mut app, ":q");
         assert_eq!(app.handle_event(enter_event()), LoopAction::Quit);
+    }
+
+    // ------------------------------------------------------------------
+    // Bare <C-h/j/k/l> window navigation (vim-tmux-navigator style) and the
+    // tmux edge hand-off. See `App::move_focus`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn bare_ctrl_h_and_ctrl_l_move_focus_between_vertical_splits_and_typing_follows() {
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        // Focus starts in the LEFT pane (the new split, b.txt); a.txt is right.
+        let left = app.windows.active_id();
+
+        // Bare <C-l> (no <C-w> prefix) moves focus right, onto a.txt.
+        app.handle_event(ctrl_event('l'));
+        assert_ne!(app.windows.active_id(), left, "<C-l> should move focus to the right pane");
+        assert_eq!(app.host.buffer().text(), "AAAAAAAA\nAAAAAAAA\n");
+
+        // Typing `x` edits the RIGHT pane, proving keys go where focus went —
+        // asserted on the painted cells.
+        app.handle_event(key_event('x'));
+        let rows = real_screen(&mut app, 40, 6);
+        assert!(rows[0].starts_with("BBBBBBBB"), "left pane untouched, got {:?}", rows[0]);
+        let right: String = rows[0].chars().skip(20).collect();
+        assert!(right.contains("AAAAAAA") && !right.contains("AAAAAAAA"),
+            "right pane lost one A, got {right:?}");
+
+        // Bare <C-h> moves focus back to the left pane (b.txt).
+        app.handle_event(ctrl_event('h'));
+        assert_eq!(app.windows.active_id(), left, "<C-h> should move focus back to the left pane");
+        assert_eq!(app.host.buffer().text(), "BBBBBBBB\nBBBBBBBB\n");
+    }
+
+    #[test]
+    fn bare_ctrl_j_and_ctrl_k_move_focus_between_horizontal_splits() {
+        let (_dir, mut app, _b) = real_app_two_files();
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('s')); // horizontal split; active is the TOP window
+        app.handle_event(key_event('j')); // move the top window's text cursor down
+        assert_eq!(app.host.cursor(), Position::new(1, 0));
+
+        // <C-j> focuses the window below (still at the origin).
+        app.handle_event(ctrl_event('j'));
+        assert_eq!(app.host.cursor(), Position::ORIGIN, "the bottom window kept its own cursor");
+
+        // <C-k> focuses the top window again, whose cursor survived.
+        app.handle_event(ctrl_event('k'));
+        assert_eq!(app.host.cursor(), Position::new(1, 0), "the top window's cursor survived the round trip");
+    }
+
+    #[test]
+    fn a_vertical_split_paints_a_visible_divider_between_the_panes() {
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        let rows = real_screen(&mut app, 40, 6);
+        // The WinSeparator column carries the box-drawing glyph on every text
+        // row. For a 40-wide 50/50 vsplit the reserved divider is column 19
+        // (left pane 19 cols, divider, right pane 20 cols).
+        for (y, row) in rows.iter().take(4).enumerate() {
+            assert_eq!(row.chars().nth(19), Some('│'), "row {y} should paint a divider at col 19: {row:?}");
+        }
+    }
+
+    #[test]
+    fn a_horizontal_split_paints_a_visible_divider_row_between_the_panes() {
+        let (_dir, mut app, _b) = real_app_two_files();
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('s')); // horizontal split
+        let rows = real_screen(&mut app, 20, 9);
+        // The windows area is rows 0..7 (statusline row 7, cmdline row 8). A
+        // 50/50 stacked split of a 7-row area reserves one row as the divider,
+        // filled with the horizontal box-drawing glyph across its width.
+        let divider = rows.iter().take(7).find(|r| r.chars().all(|c| c == '─'));
+        assert!(divider.is_some(), "a full-width `─` divider row must be painted between stacked panes:\n{rows:#?}");
+    }
+
+    #[test]
+    fn ctrl_l_at_the_right_edge_hands_off_to_tmux_when_inside_tmux() {
+        // A single window: <C-l> runs off the right edge with nowhere to go in
+        // kvim, so it hands focus to the tmux pane on the right.
+        let (_dir, mut app) = real_app_one_file("hello\n");
+        app.in_tmux = true;
+        // Establish window geometry the way a real frame would.
+        real_screen(&mut app, 40, 6);
+
+        app.handle_event(ctrl_event('l'));
+        assert_eq!(app.tmux_calls, vec![Direction::Right], "edge <C-l> issues `tmux select-pane -R`");
+
+        // And <C-h>/<C-j>/<C-k> map to their tmux compass directions.
+        app.handle_event(ctrl_event('h'));
+        app.handle_event(ctrl_event('j'));
+        app.handle_event(ctrl_event('k'));
+        assert_eq!(
+            app.tmux_calls,
+            vec![Direction::Right, Direction::Left, Direction::Down, Direction::Up],
+        );
+    }
+
+    #[test]
+    fn an_edge_move_is_a_no_op_outside_tmux() {
+        let (_dir, mut app) = real_app_one_file("hello\n");
+        app.in_tmux = false;
+        real_screen(&mut app, 40, 6);
+        assert_eq!(app.handle_event(ctrl_event('l')), LoopAction::Continue);
+        assert!(app.tmux_calls.is_empty(), "no tmux hand-off when not inside tmux");
+    }
+
+    #[test]
+    fn tmux_pane_flag_maps_directions_to_tmux_compass_letters() {
+        assert_eq!(tmux_pane_flag(Direction::Left), "-L");
+        assert_eq!(tmux_pane_flag(Direction::Down), "-D");
+        assert_eq!(tmux_pane_flag(Direction::Up), "-U");
+        assert_eq!(tmux_pane_flag(Direction::Right), "-R");
+    }
+
+    // ------------------------------------------------------------------
+    // File tree as a focus target: <C-h>/<C-l> (and the <C-w> forms) cross the
+    // tree/editor boundary. See `App::move_focus` and `ui::overlay`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ctrl_h_focuses_the_tree_and_ctrl_l_returns_to_the_editor() {
+        let (_dir, mut app) = app_with_tree();
+        // Give the app real geometry, then open the tree (which takes focus).
+        screen(&mut app, 80, 12);
+        press_leader_e(&mut app);
+        assert_eq!(app.focus(), Focus::Overlay, "opening the tree focuses it");
+
+        // <C-l> from the tree returns focus to the editor.
+        app.handle_event(ctrl_event('l'));
+        assert_eq!(app.focus(), Focus::Buffer, "<C-l> from the tree returns to the editor");
+
+        // <C-h> from the leftmost editor window focuses the tree again.
+        app.handle_event(ctrl_event('h'));
+        assert_eq!(app.focus(), Focus::Overlay, "<C-h> from the leftmost window focuses the tree");
+
+        // The <C-w> forms do the same: <C-w>l back to the editor.
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('l'));
+        assert_eq!(app.focus(), Focus::Buffer, "<C-w>l from the tree returns to the editor");
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('h'));
+        assert_eq!(app.focus(), Focus::Overlay, "<C-w>h focuses the tree");
+    }
+
+    #[test]
+    fn the_tree_editor_boundary_paints_a_divider_column() {
+        let (_dir, mut app) = app_with_tree();
+        screen(&mut app, 80, 12);
+        press_leader_e(&mut app);
+        let rows = screen(&mut app, 80, 12);
+        // The sidebar is `FileTreePanel::WIDTH` wide; the reserved separator
+        // column sits immediately to its right, carrying the vertical glyph.
+        let border_x = crate::ui::filetree::FileTreePanel::WIDTH as usize;
+        assert_eq!(rows[0].chars().nth(border_x), Some('│'),
+            "a `│` should separate the tree from the editor at col {border_x}: {:?}", rows[0]);
     }
 
     // ------------------------------------------------------------------

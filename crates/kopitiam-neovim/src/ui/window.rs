@@ -16,12 +16,23 @@
 //!
 //! Named after the vim command it implements, not after the divider's own
 //! orientation, because that's the pairing people actually hold in their
-//! head (":split, so the windows stack") and it's also where the ratatui
-//! `Direction` enum bites: `:split` draws a **horizontal** divider line but
-//! arranges windows in ratatui's `Direction::Vertical` (top-to-bottom). See
-//! [`SplitKind`]'s doc comment for the full mapping.
+//! head (":split, so the windows stack"). `:split` draws a **horizontal**
+//! divider line but stacks windows top-to-bottom; `:vsplit` draws a
+//! **vertical** divider and places them side by side. See [`SplitKind`]'s
+//! doc comment for the full mapping.
+//!
+//! # Splits reserve a divider cell
+//!
+//! Every split reserves exactly one cell — a column for `:vs`, a row for
+//! `:sp` — between its two children for the visible [`Separator`] line
+//! (Neovim's `WinSeparator`). [`WindowTree::layout`] therefore returns the
+//! *reduced* window rectangles (the ones text is actually painted into), and
+//! [`WindowTree::separators`] returns where the divider glyphs go. Reserving
+//! the cell in the layout, rather than overpainting a border on top of the
+//! first column of a pane, is what keeps a border from silently eating a
+//! column of buffer text.
 
-use ratatui::layout::{Constraint, Direction as RtDirection, Layout as RtLayout, Rect};
+use ratatui::layout::Rect;
 
 use crate::core::{BufferId, Direction, Position, WindowId};
 
@@ -33,24 +44,28 @@ use crate::core::{BufferId, Direction, Position, WindowId};
 /// * `Vertical` = `:vsplit`/`:vs` — draws a vertical divider line, placing
 ///   windows **side by side**. Maps to `Direction::Horizontal`.
 ///
-/// The vim-name-vs-ratatui-name mismatch is exactly the kind of thing that
-/// silently swaps top/bottom for left/right if re-derived from scratch at
-/// each call site, so it is centralized in [`SplitKind::ratatui_direction`]
-/// and nowhere else in this module reasons about `ratatui::Direction`
-/// directly.
+/// The vim-name-vs-divider-orientation mismatch is exactly the kind of thing
+/// that silently swaps top/bottom for left/right if re-derived from scratch at
+/// each call site, so the axis decision lives only in
+/// [`WindowTree::layout_node`] and is never re-reasoned elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitKind {
     Horizontal,
     Vertical,
 }
 
-impl SplitKind {
-    fn ratatui_direction(self) -> RtDirection {
-        match self {
-            SplitKind::Horizontal => RtDirection::Vertical,
-            SplitKind::Vertical => RtDirection::Horizontal,
-        }
-    }
+/// A divider line between two panes — the geometry Neovim paints as
+/// `WinSeparator`.
+///
+/// `rect` is exactly one cell thick: a full-height, one-column strip for a
+/// [`SplitKind::Vertical`] (side-by-side) split, or a full-width, one-row
+/// strip for a [`SplitKind::Horizontal`] (stacked) one. `kind` tells the
+/// renderer which glyph to draw (`│` vs `─`); the geometry alone cannot,
+/// because a one-cell strip is ambiguous when it is also one cell long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Separator {
+    pub rect: Rect,
+    pub kind: SplitKind,
 }
 
 /// A single window: a viewport onto one buffer, with its own cursor and
@@ -307,25 +322,49 @@ impl WindowTree {
 
     /// Computes each window's on-screen [`Rect`] within `area`, in the same
     /// traversal order as [`WindowTree::windows`].
+    ///
+    /// The rectangles are the ones text is painted into: each split has
+    /// already reserved one cell for its [`Separator`], so summing the window
+    /// widths of a single vertical split gives `area.width - 1`, not
+    /// `area.width`. Ask [`WindowTree::separators`] for the reserved cells.
     pub fn layout(&self, area: Rect) -> Vec<(WindowId, Rect)> {
-        let mut out = Vec::new();
-        Self::layout_node(&self.root, area, &mut out);
-        out
+        let (windows, _) = self.layout_inner(area);
+        windows
     }
 
-    fn layout_node(node: &Node, area: Rect, out: &mut Vec<(WindowId, Rect)>) {
+    /// The divider cells between panes, in the same recursive order the tree
+    /// is walked — one per split. Empty for a single-window tree.
+    pub fn separators(&self, area: Rect) -> Vec<Separator> {
+        let (_, seps) = self.layout_inner(area);
+        seps
+    }
+
+    fn layout_inner(&self, area: Rect) -> (Vec<(WindowId, Rect)>, Vec<Separator>) {
+        let mut windows = Vec::new();
+        let mut seps = Vec::new();
+        Self::layout_node(&self.root, area, &mut windows, &mut seps);
+        (windows, seps)
+    }
+
+    /// Lays a subtree out within `area`, reserving one cell per split for the
+    /// divider so window rectangles and separator rectangles never overlap.
+    ///
+    /// The split axis is decided here and nowhere else: a `Vertical` split
+    /// (`:vs`) divides `area` left/right with a one-column divider between; a
+    /// `Horizontal` split (`:sp`) divides it top/bottom with a one-row divider.
+    fn layout_node(
+        node: &Node,
+        area: Rect,
+        windows: &mut Vec<(WindowId, Rect)>,
+        seps: &mut Vec<Separator>,
+    ) {
         match node {
-            Node::Leaf(w) => out.push((w.id, area)),
+            Node::Leaf(w) => windows.push((w.id, area)),
             Node::Split { kind, first_percent, first, second } => {
-                let chunks = RtLayout::default()
-                    .direction(kind.ratatui_direction())
-                    .constraints([
-                        Constraint::Percentage(*first_percent),
-                        Constraint::Percentage(100 - *first_percent),
-                    ])
-                    .split(area);
-                Self::layout_node(first, chunks[0], out);
-                Self::layout_node(second, chunks[1], out);
+                let (first_area, sep, second_area) = split_area(*kind, area, *first_percent);
+                seps.push(Separator { rect: sep, kind: *kind });
+                Self::layout_node(first, first_area, windows, seps);
+                Self::layout_node(second, second_area, windows, seps);
             }
         }
     }
@@ -521,6 +560,39 @@ impl WindowTree {
     }
 }
 
+/// Divides `area` into `(first, separator, second)` for a split of the given
+/// `kind`, reserving exactly one cell for the separator between the children.
+///
+/// `first_percent` is the first child's share of the space *left after the
+/// divider is taken out*, so a 50/50 split of an 80-column area gives the
+/// children 39 and 40 columns with the 40th column (index-wise, column 39) as
+/// the divider — the pane widths need not be equal once an odd cell is spent
+/// on the border, and that is fine.
+fn split_area(kind: SplitKind, area: Rect, first_percent: u16) -> (Rect, Rect, Rect) {
+    match kind {
+        // `:vs` — side by side, a one-column divider between.
+        SplitKind::Vertical => {
+            let avail = area.width.saturating_sub(1);
+            let fw = (avail as u32 * first_percent as u32 / 100) as u16;
+            let sw = avail - fw;
+            let first = Rect { x: area.x, y: area.y, width: fw, height: area.height };
+            let sep = Rect { x: area.x + fw, y: area.y, width: 1, height: area.height };
+            let second = Rect { x: area.x + fw + 1, y: area.y, width: sw, height: area.height };
+            (first, sep, second)
+        }
+        // `:sp` — stacked, a one-row divider between.
+        SplitKind::Horizontal => {
+            let avail = area.height.saturating_sub(1);
+            let fh = (avail as u32 * first_percent as u32 / 100) as u16;
+            let sh = avail - fh;
+            let first = Rect { x: area.x, y: area.y, width: area.width, height: fh };
+            let sep = Rect { x: area.x, y: area.y + fh, width: area.width, height: 1 };
+            let second = Rect { x: area.x, y: area.y + fh + 1, width: area.width, height: sh };
+            (first, sep, second)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,13 +650,54 @@ mod tests {
     }
 
     #[test]
-    fn layout_covers_the_full_area_with_no_overlap_for_a_vertical_split() {
+    fn layout_and_separator_together_cover_the_full_area_for_a_vertical_split() {
         let mut tree = WindowTree::single(BufferId(1));
         tree.split(SplitKind::Vertical);
         let area = Rect { x: 0, y: 0, width: 80, height: 40 };
         let rects = tree.layout(area);
+        let seps = tree.separators(area);
+        // The panes plus the one reserved divider column tile the area exactly.
         let total_width: u16 = rects.iter().map(|(_, r)| r.width).sum();
-        assert_eq!(total_width, area.width);
+        let sep_width: u16 = seps.iter().map(|s| s.rect.width).sum();
+        assert_eq!(total_width + sep_width, area.width, "panes + divider must fill the area");
+        assert_eq!(seps.len(), 1);
+        assert_eq!(seps[0].kind, SplitKind::Vertical);
+    }
+
+    #[test]
+    fn a_vertical_split_reserves_a_full_height_divider_column_between_the_panes() {
+        let mut tree = WindowTree::single(BufferId(1));
+        tree.split(SplitKind::Vertical);
+        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let rects = tree.layout(area);
+        let sep = tree.separators(area)[0];
+        // The divider sits immediately right of the left pane, is one column
+        // wide, spans the full height, and the right pane starts just past it.
+        assert_eq!(sep.rect.width, 1);
+        assert_eq!(sep.rect.height, area.height);
+        assert_eq!(sep.rect.x, rects[0].1.x + rects[0].1.width, "divider abuts the left pane");
+        assert_eq!(rects[1].1.x, sep.rect.x + 1, "right pane starts just past the divider");
+    }
+
+    #[test]
+    fn a_horizontal_split_reserves_a_full_width_divider_row_between_the_panes() {
+        let mut tree = WindowTree::single(BufferId(1));
+        tree.split(SplitKind::Horizontal);
+        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let rects = tree.layout(area);
+        let sep = tree.separators(area)[0];
+        assert_eq!(sep.rect.height, 1);
+        assert_eq!(sep.rect.width, area.width);
+        assert_eq!(sep.rect.y, rects[0].1.y + rects[0].1.height, "divider abuts the top pane");
+        assert_eq!(rects[1].1.y, sep.rect.y + 1, "bottom pane starts just past the divider");
+    }
+
+    #[test]
+    fn a_single_window_has_no_separators() {
+        let tree = WindowTree::single(BufferId(1));
+        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        assert!(tree.separators(area).is_empty());
+        assert_eq!(tree.layout(area)[0].1, area, "the sole window keeps the whole area");
     }
 
     #[test]

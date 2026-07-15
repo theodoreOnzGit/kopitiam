@@ -62,6 +62,38 @@ fn write_buffer(editor: &mut crate::editor::Editor, path: Option<&Path>) -> crat
     }
 }
 
+/// Performs the write-all that [`EditorResponse::WriteAll`] asks for: saves
+/// every modified buffer that has a backing file, and reports how many were
+/// written.
+///
+/// Returns `Err` if a modified buffer has no file name — vim's `E32`. That is
+/// the one case `:wqa`/`:xa` must not quit through, since quitting would
+/// silently drop the unsaved, unnamed buffer; the caller checks the result and
+/// declines the quit. Buffers that are unmodified, or unmodified-and-unnamed,
+/// are simply skipped (an unnamed *scratch* buffer with no edits is not a
+/// reason to refuse a `:wqa`).
+fn write_all_buffers(editor: &mut crate::editor::Editor) -> crate::Result<String> {
+    let mut written = 0usize;
+    let mut unnamed_modified = false;
+    for buffer in editor.buffers_mut() {
+        if !buffer.is_modified() {
+            continue;
+        }
+        if buffer.path().is_none() {
+            unnamed_modified = true;
+            continue;
+        }
+        buffer.save()?;
+        written += 1;
+    }
+    if unnamed_modified {
+        // Matches vim's E32: a modified no-name buffer cannot be written by a
+        // bare `:wa`, so say so rather than silently leaving it unsaved.
+        return Err(crate::Error::Io(std::io::Error::other("E32: a modified buffer has no file name")));
+    }
+    Ok(format!("{written} buffer(s) written"))
+}
+
 impl BufferView for Buffer {
     fn line_count(&self) -> usize {
         Buffer::line_count(self)
@@ -109,6 +141,11 @@ impl EditorHost for crate::editor::Editor {
                 // already run inside `execute_ex`, so reaching here means the
                 // close is allowed.
                 EditorResponse::Quit => HostResponse::QuitWindow,
+                // `:qa`/`:qa!` exits the whole editor unconditionally — unlike
+                // `:q`, it does not close one window and stay. `HostResponse::Quit`
+                // already means "quit the editor" to `App`, so it is reused
+                // rather than inventing a parallel variant.
+                EditorResponse::QuitAll => HostResponse::Quit,
                 EditorResponse::Message(msg) => HostResponse::Message(msg),
 
                 // `:w` and `:wq` deliberately do not write from inside the
@@ -120,6 +157,19 @@ impl EditorHost for crate::editor::Editor {
                 },
                 EditorResponse::WriteThenQuit { path } => match write_buffer(self, path.as_deref()) {
                     Ok(_) => HostResponse::QuitWindow,
+                    Err(e) => HostResponse::Error(e.to_string()),
+                },
+                // `:wa` writes all and stays; `:wqa`/`:xa` write all and exit the
+                // whole editor. A write failure (e.g. E32: a modified no-name
+                // buffer) aborts the quit, so nothing unsaved is lost.
+                EditorResponse::WriteAll { then_quit } => match write_all_buffers(self) {
+                    Ok(msg) => {
+                        if then_quit {
+                            HostResponse::Quit
+                        } else {
+                            HostResponse::Message(msg)
+                        }
+                    }
                     Err(e) => HostResponse::Error(e.to_string()),
                 },
 

@@ -34,10 +34,13 @@
 //! * `:q` closes a *buffer* window and can never close the tree. The tree is
 //!   closed with `q`, `<Esc>`, or `<leader>e` — which is what neo-tree users
 //!   press anyway.
-//! * There is no `<C-w>h`/`<C-w>l` to move focus between the tree and the
-//!   buffer, because kvim has no window-motion keys at all yet (`WindowTree`
-//!   has no `focus_next`). Focus moves via [`Focus`] below, driven by
-//!   `<leader>e` and by opening a file.
+//! * Focus still moves between the tree and the editor with `<C-h>`/`<C-l>`
+//!   (and their `<C-w>h`/`<C-w>l` forms): because the tree is not a
+//!   [`WindowTree`] leaf, [`crate::ui::app::App::move_focus`] special-cases it
+//!   — a leftward move off the leftmost editor window focuses the tree, and a
+//!   rightward move from the tree returns to the editor. The [`Focus`] flag
+//!   below is what those moves flip; nothing about the tree being an overlay
+//!   rather than a window is visible to the user pressing those keys.
 //!
 //! If kvim ever grows Neovim's "a buffer can be anything" model, this decision
 //! is worth revisiting — but it should be revisited *because the buffer model
@@ -106,9 +109,16 @@ impl OverlayPlacement {
             Self::LeftSidebar { width } => {
                 let width = sidebar_width(width, area.width);
                 let sidebar = Rect { width, ..area };
+                // Reserve one column between the sidebar and the windows for the
+                // tree/editor `WinSeparator`, so the border does not overpaint the
+                // first column of buffer text. The window strip therefore starts
+                // one column further right than the sidebar's own width. When the
+                // terminal is too narrow to spare that column (a phone-sized
+                // screen), the border is dropped rather than eating the buffer.
+                let border = if area.width > width.saturating_add(1) { 1 } else { 0 };
                 let windows = Rect {
-                    x: area.x + width,
-                    width: area.width.saturating_sub(width),
+                    x: area.x + width + border,
+                    width: area.width.saturating_sub(width + border),
                     ..area
                 };
                 (sidebar, windows)
@@ -220,13 +230,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_sidebar_reserves_its_columns_from_the_left() {
+    fn a_sidebar_reserves_its_columns_from_the_left_plus_a_border() {
         let area = Rect { x: 0, y: 0, width: 100, height: 24 };
         let (side, windows) = OverlayPlacement::LeftSidebar { width: 30 }.split(area);
         assert_eq!(side, Rect { x: 0, y: 0, width: 30, height: 24 });
-        assert_eq!(windows, Rect { x: 30, y: 0, width: 70, height: 24 });
-        // No overlap, no gap: together they are the original area.
-        assert_eq!(side.width + windows.width, area.width);
+        // One column between them is reserved for the tree/editor separator, so
+        // the windows start at 31, not 30, and the three parts fill the area.
+        assert_eq!(windows, Rect { x: 31, y: 0, width: 69, height: 24 });
+        assert_eq!(side.width + 1 + windows.width, area.width, "sidebar + border + windows fill the area");
     }
 
     #[test]
@@ -235,7 +246,9 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 40, height: 20 };
         let (side, windows) = OverlayPlacement::LeftSidebar { width: 30 }.split(area);
         assert_eq!(side.width, 16); // 40 * 2/5
-        assert_eq!(windows.width, 24);
+        // 40 - 16 sidebar - 1 border = 23 for the windows.
+        assert_eq!(windows.width, 23);
+        assert_eq!(windows.x, 17);
     }
 
     #[test]
@@ -244,7 +257,11 @@ mod tests {
             let area = Rect { x: 0, y: 0, width, height: 5 };
             let (side, windows) = OverlayPlacement::LeftSidebar { width: 30 }.split(area);
             assert!(side.width < width.max(1), "sidebar ate the whole {width}-column screen");
-            assert_eq!(side.width + windows.width, width);
+            // The border column is dropped on a screen too narrow to spare it, so
+            // sidebar + (0-or-1 border) + windows always still tile the area.
+            let border = width - side.width - windows.width;
+            assert!(border <= 1, "at most one column goes to the border");
+            assert_eq!(side.width + border + windows.width, width);
         }
     }
 

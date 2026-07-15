@@ -75,6 +75,14 @@ impl LineRange {
 pub enum ExCommand {
     Write { path: Option<String>, then_quit: bool, force: bool },
     Quit { force: bool },
+    /// `:qa`/`:qall`/`:quita`/`:quitall` (+ optional `!`): quit *every* window
+    /// and exit the editor. Without `!` this must refuse if any buffer has
+    /// unsaved changes, the same guard `:q` uses but widened to all buffers.
+    QuitAll { force: bool },
+    /// `:wa`/`:wall` (`then_quit == false`), and `:wqa`/`:wqall`/`:xa`/`:xall`
+    /// (`then_quit == true`): write every modified buffer, then — for the
+    /// quit-all forms — exit. `force` carries a trailing `!` (`:wqa!`).
+    WriteAll { then_quit: bool, force: bool },
     Edit { path: String },
     NextBuffer,
     PrevBuffer,
@@ -139,6 +147,18 @@ pub fn parse(input: &str) -> ExCommand {
             force,
         },
         "q" | "quit" => ExCommand::Quit { force },
+        // The quit-all / write-all family. Kept as their own commands (not `q`
+        // with a count) because "all windows" is a fundamentally different
+        // action from "this window": `qa` exits the editor unconditionally
+        // across every split, where `q` closes one. vim's abbreviations all map
+        // to the same four intents.
+        "qa" | "qall" | "quita" | "quitall" => ExCommand::QuitAll { force },
+        "wa" | "wall" => ExCommand::WriteAll { then_quit: false, force },
+        "wqa" | "wqall" => ExCommand::WriteAll { then_quit: true, force },
+        // `:xa`/`:xall` is `:wqa` — write all, then quit all. (vim's `:x` skips
+        // the write when a buffer is unmodified; the write-all executor already
+        // writes only modified buffers, so `xa` and `wqa` coincide exactly.)
+        "xa" | "xall" => ExCommand::WriteAll { then_quit: true, force: true },
         "wq" => ExCommand::Write {
             path: if arg.is_empty() { None } else { Some(arg.to_string()) },
             then_quit: true,
@@ -321,6 +341,31 @@ mod tests {
         assert_eq!(parse("w out.txt"), ExCommand::Write { path: Some("out.txt".into()), then_quit: false, force: false });
         assert_eq!(parse("q"), ExCommand::Quit { force: false });
         assert_eq!(parse("q!"), ExCommand::Quit { force: true });
+        assert_eq!(parse("wq"), ExCommand::Write { path: None, then_quit: true, force: false });
+    }
+
+    #[test]
+    fn parses_quit_all_and_write_all_variants() {
+        // Quit-all abbreviations, plain and forced.
+        for name in ["qa", "qall", "quita", "quitall"] {
+            assert_eq!(parse(name), ExCommand::QuitAll { force: false }, "parsing {name:?}");
+            assert_eq!(parse(&format!("{name}!")), ExCommand::QuitAll { force: true }, "parsing {name}!");
+        }
+        // Write-all (no quit).
+        for name in ["wa", "wall"] {
+            assert_eq!(parse(name), ExCommand::WriteAll { then_quit: false, force: false }, "parsing {name:?}");
+        }
+        // Write-all-then-quit-all.
+        for name in ["wqa", "wqall"] {
+            assert_eq!(parse(name), ExCommand::WriteAll { then_quit: true, force: false }, "parsing {name:?}");
+            assert_eq!(parse(&format!("{name}!")), ExCommand::WriteAll { then_quit: true, force: true }, "parsing {name}!");
+        }
+        // `:xa`/`:xall` is write-all-then-quit-all with force (mirrors `:x`).
+        for name in ["xa", "xall"] {
+            assert_eq!(parse(name), ExCommand::WriteAll { then_quit: true, force: true }, "parsing {name:?}");
+        }
+        // The single-window forms are untouched and still distinct.
+        assert_eq!(parse("q"), ExCommand::Quit { force: false });
         assert_eq!(parse("wq"), ExCommand::Write { path: None, then_quit: true, force: false });
     }
 

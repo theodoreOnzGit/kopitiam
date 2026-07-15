@@ -118,6 +118,9 @@ rather than hand-copied, so they can't drift:
 | `<leader>gr` | LSP: list references |
 | `<leader>rn` | LSP: rename symbol |
 | `<leader>e` | Toggle the file-tree sidebar |
+| `<C-h>` / `<C-j>` / `<C-k>` / `<C-l>` | Move window focus left / down / up / right (also crosses into the file tree, and hands off to the adjacent tmux pane at the layout edge — see [tmux integration](#tmux-integration)). In Insert mode `<C-h>` stays backspace and `<C-w>` stays delete-word, so these never shadow editing. |
+| `<C-w>h` / `<C-w>j` / `<C-w>k` / `<C-w>l` | The same window-focus moves, vim's classic prefixed form (no tmux hand-off) |
+| `:qa` / `:qa!` / `:wa` / `:wqa` / `:xa` | Quit-all / write-all across every split (`:qa` refuses on unsaved changes; `:qa!` force-quits; `:wqa`/`:xa` write every modified buffer then exit) |
 | `f` | Hop: label-jump to a word on screen (deliberately shadows vim's built-in `f`, exactly as the original Neovim config does) |
 | `\ff` | Find files |
 | `\fb` | Find buffers |
@@ -130,6 +133,35 @@ rather than hand-copied, so they can't drift:
 These are compiled in as data (see [Status](#status--honesty) for which of
 them have a working UI behind them today), and are the first thing to look
 at if you want to override or extend the keymap in `config.json`.
+
+## tmux integration
+
+kvim uses `<C-h/j/k/l>` to move focus between splits, and at the edge of its
+own layout it hands off to the adjacent **tmux** pane (running `tmux
+select-pane -L/-D/-U/-R`), the vim-tmux-navigator contract. For that to work
+seamlessly in both directions, tmux must send those keys *through* to kvim
+instead of consuming them for its own pane navigation.
+
+If you use christoomey/vim-tmux-navigator's tmux side (or any config built on
+its `is_vim` check), add `kvim` to the process regex so tmux recognises it as
+a vim-like client. In `~/.tmux.conf`:
+
+```tmux
+# Treat kvim like vim/nvim: let it own <C-h/j/k/l> so its splits and the
+# tmux edge hand-off line up. Note the `k?vim` covers vim, nvim, and kvim.
+is_vim="ps -o state= -o comm= -t '#{pane_tty}' \
+    | grep -iqE '^[^TXZ ]+ +(\\S+\\/)?g?(k?vim?x?|fzf)(diff)?$'"
+bind-key -n 'C-h' if-shell "$is_vim" 'send-keys C-h' 'select-pane -L'
+bind-key -n 'C-j' if-shell "$is_vim" 'send-keys C-j' 'select-pane -D'
+bind-key -n 'C-k' if-shell "$is_vim" 'send-keys C-k' 'select-pane -U'
+bind-key -n 'C-l' if-shell "$is_vim" 'send-keys C-l' 'select-pane -R'
+```
+
+The load-bearing part is the `k?vim` in the regex: without it tmux treats
+kvim as a non-vim program and eats `<C-h/j/k/l>` before kvim ever sees them,
+so intra-kvim split navigation silently stops working. When kvim is *not*
+running inside tmux (`$TMUX` unset) the edge hand-off is simply a no-op, as
+in plain vim.
 
 ## Editing
 

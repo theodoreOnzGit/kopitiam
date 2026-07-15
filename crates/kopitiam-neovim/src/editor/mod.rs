@@ -93,6 +93,12 @@ pub enum EditorResponse {
     Continue,
     /// `:q`/`:q!` with no unsaved-changes conflict (or `!` overriding one).
     Quit,
+    /// `:qa`/`:qa!`: quit every window and exit the editor. Distinct from
+    /// [`EditorResponse::Quit`], which closes the active window and only exits
+    /// on the last one — quit-all exits unconditionally regardless of how many
+    /// windows are open. The unsaved-changes guard has already run in
+    /// [`Editor::execute_ex`], so reaching here means the exit is allowed.
+    QuitAll,
     /// `:w`/`:w {file}`. The caller decides *how* to write — typically by
     /// calling [`Buffer::save`]/[`Buffer::save_as`] on
     /// [`Editor::buffer_mut`] — rather than this crate doing it inline; see
@@ -100,6 +106,12 @@ pub enum EditorResponse {
     Write { path: Option<PathBuf> },
     /// `:wq`/`:x`.
     WriteThenQuit { path: Option<PathBuf> },
+    /// `:wa`/`:wall` (`then_quit == false`) and `:wqa`/`:xa` (`then_quit ==
+    /// true`): write every modified buffer, then — for the quit-all forms —
+    /// exit the editor. Like [`EditorResponse::Write`], the editor returns the
+    /// intent and the caller performs the I/O across all buffers (see [`ex`]'s
+    /// module docs on why writing is the caller's job).
+    WriteAll { then_quit: bool },
     /// Feedback for the statusline/echo area (`:s` match counts, error
     /// text, ...).
     Message(String),
@@ -333,6 +345,23 @@ impl Editor {
     /// `kopitiam-cj0.10.3`).
     pub fn buffer_by_id(&self, id: BufferId) -> Option<&Buffer> {
         self.buffers.get(&id)
+    }
+
+    /// Whether *any* open buffer has unsaved changes — the widened form of
+    /// [`Buffer::is_modified`] that `:qa` needs. `:q` asks only about the
+    /// current buffer; quit-all must not discard an unsaved buffer sitting in
+    /// another window, so it asks about all of them.
+    pub fn any_buffer_modified(&self) -> bool {
+        self.buffers.values().any(Buffer::is_modified)
+    }
+
+    /// Mutable access to every open buffer, in id order — the seam the UI's
+    /// write-all (`:wa`/`:wqa`) uses to save each modified buffer. Like
+    /// [`Editor::buffer_mut`], the editor exposes the buffers and lets the
+    /// caller perform the actual disk I/O (see [`ex`]'s module docs on why
+    /// writing is not done inside the editor).
+    pub fn buffers_mut(&mut self) -> impl Iterator<Item = &mut Buffer> {
+        self.buffers.values_mut()
     }
 
     /// Makes `buffer` the active buffer and moves the cursor to `cursor`
@@ -1662,6 +1691,22 @@ impl Editor {
                 }
                 Ok(EditorResponse::Quit)
             }
+            ex::ExCommand::QuitAll { force } => {
+                // The same guard `:q` uses, widened to every buffer: quit-all
+                // must not silently discard an unsaved buffer in some other
+                // window just because the current one is clean.
+                if !force && self.any_buffer_modified() {
+                    return Err(crate::Error::UnsavedChanges);
+                }
+                Ok(EditorResponse::QuitAll)
+            }
+            // `:wa`/`:wqa`/`:xa`: the write itself is the caller's I/O (see
+            // `EditorResponse::WriteAll`); the guard `:q` needs does not apply to
+            // a *write*-all, and the quit that follows `:wqa` is safe because the
+            // write clears every buffer's modified flag first.
+            ex::ExCommand::WriteAll { then_quit, force: _ } => {
+                Ok(EditorResponse::WriteAll { then_quit })
+            }
             ex::ExCommand::Edit { path } => {
                 self.open(Path::new(&path))?;
                 Ok(EditorResponse::Continue)
@@ -2428,6 +2473,56 @@ mod tests {
         let resp = ed.execute_ex("w /tmp/should-not-be-created-by-this-test.kvimtest").unwrap();
         assert_eq!(resp, EditorResponse::Write { path: Some(PathBuf::from("/tmp/should-not-be-created-by-this-test.kvimtest")) });
         assert!(!Path::new("/tmp/should-not-be-created-by-this-test.kvimtest").exists(), "Editor must not perform I/O itself for :w");
+    }
+
+    #[test]
+    fn quit_all_quits_when_clean_refuses_when_dirty_and_bang_forces() {
+        let mut ed = editor_with("hello");
+        // A clean buffer: `:qa` exits the whole editor.
+        assert_eq!(ed.execute_ex("qa").unwrap(), EditorResponse::QuitAll);
+
+        // Make it dirty, and `:qa` must refuse — the same guard `:q` uses.
+        // The `<Esc>` closes the insert session so the edit commits to the undo
+        // tree; `is_modified` is `current_id != saved_at`, which only advances
+        // once the group ends (see `Buffer::saved_at`). This also mirrors how a
+        // user reaches `:qa` — from Normal mode, not mid-insert.
+        feed(&mut ed, "ix<Esc>");
+        assert!(ed.any_buffer_modified());
+        assert!(
+            matches!(ed.execute_ex("qa"), Err(crate::Error::UnsavedChanges)),
+            "`:qa` on a modified buffer must refuse"
+        );
+        // `!` overrides, discarding the changes.
+        assert_eq!(ed.execute_ex("qa!").unwrap(), EditorResponse::QuitAll);
+    }
+
+    #[test]
+    fn quit_all_checks_every_buffer_not_just_the_current_one() {
+        let mut ed = editor_with("clean");
+        let first = ed.buffer_id();
+        // A second buffer, made dirty, then switch focus back to the clean one.
+        let second = ed.new_buffer();
+        ed.set_active(second, Position::ORIGIN);
+        feed(&mut ed, "iDIRTY<Esc>"); // `<Esc>` commits the insert so the buffer reads modified
+        ed.set_active(first, Position::ORIGIN);
+
+        assert!(!ed.current_buffer().is_modified(), "the current buffer is clean");
+        assert!(ed.any_buffer_modified(), "but another buffer is dirty");
+        assert!(
+            matches!(ed.execute_ex("qa"), Err(crate::Error::UnsavedChanges)),
+            "`:qa` must refuse while any buffer is dirty, not just the current one"
+        );
+    }
+
+    #[test]
+    fn write_all_variants_are_returned_as_effects() {
+        let mut ed = editor_with("hello");
+        assert_eq!(ed.execute_ex("wa").unwrap(), EditorResponse::WriteAll { then_quit: false });
+        assert_eq!(ed.execute_ex("wqa").unwrap(), EditorResponse::WriteAll { then_quit: true });
+        assert_eq!(ed.execute_ex("xa").unwrap(), EditorResponse::WriteAll { then_quit: true });
+        // Write-all is not gated by the unsaved guard — writing is the point.
+        feed(&mut ed, "ix<Esc>");
+        assert_eq!(ed.execute_ex("wa").unwrap(), EditorResponse::WriteAll { then_quit: false });
     }
 
     // -----------------------------------------------------------------
