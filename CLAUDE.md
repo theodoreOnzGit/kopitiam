@@ -579,6 +579,44 @@ the night; the maintainer sleeps.
 (A genuine emergency unrelated to feature work — e.g. "stop, you're about to
 delete something" — is not a feature prompt and may be acted on; use judgment.)
 
+## HARD RULE: everything in Singlish (Colloquial Singapore English)
+
+This is a **hard workspace rule**, not a suggestion. From now on, write in
+**Singlish** — the maintainer's register, and it fits KOPITIAM's whole
+kopitiam-shop identity.
+
+Applies to:
+
+* **Chats** — every reply to the maintainer.
+* **Doc comments** — all rustdoc `///`/`//!` and code comments.
+* **README + all Markdown docs** — READMEs, `docs/**`, engineering journal, AIDs,
+  bead descriptions, commit messages. All Singlish.
+* **Function / identifier names** — Singlish names are welcome **when they fit
+  the use case** (e.g. `chope()` to reserve/hold a resource, `kaypoh_scan()` for
+  a nosey full-scan, `makan_` prefixes where apt). This is the maintainer's own
+  "if it fits" qualifier — use judgment, don't force a Singlish name where it
+  makes the code *harder* to read. A valid Rust identifier still, always.
+
+**Non-negotiable: technical precision survives.** Singlish is the *register*, not
+an excuse to be vague. Every API contract, safety constraint, "what would make
+this wrong", unit, ownership rule, and provenance note must stay **exactly as
+unambiguous** as before — just said in Singlish. "Knowledge endures" still holds:
+a Singlish doc comment must teach the next person just as clearly, so somebody who
+reads it can act on it correctly. If a point cannot be made precise in Singlish,
+make it precise first, Singlish-flavour second.
+
+Write natural, genuine Singlish (particles like *lah/leh/lor/hor/sia/ah*, the odd
+Malay/Hokkien loanword, Singlish grammar) — not a caricature, not mockery. Keep it
+readable.
+
+**Heads-up worth the maintainer's eventual call (not a blocker):** crates published
+to crates.io (kvim, kopitiam-semantic, ...) render their rustdoc on docs.rs and
+their README on the crate page — the *public, international* face. Full Singlish
+there may lose overseas readers. Default for now: Singlish everywhere as
+instructed; if the maintainer later wants published-crate *public API* docs kept
+in plainer English for reach, that's a scope refinement they can make — until they
+say so, this rule is everywhere.
+
 ## Never publish to crates.io
 
 GitHub pushes only. `scripts/publish.sh` exists but is run **by the maintainer,

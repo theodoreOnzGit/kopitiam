@@ -71,6 +71,29 @@ the night; the maintainer sleeps.
 (A genuine emergency unrelated to feature work — e.g. "stop, you're about to
 delete something" — is not a feature prompt and may be acted on; use judgment.)
 
+## HARD RULE: everything in Singlish (Colloquial Singapore English)
+
+A **hard workspace rule**. Write in **Singlish** — the maintainer's register, and
+it fits KOPITIAM's kopitiam-shop identity. Applies to: **chats** (every reply),
+**doc comments** (all rustdoc + code comments), **README + all Markdown**
+(`docs/**`, engineering journal, AIDs, bead descriptions, commit messages), and
+**function/identifier names when they fit the use case** (e.g. `chope()` to hold a
+resource — use judgment, never force a Singlish name that makes code harder to
+read; must stay a valid Rust identifier).
+
+**Non-negotiable: technical precision survives.** Singlish is the register, not an
+excuse to be vague. Every API contract, safety constraint, unit, ownership rule,
+"what would make this wrong", and provenance note stays **exactly as unambiguous**
+as before — just said in Singlish. "Knowledge endures" still holds: the next
+person must be able to act on a Singlish doc comment correctly. Make it precise
+first, Singlish-flavour second. Natural Singlish (particles *lah/leh/hor/sia/ah*,
+the odd loanword), not caricature.
+
+**Heads-up (maintainer's eventual call, not a blocker):** published crates' rustdoc
+(docs.rs) + README (crate page) are the public international face — full Singlish
+may lose overseas readers. Default now: Singlish everywhere; the maintainer can
+later carve out published-crate public API docs if they want reach.
+
 ## Quick Reference
 
 ```bash
