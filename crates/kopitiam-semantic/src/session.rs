@@ -43,8 +43,37 @@ impl RustAnalyzerSession {
     }
 
     pub fn connect_with_binary(binary: &str, root: &Path) -> Result<Self> {
-        let client = LspClient::spawn(binary, root, Duration::from_secs(180))?;
+        Self::connect_with(binary, &[], root, Duration::from_secs(180))
+    }
+
+    /// The general connect used by both the convenience constructors above and
+    /// the asynchronous [`crate::AsyncRustAnalyzerSession`]: spawns `binary`
+    /// with `args`, performs the handshake against `root`, and blocks up to
+    /// `index_timeout` for indexing (see [`LspClient::spawn_with_args`] and the
+    /// readiness discussion in `docs/ai-decisions/AID-0022`).
+    ///
+    /// `args` exists because non-rust-analyzer servers need command-line flags
+    /// to speak LSP on stdio (pyright's `--stdio`, OmniSharp's `-lsp`, …); an
+    /// explicit `index_timeout` exists because the async front end and its
+    /// tests want to bound the connect, rather than inheriting the 180 s default
+    /// baked into [`Self::connect`].
+    pub fn connect_with(binary: &str, args: &[&str], root: &Path, index_timeout: Duration) -> Result<Self> {
+        let client = LspClient::spawn_with_args(binary, args, root, index_timeout)?;
         Ok(Self { client })
+    }
+
+    /// Drains any server notifications the reader thread has queued — chiefly
+    /// pushed `textDocument/publishDiagnostics` — into the client's diagnostics
+    /// store, without issuing a request.
+    ///
+    /// A synchronous caller never needs this because [`Self::diagnostics`]
+    /// pumps first, but the asynchronous [`crate::AsyncRustAnalyzerSession`]
+    /// worker calls it on its idle tick so diagnostics keep flowing into the
+    /// store even while the caller issues no requests — which is exactly the
+    /// "a file you only open and read still shows diagnostics" behaviour
+    /// `docs/ai-decisions/AID-0023` is about.
+    pub fn pump(&mut self) -> Result<()> {
+        self.client.pump_notifications()
     }
 
     /// Computes (but does not write) the edit that would rename the symbol

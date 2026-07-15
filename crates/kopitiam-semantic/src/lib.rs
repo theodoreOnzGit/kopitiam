@@ -6,6 +6,7 @@
 //! adapters (C, C++, Go, Fortran, Visual Basic, C#) will live alongside these
 //! under [`providers`], each emitting the same semantic representation.
 
+mod async_session;
 pub mod edit;
 mod lsp_client;
 mod lsp_types;
@@ -14,6 +15,7 @@ mod provider;
 pub mod providers;
 mod session;
 
+pub use async_session::{AsyncRustAnalyzerSession, DEFAULT_INDEX_TIMEOUT, LspState, RequestError};
 pub use lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, Hover, Location, Position, Range, Severity,
 };
