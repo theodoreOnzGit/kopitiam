@@ -241,6 +241,14 @@ pub enum WindowCommand {
     /// `:close`: close the active window (a no-op message on the last one —
     /// vim refuses to `:close` the final window).
     Close,
+    /// `:bd`/`:bw`: a buffer was just deleted from the editor, so any window
+    /// still pointing at `deleted` must be repointed at `replacement` (the
+    /// surviving buffer the editor switched to). The editor owns the buffer
+    /// table but not the window tree, so — exactly like [`WindowCommand::Split`]
+    /// — it hands the UI the fact and lets the UI update its own tree. Without
+    /// this, a split showing the deleted buffer would be left dangling on a
+    /// dead id and paint blank.
+    BufferDeleted { deleted: BufferId, replacement: BufferId },
 }
 
 /// A single edit to a buffer: replace the text in `range` with `text`.

@@ -436,6 +436,78 @@ impl Editor {
         id
     }
 
+    /// `:bd`/`:bw`: chuck away the current buffer and land on a surviving one,
+    /// returning `(deleted, replacement)` so the UI can repoint any window that
+    /// was showing the deleted buffer (see
+    /// [`WindowCommand::BufferDeleted`]).
+    ///
+    /// The rules follow vim:
+    ///
+    /// * **Unsaved guard.** Without `force`, a modified buffer refuses with
+    ///   [`crate::Error::UnsavedChanges`] — the same guard `:q` uses — so you
+    ///   cannot lose changes by a stray `:bd`. `:bd!` (`force == true`) deletes
+    ///   anyway and discards the changes.
+    /// * **Never zero buffers.** Deleting the *only* buffer would leave the
+    ///   editor with none, which every accessor here assumes cannot happen
+    ///   (`current` is always a live id). vim solves this by opening a fresh
+    ///   empty buffer in the deleted one's place; so do we.
+    /// * **Land on the alternate.** With more than one buffer open, we switch
+    ///   to the next buffer in order, or the previous one if we were on the
+    ///   last — the buffer vim leaves you on after a `:bd`.
+    ///
+    /// `wipe` (`:bw` vs `:bd`) makes no behavioural difference today: kvim does
+    /// not yet track vim's unlisted/hidden-buffer state, so both forms remove
+    /// the buffer outright. See [`ex::ExCommand::DeleteBuffer`] for why the flag
+    /// is carried anyway.
+    pub fn delete_buffer(&mut self, force: bool, _wipe: bool) -> crate::Result<(BufferId, BufferId)> {
+        if !force && self.current_buffer().is_modified() {
+            return Err(crate::Error::UnsavedChanges);
+        }
+        let deleted = self.current;
+        let idx = self
+            .buffer_order
+            .iter()
+            .position(|&id| id == deleted)
+            .expect("current buffer id is always present in buffer_order");
+
+        let replacement = if self.buffer_order.len() > 1 {
+            let alt_idx = if idx + 1 < self.buffer_order.len() { idx + 1 } else { idx - 1 };
+            self.buffer_order[alt_idx]
+        } else {
+            let new_id = BufferId(self.next_buffer_id);
+            self.next_buffer_id += 1;
+            self.buffers.insert(new_id, Buffer::new());
+            self.buffer_order.push(new_id);
+            new_id
+        };
+
+        self.buffers.remove(&deleted);
+        self.buffer_order.retain(|&id| id != deleted);
+        self.saved_cursor.remove(&deleted);
+        self.current = replacement;
+        let landed = *self.saved_cursor.get(&replacement).unwrap_or(&Position::ORIGIN);
+        self.cursor = self.current_buffer().clamp(landed);
+        Ok((deleted, replacement))
+    }
+
+    /// `:ls`/`:buffers`: one line per open buffer, in buffer order, echoing
+    /// vim's layout closely enough to be familiar — the id, a `%a` marker on
+    /// the active buffer, a `+` when the buffer got unsaved changes, and the
+    /// file name (`[No Name]` for a scratch buffer with no path).
+    pub fn buffer_list(&self) -> String {
+        self.buffer_order
+            .iter()
+            .filter_map(|&id| self.buffers.get(&id).map(|buf| (id, buf)))
+            .map(|(id, buf)| {
+                let active = if id == self.current { "%a" } else { "  " };
+                let modified = if buf.is_modified() { "+" } else { " " };
+                let name = buf.path().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".to_string());
+                format!("{:>3} {active} {modified} {name}", id.0)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Which prompt the command line is serving, or `None` when not in
     /// [`Mode::Command`]. Lets the UI draw `:` vs `/` vs `?`.
     pub fn command_line_kind(&self) -> Option<CommandKind> {
@@ -1728,6 +1800,14 @@ impl Editor {
                 }
                 Ok(EditorResponse::Continue)
             }
+            ex::ExCommand::DeleteBuffer { force, wipe } => {
+                let (deleted, replacement) = self.delete_buffer(force, wipe)?;
+                // The editor already switched to `replacement`; the UI still has
+                // to repoint any window (active or split) that was showing the
+                // deleted buffer. See `WindowCommand::BufferDeleted`.
+                Ok(EditorResponse::Window(WindowCommand::BufferDeleted { deleted, replacement }))
+            }
+            ex::ExCommand::ListBuffers => Ok(EditorResponse::Message(self.buffer_list())),
             ex::ExCommand::Substitute { range, pattern, replacement, global } => {
                 let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
                 let n = ex::substitute(self.current_buffer_mut(), first, last, &pattern, &replacement, global)?;
@@ -2533,6 +2613,76 @@ mod tests {
             matches!(ed.execute_ex("qa"), Err(crate::Error::UnsavedChanges)),
             "`:qa` must refuse while any buffer is dirty, not just the current one"
         );
+    }
+
+    #[test]
+    fn bd_deletes_current_buffer_and_lands_on_the_other() {
+        let mut ed = editor_with("first");
+        let first = ed.buffer_id();
+        let second = ed.new_buffer(); // empty scratch, now current
+        feed(&mut ed, "isecond<Esc>"); // give it its own text
+
+        // `:bd!` (force, since we just made `second` dirty) removes it and
+        // switches focus to the surviving buffer, telling the UI to repoint.
+        let resp = ed.execute_ex("bd!").unwrap();
+        assert_eq!(resp, EditorResponse::Window(WindowCommand::BufferDeleted { deleted: second, replacement: first }));
+        assert_eq!(ed.buffer_id(), first, "focus must land on the surviving buffer");
+        assert_eq!(ed.current_buffer().text(), "first", "and it must show the surviving buffer's text");
+        assert!(ed.buffer_by_id(second).is_none(), "the deleted buffer must be gone from the table");
+    }
+
+    #[test]
+    fn bd_refuses_a_modified_buffer_and_bang_forces() {
+        let mut ed = editor_with("keep");
+        let first = ed.buffer_id();
+        let second = ed.new_buffer();
+        feed(&mut ed, "idirty<Esc>"); // `<Esc>` commits so the buffer reads modified
+        assert!(ed.current_buffer().is_modified());
+
+        // Plain `:bd` must refuse — the same unsaved guard `:q` uses.
+        assert!(
+            matches!(ed.execute_ex("bd"), Err(crate::Error::UnsavedChanges)),
+            "`:bd` on a modified buffer must refuse"
+        );
+        assert_eq!(ed.buffer_id(), second, "a refused `:bd` must not delete anything");
+
+        // `:bd!` overrides, discarding the changes.
+        let resp = ed.execute_ex("bd!").unwrap();
+        assert_eq!(resp, EditorResponse::Window(WindowCommand::BufferDeleted { deleted: second, replacement: first }));
+        assert_eq!(ed.buffer_id(), first);
+    }
+
+    #[test]
+    fn bd_on_the_last_buffer_opens_a_fresh_empty_one() {
+        // vim never leaves you with zero buffers; deleting the only buffer must
+        // replace it with a fresh empty scratch rather than deleting into nothing.
+        let mut ed = editor_with("only");
+        let only_id = ed.buffer_id();
+        let resp = ed.execute_ex("bd").unwrap();
+        match resp {
+            EditorResponse::Window(WindowCommand::BufferDeleted { deleted, replacement }) => {
+                assert_eq!(deleted, only_id);
+                assert_ne!(replacement, only_id, "the replacement must be a brand-new buffer");
+            }
+            other => panic!("expected a BufferDeleted window command, got {other:?}"),
+        }
+        assert_ne!(ed.buffer_id(), only_id, "the old buffer must no longer be current");
+        assert_eq!(ed.current_buffer().text(), "", "and the fresh buffer must be empty");
+        assert!(ed.buffer_by_id(only_id).is_none());
+    }
+
+    #[test]
+    fn ls_lists_every_open_buffer_with_a_modified_flag() {
+        let mut ed = editor_with("aaa");
+        ed.new_buffer(); // a second, empty, now-active buffer
+        feed(&mut ed, "ibbb<Esc>"); // make the active one modified
+
+        let EditorResponse::Message(list) = ed.execute_ex("ls").unwrap() else {
+            panic!("`:ls` must report a message");
+        };
+        assert_eq!(list.lines().count(), 2, "one line per open buffer");
+        assert!(list.contains("%a"), "the active buffer must be marked");
+        assert!(list.contains('+'), "the modified buffer must carry a `+` flag");
     }
 
     #[test]

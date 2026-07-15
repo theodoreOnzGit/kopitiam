@@ -87,6 +87,23 @@ pub enum ExCommand {
     NextBuffer,
     PrevBuffer,
     GotoBuffer(usize),
+    /// `:bd`/`:bdelete` (`wipe == false`) and `:bw`/`:bwipeout`
+    /// (`wipe == true`): chuck away the current buffer. Without `!` this must
+    /// refuse if the buffer got unsaved changes — same guard `:q` uses. With
+    /// `!` (`force == true`) it deletes anyway and throws the changes away.
+    ///
+    /// vim draws a line between `:bd` (unload the buffer but keep it in the
+    /// `:ls` list, marked as unlisted) and `:bw` (wipe it out completely, gone
+    /// from `:ls` too). kvim doesn't yet carry that hidden/unlisted-buffer
+    /// state — every open buffer is a live, listed buffer — so today both forms
+    /// do the same thing: remove the buffer outright. `wipe` is kept in the
+    /// grammar now so the two commands stay distinct at the parse layer, and
+    /// the day kvim grows an unlisted-buffer concept, only the executor needs
+    /// to change, not the command surface.
+    DeleteBuffer { force: bool, wipe: bool },
+    /// `:ls`/`:buffers`/`:files` — list every open buffer with its id and a
+    /// modified (`+`) flag, the way vim's `:ls` does.
+    ListBuffers,
     Substitute { range: LineRange, pattern: String, replacement: String, global: bool },
     Global { pattern: String, cmd: String },
     Delete { range: LineRange },
@@ -177,6 +194,9 @@ pub fn parse(input: &str) -> ExCommand {
         "bn" | "bnext" => ExCommand::NextBuffer,
         "bp" | "bprev" | "bprevious" => ExCommand::PrevBuffer,
         "b" | "buffer" => arg.parse::<usize>().map(ExCommand::GotoBuffer).unwrap_or_else(|_| ExCommand::Unknown(input.to_string())),
+        "bd" | "bdel" | "bdelete" => ExCommand::DeleteBuffer { force, wipe: false },
+        "bw" | "bwipe" | "bwipeout" => ExCommand::DeleteBuffer { force, wipe: true },
+        "ls" | "buffers" | "files" => ExCommand::ListBuffers,
         "s" | "substitute" => parse_substitute(range, after),
         "g" | "global" => parse_global(after),
         "d" | "delete" => ExCommand::Delete { range },
@@ -372,6 +392,24 @@ mod tests {
         // The single-window forms are untouched and still distinct.
         assert_eq!(parse("q"), ExCommand::Quit { force: false });
         assert_eq!(parse("wq"), ExCommand::Write { path: None, then_quit: true, force: false });
+    }
+
+    #[test]
+    fn parses_buffer_management_family() {
+        // `:bd` / `:bdelete`, plain and forced.
+        assert_eq!(parse("bd"), ExCommand::DeleteBuffer { force: false, wipe: false });
+        assert_eq!(parse("bdelete"), ExCommand::DeleteBuffer { force: false, wipe: false });
+        assert_eq!(parse("bd!"), ExCommand::DeleteBuffer { force: true, wipe: false });
+        assert_eq!(parse("bdelete!"), ExCommand::DeleteBuffer { force: true, wipe: false });
+        // `:bw` / `:bwipeout` carry the wipe flag.
+        assert_eq!(parse("bw"), ExCommand::DeleteBuffer { force: false, wipe: true });
+        assert_eq!(parse("bwipeout"), ExCommand::DeleteBuffer { force: false, wipe: true });
+        assert_eq!(parse("bw!"), ExCommand::DeleteBuffer { force: true, wipe: true });
+        // The buffer-list commands.
+        assert_eq!(parse("ls"), ExCommand::ListBuffers);
+        assert_eq!(parse("buffers"), ExCommand::ListBuffers);
+        // `:b{n}` (goto) stays distinct from the delete/list family.
+        assert_eq!(parse("b2"), ExCommand::GotoBuffer(2));
     }
 
     #[test]

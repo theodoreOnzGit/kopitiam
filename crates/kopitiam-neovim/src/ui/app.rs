@@ -1549,6 +1549,17 @@ impl<H: EditorHost> App<H> {
                 self.load_active_window();
                 LoopAction::Redraw
             }
+            // `:bd`/`:bw`: the editor already deleted the buffer and switched to
+            // `replacement`. Repoint every window that was showing the deleted
+            // buffer at the survivor (a split could have been showing it too),
+            // then sync the active window's cursor/scroll to the editor, which
+            // landed on the alternate buffer's saved position.
+            WindowCommand::BufferDeleted { deleted, replacement } => {
+                self.windows.remap_buffer(deleted, replacement);
+                self.sync_active_window();
+                self.windows.active_mut().scroll = Scroll::default();
+                LoopAction::Redraw
+            }
         }
     }
 

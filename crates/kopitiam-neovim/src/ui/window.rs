@@ -159,6 +159,30 @@ impl WindowTree {
         }
     }
 
+    /// Repoints every window showing `old` at `new` — the window-tree half of
+    /// a `:bd`/`:bw`. When the editor deletes a buffer it switches to a
+    /// surviving one, but each window keeps its own copy of "which buffer am I
+    /// showing"; any window still holding the deleted id would render blank
+    /// (its `buffer_by_id` lookup now returns `None`). This walks the whole
+    /// tree — not just the active window — because a split could have been
+    /// showing the deleted buffer too. Windows on other buffers are untouched.
+    pub fn remap_buffer(&mut self, old: BufferId, new: BufferId) {
+        fn go(node: &mut Node, old: BufferId, new: BufferId) {
+            match node {
+                Node::Leaf(w) => {
+                    if w.buffer == old {
+                        w.buffer = new;
+                    }
+                }
+                Node::Split { first, second, .. } => {
+                    go(first, old, new);
+                    go(second, old, new);
+                }
+            }
+        }
+        go(&mut self.root, old, new);
+    }
+
     fn find(&self, id: WindowId) -> Option<&Window> {
         fn go(node: &Node, id: WindowId) -> Option<&Window> {
             match node {
