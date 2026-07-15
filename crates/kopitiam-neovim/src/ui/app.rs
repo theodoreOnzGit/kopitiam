@@ -2604,6 +2604,56 @@ mod tests {
         assert_eq!(terminal.get_cursor_position().unwrap().y, 0, "and back in the text afterwards");
     }
 
+    /// The painted-cell proof for `:help`: a real [`crate::editor::Editor`]
+    /// runs `:help`, and we assert the Singlish manual — with an exact key name
+    /// — actually reaches the screen, not just some state field. Same lesson as
+    /// the `:Neotree` regression above: only reading painted cells catches text
+    /// that never made it out of the editor.
+    #[test]
+    fn help_command_paints_the_singlish_manual_on_screen() {
+        let mut editor = crate::editor::Editor::new();
+        editor.execute_ex("help").unwrap();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Flatten every text row into one big string and look for our markers.
+        let mut screen = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                screen.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("kvim :help"), "the manual title must be painted; screen was:\n{screen}");
+        assert!(screen.contains("<leader>"), "a real key name must survive to the screen");
+    }
+
+    /// `:help lsp` must scroll/position so the LSP section is actually visible
+    /// on screen, not just move an off-screen cursor.
+    #[test]
+    fn help_topic_paints_that_section_on_screen() {
+        let mut editor = crate::editor::Editor::new();
+        editor.execute_ex("help lsp").unwrap();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        // Give the editor a viewport height so scrolling can centre the target.
+        app.host.set_viewport_height(22);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                screen.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("LSP"), "the LSP section must be on screen; screen was:\n{screen}");
+        assert!(screen.contains("<leader>gd"), "the go-to-definition binding must be painted");
+    }
+
     #[test]
     fn filetype_is_derived_from_the_file_extension() {
         assert_eq!(filetype_from_path(Some(Path::new("src/main.rs"))), "rust");

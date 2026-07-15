@@ -105,6 +105,12 @@ pub struct FileTreePanel {
     /// [`FileTreePanel::render`]), because the panel does not know how tall it
     /// is until it is asked to draw.
     scroll_top: usize,
+    /// The viewport height from the last draw, remembered so that `<C-d>`/`<C-u>`
+    /// know how far "half a page" is. The panel is not told its height until it
+    /// renders (same reason `scroll_top` is recomputed there), so a scroll that
+    /// happens *before* the first draw falls back to a one-step nudge — see
+    /// [`FileTreePanel::scroll_half_page`].
+    last_height: usize,
     /// `?` replaces the tree with the keymap table until the next key.
     help: bool,
     /// The configured leader (Space, in the maintainer's config), so that
@@ -135,6 +141,7 @@ impl FileTreePanel {
             tree: FileTree::new(root)?,
             selected: 0,
             scroll_top: 0,
+            last_height: 0,
             help: false,
             leader,
             leader_pending: false,
@@ -229,6 +236,19 @@ impl FileTreePanel {
             return OverlayOutcome::Consumed;
         }
 
+        // `<C-d>`/`<C-u>`: scroll the tree half a page down / up, same as vim
+        // and neo-tree inside a file tree. Guarded on the Ctrl modifier so the
+        // plain keys are untouched — `u` is navigate-up-a-directory above, and a
+        // bare `d` has no tree mapping. Before this, both fell through to the
+        // `_ => Ignored` arm and did nothing, which felt broken in a long tree.
+        if key.mods.ctrl {
+            match key.key {
+                Key::Char('d') => return self.scroll_half_page(true),
+                Key::Char('u') => return self.scroll_half_page(false),
+                _ => {}
+            }
+        }
+
         match key.key {
             Key::Char('j') | Key::Down => self.move_selection(1),
             Key::Char('k') | Key::Up => self.move_selection(-1),
@@ -280,6 +300,31 @@ impl FileTreePanel {
         let next = self.selected.saturating_add_signed(delta).min(len - 1);
         if next == self.selected {
             // Already at an edge: nothing changed, so do not ask for a redraw.
+            return OverlayOutcome::Ignored;
+        }
+        self.selected = next;
+        OverlayOutcome::Consumed
+    }
+
+    /// `<C-d>`/`<C-u>`: move the selection half a page down (`down == true`) or
+    /// up, and let [`Self::scroll_into_view`] drag `scroll_top` along on the
+    /// next draw so a lower (or higher) entry comes into view. The cursor and
+    /// the viewport move together, which is exactly how a tree scrolls in vim.
+    ///
+    /// "Half a page" is half the last-rendered height; before the first draw we
+    /// don't know that yet, so it falls back to a one-row nudge rather than
+    /// doing nothing. Clamped at both ends — cannot go past the last row or
+    /// before the first.
+    fn scroll_half_page(&mut self, down: bool) -> OverlayOutcome {
+        let len = self.rows().len();
+        if len == 0 {
+            return OverlayOutcome::Ignored;
+        }
+        let half = (self.last_height / 2).max(1) as isize;
+        let delta = if down { half } else { -half };
+        let next = self.selected.saturating_add_signed(delta).min(len - 1);
+        if next == self.selected {
+            // Already pinned at the top or bottom: nothing moved, no redraw.
             return OverlayOutcome::Ignored;
         }
         self.selected = next;
@@ -412,6 +457,8 @@ impl FileTreePanel {
         if height == 0 {
             return;
         }
+        // Remember how tall we are, so `<C-d>`/`<C-u>` can scroll by half of it.
+        self.last_height = height;
         if self.selected < self.scroll_top {
             self.scroll_top = self.selected;
         } else if self.selected >= self.scroll_top + height {
@@ -573,6 +620,7 @@ impl Widget for FileTreeView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::event::Modifiers;
     use ratatui::{backend::TestBackend, Terminal};
 
     /// A tree over: root/{src/{main.rs}, README.md, .hidden}
@@ -591,6 +639,104 @@ mod tests {
 
     fn press(c: char) -> KeyPress {
         KeyPress::plain(Key::Char(c))
+    }
+
+    fn ctrl(c: char) -> KeyPress {
+        KeyPress::new(Key::Char(c), Modifiers { ctrl: true, alt: false, shift: false })
+    }
+
+    /// A fixture with enough files that the tree overflows a short viewport, so
+    /// scrolling has somewhere to go: root/{f00.txt .. f19.txt}.
+    fn tall_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.path().join(format!("f{i:02}.txt")), "").unwrap();
+        }
+        dir
+    }
+
+    /// Renders the panel at a caller-chosen height (the [`painted`] helper is
+    /// fixed at 12), so a test can prime `last_height` and read a short window.
+    fn painted_h(panel: &mut FileTreePanel, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(FileTreePanel::WIDTH, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::gruvbox_dark();
+        terminal
+            .draw(|frame| {
+                panel.render(frame, frame.area(), &theme, IconSet::Ascii, true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..FileTreePanel::WIDTH - 1)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_scroll_the_tree_half_a_page() {
+        let dir = tall_fixture();
+        let mut p = panel(dir.path());
+        // Draw once at height 8 so the panel learns its viewport (half-page = 4).
+        // The root row plus 20 files overflow 8 rows, so there is room to scroll.
+        let first = painted_h(&mut p, 8);
+        assert_eq!(p.selected, 0, "starts at the top");
+        // Only the first handful of files fit; a later file is off-screen.
+        assert!(first.iter().any(|r| r.contains("f00.txt")), "f00 visible at first");
+        assert!(!first.iter().any(|r| r.contains("f10.txt")), "f10 off-screen at first");
+
+        // `<C-d>`: half a page down. Selection jumps by 4 and the viewport drags
+        // along, so a lower entry that was off-screen becomes visible.
+        assert_eq!(p.handle_key(ctrl('d')), OverlayOutcome::Consumed);
+        assert_eq!(p.selected, 4, "half a page (8/2) down");
+
+        // Keep going until a deep entry is on screen, proving the viewport scrolls
+        // (the first `<C-d>` only moves the selection; the top row does not move
+        // until the selection would leave the window).
+        p.handle_key(ctrl('d'));
+        p.handle_key(ctrl('d'));
+        let deep = painted_h(&mut p, 8);
+        assert_ne!(deep, first, "the painted rows must actually move once scrolled");
+        assert!(deep.iter().any(|r| r.contains("f10.txt")), "a far entry scrolled into view: {deep:?}");
+        assert!(!deep.iter().any(|r| r.contains("f00.txt")), "the top rows scrolled off: {deep:?}");
+
+        // `<C-u>`: half a page back up. Selection climbs and the top row moves up.
+        let sel_before_up = p.selected;
+        assert_eq!(p.handle_key(ctrl('u')), OverlayOutcome::Consumed);
+        assert!(p.selected < sel_before_up, "`<C-u>` moves the selection up");
+        assert_eq!(sel_before_up - p.selected, 4, "half a page up too");
+    }
+
+    #[test]
+    fn ctrl_d_at_the_bottom_is_a_no_op() {
+        let dir = tall_fixture();
+        let mut p = panel(dir.path());
+        painted_h(&mut p, 8);
+        // Drive all the way to the last row.
+        for _ in 0..30 {
+            p.handle_key(ctrl('d'));
+        }
+        let last = p.selected;
+        assert_eq!(last, p.rows().len() - 1, "clamped at the last row");
+        // One more `<C-d>` cannot move past the end: nothing changed, no redraw.
+        assert_eq!(p.handle_key(ctrl('d')), OverlayOutcome::Ignored);
+        assert_eq!(p.selected, last, "still pinned at the bottom");
+    }
+
+    #[test]
+    fn plain_u_still_navigates_up_a_directory_not_scrolls() {
+        // The scroll guard is Ctrl-only: a bare `u` must keep its NERDTree
+        // meaning (re-root at the parent), untouched by the new scroll handling.
+        let dir = fixture();
+        let mut p = panel(&dir.path().join("src"));
+        assert_eq!(p.root(), dir.path().join("src"));
+        p.handle_key(press('u'));
+        assert_eq!(p.root(), dir.path(), "bare u still re-roots to the parent");
     }
 
     fn names(panel: &FileTreePanel) -> Vec<String> {

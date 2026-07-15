@@ -29,6 +29,7 @@
 //!   [`EditorResponse`] instead of happening inline.
 
 pub mod ex;
+pub mod help;
 pub mod key;
 pub mod motion;
 pub mod operator;
@@ -1775,6 +1776,26 @@ impl Editor {
                 self.cursor = Position::ORIGIN;
                 Ok(EditorResponse::Continue)
             }
+            // `:help [topic]` opens kvim's built-in Singlish manual in a fresh
+            // scratch buffer — reusing the same "new_buffer + insert text"
+            // machinery `:term` uses. The manual and its section line-index are
+            // rendered together (see `help::render`), so `:help <topic>` can put
+            // the cursor right on that section's heading. An unknown topic falls
+            // back to the top of the manual rather than erroring: a typo should
+            // still show *some* help, the way real vim does.
+            ex::ExCommand::Help { topic } => {
+                let rendered = help::render();
+                self.new_buffer();
+                self.current_buffer_mut().apply(Edit::insert(Position::ORIGIN, rendered.text))?;
+                let line = topic
+                    .as_deref()
+                    .and_then(help::resolve)
+                    .and_then(|id| help::section_line(&rendered.sections, id))
+                    .unwrap_or(0);
+                self.record_jump();
+                self.cursor = self.current_buffer().clamp(Position::new(line, 0));
+                Ok(EditorResponse::Continue)
+            }
             ex::ExCommand::Unknown(s) => Err(crate::Error::UnknownCommand(s)),
         }
     }
@@ -2512,6 +2533,36 @@ mod tests {
             matches!(ed.execute_ex("qa"), Err(crate::Error::UnsavedChanges)),
             "`:qa` must refuse while any buffer is dirty, not just the current one"
         );
+    }
+
+    #[test]
+    fn help_opens_a_buffer_of_singlish_manual_text() {
+        let mut ed = editor_with("hello");
+        let resp = ed.execute_ex("help").unwrap();
+        assert_eq!(resp, EditorResponse::Continue);
+        // A fresh scratch buffer now holds the manual, cursor at the top.
+        assert_eq!(ed.cursor, Position::new(0, 0));
+        let text = ed.current_buffer().text();
+        assert!(text.contains("kvim :help"), "the help buffer must hold the manual");
+        assert!(text.contains("<leader>e"), "and quote real key names verbatim");
+    }
+
+    #[test]
+    fn help_topic_jumps_the_cursor_to_that_section() {
+        let mut ed = editor_with("hello");
+        ed.execute_ex("help lsp").unwrap();
+        let line = ed.cursor.line;
+        // The cursor's line must be the LSP section's heading, not the top.
+        assert!(line > 0, "`:help lsp` must jump past the overview");
+        let heading = ed.current_buffer().line(line).unwrap();
+        assert!(heading.contains("LSP"), "landed on {heading:?}, expected the LSP heading");
+    }
+
+    #[test]
+    fn help_with_an_unknown_topic_falls_back_to_the_top() {
+        let mut ed = editor_with("hello");
+        ed.execute_ex("help nonsense-topic-lah").unwrap();
+        assert_eq!(ed.cursor, Position::new(0, 0), "an unknown topic still shows the manual, at the top");
     }
 
     #[test]

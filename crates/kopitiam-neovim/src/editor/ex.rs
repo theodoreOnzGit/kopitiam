@@ -105,6 +105,10 @@ pub enum ExCommand {
     /// an honest placeholder buffer rather than a broken or silent one. See
     /// `Editor::execute_ex` and bead `kopitiam-cj0.10.4`.
     Terminal,
+    /// `:help`/`:h [topic]` — open kvim's built-in Singlish help manual in a
+    /// scratch buffer. `topic` is the optional `:help <topic>` argument that
+    /// jumps to a section (see [`super::help`]); `None` opens at the top.
+    Help { topic: Option<String> },
     /// An empty command line (`:` followed immediately by Enter).
     Empty,
     /// Parsed but not recognized — surfaced to the user as
@@ -185,6 +189,7 @@ pub fn parse(input: &str) -> ExCommand {
         "on" | "only" => ExCommand::Only,
         "clo" | "close" => ExCommand::Close,
         "term" | "terminal" => ExCommand::Terminal,
+        "h" | "help" => ExCommand::Help { topic: opt_arg(arg) },
         _ => ExCommand::Unknown(input.to_string()),
     }
 }
@@ -399,6 +404,16 @@ mod tests {
     #[test]
     fn parses_global() {
         assert_eq!(parse("g/foo/d"), ExCommand::Global { pattern: "foo".into(), cmd: "d".into() });
+    }
+
+    #[test]
+    fn parses_help_with_and_without_a_topic() {
+        // Bare `:help` / `:h` open the manual at the top (no topic).
+        assert_eq!(parse("help"), ExCommand::Help { topic: None });
+        assert_eq!(parse("h"), ExCommand::Help { topic: None });
+        // `:help <topic>` carries the topic through for the jump.
+        assert_eq!(parse("help lsp"), ExCommand::Help { topic: Some("lsp".into()) });
+        assert_eq!(parse("h windows"), ExCommand::Help { topic: Some("windows".into()) });
     }
 
     #[test]
