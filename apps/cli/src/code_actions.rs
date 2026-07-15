@@ -43,14 +43,22 @@ pub struct CodeActionsArgs {
 /// Runs `kopitiam code-actions`: list available actions, or apply one.
 pub fn run(args: CodeActionsArgs) -> Result<()> {
     let root = std::fs::canonicalize(&args.root)?;
-    println!("Starting rust-analyzer and waiting for it to index {}...", root.display());
+    println!(
+        "Starting rust-analyzer and waiting for it to index {}...",
+        root.display()
+    );
     let mut session = RustAnalyzerSession::connect(&root)?;
 
     let actions = session.code_actions(&args.file, args.line, args.character)?;
 
     let Some(index) = args.apply else {
         if actions.is_empty() {
-            println!("No code actions available at {}:{}:{}.", args.file.display(), args.line, args.character);
+            println!(
+                "No code actions available at {}:{}:{}.",
+                args.file.display(),
+                args.line,
+                args.character
+            );
         } else {
             println!("Available code actions:");
             for (i, action) in actions.iter().enumerate() {
@@ -63,9 +71,12 @@ pub fn run(args: CodeActionsArgs) -> Result<()> {
         return Ok(());
     };
 
-    let action = actions
-        .get(index)
-        .with_context(|| format!("no code action at index {index} (there are {})", actions.len()))?;
+    let action = actions.get(index).with_context(|| {
+        format!(
+            "no code action at index {index} (there are {})",
+            actions.len()
+        )
+    })?;
     println!("Applying: {}", action.title);
     let file_edits = session.apply_code_action(action)?;
     let _ = session.shutdown();

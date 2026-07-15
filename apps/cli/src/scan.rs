@@ -25,7 +25,9 @@ use anyhow::Result;
 use clap::Args;
 use kopitiam_knowledge::SemanticGraph;
 use kopitiam_ontology::EntityKind;
-use kopitiam_semantic::{CargoMetadataProvider, KnowledgeProvider, RustAnalyzerProvider, RustdocProvider};
+use kopitiam_semantic::{
+    CargoMetadataProvider, KnowledgeProvider, RustAnalyzerProvider, RustdocProvider,
+};
 use kopitiam_workspace::ProjectState;
 
 /// Options for `kopitiam scan`.
@@ -83,7 +85,11 @@ pub fn run(args: ScanArgs) -> Result<()> {
 /// provider ran and how many facts it contributed. Kept as a free function
 /// (rather than a method) so adding a fourth provider later is a one-line
 /// change in [`run`].
-fn run_provider(graph: &mut SemanticGraph, root: &Path, provider: &dyn KnowledgeProvider) -> Result<()> {
+fn run_provider(
+    graph: &mut SemanticGraph,
+    root: &Path,
+    provider: &dyn KnowledgeProvider,
+) -> Result<()> {
     let output = provider.collect(root)?;
     let entity_delta = output.entities.len();
     let relationship_delta = output.relationships.len();
@@ -126,7 +132,10 @@ fn print_summary(graph: &SemanticGraph, verbose: bool) {
         println!();
         println!("Entities:");
         for entity in graph.entities() {
-            println!("  [{:?}] {} (source: {})", entity.kind, entity.name, entity.source);
+            println!(
+                "  [{:?}] {} (source: {})",
+                entity.kind, entity.name, entity.source
+            );
         }
     }
 }

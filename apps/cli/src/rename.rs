@@ -47,7 +47,10 @@ pub struct RenameArgs {
 /// at the given position, and either print a diff or write the result.
 pub fn run(args: RenameArgs) -> Result<()> {
     let root = std::fs::canonicalize(&args.root)?;
-    println!("Starting rust-analyzer and waiting for it to index {}...", root.display());
+    println!(
+        "Starting rust-analyzer and waiting for it to index {}...",
+        root.display()
+    );
     let mut session = RustAnalyzerSession::connect(&root)?;
 
     let file_edits = session.rename(&args.file, args.line, args.character, &args.new_name)?;

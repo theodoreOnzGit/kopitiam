@@ -22,12 +22,14 @@
 //! symbols and apply refactorings (see [`rename`] and [`code_actions`]).
 
 mod code_actions;
+mod models;
 mod plan;
 mod rename;
 mod scan;
 mod status;
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
@@ -104,19 +106,53 @@ enum Command {
     /// proving the full `load state -> collect facts -> build context ->
     /// invoke model -> validate -> persist` pipeline end to end.
     Plan(plan::PlanArgs),
+
+    /// Go and get, then check, the local model weights the AI layer runs on.
+    ///
+    /// Group of four actions — `list`, `pull`, `path`, `verify` — over the
+    /// `kopitiam-models` model store. `pull` is the autofetch path (download
+    /// plus SHA-256 verify from the catalog); a user who already got the file
+    /// can drop it where `path` say and skip the network (bring-your-own).
+    /// This keeps `CLAUDE.md`'s Offline-First promise real: no local weights,
+    /// no local model. See `apps/cli/src/models.rs` for the full story.
+    Models(models::ModelsArgs),
 }
 
-fn main() -> anyhow::Result<()> {
+// `main` return `anyhow::Result<ExitCode>` (not `Result<()>`) because one
+// subcommand — `models path` — must exit nonzero when a model not present, so
+// it can compose inside shell scripts. Every other arm just report
+// `ExitCode::SUCCESS`; genuine errors still bubble up as `Err` and clap/anyhow
+// print them. `models::run` is the only arm that carry a real exit code.
+fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Pdf2md { input, output } => pdf2md(&input, output)?,
-        Command::Scan(args) => scan::run(args)?,
-        Command::Rename(args) => rename::run(args)?,
-        Command::CodeActions(args) => code_actions::run(args)?,
-        Command::Status(args) => status::run(args)?,
-        Command::Plan(args) => plan::run(args)?,
-    }
-    Ok(())
+    let code = match cli.command {
+        Command::Pdf2md { input, output } => {
+            pdf2md(&input, output)?;
+            ExitCode::SUCCESS
+        }
+        Command::Scan(args) => {
+            scan::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Rename(args) => {
+            rename::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::CodeActions(args) => {
+            code_actions::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Status(args) => {
+            status::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Plan(args) => {
+            plan::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Models(args) => models::run(args)?,
+    };
+    Ok(code)
 }
 
 /// Implements [`Command::Pdf2md`]: PDF in, semantic Markdown out, plus a

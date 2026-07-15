@@ -21,5 +21,6 @@ kopitiam-index = { workspace = true }
 kopitiam-workspace = { workspace = true }
 kopitiam-workflow = { workspace = true }
 kopitiam-ai = { workspace = true }
+kopitiam-models = { path = "../../crates/kopitiam-models" }
 clap = { workspace = true }
 anyhow = { workspace = true }

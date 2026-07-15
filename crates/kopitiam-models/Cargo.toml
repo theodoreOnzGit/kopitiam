@@ -1,0 +1,59 @@
+[package]
+name = "kopitiam-models"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM model acquisition: curated multi-family model catalog, XDG cache resolution, sha256 verification, and an autofetch-first / bring-your-own acquire path. Sits below kopitiam-ai; hands verified on-disk paths to kopitiam-loader."
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Content hashing for artifact verification (SHA-256). RustCrypto's `sha2`:
+# pure Rust one, no C, no build script compiling native code -- its `asm`
+# feature is opt-in and we NEVER on it here. Already inside this workspace's
+# Cargo.lock (kopitiam-web, lopdf, rmux), so adding this one no extra
+# supply-chain surface lah.
+sha2 = "0.10"
+
+# ---------------------------------------------------------------------------
+# The network stack. This one is the ONLY network touch-point in the whole
+# crate, and we chope it behind the `net` feature plus the `Fetcher` trait, so
+# the core -- catalog, store, verification, the BYO acquire path -- can compile
+# and test with zero network code inside (`--no-default-features`).
+# ---------------------------------------------------------------------------
+#
+# `default-features = false, features = ["rustls"]` is copy verbatim from
+# `crates/kopitiam-web/Cargo.toml` -- same TLS decision, same tradeoff hor. It
+# picks ureq's rustls backend and leaves ureq's `native-tls` feature OFF, which
+# is the thing that would otherwise drag in OpenSSL (a C library, and the surest
+# way to break an Android cross-build).
+#
+# Must say the honest caveat, because people always get this one wrong: "rustls"
+# does NOT mean "no C" ah. rustls is a pure-Rust TLS *protocol* implementation,
+# but ureq's `rustls` feature picks the `ring` provider (C + perlasm) to do the
+# actual crypto. We accept `ring` on purpose -- it cross-compiles clean to the
+# targets KOPITIAM care about (including Android/aarch64, where OpenSSL famously
+# cannot), and it stay chope-d behind an off-by-default feature, so the
+# default-off / BYO-only build never compile even one byte of it. Same tradeoff
+# kopitiam-web already made; see docs/ai-decisions/AID-0013.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# Autofetch work out of the box: the default build ship `HttpFetcher`, so
+# `ensure_available` can pull a missing model over the network already, no need
+# to juggle features.
+default = ["net"]
+
+# The HTTP stack behind `HttpFetcher`. On you off it (`--no-default-features`),
+# you get a pure BRING-YOUR-OWN, offline-only build: catalog, store,
+# verification, and `ensure_available` all still work, but the caller must pass
+# in a `Fetcher` (or already have every artifact sitting on disk). No socket, no
+# TLS, no `ring`.
+net = ["dep:ureq"]
