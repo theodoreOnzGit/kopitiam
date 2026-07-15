@@ -2001,6 +2001,14 @@ impl<H: EditorHost> App<H> {
 
     fn render_statusline(&self, frame: &mut Frame, area: Rect) {
         let buffer = self.host.buffer();
+        // Subtle hint while the async LSP client is connecting on its background
+        // thread (bead kopitiam-cj0.27): shown only for a buffer whose language
+        // server is still `Connecting`, and gone the moment it is ready.
+        let lsp_status = buffer
+            .path()
+            .and_then(lsp_filetype)
+            .filter(|ft| self.lsp.is_starting(ft))
+            .map(|_| "LSP: starting…".to_string());
         let data = StatuslineData {
             mode: self.host.mode(),
             file_name: display_file_name(buffer.path()),
@@ -2009,6 +2017,7 @@ impl<H: EditorHost> App<H> {
             // Populated by the plugin layer's git integration once it
             // exists; see `ui/statusline.rs`'s module docs.
             git_branch: None,
+            lsp_status,
             cursor: self.host.cursor(),
             line_count: buffer.line_count(),
         };

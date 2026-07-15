@@ -62,6 +62,13 @@ pub struct StatuslineData {
     /// `None` when git integration hasn't populated this yet, or the file
     /// isn't in a git repository — the segment is simply omitted.
     pub git_branch: Option<String>,
+    /// A short language-server status hint, e.g. `"LSP: starting…"` while the
+    /// server for this buffer is connecting on its background thread. `None`
+    /// once the server is ready (or when the buffer has no server), so the
+    /// segment is shown only while it carries information — the async LSP
+    /// client's non-blocking connect (bead `kopitiam-cj0.27`) is otherwise
+    /// invisible, and this is the subtle cue that it is warming up.
+    pub lsp_status: Option<String>,
     pub cursor: Position,
     pub line_count: usize,
 }
@@ -133,6 +140,11 @@ impl<'a> Statusline<'a> {
 
     fn right_segments(&self) -> Vec<Segment> {
         let mut segments = Vec::new();
+        // The LSP hint sits at the far left of the right group (outermost, so it
+        // reads first) and only while the server is starting.
+        if let Some(status) = &self.data.lsp_status {
+            segments.push(Segment { text: format!(" {status} "), bg: self.theme.bg2 });
+        }
         if !self.data.filetype.is_empty() {
             segments.push(Segment { text: format!(" {} ", self.data.filetype), bg: self.theme.bg2 });
         }
@@ -229,6 +241,7 @@ mod tests {
             modified: true,
             filetype: "rust".to_string(),
             git_branch: Some("main".to_string()),
+            lsp_status: None,
             cursor: Position::new(9, 3),
             line_count: 42,
         }
