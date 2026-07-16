@@ -245,6 +245,29 @@ pub trait EditorHost {
     /// used to jump between snippet tabstops. Defaults to a no-op.
     fn move_cursor(&mut self, _pos: Position) {}
 
+    /// Runs one ex command line against the active buffer, for `:cdo`/`:ldo` to
+    /// apply an edit (typically a `:s///`) at each quickfix entry.
+    ///
+    /// Returns `Ok(())` on success (buffer-level effects like `:s` are applied in
+    /// place) or an error string to report. This is deliberately narrow: `:cdo`
+    /// positions the cursor at an entry (via [`EditorHost::open`] +
+    /// [`EditorHost::move_cursor`]) and then asks the editor to run the command
+    /// there. Window/quit effects the command might return are not meaningful
+    /// mid-iteration and are ignored — a scope stated in `App::quickfix_do`.
+    ///
+    /// Defaults to a no-op `Ok(())` so a fake host that never exercises `:cdo`
+    /// need not implement it.
+    fn run_ex(&mut self, _line: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Writes the active buffer to its backing file (`:cdo`'s implied `update`
+    /// after an edit). Errors if the buffer has no path or the write fails.
+    /// Defaults to `Ok(())` for hosts with no filesystem.
+    fn save(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Opens `path` and makes it the active buffer.
     ///
     /// The UI needs this because an overlay (the file tree today; the fuzzy
@@ -384,6 +407,12 @@ pub enum HostResponse {
     ///
     /// [`Action`]: crate::config::Action
     Action(crate::config::Action),
+    /// A quickfix / location-list command (`:grep`, `:copen`, `:cnext`, …) for
+    /// the UI to carry out — the editor parsed it but owns neither the search
+    /// root nor the list windows. Carried the last hop from the `EditorHost`
+    /// adapter to [`crate::ui::app::App`], the layer that owns both. See
+    /// [`crate::editor::ex::QuickfixCommand`].
+    Quickfix(crate::editor::ex::QuickfixCommand),
 }
 
 /// Read-only view of a buffer's text, matching the frozen `text::Buffer`

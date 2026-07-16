@@ -45,7 +45,10 @@ use ratatui::{
 
 use crate::config::{Action, Options};
 use crate::core::{BufferId, Direction, Mode, Position, Range, ViewportScroll, WindowCommand};
+use crate::editor::ex::QuickfixCommand;
+use crate::editor::quickfix::{ListKind, NavError, QuickfixEntry, QuickfixList};
 use crate::icons::IconSet;
+use crate::plugins::grep;
 use crate::lsp::completion::{self, CompletionItem as CItem, CompletionSource};
 use crate::lsp::{Location as LspLocation, LspClient};
 use crate::ui::completion_menu::{anchored_rect, menu_rect, Anchor, CompletionMenu as CompletionMenuWidget};
@@ -165,6 +168,31 @@ pub struct App<H: EditorHost> {
     /// Set after `]`/`[` in Normal mode: the next key (`d`) completes a
     /// diagnostic-navigation motion (`]d`/`[d`). See [`App::handle_event`].
     pending_bracket: Option<char>,
+    /// The global quickfix list, populated by `:grep`/`:vimgrep` and walked by
+    /// `:cnext`/`:cprev`/`:cc`. Shares its "current entry" cursor with the
+    /// quickfix window, so a `j`/`k` in the window and a `:cnext` move the same
+    /// thing. See [`crate::editor::quickfix`].
+    quickfix: QuickfixList,
+    /// The location list — the window-local twin of the quickfix list, driven by
+    /// the `:l`-prefixed commands (`:lgrep`, `:lopen`, `:lnext`, …).
+    ///
+    /// SCOPE: kvim keeps a *single* location list on the app for now, not one
+    /// per window as vim does. For the common one-or-two-window session this is
+    /// indistinguishable; the per-window twin is filed as a follow-up bead. See
+    /// this session's report.
+    location: QuickfixList,
+    /// Which list's window is currently open at the bottom of the screen, if
+    /// any. Only one is shown at a time (`:copen` and `:lopen` share the bottom
+    /// strip); opening one closes the other. `None` means no list window is up.
+    qf_window: Option<ListKind>,
+    /// Whether the open list window currently has the keyboard: `j`/`k` move the
+    /// selected entry, `<CR>` jumps to it, `q`/`<Esc>` closes. Set by `:copen`
+    /// (vim drops you into the quickfix window) and cleared when a jump moves
+    /// focus back to the buffer or the window closes. Kept separate from
+    /// [`Self::qf_window`] because the window can be *visible* while the buffer
+    /// has focus (after a `<CR>` jump), the same visible-but-inert state the file
+    /// tree's [`Focus`] models.
+    qf_focused: bool,
     /// The open insert-mode completion popup, if any. Driven by
     /// [`App::refresh_completion`] as the user types, navigated with
     /// `<C-n>`/`<C-p>`, accepted with `<CR>`/`<Tab>` — see
@@ -340,6 +368,10 @@ impl<H: EditorHost> App<H> {
             lsp_opened: std::collections::HashSet::new(),
             lsp_no_server: std::collections::HashSet::new(),
             pending_bracket: None,
+            quickfix: QuickfixList::default(),
+            location: QuickfixList::default(),
+            qf_window: None,
+            qf_focused: false,
             completion: None,
             ctrl_x_pending: false,
             snippet: None,
@@ -528,6 +560,15 @@ impl<H: EditorHost> App<H> {
                         self.handle_overlay_key(kp)
                     }
                     Focus::Buffer => {
+                        // The bottom quickfix/location window, when focused, owns
+                        // the keyboard like an overlay: `j`/`k`/`<CR>`/`q` move,
+                        // jump and close the list. Suspended while a `:` prompt is
+                        // open, so a command typed *from* the list window (the `:`
+                        // handler in `handle_quickfix_key` opens it) reaches the
+                        // editor rather than looping back here.
+                        if self.qf_focused && self.host.command_line().is_none() {
+                            return self.handle_quickfix_key(kp);
+                        }
                         // An LSP prompt/list in flight owns the keyboard, like an
                         // overlay: rename input and reference navigation must not
                         // reach the editor. Checked before hop and window keys.
@@ -630,6 +671,7 @@ impl<H: EditorHost> App<H> {
             HostResponse::Action(action) => self.handle_action(action),
             HostResponse::Window(cmd) => self.handle_window_command(cmd),
             HostResponse::Scroll(req) => self.handle_scroll(req),
+            HostResponse::Quickfix(cmd) => self.handle_quickfix(cmd),
         }
     }
 
@@ -845,6 +887,262 @@ impl<H: EditorHost> App<H> {
         self.sync_active_window();
         self.windows.active_mut().scroll = Scroll::default();
         self.info(format!("{}:{pos}", file.display()))
+    }
+
+    // ---------------------------------------------------------------
+    // Quickfix & location lists (`:grep`, `:copen`, `:cnext`, `:cdo`, …).
+    //
+    // The editor parses these and hands them here through
+    // `HostResponse::Quickfix`; this layer owns the search root, the two lists,
+    // the bottom list-window, and the jumps. The list *model* and its navigation
+    // grammar live in `crate::editor::quickfix`; the search *engine* in
+    // `crate::plugins::grep`. This is the wiring between them.
+    // ---------------------------------------------------------------
+
+    /// The most matches a single `:grep` will collect before it stops and reports
+    /// the list as truncated. A broad pattern over a big tree must never build an
+    /// unbounded list and lock the editor up; a thousand hits is already far more
+    /// than anyone pages through by hand.
+    const QUICKFIX_MATCH_CAP: usize = 1000;
+
+    /// The list a command targets, mutably. The one place the `Quickfix`/`Location`
+    /// choice turns into a concrete field, so nothing else branches on it.
+    fn list_mut(&mut self, kind: ListKind) -> &mut QuickfixList {
+        match kind {
+            ListKind::Quickfix => &mut self.quickfix,
+            ListKind::Location => &mut self.location,
+        }
+    }
+
+    /// The list a command targets, immutably.
+    fn list(&self, kind: ListKind) -> &QuickfixList {
+        match kind {
+            ListKind::Quickfix => &self.quickfix,
+            ListKind::Location => &self.location,
+        }
+    }
+
+    /// Performs one parsed quickfix / location-list command.
+    fn handle_quickfix(&mut self, cmd: QuickfixCommand) -> LoopAction {
+        match cmd {
+            QuickfixCommand::Grep { kind, pattern, globs } => self.quickfix_grep(kind, &pattern, &globs),
+            QuickfixCommand::Open(kind) => {
+                // `:copen`/`:lopen` open the bottom window and drop focus into it,
+                // the way vim leaves you in the quickfix window.
+                self.qf_window = Some(kind);
+                self.qf_focused = !self.list(kind).is_empty();
+                LoopAction::Redraw
+            }
+            QuickfixCommand::Close(kind) => {
+                if self.qf_window == Some(kind) {
+                    self.qf_window = None;
+                    self.qf_focused = false;
+                }
+                LoopAction::Redraw
+            }
+            QuickfixCommand::Window(kind) => {
+                // `:cwindow`/`:lwindow`: open iff the list has entries, else close.
+                if self.list(kind).is_empty() {
+                    if self.qf_window == Some(kind) {
+                        self.qf_window = None;
+                        self.qf_focused = false;
+                    }
+                } else {
+                    self.qf_window = Some(kind);
+                    self.qf_focused = true;
+                }
+                LoopAction::Redraw
+            }
+            QuickfixCommand::Next(kind) => self.quickfix_nav(kind, QfNav::Next),
+            QuickfixCommand::Prev(kind) => self.quickfix_nav(kind, QfNav::Prev),
+            QuickfixCommand::First(kind) => self.quickfix_nav(kind, QfNav::First),
+            QuickfixCommand::Last(kind) => self.quickfix_nav(kind, QfNav::Last),
+            QuickfixCommand::Nth { kind, nr } => self.quickfix_nav(kind, QfNav::Nth(nr)),
+            QuickfixCommand::Do { kind, cmd } => self.quickfix_do(kind, &cmd),
+        }
+    }
+
+    /// Runs `:grep`/`:vimgrep` (or an `l`-twin): searches [`Self::tree_root`] with
+    /// the pure-Rust engine, replaces the list, and — as vim does — jumps to the
+    /// first match. An invalid regex or an empty result is reported rather than
+    /// leaving a stale list up.
+    fn quickfix_grep(&mut self, kind: ListKind, pattern: &str, globs: &[String]) -> LoopAction {
+        let re = match regex::Regex::new(pattern) {
+            Ok(re) => re,
+            Err(e) => return self.error(format!("invalid pattern /{pattern}/: {e}")),
+        };
+        let root = self.tree_root.clone();
+        let outcome = grep::grep(&root, &re, globs, Self::QUICKFIX_MATCH_CAP);
+        let entries: Vec<QuickfixEntry> = outcome
+            .matches
+            .into_iter()
+            .map(|m| QuickfixEntry { path: m.path, line: m.line, col: m.col, text: m.text })
+            .collect();
+        let n = entries.len();
+        let first = entries.first().map(|e| (e.path.clone(), e.line, e.col));
+        self.list_mut(kind).set(entries);
+
+        if n == 0 {
+            return self.info(format!("no match: {pattern}"));
+        }
+        // Vim jumps to the first match on `:grep`/`:vimgrep`.
+        if let Some((path, line, col)) = first {
+            self.jump_qf(&path, line, col);
+        }
+        let where_to = kind.label();
+        if outcome.truncated {
+            self.info(format!("{n} match(es) in the {where_to} list (truncated at {})", Self::QUICKFIX_MATCH_CAP))
+        } else {
+            self.info(format!("{n} match(es) in the {where_to} list"))
+        }
+    }
+
+    /// Runs a `:cnext`/`:cprev`/`:cfirst`/`:clast`/`:cc` navigation, jumping to
+    /// the landed entry or reporting the vim-style error at the ends.
+    fn quickfix_nav(&mut self, kind: ListKind, nav: QfNav) -> LoopAction {
+        // Compute the move against the list, then drop the borrow before jumping
+        // (the jump needs `&mut self`), carrying only the owned target out.
+        let landed: Result<(PathBuf, usize, usize), NavError> = {
+            let list = self.list_mut(kind);
+            let r = match nav {
+                QfNav::Next => list.advance(),
+                QfNav::Prev => list.retreat(),
+                QfNav::First => list.first(),
+                QfNav::Last => list.last(),
+                QfNav::Nth(nr) => list.goto(nr),
+            };
+            r.map(|e| (e.path.clone(), e.line, e.col))
+        };
+        match landed {
+            Ok((path, line, col)) => self.jump_qf(&path, line, col),
+            Err(e) => self.info(nav_error_message(kind, e)),
+        }
+    }
+
+    /// `:cdo {cmd}`/`:ldo {cmd}`: run `cmd` on each entry's buffer.
+    ///
+    /// SCOPE (stated plainly): kvim runs a *single* ex command per entry and then
+    /// auto-saves that buffer — the implied `| update` of the usual
+    /// `:cdo s/old/new/ | update`. It does **not** parse the `|`-chained form; a
+    /// bare `:cdo s/old/new/` is the supported shape, and the save is automatic.
+    /// The command runs with the cursor parked at column 0 of the entry's line,
+    /// so a bare `:s` acts on that line. Multi-entry edits in one file work
+    /// because each entry saves before the next reopens the file. The `|`-chain
+    /// and richer `:cdo` semantics are a filed follow-up bead.
+    fn quickfix_do(&mut self, kind: ListKind, cmd: &str) -> LoopAction {
+        let targets: Vec<(PathBuf, usize)> =
+            self.list(kind).entries().iter().map(|e| (e.path.clone(), e.line)).collect();
+        if targets.is_empty() {
+            return self.info(format!("no {} entries", kind.label()));
+        }
+        let mut ran = 0usize;
+        let mut errors = 0usize;
+        for (path, line) in &targets {
+            if self.host.open(path).is_err() {
+                errors += 1;
+                continue;
+            }
+            self.host.move_cursor(Position::new(line.saturating_sub(1), 0));
+            match self.host.run_ex(cmd) {
+                Ok(()) => {
+                    if self.host.save().is_ok() {
+                        ran += 1;
+                    } else {
+                        errors += 1;
+                    }
+                }
+                Err(_) => errors += 1,
+            }
+        }
+        self.sync_active_window();
+        if errors == 0 {
+            self.info(format!("{}do: ran `{cmd}` on {ran} entr(ies)", kind.label().chars().next().unwrap_or('c')))
+        } else {
+            self.info(format!("{}do: ran on {ran}, {errors} error(s)", kind.label().chars().next().unwrap_or('c')))
+        }
+    }
+
+    /// Jumps to a quickfix entry: converts its 1-based `line`/`col` to a 0-based
+    /// [`Position`] and opens the file there. A jump moves focus back to the
+    /// buffer (the list window, if open, stays visible but inert — matching vim,
+    /// where `<CR>` in the quickfix window leaves the window open behind you).
+    fn jump_qf(&mut self, path: &Path, line: usize, col: usize) -> LoopAction {
+        let pos = Position::new(line.saturating_sub(1), col.saturating_sub(1));
+        self.qf_focused = false;
+        self.jump_to_location(path, pos)
+    }
+
+    /// A key while the bottom list-window has focus: `j`/`k` (and arrows) move the
+    /// selected entry, `<CR>` jumps to it, `G` goes to the last, `q`/`<Esc>` close
+    /// the window, and `:` opens the command line (so `:cnext` etc. still work
+    /// from here). Every other key is inert while the window is focused.
+    fn handle_quickfix_key(&mut self, kp: KeyPress) -> LoopAction {
+        let Some(kind) = self.qf_window else {
+            // Belt-and-braces: no window means nothing to focus.
+            self.qf_focused = false;
+            return LoopAction::Continue;
+        };
+        match kp.key {
+            Key::Escape | Key::Char('q') => {
+                self.qf_window = None;
+                self.qf_focused = false;
+                LoopAction::Redraw
+            }
+            Key::Char('j') | Key::Down => {
+                let next = self.list(kind).current_index() + 1;
+                self.list_mut(kind).select(next);
+                LoopAction::Redraw
+            }
+            Key::Char('k') | Key::Up => {
+                let prev = self.list(kind).current_index().saturating_sub(1);
+                self.list_mut(kind).select(prev);
+                LoopAction::Redraw
+            }
+            Key::Char('G') => {
+                let last = self.list(kind).len().saturating_sub(1);
+                self.list_mut(kind).select(last);
+                LoopAction::Redraw
+            }
+            Key::Enter => {
+                let target = self.list(kind).current().map(|e| (e.path.clone(), e.line, e.col));
+                match target {
+                    Some((path, line, col)) => self.jump_qf(&path, line, col),
+                    None => LoopAction::Continue,
+                }
+            }
+            // Let `:` open the command line so quickfix ex commands still work
+            // from the list window. The command-line guard in `handle_event` then
+            // routes the typed keys to the editor, not back here.
+            Key::Char(':') => self.host_key_then_refresh_completion(kp),
+            _ => LoopAction::Continue,
+        }
+    }
+
+    /// Draws the bottom list-window (`:copen`/`:lopen`) into `area`, with the
+    /// current entry highlighted. Each row is vim's quickfix format,
+    /// `path|lnum col N| text`.
+    fn render_quickfix_window(&self, frame: &mut Frame, area: Rect, kind: ListKind) {
+        let list = self.list(kind);
+        let lines = quickfix_lines(list);
+        let current = list.current_index();
+        let inner_h = area.height.saturating_sub(2) as usize;
+        // Keep the current row visible in a long list.
+        let scroll = current.saturating_sub(inner_h.saturating_sub(1));
+        let title = if list.is_empty() {
+            format!("{} list (empty)", kind.label())
+        } else {
+            format!("{} list — {} of {}", kind.label(), current + 1, list.len())
+        };
+        frame.render_widget(
+            InfoBox {
+                title: &title,
+                lines: &lines,
+                selected: if list.is_empty() { None } else { Some(current) },
+                theme: &self.theme,
+                scroll,
+            },
+            area,
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2113,6 +2411,23 @@ impl<H: EditorHost> App<H> {
             None => (None, full_windows_area),
         };
 
+        // Reserve a bottom strip for the quickfix/location window, when open, so
+        // the editor windows lay out in what remains and the list never paints
+        // over live text — the same carve-then-shrink the left sidebar does.
+        let (windows_area, quickfix_area) = match self.qf_window {
+            Some(kind) => {
+                let h = quickfix_window_height(self.list(kind).len(), windows_area.height);
+                if h == 0 {
+                    (windows_area, None)
+                } else {
+                    let windows = Rect { height: windows_area.height - h, ..windows_area };
+                    let qf = Rect { y: windows_area.y + windows_area.height - h, height: h, ..windows_area };
+                    (windows, Some((qf, kind)))
+                }
+            }
+            None => (windows_area, None),
+        };
+
         self.render_windows(frame, windows_area);
         self.render_statusline(frame, statusline_area);
         self.render_cmdline(frame, cmdline_area);
@@ -2140,6 +2455,11 @@ impl<H: EditorHost> App<H> {
         // that appears the moment a multi-key prefix is buffered. Suppressed
         // while an overlay or hop owns the keyboard (their own keys are not the
         // editor's keymaps) or a `:` prompt is open.
+        // The quickfix/location window sits in the strip carved for it above,
+        // painted after the editor windows so its border is clean.
+        if let Some((rect, kind)) = quickfix_area {
+            self.render_quickfix_window(frame, rect, kind);
+        }
         self.render_which_key(frame, windows_area);
         self.render_lsp_popups(frame, windows_area);
         // The completion popup sits on top of everything, anchored at the cursor
@@ -2749,6 +3069,57 @@ fn convert_completion_item(item: kopitiam_semantic::CompletionItem) -> CItem {
 /// A short display form for a location's path: the file name plus its parent
 /// directory, so a references list reads `src/lib.rs` rather than an absolute
 /// path that overflows the popup.
+/// The tallest the bottom list-window grows, in rows (content + border). Vim's
+/// quickfix window defaults to 10 lines; this caps near there and shrinks to fit
+/// a short list or a short screen.
+const QUICKFIX_WINDOW_MAX_ROWS: u16 = 12;
+
+/// The height (rows) the bottom list-window takes: enough for its entries plus a
+/// border, capped at [`QUICKFIX_WINDOW_MAX_ROWS`], at half the available height,
+/// and always leaving at least one row for the editor above it. Returns `0` when
+/// there is no room for both a `>= 3`-row bordered box and a `>= 1`-row editor (a
+/// screen under four rows tall), so the caller skips drawing it.
+fn quickfix_window_height(entries: usize, available: u16) -> u16 {
+    if available < 4 {
+        return 0;
+    }
+    let want = (entries as u16).saturating_add(2).clamp(3, QUICKFIX_WINDOW_MAX_ROWS);
+    // Prefer half the screen, never below a 3-row box, never eating the last
+    // editor row.
+    want.min(available / 2).max(3).min(available - 1)
+}
+
+/// Which navigation a `:c*`/`:l*` step is — the internal shape
+/// [`App::quickfix_nav`] dispatches on, so the five commands share one method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QfNav {
+    Next,
+    Prev,
+    First,
+    Last,
+    Nth(Option<usize>),
+}
+
+/// The vim-style message for a failed quickfix navigation. The error numbers
+/// match vim's so a user who knows `E553` recognises it.
+fn nav_error_message(kind: ListKind, e: NavError) -> String {
+    match e {
+        NavError::Empty => format!("E42: no {} entries", kind.label()),
+        NavError::AtEnd | NavError::AtStart => "E553: no more items".to_string(),
+        NavError::OutOfRange => "E541: entry number out of range".to_string(),
+    }
+}
+
+/// Formats a quickfix/location list's entries for the list window, one row each
+/// in vim's `path|lnum col N| text` shape. The line text is trimmed of leading
+/// whitespace so the columns line up regardless of source indentation.
+fn quickfix_lines(list: &QuickfixList) -> Vec<String> {
+    list.entries()
+        .iter()
+        .map(|e| format!("{}|{} col {}| {}", display_path(&e.path), e.line, e.col, e.text.trim_start()))
+        .collect()
+}
+
 fn display_path(path: &Path) -> String {
     let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
     match path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
@@ -2927,6 +3298,111 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// A fixture project tree for the quickfix tests: three files under `src/`,
+    /// each with `TODO` on a known line, and an app rooted at it.
+    fn app_with_grep_tree() -> (tempfile::TempDir, App<FakeHost>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "// TODO one\nfn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}\n// TODO two\n").unwrap();
+        std::fs::write(dir.path().join("src/c.rs"), "// TODO three\n").unwrap();
+        let mut app = app_with(vec!["x"]);
+        app.tree_root = dir.path().to_path_buf();
+        (dir, app)
+    }
+
+    #[test]
+    fn grep_populates_the_quickfix_list_and_jumps_to_the_first_match() {
+        let (_dir, mut app) = app_with_grep_tree();
+        app.handle_quickfix(QuickfixCommand::Grep {
+            kind: ListKind::Quickfix,
+            pattern: "TODO".to_string(),
+            globs: vec![],
+        });
+        // Three TODO lines across the three files, sorted → a.rs, b.rs, c.rs.
+        assert_eq!(app.quickfix.len(), 3);
+        assert_eq!(app.quickfix.current_index(), 0);
+        // `:grep` jumps to the first match, so the host opened src/a.rs.
+        assert!(app.host.opened.last().unwrap().ends_with("src/a.rs"), "opened: {:?}", app.host.opened);
+    }
+
+    #[test]
+    fn cnext_and_cprev_move_the_current_entry_and_jump() {
+        let (_dir, mut app) = app_with_grep_tree();
+        app.handle_quickfix(QuickfixCommand::Grep { kind: ListKind::Quickfix, pattern: "TODO".into(), globs: vec![] });
+        // :cnext advances current 0 → 1 and opens the second file (b.rs).
+        app.handle_quickfix(QuickfixCommand::Next(ListKind::Quickfix));
+        assert_eq!(app.quickfix.current_index(), 1);
+        assert!(app.host.opened.last().unwrap().ends_with("src/b.rs"));
+        // :cprev steps back to a.rs.
+        app.handle_quickfix(QuickfixCommand::Prev(ListKind::Quickfix));
+        assert_eq!(app.quickfix.current_index(), 0);
+        assert!(app.host.opened.last().unwrap().ends_with("src/a.rs"));
+        // :cprev at the first entry errors and does not move (vim E553).
+        app.handle_quickfix(QuickfixCommand::Prev(ListKind::Quickfix));
+        assert_eq!(app.quickfix.current_index(), 0);
+    }
+
+    #[test]
+    fn cc_jumps_to_an_explicit_entry() {
+        let (_dir, mut app) = app_with_grep_tree();
+        app.handle_quickfix(QuickfixCommand::Grep { kind: ListKind::Quickfix, pattern: "TODO".into(), globs: vec![] });
+        // :cc 3 goes to the third entry (c.rs) — 1-based.
+        app.handle_quickfix(QuickfixCommand::Nth { kind: ListKind::Quickfix, nr: Some(3) });
+        assert_eq!(app.quickfix.current_index(), 2);
+        assert!(app.host.opened.last().unwrap().ends_with("src/c.rs"));
+    }
+
+    #[test]
+    fn copen_renders_the_quickfix_window_with_file_line_and_text() {
+        let (_dir, mut app) = app_with_grep_tree();
+        app.handle_quickfix(QuickfixCommand::Grep { kind: ListKind::Quickfix, pattern: "TODO".into(), globs: vec![] });
+        // :copen shows the bottom list-window.
+        app.handle_quickfix(QuickfixCommand::Open(ListKind::Quickfix));
+        assert_eq!(app.qf_window, Some(ListKind::Quickfix));
+        let text = screen(&mut app, 80, 24).join("\n");
+        // Every entry renders in vim's `path|lnum col N| text` shape.
+        assert!(text.contains("a.rs|1 col 4| // TODO one"), "quickfix window text:\n{text}");
+        assert!(text.contains("b.rs|2 col 4| // TODO two"), "quickfix window text:\n{text}");
+        assert!(text.contains("c.rs|1 col 4| // TODO three"), "quickfix window text:\n{text}");
+        // The title names the list and the current position.
+        assert!(text.contains("quickfix list"), "quickfix window text:\n{text}");
+    }
+
+    #[test]
+    fn a_grep_that_finds_nothing_reports_it_and_leaves_an_empty_list() {
+        let (_dir, mut app) = app_with_grep_tree();
+        app.handle_quickfix(QuickfixCommand::Grep {
+            kind: ListKind::Quickfix,
+            pattern: "no-such-token-anywhere".into(),
+            globs: vec![],
+        });
+        assert!(app.quickfix.is_empty());
+    }
+
+    #[test]
+    fn the_quickfix_window_focus_routes_navigation_keys() {
+        let (_dir, mut app) = app_with_grep_tree();
+        app.handle_quickfix(QuickfixCommand::Grep { kind: ListKind::Quickfix, pattern: "TODO".into(), globs: vec![] });
+        app.handle_quickfix(QuickfixCommand::Open(ListKind::Quickfix));
+        assert!(app.qf_focused, ":copen drops focus into the list window");
+        // `j` in the focused window moves the selected entry (0 → 1).
+        app.handle_event(key_event('j'));
+        assert_eq!(app.quickfix.current_index(), 1);
+        // `<CR>` jumps to the selected entry and returns focus to the buffer.
+        let enter = Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        app.handle_event(enter);
+        assert!(!app.qf_focused, "a <CR> jump returns focus to the buffer");
+        assert!(app.host.opened.last().unwrap().ends_with("src/b.rs"));
+        // The window stays open behind the jump, matching vim.
+        assert_eq!(app.qf_window, Some(ListKind::Quickfix));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub mod key;
 pub mod motion;
 pub mod operator;
 pub mod pending;
+pub mod quickfix;
 pub mod register;
 pub mod search;
 pub mod text_object;
@@ -130,6 +131,14 @@ pub enum EditorResponse {
     /// A viewport reposition request (`zz`, `zt`, `zb`, `<C-e>`, `<C-y>`).
     /// See [`ViewportScroll`] for why this is a request, not an edit.
     Scroll(ViewportScroll),
+    /// A quickfix / location-list command (`:grep`, `:copen`, `:cnext`, …) the
+    /// editor parsed but cannot perform. Like [`EditorResponse::Window`], the
+    /// work lives in the UI: the search root, the two list windows and the
+    /// file-jumps are all `App`'s, and the editor has no window tree to open a
+    /// bottom split in. So the editor recognises the command (keeping the ex
+    /// grammar where it belongs) and hands the parsed request back. See
+    /// [`ex::QuickfixCommand`] and [`crate::ui::app::App`].
+    Quickfix(ex::QuickfixCommand),
 }
 
 /// Which of the three command-line prompts is currently open — `:` for ex
@@ -2675,6 +2684,11 @@ impl Editor {
                 self.cursor = self.current_buffer().clamp(Position::new(line, 0));
                 Ok(EditorResponse::Continue)
             }
+            // The quickfix / location-list family is recognised here but
+            // performed by the UI (it owns the search root, the list windows and
+            // the jumps). Hand the parsed command straight back — see
+            // `EditorResponse::Quickfix`.
+            ex::ExCommand::Quickfix(cmd) => Ok(EditorResponse::Quickfix(cmd)),
             ex::ExCommand::Unknown(s) => Err(crate::Error::UnknownCommand(s)),
         }
     }

@@ -27,10 +27,12 @@
 //! | [`hop`] | hop.nvim | `HopWords` |
 //! | [`align`] | vim-easy-align | `EasyAlign` |
 //! | [`git`] | vim-fugitive/airline (statusline slice only) | (consumed by the statusline, not a keymap) |
+//! | [`grep`] | vim's `:grep`/`grepprg` (pure-Rust, no shell-out) | (driven by the `:grep`/`:vimgrep` ex commands, not a keymap) |
 
 pub mod align;
 pub mod filetree;
 pub mod git;
+pub mod grep;
 pub mod harpoon;
 pub mod hop;
 pub mod picker;

@@ -114,6 +114,55 @@ pub enum CommandId {
     Terminal,
     /// `:h`/`:help`.
     Help,
+
+    // --- Quickfix & location lists (kopitiam-cj0.18) ---
+    // Project-wide search into a navigable list. The `c`-prefixed commands act
+    // on the global *quickfix* list; the `l`-prefixed twins act on the
+    // window-local *location* list. See `super::quickfix`.
+    /// `:gr`/`:grep {pattern} [globs]` — search the project into the quickfix list.
+    Grep,
+    /// `:vim`/`:vimgrep {pattern} [globs]` — same, vim's in-process grep name.
+    VimGrep,
+    /// `:lgr`/`:lgrep` — `:grep` into the location list.
+    LGrep,
+    /// `:lvim`/`:lvimgrep` — `:vimgrep` into the location list.
+    LVimGrep,
+    /// `:cope`/`:copen` — open the quickfix window.
+    Copen,
+    /// `:ccl`/`:cclose` — close the quickfix window.
+    Cclose,
+    /// `:cw`/`:cwindow` — open the quickfix window if it has entries, else close it.
+    Cwindow,
+    /// `:cn`/`:cnext` — go to the next quickfix entry.
+    Cnext,
+    /// `:cp`/`:cprev`/`:cprevious` — go to the previous quickfix entry.
+    Cprev,
+    /// `:cfir`/`:cfirst` — go to the first quickfix entry.
+    Cfirst,
+    /// `:cla`/`:clast` — go to the last quickfix entry.
+    Clast,
+    /// `:cc [nr]` — go to quickfix entry `nr` (or re-display the current one).
+    CC,
+    /// `:cdo {cmd}` — run an ex command on each quickfix entry's buffer.
+    Cdo,
+    /// `:lop`/`:lopen` — open the location window.
+    Lopen,
+    /// `:lcl`/`:lclose` — close the location window.
+    Lclose,
+    /// `:lw`/`:lwindow` — open the location window if it has entries, else close it.
+    Lwindow,
+    /// `:lne`/`:lnext` — go to the next location entry.
+    Lnext,
+    /// `:lp`/`:lprev`/`:lprevious` — go to the previous location entry.
+    Lprev,
+    /// `:lfir`/`:lfirst` — go to the first location entry.
+    Lfirst,
+    /// `:lla`/`:llast` — go to the last location entry.
+    Llast,
+    /// `:ll [nr]` — go to location entry `nr` (or re-display the current one).
+    LL,
+    /// `:ldo {cmd}` — run an ex command on each location entry's buffer.
+    Ldo,
 }
 
 /// One row of the registry.
@@ -169,6 +218,32 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::Close, names: &["clo", "close"], arg: ArgKind::None, help: "close this window" },
     CommandSpec { id: CommandId::Terminal, names: &["term", "terminal"], arg: ArgKind::None, help: "open a terminal buffer" },
     CommandSpec { id: CommandId::Help, names: &["h", "help"], arg: ArgKind::File, help: "open the help manual" },
+
+    // Quickfix list (global) — project search + navigate + iterate.
+    CommandSpec { id: CommandId::Grep, names: &["gr", "grep"], arg: ArgKind::None, help: "search project into the quickfix list" },
+    CommandSpec { id: CommandId::VimGrep, names: &["vim", "vimgrep"], arg: ArgKind::None, help: "search project into the quickfix list" },
+    CommandSpec { id: CommandId::Copen, names: &["cope", "copen"], arg: ArgKind::None, help: "open the quickfix window" },
+    CommandSpec { id: CommandId::Cclose, names: &["ccl", "cclose"], arg: ArgKind::None, help: "close the quickfix window" },
+    CommandSpec { id: CommandId::Cwindow, names: &["cw", "cwindow"], arg: ArgKind::None, help: "open quickfix window if non-empty" },
+    CommandSpec { id: CommandId::Cnext, names: &["cn", "cnext"], arg: ArgKind::None, help: "next quickfix entry" },
+    CommandSpec { id: CommandId::Cprev, names: &["cp", "cprev", "cprevious"], arg: ArgKind::None, help: "previous quickfix entry" },
+    CommandSpec { id: CommandId::Cfirst, names: &["cfir", "cfirst"], arg: ArgKind::None, help: "first quickfix entry" },
+    CommandSpec { id: CommandId::Clast, names: &["cla", "clast"], arg: ArgKind::None, help: "last quickfix entry" },
+    CommandSpec { id: CommandId::CC, names: &["cc"], arg: ArgKind::None, help: "go to quickfix entry [nr]" },
+    CommandSpec { id: CommandId::Cdo, names: &["cdo"], arg: ArgKind::None, help: "run a command on each quickfix entry" },
+
+    // Location list (window-local) — the `l`-prefixed twins.
+    CommandSpec { id: CommandId::LGrep, names: &["lgr", "lgrep"], arg: ArgKind::None, help: "search project into the location list" },
+    CommandSpec { id: CommandId::LVimGrep, names: &["lvim", "lvimgrep"], arg: ArgKind::None, help: "search project into the location list" },
+    CommandSpec { id: CommandId::Lopen, names: &["lop", "lopen"], arg: ArgKind::None, help: "open the location window" },
+    CommandSpec { id: CommandId::Lclose, names: &["lcl", "lclose"], arg: ArgKind::None, help: "close the location window" },
+    CommandSpec { id: CommandId::Lwindow, names: &["lw", "lwindow"], arg: ArgKind::None, help: "open location window if non-empty" },
+    CommandSpec { id: CommandId::Lnext, names: &["lne", "lnext"], arg: ArgKind::None, help: "next location entry" },
+    CommandSpec { id: CommandId::Lprev, names: &["lp", "lprev", "lprevious"], arg: ArgKind::None, help: "previous location entry" },
+    CommandSpec { id: CommandId::Lfirst, names: &["lfir", "lfirst"], arg: ArgKind::None, help: "first location entry" },
+    CommandSpec { id: CommandId::Llast, names: &["lla", "llast"], arg: ArgKind::None, help: "last location entry" },
+    CommandSpec { id: CommandId::LL, names: &["ll"], arg: ArgKind::None, help: "go to location entry [nr]" },
+    CommandSpec { id: CommandId::Ldo, names: &["ldo"], arg: ArgKind::None, help: "run a command on each location entry" },
 ];
 
 /// Looks up a command by any of its names (exact match).

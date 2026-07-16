@@ -25,6 +25,7 @@ use crate::text::Buffer;
 
 use super::command::{self, CommandId};
 use super::operator;
+use super::quickfix::ListKind;
 
 /// A line reference as written in a command line, resolved to a concrete
 /// 0-based line index only once the buffer it applies to is known (see
@@ -165,11 +166,111 @@ pub enum ExCommand {
     /// scratch buffer. `topic` is the optional `:help <topic>` argument that
     /// jumps to a section (see [`super::help`]); `None` opens at the top.
     Help { topic: Option<String> },
+    /// The quickfix / location-list family (`:grep`, `:copen`, `:cnext`, …).
+    /// Every one of these is recognised by the editor but *performed* by the UI,
+    /// which owns the search root, the list windows and the jumps — the editor
+    /// returns it through `EditorResponse::Quickfix` the same way it hands back
+    /// window commands. See [`QuickfixCommand`] and [`super::quickfix`].
+    Quickfix(QuickfixCommand),
     /// An empty command line (`:` followed immediately by Enter).
     Empty,
     /// Parsed but not recognized — surfaced to the user as
     /// [`crate::Error::UnknownCommand`] rather than silently ignored.
     Unknown(String),
+}
+
+/// One parsed quickfix / location-list command. The `kind` on each variant is
+/// [`ListKind::Quickfix`] for the `c`-prefixed forms and [`ListKind::Location`]
+/// for the `l`-prefixed twins, so the UI executor picks the right list off a
+/// single enum instead of duplicating every arm.
+///
+/// Parsing is all this layer does — see [`ExCommand::Quickfix`] for why the
+/// doing lives in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuickfixCommand {
+    /// `:grep`/`:vimgrep` (and their `l` twins): search `pattern` across the
+    /// project, optionally restricted to `globs`, into the list. See
+    /// [`parse_grep`] for the accepted argument forms.
+    Grep { kind: ListKind, pattern: String, globs: Vec<String> },
+    /// `:copen`/`:lopen` — open the list window.
+    Open(ListKind),
+    /// `:cclose`/`:lclose` — close the list window.
+    Close(ListKind),
+    /// `:cwindow`/`:lwindow` — open the window iff the list is non-empty, else
+    /// close it.
+    Window(ListKind),
+    /// `:cnext`/`:lnext`.
+    Next(ListKind),
+    /// `:cprev`/`:lprev`.
+    Prev(ListKind),
+    /// `:cfirst`/`:lfirst`.
+    First(ListKind),
+    /// `:clast`/`:llast`.
+    Last(ListKind),
+    /// `:cc [nr]`/`:ll [nr]` — go to entry `nr` (1-based), or the current entry
+    /// when `nr` is `None`.
+    Nth { kind: ListKind, nr: Option<usize> },
+    /// `:cdo {cmd}`/`:ldo {cmd}` — run `cmd` on each entry's buffer.
+    Do { kind: ListKind, cmd: String },
+}
+
+/// Parses the argument of a `:grep`/`:vimgrep` command into a pattern and an
+/// optional glob list.
+///
+/// Two forms are accepted, so both the vim habit and the shell habit work:
+///
+/// * **Delimited** `/pattern/ globs...` — vim's `:vimgrep /re/ *.rs` style. The
+///   pattern is taken verbatim between the first two `/`, so it may contain
+///   spaces; everything after the closing `/` is split on whitespace into globs.
+/// * **Bare** `pattern globs...` — the first whitespace-delimited token is the
+///   pattern, the rest are globs. This is the quick `:grep TODO` form.
+///
+/// An empty argument yields `None`; the caller turns that into an error, since a
+/// grep with no pattern has nothing to search for (kvim does not implement vim's
+/// "reuse the last pattern" shorthand — a filed scope cut).
+fn parse_grep(kind: ListKind, arg: &str) -> Option<QuickfixCommand> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return None;
+    }
+    let (pattern, rest) = if let Some(after) = arg.strip_prefix('/') {
+        // Delimited: pattern is up to the next unescaped '/'.
+        match after.find('/') {
+            Some(end) => (after[..end].to_string(), after[end + 1..].trim()),
+            // No closing delimiter: treat the whole remainder as the pattern.
+            None => (after.to_string(), ""),
+        }
+    } else {
+        match arg.split_once(char::is_whitespace) {
+            Some((p, rest)) => (p.to_string(), rest.trim()),
+            None => (arg.to_string(), ""),
+        }
+    };
+    if pattern.is_empty() {
+        return None;
+    }
+    let globs = rest.split_whitespace().map(str::to_string).collect();
+    Some(QuickfixCommand::Grep { kind, pattern, globs })
+}
+
+/// `:cc [nr]`/`:ll [nr]`: an optional 1-based entry number. Empty (or
+/// unparseable) means "the current entry", which the list model treats as a
+/// re-select — matching vim's bare `:cc`.
+fn parse_optional_nr(arg: &str) -> Option<usize> {
+    arg.trim().parse::<usize>().ok()
+}
+
+/// `:cdo {cmd}`/`:ldo {cmd}`: everything after the command name is the ex
+/// command to run on each entry. Exactly one separating space is stripped (so
+/// the command keeps any further leading whitespace it wants); an empty command
+/// yields `None`, which the caller reports as an error rather than iterating the
+/// list to run nothing.
+fn parse_list_do(kind: ListKind, after: &str) -> Option<QuickfixCommand> {
+    let cmd = after.strip_prefix(' ').unwrap_or(after).trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(QuickfixCommand::Do { kind, cmd: cmd.to_string() })
 }
 
 /// Parses one command-line entry (without its leading `:`).
@@ -273,6 +374,36 @@ pub fn parse(input: &str) -> ExCommand {
         Some(CommandId::Close) => ExCommand::Close,
         Some(CommandId::Terminal) => ExCommand::Terminal,
         Some(CommandId::Help) => ExCommand::Help { topic: opt_arg(arg) },
+
+        // Quickfix (global) and location (`l`-prefixed) list commands. The two
+        // families share `QuickfixCommand`; only the `ListKind` differs, so the
+        // arms come in `c`/`l` pairs pointing at the same variant. `:grep` takes
+        // a pattern (+globs) that needs its own parse; a missing pattern is an
+        // error, not a silent no-op. `:cc`/`:ll` take an optional entry number;
+        // `:cdo`/`:ldo` take a whole command line as their argument.
+        Some(CommandId::Grep) => parse_grep(ListKind::Quickfix, arg).map(ExCommand::Quickfix).unwrap_or_else(|| ExCommand::Unknown(input.to_string())),
+        Some(CommandId::VimGrep) => parse_grep(ListKind::Quickfix, arg).map(ExCommand::Quickfix).unwrap_or_else(|| ExCommand::Unknown(input.to_string())),
+        Some(CommandId::LGrep) => parse_grep(ListKind::Location, arg).map(ExCommand::Quickfix).unwrap_or_else(|| ExCommand::Unknown(input.to_string())),
+        Some(CommandId::LVimGrep) => parse_grep(ListKind::Location, arg).map(ExCommand::Quickfix).unwrap_or_else(|| ExCommand::Unknown(input.to_string())),
+        Some(CommandId::Copen) => ExCommand::Quickfix(QuickfixCommand::Open(ListKind::Quickfix)),
+        Some(CommandId::Lopen) => ExCommand::Quickfix(QuickfixCommand::Open(ListKind::Location)),
+        Some(CommandId::Cclose) => ExCommand::Quickfix(QuickfixCommand::Close(ListKind::Quickfix)),
+        Some(CommandId::Lclose) => ExCommand::Quickfix(QuickfixCommand::Close(ListKind::Location)),
+        Some(CommandId::Cwindow) => ExCommand::Quickfix(QuickfixCommand::Window(ListKind::Quickfix)),
+        Some(CommandId::Lwindow) => ExCommand::Quickfix(QuickfixCommand::Window(ListKind::Location)),
+        Some(CommandId::Cnext) => ExCommand::Quickfix(QuickfixCommand::Next(ListKind::Quickfix)),
+        Some(CommandId::Lnext) => ExCommand::Quickfix(QuickfixCommand::Next(ListKind::Location)),
+        Some(CommandId::Cprev) => ExCommand::Quickfix(QuickfixCommand::Prev(ListKind::Quickfix)),
+        Some(CommandId::Lprev) => ExCommand::Quickfix(QuickfixCommand::Prev(ListKind::Location)),
+        Some(CommandId::Cfirst) => ExCommand::Quickfix(QuickfixCommand::First(ListKind::Quickfix)),
+        Some(CommandId::Lfirst) => ExCommand::Quickfix(QuickfixCommand::First(ListKind::Location)),
+        Some(CommandId::Clast) => ExCommand::Quickfix(QuickfixCommand::Last(ListKind::Quickfix)),
+        Some(CommandId::Llast) => ExCommand::Quickfix(QuickfixCommand::Last(ListKind::Location)),
+        Some(CommandId::CC) => ExCommand::Quickfix(QuickfixCommand::Nth { kind: ListKind::Quickfix, nr: parse_optional_nr(arg) }),
+        Some(CommandId::LL) => ExCommand::Quickfix(QuickfixCommand::Nth { kind: ListKind::Location, nr: parse_optional_nr(arg) }),
+        Some(CommandId::Cdo) => parse_list_do(ListKind::Quickfix, after).map(ExCommand::Quickfix).unwrap_or_else(|| ExCommand::Unknown(input.to_string())),
+        Some(CommandId::Ldo) => parse_list_do(ListKind::Location, after).map(ExCommand::Quickfix).unwrap_or_else(|| ExCommand::Unknown(input.to_string())),
+
         None => ExCommand::Unknown(input.to_string()),
     }
 }
@@ -842,6 +973,73 @@ mod tests {
         // `:help <topic>` carries the topic through for the jump.
         assert_eq!(parse("help lsp"), ExCommand::Help { topic: Some("lsp".into()) });
         assert_eq!(parse("h windows"), ExCommand::Help { topic: Some("windows".into()) });
+    }
+
+    #[test]
+    fn parses_grep_bare_and_delimited_forms() {
+        // Bare: first token is the pattern, the rest are globs.
+        assert_eq!(
+            parse("grep TODO"),
+            ExCommand::Quickfix(QuickfixCommand::Grep { kind: ListKind::Quickfix, pattern: "TODO".into(), globs: vec![] })
+        );
+        assert_eq!(
+            parse("grep TODO *.rs src/"),
+            ExCommand::Quickfix(QuickfixCommand::Grep {
+                kind: ListKind::Quickfix,
+                pattern: "TODO".into(),
+                globs: vec!["*.rs".into(), "src/".into()],
+            })
+        );
+        // Delimited: the pattern between the slashes may contain spaces.
+        assert_eq!(
+            parse("vimgrep /foo bar/ *.rs"),
+            ExCommand::Quickfix(QuickfixCommand::Grep {
+                kind: ListKind::Quickfix,
+                pattern: "foo bar".into(),
+                globs: vec!["*.rs".into()],
+            })
+        );
+        // The `l`-twin targets the location list.
+        assert_eq!(
+            parse("lgrep TODO"),
+            ExCommand::Quickfix(QuickfixCommand::Grep { kind: ListKind::Location, pattern: "TODO".into(), globs: vec![] })
+        );
+        // No pattern is an error, not a silent empty search.
+        assert!(matches!(parse("grep"), ExCommand::Unknown(_)));
+        assert!(matches!(parse("grep   "), ExCommand::Unknown(_)));
+    }
+
+    #[test]
+    fn parses_quickfix_navigation_and_windows() {
+        use QuickfixCommand::*;
+        assert_eq!(parse("copen"), ExCommand::Quickfix(Open(ListKind::Quickfix)));
+        assert_eq!(parse("cclose"), ExCommand::Quickfix(Close(ListKind::Quickfix)));
+        assert_eq!(parse("cwindow"), ExCommand::Quickfix(Window(ListKind::Quickfix)));
+        assert_eq!(parse("cn"), ExCommand::Quickfix(Next(ListKind::Quickfix)));
+        assert_eq!(parse("cnext"), ExCommand::Quickfix(Next(ListKind::Quickfix)));
+        assert_eq!(parse("cp"), ExCommand::Quickfix(Prev(ListKind::Quickfix)));
+        assert_eq!(parse("cfirst"), ExCommand::Quickfix(First(ListKind::Quickfix)));
+        assert_eq!(parse("clast"), ExCommand::Quickfix(Last(ListKind::Quickfix)));
+        assert_eq!(parse("cc"), ExCommand::Quickfix(Nth { kind: ListKind::Quickfix, nr: None }));
+        assert_eq!(parse("cc 3"), ExCommand::Quickfix(Nth { kind: ListKind::Quickfix, nr: Some(3) }));
+        // Location twins.
+        assert_eq!(parse("lopen"), ExCommand::Quickfix(Open(ListKind::Location)));
+        assert_eq!(parse("lnext"), ExCommand::Quickfix(Next(ListKind::Location)));
+        assert_eq!(parse("ll 2"), ExCommand::Quickfix(Nth { kind: ListKind::Location, nr: Some(2) }));
+    }
+
+    #[test]
+    fn parses_cdo_keeping_the_whole_command() {
+        assert_eq!(
+            parse("cdo s/foo/bar/g"),
+            ExCommand::Quickfix(QuickfixCommand::Do { kind: ListKind::Quickfix, cmd: "s/foo/bar/g".into() })
+        );
+        assert_eq!(
+            parse("ldo normal A;"),
+            ExCommand::Quickfix(QuickfixCommand::Do { kind: ListKind::Location, cmd: "normal A;".into() })
+        );
+        // An empty command is an error.
+        assert!(matches!(parse("cdo"), ExCommand::Unknown(_)));
     }
 
     #[test]

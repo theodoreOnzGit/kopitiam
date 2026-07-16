@@ -188,6 +188,10 @@ impl EditorHost for crate::editor::Editor {
                 // decides what each one does, and still answers honestly for the
                 // ones with no UI yet.
                 EditorResponse::Action(action) => HostResponse::Action(action),
+
+                // The quickfix / location-list family, parsed by the editor and
+                // performed by `App` (see `EditorResponse::Quickfix`).
+                EditorResponse::Quickfix(cmd) => HostResponse::Quickfix(cmd),
             },
             Err(e) => HostResponse::Error(e.to_string()),
         }
@@ -215,6 +219,16 @@ impl EditorHost for crate::editor::Editor {
 
     fn move_cursor(&mut self, pos: Position) {
         crate::editor::Editor::move_cursor(self, pos);
+    }
+
+    fn run_ex(&mut self, line: &str) -> Result<(), String> {
+        // `:cdo` only cares that the buffer edit (its `:s`) lands; window/quit
+        // effects are not meaningful mid-iteration, so they are dropped here.
+        crate::editor::Editor::execute_ex(self, line).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn save(&mut self) -> Result<(), String> {
+        write_buffer(self, None).map(|_| ()).map_err(|e| e.to_string())
     }
 
     // The two accessors below are the whole fix for "`:` commands were invisible
