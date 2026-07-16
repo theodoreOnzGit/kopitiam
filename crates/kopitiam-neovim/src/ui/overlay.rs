@@ -64,9 +64,11 @@ use std::path::PathBuf;
 
 use ratatui::{layout::Rect, Frame};
 
+use crate::core::BufferId;
 use crate::icons::IconSet;
 use crate::ui::event::KeyPress;
 use crate::ui::filetree::FileTreePanel;
+use crate::ui::picker::PickerPanel;
 use crate::ui::theme::Theme;
 
 /// Where keystrokes go. Modelled explicitly, and *never* inferred from "is an
@@ -178,6 +180,16 @@ pub enum OverlayOutcome {
     /// Open `path` in the editor, then focus the buffer. The overlay stays open
     /// (neo-tree keeps the tree visible after you open a file from it).
     OpenPath { path: PathBuf, target: OpenTarget },
+    /// A picker confirmed a file (`\ff`): open it in the current window and
+    /// **close** the picker. Distinct from [`OverlayOutcome::OpenPath`], which
+    /// keeps its overlay open — telescope disappears the moment you pick, so the
+    /// pickers say "close" rather than reusing the tree's stay-open semantics.
+    PickPath(PathBuf),
+    /// A picker confirmed a buffer (`\fb`): switch to it and close the picker.
+    PickBuffer(BufferId),
+    /// A picker confirmed a help topic (`\fh`): run `:help <topic>` and close
+    /// the picker.
+    PickHelp(String),
     /// Show an informational message on the command line.
     Message(String),
     /// Show an error on the command line.
@@ -189,6 +201,10 @@ pub enum OverlayOutcome {
 /// picker takes focus, and closing it returns you to where you were).
 pub enum Overlay {
     FileTree(FileTreePanel),
+    /// A fuzzy picker (`\ff`/`\fb`/`\fh`) — see [`crate::ui::picker`]. Floats
+    /// over the window tree rather than reserving a strip, which is why
+    /// [`OverlayPlacement::Float`] finally has a user.
+    Picker(PickerPanel),
 }
 
 impl Overlay {
@@ -196,6 +212,9 @@ impl Overlay {
     pub fn placement(&self) -> OverlayPlacement {
         match self {
             Self::FileTree(_) => OverlayPlacement::LeftSidebar { width: FileTreePanel::WIDTH },
+            // A telescope-sized float: wide and tall enough to browse, but not
+            // fullscreen — you can still see the buffer it sits over.
+            Self::Picker(_) => OverlayPlacement::Float { width_pct: 80, height_pct: 80 },
         }
     }
 
@@ -204,6 +223,7 @@ impl Overlay {
     pub fn handle_key(&mut self, key: KeyPress) -> OverlayOutcome {
         match self {
             Self::FileTree(panel) => panel.handle_key(key),
+            Self::Picker(panel) => panel.handle_key(key),
         }
     }
 
@@ -221,6 +241,7 @@ impl Overlay {
     ) -> Option<(u16, u16)> {
         match self {
             Self::FileTree(panel) => panel.render(frame, rect, theme, icons, focused),
+            Self::Picker(panel) => panel.render(frame, rect, theme, icons, focused),
         }
     }
 }

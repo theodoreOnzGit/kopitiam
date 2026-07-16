@@ -49,6 +49,7 @@ use crate::editor::ex::QuickfixCommand;
 use crate::editor::quickfix::{ListKind, NavError, QuickfixEntry, QuickfixList};
 use crate::icons::IconSet;
 use crate::plugins::grep;
+use crate::plugins::picker::walk_files;
 use crate::lsp::completion::{self, CompletionItem as CItem, CompletionSource};
 use crate::lsp::{Location as LspLocation, LspClient};
 use crate::ui::completion_menu::{anchored_rect, menu_rect, Anchor, CompletionMenu as CompletionMenuWidget};
@@ -60,6 +61,7 @@ use crate::ui::filetree::FileTreePanel;
 use crate::ui::gutter::LineNumberMode;
 use crate::ui::hop::{HopFeed, HopState};
 use crate::ui::overlay::{Focus, OpenTarget, Overlay, OverlayOutcome};
+use crate::ui::picker::{PickAction, PickRow, PickerPanel};
 use crate::ui::scrolling;
 use crate::ui::statusline::{Statusline, StatuslineData};
 use crate::ui::textarea::{Scroll, Selection, TextArea};
@@ -271,6 +273,11 @@ struct RenameState {
 /// The most rows the completion popup shows at once before it starts to scroll
 /// to keep the selection visible — a blink.cmp-ish height.
 const MAX_COMPLETION_ROWS: usize = 8;
+
+/// The most files `\ff` will walk before stopping. Ten thousand is far past a
+/// screenful yet cheap to score per keystroke — see [`walk_files`] for why a
+/// bounded, responsive list beats a complete, frozen one on a monorepo.
+const FILE_PICKER_CAP: usize = 10_000;
 
 /// How many content rows the cursor-anchored hover box will paint before it stop
 /// growing — a long rust-analyzer doc string kena truncate instead of eating up the
@@ -712,6 +719,9 @@ impl<H: EditorHost> App<H> {
     fn handle_action(&mut self, action: Action) -> LoopAction {
         match action {
             Action::FileTreeToggle => self.toggle_file_tree(),
+            Action::FindFiles => self.open_file_picker(),
+            Action::FindBuffers => self.open_buffer_picker(),
+            Action::FindHelp => self.open_help_picker(),
             Action::HopWords => self.start_hop(),
             Action::LspDefinition => self.lsp_definition(),
             Action::LspReferences => self.lsp_references(),
@@ -1981,6 +1991,68 @@ impl<H: EditorHost> App<H> {
         }
     }
 
+    /// `\ff`. Opens the file picker: a gitignore-aware walk of the tree root,
+    /// fuzzy-filtered as you type, `<CR>` to open. See [`crate::ui::picker`].
+    ///
+    /// The walk runs once, up front, and is capped (see [`walk_files`]) so a
+    /// huge tree cannot stall the open. Rows carry the *absolute* path to open
+    /// but display the *relative* one — you fuzzy-match `src/pick`, not
+    /// `/home/you/proj/src/pick`.
+    fn open_file_picker(&mut self) -> LoopAction {
+        let root = self.tree_root.clone();
+        let rows: Vec<PickRow> = walk_files(&root, FILE_PICKER_CAP)
+            .into_iter()
+            .map(|item| {
+                let label = item.relative_path.to_string_lossy().into_owned();
+                PickRow::new(label, PickAction::OpenFile(root.join(&item.relative_path)))
+            })
+            .collect();
+        self.open_picker(PickerPanel::new("Find Files", rows))
+    }
+
+    /// `\fb`. Opens the buffer picker: every open buffer as `id name [+]`,
+    /// fuzzy-filtered, `<CR>` to switch to it.
+    fn open_buffer_picker(&mut self) -> LoopAction {
+        let rows: Vec<PickRow> = self
+            .host
+            .buffers()
+            .into_iter()
+            .map(|b| {
+                let name = if b.name.is_empty() { "[No Name]".to_string() } else { b.name };
+                let modified = if b.modified { " [+]" } else { "" };
+                PickRow::new(format!("{}  {name}{modified}", b.id.0), PickAction::SwitchBuffer(b.id))
+            })
+            .collect();
+        self.open_picker(PickerPanel::new("Find Buffers", rows))
+    }
+
+    /// `\fh`. Opens the help-tag picker: every `:help` topic (from
+    /// [`crate::editor::help::TOPICS`]), fuzzy-filtered, `<CR>` runs
+    /// `:help <topic>` and lands on that section.
+    fn open_help_picker(&mut self) -> LoopAction {
+        let rows: Vec<PickRow> = crate::editor::help::TOPICS
+            .iter()
+            .map(|topic| {
+                // Show the tag and its heading so the list reads like telescope's
+                // help_tags; match against both so either the id or a word from
+                // the title finds it.
+                let label = format!("{}  —  {}", topic.id, topic.title);
+                PickRow::new(label, PickAction::OpenHelp(topic.id.to_string()))
+            })
+            .collect();
+        self.open_picker(PickerPanel::new("Find Help", rows))
+    }
+
+    /// Shows `panel` as the active overlay and drops focus into it. Replaces any
+    /// overlay already open (opening a picker over the file tree is fine — the
+    /// picker takes focus, and closing it returns you underneath), matching how
+    /// telescope floats over whatever you were doing.
+    fn open_picker(&mut self, panel: PickerPanel) -> LoopAction {
+        self.overlay = Some(Overlay::Picker(panel));
+        self.focus = Focus::Overlay;
+        LoopAction::Redraw
+    }
+
     /// Feeds a key to the focused overlay and acts on what it asks for. The
     /// overlay never touches the editor or the window tree itself — see
     /// [`OverlayOutcome`].
@@ -2000,7 +2072,47 @@ impl<H: EditorHost> App<H> {
             OverlayOutcome::Message(m) => self.info(m),
             OverlayOutcome::Error(e) => self.error(e),
             OverlayOutcome::OpenPath { path, target } => self.open_path(&path, target),
+            // The picker family: do the thing, then close (telescope disappears
+            // on select — unlike the file tree, which stays open).
+            OverlayOutcome::PickPath(path) => {
+                self.close_overlay();
+                self.open_path(&path, OpenTarget::Current)
+            }
+            OverlayOutcome::PickBuffer(id) => {
+                self.close_overlay();
+                self.switch_to_buffer(id)
+            }
+            OverlayOutcome::PickHelp(topic) => {
+                self.close_overlay();
+                self.open_help_topic(&topic)
+            }
         }
+    }
+
+    /// Switches the active window to buffer `id` (the `\fb` accept). Goes through
+    /// the editor seam so the buffer's own saved cursor is restored, then syncs
+    /// the window tree so the active window records the new buffer.
+    fn switch_to_buffer(&mut self, id: BufferId) -> LoopAction {
+        self.host.focus_buffer(id);
+        self.focus = Focus::Buffer;
+        self.sync_active_window();
+        // A different buffer means a different cursor, so the previous buffer's
+        // scroll offset must not survive; the next render re-derives it.
+        self.windows.active_mut().scroll = Scroll::default();
+        LoopAction::Redraw
+    }
+
+    /// Runs `:help <topic>` (the `\fh` accept) through the editor's ex layer,
+    /// which opens the help buffer and jumps to the section. Reports any error
+    /// on the command line rather than swallowing it.
+    fn open_help_topic(&mut self, topic: &str) -> LoopAction {
+        if let Err(e) = self.host.run_ex(&format!("help {topic}")) {
+            return self.error(e);
+        }
+        self.focus = Focus::Buffer;
+        self.sync_active_window();
+        self.windows.active_mut().scroll = Scroll::default();
+        LoopAction::Redraw
     }
 
     /// Opens a path an overlay selected, and moves focus to the buffer.
@@ -4893,5 +5005,112 @@ mod tests {
         app.apply_startup_advice(crate::tmux::StartupAdvice::Note("you inside screen".to_string()));
         assert!(app.tmux_prompt.is_none(), "a note arms no modal popup");
         assert_eq!(app.message, StatusMessage::Info("you inside screen".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // The fuzzy pickers (\ff / \fb / \fh) — cj0.10 "wire the pickers".
+    // ------------------------------------------------------------------
+
+    /// `\ff`: the file picker paints its box + candidates, typing narrows the
+    /// list to the matching file, and `<CR>` opens it. Driven through
+    /// `FakeHost` so the open is asserted on its `opened` vec.
+    #[test]
+    fn find_files_picker_filters_then_opens_on_enter() {
+        let (_dir, mut app) = app_with_tree(); // src/main.rs + README.md, rooted at a temp dir
+        app.host.answer_next_with(HostResponse::Action(Action::FindFiles));
+        app.handle_event(key_event('x'));
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))), "\\ff opens a picker overlay");
+
+        // The float paints its title and both candidates while unfiltered.
+        let text = screen(&mut app, 60, 16).join("\n");
+        assert!(text.contains("Find Files"), "picker box painted:\n{text}");
+        assert!(text.contains("main.rs"), "candidate listed:\n{text}");
+        assert!(text.contains("README.md"), "candidate listed:\n{text}");
+
+        // Typing "main" narrows to src/main.rs and drops README.md.
+        for c in "main".chars() {
+            app.handle_event(key_event(c));
+        }
+        let text = screen(&mut app, 60, 16).join("\n");
+        assert!(text.contains("main.rs"), "the matching candidate stays:\n{text}");
+        assert!(!text.contains("README"), "the non-matching candidate is filtered out:\n{text}");
+
+        // <CR> opens the selected file and closes the picker.
+        app.handle_event(enter_event());
+        assert!(app.overlay.is_none(), "the picker closes on select");
+        assert!(
+            app.host.opened.last().is_some_and(|p| p.ends_with("src/main.rs")),
+            "the file was opened: {:?}",
+            app.host.opened
+        );
+    }
+
+    /// `\ff` with a nonsense query paints no candidates, and `<CR>` on an empty
+    /// result opens nothing (telescope just closes).
+    #[test]
+    fn find_files_picker_with_no_match_opens_nothing() {
+        let (_dir, mut app) = app_with_tree();
+        app.host.answer_next_with(HostResponse::Action(Action::FindFiles));
+        app.handle_event(key_event('x'));
+        for c in "zzqqxx".chars() {
+            app.handle_event(key_event(c));
+        }
+        app.handle_event(enter_event());
+        assert!(app.overlay.is_none(), "an empty-result <CR> still closes the picker");
+        assert!(app.host.opened.is_empty(), "nothing was opened: {:?}", app.host.opened);
+    }
+
+    /// `\fb`: the buffer picker lists the open buffers and `<CR>` switches to the
+    /// selected one — asserted through `FakeHost::switched_to`.
+    #[test]
+    fn find_buffers_picker_switches_on_enter() {
+        let mut app = app_with(vec!["x"]);
+        app.host.buffer_entries = vec![
+            crate::ui::event::BufferEntry { id: BufferId(1), name: "src/main.rs".into(), modified: false },
+            crate::ui::event::BufferEntry { id: BufferId(2), name: "src/lib.rs".into(), modified: true },
+        ];
+        app.host.answer_next_with(HostResponse::Action(Action::FindBuffers));
+        app.handle_event(key_event('x'));
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))), "\\fb opens a picker overlay");
+
+        let text = screen(&mut app, 60, 12).join("\n");
+        assert!(text.contains("Find Buffers"), "picker box painted:\n{text}");
+        assert!(text.contains("main.rs"), "a buffer is listed:\n{text}");
+        assert!(text.contains("lib.rs [+]"), "the modified buffer shows its flag:\n{text}");
+
+        // Filter to lib and switch to it (buffer id 2).
+        for c in "lib".chars() {
+            app.handle_event(key_event(c));
+        }
+        app.handle_event(enter_event());
+        assert!(app.overlay.is_none(), "the picker closes on select");
+        assert_eq!(app.host.switched_to, Some(BufferId(2)), "the editor was asked to switch to buffer 2");
+    }
+
+    /// `\fh`: the help picker lists `:help` topics and `<CR>` opens that section.
+    /// Driven through the REAL editor, so the help buffer really opens and its
+    /// manual is asserted on the painted cells.
+    #[test]
+    fn find_help_picker_opens_the_chosen_section() {
+        let (_dir, mut app) = real_app_one_file("hi\n");
+        feed_str(&mut app, "\\fh");
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))), "\\fh opens a picker overlay");
+
+        let text = real_screen(&mut app, 80, 20).join("\n");
+        assert!(text.contains("Find Help"), "the help picker box painted:\n{text}");
+
+        // Filter to the LSP topic and open it.
+        for c in "lsp".chars() {
+            app.handle_event(key_event(c));
+        }
+        app.handle_event(enter_event());
+        assert!(app.overlay.is_none(), "the picker closes on select");
+
+        // The help manual is now the active buffer, sitting on the LSP section.
+        let text = real_screen(&mut app, 80, 24).join("\n");
+        assert!(
+            text.contains("go-to-definition") || text.contains("language servers"),
+            "the LSP help section is on screen:\n{text}"
+        );
     }
 }

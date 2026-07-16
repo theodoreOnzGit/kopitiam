@@ -162,6 +162,17 @@ pub fn map_crossterm_key(ev: KeyEvent) -> Option<KeyPress> {
 /// concrete, statically-dispatched buffer reference — the renderer runs on
 /// every redraw and should not pay virtual-dispatch overhead for something
 /// as hot as "read the current line".
+/// One open buffer as the `\fb` picker needs to see it: its id, a display name
+/// (its path, or `[No Name]` for a scratch buffer), and whether it has unsaved
+/// changes. A flattened, UI-facing view — the picker never touches the editor's
+/// `Buffer` type directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferEntry {
+    pub id: BufferId,
+    pub name: String,
+    pub modified: bool,
+}
+
 pub trait EditorHost {
     type Buffer: BufferView;
 
@@ -184,6 +195,23 @@ pub trait EditorHost {
     /// buffer and never split; the real editor overrides it.
     fn active_buffer_id(&self) -> BufferId {
         BufferId(0)
+    }
+
+    /// The open buffers, for the `\fb` buffer picker — one [`BufferEntry`] each,
+    /// in buffer order. The default is the single active buffer, which is
+    /// correct for a fake/placeholder that owns exactly one buffer; the real
+    /// editor overrides it with the full list.
+    fn buffers(&self) -> Vec<BufferEntry> {
+        vec![BufferEntry { id: self.active_buffer_id(), name: String::new(), modified: self.buffer().is_modified() }]
+    }
+
+    /// Makes buffer `id` active, restoring *that buffer's* own saved cursor —
+    /// the seam behind `\fb` picking a buffer. The default reuses
+    /// [`EditorHost::set_active`] with the current cursor (harmless for a
+    /// single-buffer host, which only ever switches to itself); the real editor
+    /// overrides it to restore the target's remembered position.
+    fn focus_buffer(&mut self, id: BufferId) {
+        self.set_active(id, self.cursor());
     }
 
     /// Read-only access to *any* open buffer by id — the seam a split window

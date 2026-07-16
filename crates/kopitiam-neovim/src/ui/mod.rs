@@ -86,6 +86,7 @@ pub mod highlight;
 pub mod hop;
 pub mod lsp_ui;
 pub mod overlay;
+pub mod picker;
 pub mod scrolling;
 pub mod snippet;
 pub mod statusline;

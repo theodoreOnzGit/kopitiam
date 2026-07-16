@@ -211,8 +211,19 @@ impl Searchable for FileItem {
 /// `.git/info/exclude` and global gitignore — exactly what `ignore::Walk`
 /// gives for free, and exactly what telescope's `find_files` picker does by
 /// default. Directories are not returned as items; only regular files are.
-pub fn walk_files(root: &Path) -> Vec<FileItem> {
+///
+/// The walk stops after `cap` files. A monorepo can hold hundreds of thousands
+/// of tracked files; materialising all of them into a `Vec` (and then scoring
+/// every one on every keystroke) would stall the editor on open for no benefit,
+/// since nobody scrolls past the first screen of a fuzzy list — you type to
+/// narrow it. `.gitignore` already keeps `target/`/`node_modules/` out, so the
+/// cap only ever bites on genuinely enormous trees, where a bounded, responsive
+/// list beats a complete, frozen one. `require_git(false)` is set so the ignore
+/// rules apply whether or not `git init` has been run, matching the file tree
+/// and `:grep`.
+pub fn walk_files(root: &Path, cap: usize) -> Vec<FileItem> {
     ignore::WalkBuilder::new(root)
+        .require_git(false)
         .build()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
@@ -220,6 +231,7 @@ pub fn walk_files(root: &Path) -> Vec<FileItem> {
             let relative = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_path_buf();
             FileItem::new(relative)
         })
+        .take(cap)
         .collect()
 }
 
@@ -326,17 +338,15 @@ mod tests {
 
     #[test]
     fn walk_files_honours_gitignore() {
-        // `.gitignore` is only honoured inside an actual git repository
-        // (matching ripgrep's and telescope's own default) — an empty
-        // `.git/` directory is enough to establish that boundary without
-        // pulling in the `git` binary as a test dependency.
+        // With `require_git(false)`, `.gitignore` is honoured whether or not the
+        // tree is a git repo — matching ripgrep's "respect .gitignore anyway"
+        // default and the file tree / `:grep`. No `.git/` dir needed to prove it.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "").unwrap();
         std::fs::write(dir.path().join("kept.txt"), "").unwrap();
 
-        let files = walk_files(dir.path());
+        let files = walk_files(dir.path(), 1000);
         let names: Vec<_> = files.iter().map(|f| f.relative_path.display().to_string()).collect();
         assert!(names.contains(&"kept.txt".to_string()));
         assert!(!names.contains(&"ignored.txt".to_string()));
@@ -344,5 +354,16 @@ mod tests {
         // ripgrep and telescope's `find_files` use), so `.gitignore` itself
         // is not among the results.
         assert!(!names.contains(&".gitignore".to_string()));
+    }
+
+    #[test]
+    fn walk_files_stops_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "").unwrap();
+        }
+        // A cap of 5 must yield at most 5 items, however many files exist.
+        let files = walk_files(dir.path(), 5);
+        assert_eq!(files.len(), 5, "the walk must stop at the cap");
     }
 }

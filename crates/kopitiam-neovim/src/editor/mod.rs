@@ -453,6 +453,40 @@ impl Editor {
         self.buffers.get(&id)
     }
 
+    /// The open buffers in buffer order, each as `(id, name, modified)` — the
+    /// data the `\fb` picker lists. `name` is the buffer's path, or `[No Name]`
+    /// for a scratch buffer, matching what [`Self::buffer_list`] (`:ls`) prints.
+    pub fn buffer_entries(&self) -> Vec<(BufferId, String, bool)> {
+        self.buffer_order
+            .iter()
+            .filter_map(|&id| self.buffers.get(&id).map(|buf| (id, buf)))
+            .map(|(id, buf)| {
+                let name = buf.path().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".to_string());
+                (id, name, buf.is_modified())
+            })
+            .collect()
+    }
+
+    /// Switches the active buffer to `id`, restoring *that buffer's* own saved
+    /// cursor — the `\fb`/`:b` "go to this buffer" primitive. A no-op if `id` is
+    /// not open (a stale pick can never point the editor at a gone buffer). This
+    /// is the same save-and-restore `:b {n}` does inline; factored out here so
+    /// the buffer picker does not have to reach for the private `saved_cursor`
+    /// map or re-parse a `:b` command line just to switch by id.
+    pub fn focus_buffer(&mut self, id: BufferId) {
+        if !self.buffers.contains_key(&id) || id == self.current {
+            return;
+        }
+        self.alternate = Some(self.current);
+        self.saved_cursor.insert(self.current, self.cursor);
+        self.current = id;
+        self.cursor = *self.saved_cursor.get(&id).unwrap_or(&Position::ORIGIN);
+        // A focus change lands in a clean Normal-mode slate, same as
+        // `set_active` — no half-typed operator leaks across the switch.
+        self.mode = Mode::Normal;
+        self.pending.reset();
+    }
+
     /// Whether *any* open buffer has unsaved changes — the widened form of
     /// [`Buffer::is_modified`] that `:qa` needs. `:q` asks only about the
     /// current buffer; quit-all must not discard an unsaved buffer sitting in

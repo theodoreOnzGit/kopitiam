@@ -284,6 +284,17 @@ impl EditorHost for crate::editor::Editor {
         crate::editor::Editor::set_active(self, buffer, cursor);
     }
 
+    fn buffers(&self) -> Vec<crate::ui::event::BufferEntry> {
+        crate::editor::Editor::buffer_entries(self)
+            .into_iter()
+            .map(|(id, name, modified)| crate::ui::event::BufferEntry { id, name, modified })
+            .collect()
+    }
+
+    fn focus_buffer(&mut self, id: crate::core::BufferId) {
+        crate::editor::Editor::focus_buffer(self, id);
+    }
+
     fn new_buffer(&mut self) -> crate::core::BufferId {
         crate::editor::Editor::new_buffer(self)
     }

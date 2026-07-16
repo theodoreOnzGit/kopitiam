@@ -100,6 +100,14 @@ pub struct FakeHost {
     /// The visual selection the editor would report. Set it alongside a visual
     /// [`FakeHost::mode`] to test the highlight.
     pub selection: Option<(Position, Position)>,
+    /// The open-buffer list the `\fb` picker should see. Empty means "fall back
+    /// to the real trait default" (the single active buffer); a test that
+    /// exercises the buffer picker sets it to a scripted list.
+    pub buffer_entries: Vec<crate::ui::event::BufferEntry>,
+    /// Records the last `focus_buffer` target, so a `\fb` test can assert the
+    /// picker really asked the editor to switch — the buffer twin of
+    /// [`FakeHost::opened`].
+    pub switched_to: Option<crate::core::BufferId>,
 }
 
 impl FakeHost {
@@ -115,6 +123,8 @@ impl FakeHost {
             command_cursor: None,
             command_completions: None,
             selection: None,
+            buffer_entries: Vec::new(),
+            switched_to: None,
         }
     }
 
@@ -242,6 +252,22 @@ impl EditorHost for FakeHost {
 
     fn move_cursor(&mut self, pos: Position) {
         self.cursor = pos;
+    }
+
+    fn buffers(&self) -> Vec<crate::ui::event::BufferEntry> {
+        if self.buffer_entries.is_empty() {
+            vec![crate::ui::event::BufferEntry {
+                id: self.active_buffer_id(),
+                name: self.buffer.path().map(|p| p.display().to_string()).unwrap_or_default(),
+                modified: self.buffer.is_modified(),
+            }]
+        } else {
+            self.buffer_entries.clone()
+        }
+    }
+
+    fn focus_buffer(&mut self, id: crate::core::BufferId) {
+        self.switched_to = Some(id);
     }
 
     /// Reads the file for real, so that the failure path (opening a directory, a
