@@ -224,6 +224,21 @@ pub trait EditorHost {
         Some(self.buffer())
     }
 
+    /// The *closed* manual folds collapsing buffer `id`, as `(start, end)`
+    /// inclusive line ranges (non-overlapping, outermost only) — the render
+    /// seam through which the manual-fold state reaches [`TextArea`]. The UI
+    /// wraps these in a [`crate::editor::fold::FoldRows`] per frame; it does not
+    /// touch the editor's authoring [`crate::editor::fold::FoldSet`] directly,
+    /// keeping the fold model on the editor side of this seam (the same split
+    /// [`EditorHost::buffer_by_id`] draws for buffer text).
+    ///
+    /// Defaults to no folds — correct for a fake/placeholder host that never
+    /// creates any. The real editor overrides it. See
+    /// [`crate::editor::Editor::collapsed_folds_for`].
+    fn collapsed_folds(&self, _id: BufferId) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+
     /// Switch the active buffer/cursor to a window's saved state, when window
     /// focus moves. Default no-op (a single-window host never calls it).
     fn set_active(&mut self, _buffer: BufferId, _cursor: Position) {}

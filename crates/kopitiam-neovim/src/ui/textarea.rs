@@ -70,6 +70,27 @@ pub fn display_width(line: &str, tabstop: usize) -> usize {
     expand_line(line, tabstop).width()
 }
 
+/// Builds the text drawn on a closed fold's single header row, in vim's default
+/// `foldtext` style: `+--{level dashes} {N} lines: {first line}` padded to the
+/// text width with the `·` (middle dot) fill vim uses.
+///
+/// `first_line` is the fold's first buffer line (leading whitespace trimmed,
+/// like vim); `line_count` is how many buffer lines the fold spans; `level` is
+/// the fold's nesting depth (one extra dash per level, matching vim's
+/// `+--`/`+---`/... prefix). `width` is the available text width in cells; the
+/// fill is applied out to it so the whole row reads as one unbroken fold marker.
+pub fn fold_text(first_line: &str, line_count: usize, level: usize, width: usize) -> String {
+    let dashes = "-".repeat(level + 2);
+    let head = format!("+{dashes} {line_count} lines: {} ", first_line.trim_start());
+    let head_w = head.width();
+    if head_w >= width {
+        head
+    } else {
+        let fill = "·".repeat(width - head_w);
+        format!("{head}{fill}")
+    }
+}
+
 /// The display column (0-based, post tab-expansion) at which grapheme index
 /// `grapheme_idx` of `line` begins. Used to place the cursor: the editor
 /// tracks cursor position in graphemes ([`Position::col`]), but the
@@ -256,6 +277,13 @@ pub struct TextArea<'a, B: BufferView> {
     /// cell) but **over** the syntax pass, following vim's highlight precedence.
     /// See the `render` body.
     pub search: Option<&'a regex::Regex>,
+    /// The closed folds collapsing this buffer's lines, as the "visible rows"
+    /// view (see [`crate::editor::fold::FoldRows`]). A closed fold renders as a
+    /// single fold-header row and hides the lines beneath it; vertical row math
+    /// (cursor placement, which line renders where) counts collapsed folds as
+    /// one row each. [`FoldRows::none`] for a buffer with no closed folds — the
+    /// common case, and the fast path every fold check short-circuits on.
+    pub folds: crate::editor::fold::FoldRows,
 }
 
 impl<'a, B: BufferView> TextArea<'a, B> {
@@ -273,7 +301,17 @@ impl<'a, B: BufferView> TextArea<'a, B> {
     /// the kind of desync that produces a cursor rendered off-screen.
     pub fn cursor_screen_position(&self, area: Rect) -> Option<(u16, u16)> {
         let gutter_w = gutter::gutter_width(self.buffer.line_count(), self.line_numbers);
-        let row = self.cursor.line.checked_sub(self.scroll.top)?;
+        // With folds, the screen row is the count of *visible* rows between the
+        // top of the viewport and the cursor line — a collapsed fold above the
+        // cursor occupies one row, not its full line span. Without folds this
+        // reduces to `cursor.line - scroll.top`.
+        let row = if self.folds.is_empty() {
+            self.cursor.line.checked_sub(self.scroll.top)?
+        } else if self.cursor.line < self.scroll.top {
+            return None;
+        } else {
+            self.folds.rows_between(self.scroll.top, self.cursor.line)
+        };
         if row >= area.height as usize {
             return None;
         }
@@ -348,7 +386,12 @@ impl<'a, B: BufferView> TextArea<'a, B> {
     /// is a worthwhile follow-up, tracked separately — correctness first.
     fn visible_highlights(&self, height: u16) -> Option<HashMap<usize, Vec<HighlightSpan>>> {
         let language = self.language?;
-        let last_visible = (self.scroll.top + height as usize).min(self.buffer.line_count());
+        // Without folds, `height` rows show `height` buffer lines; with folds a
+        // closed fold shows many buffer lines in one row, so the last buffer
+        // line on screen can be far below `scroll.top + height`. Walk the folds
+        // to find the true last visible line so lines below a fold still get
+        // highlighted.
+        let last_visible = self.last_visible_buffer_line(height).min(self.buffer.line_count());
         let mut highlighter = Highlighter::new(language);
         let mut map = HashMap::new();
         for idx in 0..last_visible {
@@ -359,6 +402,27 @@ impl<'a, B: BufferView> TextArea<'a, B> {
             }
         }
         Some(map)
+    }
+
+    /// One past the last buffer line that `height` visible rows reach from the
+    /// top of the viewport, accounting for closed folds each collapsing many
+    /// buffer lines into one row. Without folds this is `scroll.top + height`.
+    fn last_visible_buffer_line(&self, height: u16) -> usize {
+        if self.folds.is_empty() {
+            return self.scroll.top + height as usize;
+        }
+        let mut line = self.folds.header_of(self.scroll.top);
+        let line_count = self.buffer.line_count();
+        for _ in 0..height {
+            if line >= line_count {
+                break;
+            }
+            line = match self.folds.fold_at(line) {
+                Some((_, end)) => end + 1,
+                None => line + 1,
+            };
+        }
+        line
     }
 
     /// Paint every search match on this line with the theme's search colours,
@@ -430,9 +494,53 @@ impl<'a, B: BufferView> Widget for TextArea<'a, B> {
         // the multi-line state carried down from the top of the buffer.
         let highlights = self.visible_highlights(area.height);
 
+        // Walk the *visible* rows from the top of the viewport: a closed fold
+        // is one row (its header) and hides the lines beneath it, so the buffer
+        // line a given screen row shows is not simply `scroll.top + row` once
+        // folds are involved. `line_cursor` steps through buffer lines,
+        // skipping the interior of each closed fold. See
+        // [`crate::editor::fold::FoldRows`].
+        let has_folds = !self.folds.is_empty();
+        let mut line_cursor = if has_folds { self.folds.header_of(self.scroll.top) } else { self.scroll.top };
         for row in 0..area.height {
             let y = area.y + row;
-            let line_idx = self.scroll.top + row as usize;
+            let line_idx = line_cursor;
+            // Is this row a closed fold's header? If so we render one fold line
+            // and advance past the whole fold; otherwise a plain buffer line.
+            let fold = if has_folds { self.folds.fold_at(line_idx) } else { None };
+
+            // Fold header row: draw the gutter number of the fold's first line,
+            // then the `foldtext` marker across the whole width, and skip the
+            // hidden interior.
+            if let Some((start, end)) = fold {
+                if gutter_w > 0 {
+                    let label = gutter::line_number_label(start, self.cursor.line, self.line_numbers);
+                    let style = if line_idx == self.cursor.line { cursor_line_gutter_style } else { gutter_style };
+                    match label {
+                        Some(label) => {
+                            let field_width = (gutter_w - 1) as usize;
+                            let padded = format!("{label:>field_width$} ");
+                            buf.set_stringn(area.x, y, &padded, gutter_w as usize, style);
+                        }
+                        None => {
+                            buf.set_stringn(area.x, y, "~", gutter_w as usize, style);
+                        }
+                    }
+                }
+                let first = self.buffer.line(start).unwrap_or_default();
+                let text = fold_text(&first, end - start + 1, 0, text_width);
+                let fold_style = Style::default().fg(self.theme.fg).bg(self.theme.bg1);
+                buf.set_style(Rect { x: text_x, y, width: text_width as u16, height: 1 }, fold_style);
+                buf.set_stringn(text_x, y, &text, text_width, fold_style);
+                // Advance past the whole fold to the next visible line.
+                line_cursor = end + 1;
+                continue;
+            }
+            if has_folds {
+                line_cursor += 1;
+            } else {
+                line_cursor = self.scroll.top + row as usize + 1;
+            }
 
             // Gutter.
             if gutter_w > 0 {
@@ -562,6 +670,7 @@ mod tests {
                     selection: Some(selection),
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -703,6 +812,7 @@ mod tests {
                     }),
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -748,6 +858,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -785,6 +896,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: Some(&re),
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -833,6 +945,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: Some(&re),
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -874,6 +987,7 @@ mod tests {
                     }),
                     language: None,
                     search: Some(&re),
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -925,6 +1039,7 @@ mod tests {
                     selection: None,
                     language: Some(Language::Rust),
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -971,6 +1086,7 @@ mod tests {
                     selection: None,
                     language: Some(Language::Rust),
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -1022,6 +1138,7 @@ mod tests {
             selection: None,
             language: None,
             search: None,
+            folds: crate::editor::fold::FoldRows::none(),
         };
         let area = Rect { x: 0, y: 0, width: 40, height: 10 };
         // gutter_width(10 lines) = 3 digits floor + 1 pad = 4.
@@ -1053,6 +1170,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -1087,6 +1205,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -1118,6 +1237,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -1155,6 +1275,7 @@ mod tests {
                     selection: None,
                     language: None,
                     search: None,
+                    folds: crate::editor::fold::FoldRows::none(),
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -1168,5 +1289,59 @@ mod tests {
         assert_eq!(row_text(0).trim(), "4"); // |cursor_line - 0| = 4
         assert_eq!(row_text(4).trim(), "5"); // cursor line: absolute 5.
         assert_eq!(row_text(9).trim(), "5"); // |9 - 4| = 5
+    }
+
+    /// Renders the full row text of `lines` with `folds` applied, no gutter.
+    fn rendered_rows(lines: &[&str], folds: crate::editor::fold::FoldRows, width: u16, height: u16) -> Vec<String> {
+        let fb = FakeBuffer::new(lines.iter().map(|l| l.to_string()).collect());
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let th = theme();
+        terminal
+            .draw(|frame| {
+                let ta = TextArea {
+                    buffer: &fb,
+                    cursor: Position::new(0, 0),
+                    mode: Mode::Normal,
+                    scroll: Scroll::default(),
+                    line_numbers: LineNumberMode::none(),
+                    colorcolumn: None,
+                    tabstop: 4,
+                    theme: &th,
+                    selection: None,
+                    language: None,
+                    search: None,
+                    folds,
+                };
+                frame.render_widget(ta, frame.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_fold_renders_one_fold_line_and_hides_its_content() {
+        // Six lines; a closed fold over lines 1..=4 (four lines).
+        let folds = crate::editor::fold::FoldRows::from_ranges(vec![(1, 4)]);
+        let rows = rendered_rows(&["zero", "one", "two", "three", "four", "five"], folds, 40, 6);
+        // Row 0: line 0 shown as-is.
+        assert_eq!(rows[0], "zero");
+        // Row 1: the fold header — vim's `+-- N lines: firstline` marker.
+        assert!(rows[1].starts_with("+-- 4 lines: one"), "fold header, got {:?}", rows[1]);
+        // The folded content (two/three/four) must NOT appear anywhere.
+        for r in &rows {
+            assert!(!r.contains("two") && !r.contains("three") && !r.contains("four"), "hidden line leaked: {r:?}");
+        }
+        // Row 2: the first visible line after the fold is line 5 ("five").
+        assert_eq!(rows[2], "five");
+    }
+
+    #[test]
+    fn an_open_fold_renders_every_line_normally() {
+        // No closed ranges -> nothing collapses.
+        let rows = rendered_rows(&["a", "b", "c"], crate::editor::fold::FoldRows::none(), 20, 3);
+        assert_eq!(rows, vec!["a", "b", "c"]);
     }
 }

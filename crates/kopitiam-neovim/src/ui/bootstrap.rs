@@ -280,6 +280,10 @@ impl EditorHost for crate::editor::Editor {
         crate::editor::Editor::buffer_by_id(self, id)
     }
 
+    fn collapsed_folds(&self, id: crate::core::BufferId) -> Vec<(usize, usize)> {
+        crate::editor::Editor::collapsed_folds_for(self, id)
+    }
+
     fn set_active(&mut self, buffer: crate::core::BufferId, cursor: Position) {
         crate::editor::Editor::set_active(self, buffer, cursor);
     }

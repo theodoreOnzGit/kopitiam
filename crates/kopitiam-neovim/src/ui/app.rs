@@ -3023,6 +3023,15 @@ impl<H: EditorHost> App<H> {
                         .and_then(kopitiam_syntax::Language::from_extension)
                 })
                 .flatten();
+            // Manual folds for this window's buffer. Wrapped in a `FoldRows`
+            // view the renderer walks; snap `scroll.top` to a fold header so the
+            // viewport never starts partway through a collapsed fold.
+            let folds = crate::editor::fold::FoldRows::from_ranges(self.host.collapsed_folds(buffer_id));
+            let scroll = if folds.is_empty() {
+                scroll
+            } else {
+                Scroll { top: folds.header_of(scroll.top), left: scroll.left }
+            };
             let text_area = TextArea {
                 buffer,
                 cursor,
@@ -3044,6 +3053,7 @@ impl<H: EditorHost> App<H> {
                     .flatten(),
                 language,
                 search: search_re.as_ref(),
+                folds,
             };
 
             // The terminal cursor belongs to whatever has focus. With the file
