@@ -123,8 +123,12 @@ kopitiam-bibliography = { path = "crates/kopitiam-bibliography", version = "0.1.
 # behind kopitiam-ai's ModelAdapter. Layered core -> tensor -> {loader,
 # tokenizer} -> runtime; see docs/ai-decisions/AID-0001 for why these are
 # engines under crates/ with no CLI/TUI crate of their own.
-kopitiam-core = { path = "crates/kopitiam-core", version = "0.1.0" }
-kopitiam-tensor = { path = "crates/kopitiam-tensor", version = "0.1.0" }
+# core + tensor are seeded on crates.io at 0.0.1 (early name reservation, see
+# scripts/publish-runtime-seed.sh), so their version reqs must match 0.0.1 or the
+# path-dep version check fails the local build. Bump these back in lockstep with
+# the workspace when the Runtime tree does its real 0.1.x release.
+kopitiam-core = { path = "crates/kopitiam-core", version = "0.0.1" }
+kopitiam-tensor = { path = "crates/kopitiam-tensor", version = "0.0.1" }
 kopitiam-loader = { path = "crates/kopitiam-loader", version = "0.1.0" }
 kopitiam-tokenizer = { path = "crates/kopitiam-tokenizer", version = "0.1.0" }
 kopitiam-runtime = { path = "crates/kopitiam-runtime", version = "0.1.0" }

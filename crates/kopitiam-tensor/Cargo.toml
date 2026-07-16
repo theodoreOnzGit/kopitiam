@@ -1,6 +1,9 @@
 [package]
 name = "kopitiam-tensor"
-version.workspace = true
+# Seeded at 0.0.1 as an early name reservation (mid-build), behind the workspace
+# version on purpose. Depends on kopitiam-core, which is seeded the same way, so
+# core must go up first. See scripts/publish-runtime-seed.sh.
+version = "0.0.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

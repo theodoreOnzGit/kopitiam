@@ -1,6 +1,10 @@
 [package]
 name = "kopitiam-core"
-version.workspace = true
+# Seeded onto crates.io at 0.0.1 as an early name reservation while the Kopitiam
+# Runtime is still mid-build — deliberately BEHIND the workspace version so the
+# real release (0.1.x, in lockstep with the rest) supersedes it later. Overrides
+# `version.workspace` on purpose; see scripts/publish-runtime-seed.sh.
+version = "0.0.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

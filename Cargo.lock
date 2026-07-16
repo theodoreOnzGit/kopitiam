@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-core"
-version = "0.1.2"
+version = "0.0.1"
 dependencies = [
  "thiserror",
 ]
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-models"
-version = "0.1.2"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1782,7 +1782,7 @@ version = "0.1.2"
 
 [[package]]
 name = "kopitiam-tensor"
-version = "0.1.2"
+version = "0.0.1"
 dependencies = [
  "kopitiam-core",
 ]

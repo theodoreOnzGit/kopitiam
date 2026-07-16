@@ -1,6 +1,9 @@
 [package]
 name = "kopitiam-models"
-version.workspace = true
+# Seeded at 0.0.1 as an early name reservation (mid-build), behind the workspace
+# version on purpose. No internal deps, so it publishes standalone. See
+# scripts/publish-runtime-seed.sh.
+version = "0.0.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
