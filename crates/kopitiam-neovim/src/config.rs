@@ -381,14 +381,14 @@ impl Config {
     /// Lua configuration files found in kvim's directory, in load order:
     /// `init.lua` first, then `lua/*.lua` sorted by name.
     ///
-    /// # These are discovered, not yet executed
+    /// # These are discovered here, and executed by [`crate::luaconfig`]
     ///
-    /// Running them needs a Lua interpreter, and KOPITIAM is committed to a
-    /// **pure-Rust** one (`kopitiam-lua`, kvim Phase 4 — see
-    /// `docs/ai-decisions/AID-0003`), which does not exist yet. Until it does,
-    /// kvim finds these files and reports them rather than silently ignoring
-    /// them: a config that is quietly not loaded is far worse than one that
-    /// says out loud it is not loaded.
+    /// This method only *lists* the files (it is what `kvim --config-path`
+    /// prints). Actually running them is [`crate::luaconfig::LuaRuntime::load`]'s
+    /// job: it feeds `init.lua` — with `lua/*.lua` reachable through `require` —
+    /// to the pure-Rust `kopitiam-lua` VM behind a `vim.*` shim, so the config
+    /// mutates a real [`Config`]. See `docs/ai-decisions/AID-0003` (why a
+    /// pure-Rust VM) and `AID-0034` (how the shim maps Lua onto the editor).
     ///
     /// Returns an empty vector when the directory does not exist, which is the
     /// normal case — kvim's defaults *are* a full configuration, so a user need

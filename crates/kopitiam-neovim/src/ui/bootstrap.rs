@@ -417,6 +417,15 @@ impl EditorHost for PlaceholderHost {
 /// exactly "while `run` is on the stack," which is also exactly "while
 /// there is a UI to draw."
 pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
+    // Execute the discovered `init.lua` / `lua/*.lua` (if any) on top of the
+    // loaded config, through the `vim.*` shim. This is where the Lua the
+    // maintainer wrote actually takes effect — options, keymaps, leader, theme.
+    // A config that binds a Lua *function* to a key hands back a live runtime,
+    // kept alive for the session so the closure can fire on the keypress. A
+    // broken or unsupported config degrades to warnings, never a failure to
+    // start — see `crate::luaconfig`.
+    let (config, lua_runtime, startup_note) = apply_lua_config(config);
+
     let theme = Theme::from_name(&config.theme);
     let options = config.options.clone();
     let leader = config.leader;
@@ -434,6 +443,12 @@ pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
     }
 
     let mut app = App::new(editor, options, theme, icons, leader);
+    if let Some(runtime) = lua_runtime {
+        app.set_lua_runtime(runtime);
+    }
+    if let Some(note) = startup_note {
+        app.set_startup_message(note);
+    }
     // Once the App exists but before the terminal is taken over: if kvim is
     // running inside a multiplexer, work out whether tmux would eat its
     // `<C-h/j/k/l>` (the vim-tmux-navigator `is_vim` problem) and arm the
@@ -459,9 +474,64 @@ pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
     result.map_err(anyhow::Error::from)
 }
 
+/// Runs the discovered Lua config on top of `base`, returning the merged
+/// config, the live runtime (when the config bound Lua-function keymaps or we
+/// want it kept anyway), and an optional one-line startup note summarising
+/// anything that did not fully apply.
+///
+/// Split out of [`run`] so the wiring is unit-testable without a terminal: it
+/// reads the real config directory (empty on most machines, in which case the
+/// base config passes straight through untouched).
+fn apply_lua_config(
+    base: Config,
+) -> (Config, Option<crate::luaconfig::LuaRuntime>, Option<String>) {
+    let discovered = crate::luaconfig::Discovered::from_config_dir();
+    if discovered.is_empty() {
+        return (base, None, None);
+    }
+
+    let runtime = crate::luaconfig::LuaRuntime::load(base, &discovered);
+    let config = runtime.config();
+
+    // A startup note only when there is something the user should know: a
+    // notification the config raised, or a count of vim.* items kvim could not
+    // apply. Silence otherwise — a clean config should not nag.
+    let warnings = runtime.warnings();
+    let note = runtime
+        .notifications()
+        .into_iter()
+        .next_back()
+        .or_else(|| {
+            (!warnings.is_empty()).then(|| {
+                format!(
+                    "kvim: {} item(s) in your Lua config are not supported yet (config still loaded)",
+                    warnings.len()
+                )
+            })
+        });
+
+    (config, Some(runtime), note)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_lua_config_is_a_no_op_when_there_is_no_lua() {
+        // On a machine with no ~/.kopitiam/kopitiam-neovim Lua files, the base
+        // config must pass through byte-for-byte, with no runtime and no note.
+        // (If the developer running the suite happens to HAVE such a config, the
+        // merged config is still valid — so only assert the no-Lua invariant when
+        // the directory is genuinely empty.)
+        if crate::luaconfig::Discovered::from_config_dir().is_empty() {
+            let base = Config::default();
+            let (cfg, rt, note) = apply_lua_config(base.clone());
+            assert_eq!(cfg, base);
+            assert!(rt.is_none());
+            assert!(note.is_none());
+        }
+    }
 
     #[test]
     fn placeholder_host_moves_the_cursor_and_clamps_to_the_buffer() {

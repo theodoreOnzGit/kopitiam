@@ -118,9 +118,12 @@ fn show_config_paths() -> anyhow::Result<()> {
             println!("                   {}", path.display());
         }
         println!();
-        println!("NOTE: these are found but NOT YET EXECUTED. Running them needs a Lua");
-        println!("interpreter, and KOPITIAM is committed to a pure-Rust one (kopitiam-lua)");
-        println!("which is not built yet. kvim tells you rather than silently ignoring them.");
+        println!("These are EXECUTED at startup through kvim's pure-Rust Lua VM");
+        println!("(kopitiam-lua) against a vim.* shim: vim.opt/vim.g/vim.keymap.set/");
+        println!("vim.cmd and friends map onto kvim's real options, keymaps, leader and");
+        println!("theme. Plugin-manager boilerplate (lazy.nvim, require of a built-in");
+        println!("plugin) degrades to a no-op, and anything unsupported becomes a warning");
+        println!("shown at startup rather than a crash. See docs/ai-decisions/AID-0034.");
     }
 
     println!();
