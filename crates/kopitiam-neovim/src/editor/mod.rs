@@ -33,6 +33,7 @@ pub mod cmdline;
 pub mod command;
 pub mod digraph;
 pub mod ex;
+pub mod fold;
 pub mod help;
 pub mod key;
 pub mod motion;
@@ -58,7 +59,7 @@ pub use pending::{GrammarCommand, InsertPos};
 use motion::{FindKind, Motion};
 use operator::Operator;
 use cmdline::{CmdlineBuffer, History};
-use pending::{FeedResult, Pending};
+use pending::{FeedResult, FoldOp, Pending};
 use register::{RegisterContent, Registers};
 use clipboard::{ClipboardProvider, SystemClipboard};
 use shell::{CommandRunner, ShellRunner};
@@ -364,6 +365,13 @@ pub struct Editor {
     /// a second buffer has ever been visited.
     alternate: Option<BufferId>,
 
+    /// Manual folds, one [`fold::FoldSet`] per buffer. Buffer-scoped rather
+    /// than window-scoped — kvim's deliberate deviation from vim's
+    /// window-local folds, explained in [`fold`]'s module docs. A buffer with
+    /// no entry here simply has no folds; entries are created lazily on the
+    /// first `zf`.
+    folds: HashMap<BufferId, fold::FoldSet>,
+
     options: crate::config::Options,
 }
 
@@ -433,6 +441,7 @@ impl Editor {
             keymap_buffer: Vec::new(),
             last_substitution: None,
             alternate: None,
+            folds: HashMap::new(),
             options: config.options,
         }
     }
@@ -1118,7 +1127,7 @@ impl Editor {
                 if matches!(motion, Motion::FileStart | Motion::FileEnd) {
                     self.record_jump();
                 }
-                self.cursor = motion.apply(self.current_buffer(), self.cursor, count);
+                self.cursor = self.fold_aware_move(motion, count);
                 self.remember_find(motion);
                 self.discard_dot();
                 self.mode = Mode::Normal;
@@ -1287,6 +1296,12 @@ impl Editor {
                 self.discard_dot();
                 self.mode = Mode::Normal;
                 Ok(EditorResponse::Scroll(req))
+            }
+            GrammarCommand::Fold(op) => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                self.apply_fold_op(op);
+                Ok(EditorResponse::Continue)
             }
             GrammarCommand::ReselectVisual => {
                 self.discard_dot();
@@ -1919,6 +1934,21 @@ impl Editor {
         if operator == Operator::Filter {
             return self.begin_filter(range);
         }
+        // The fold-create operator (`zf{motion}`) does not touch the text
+        // either: it folds the motion's *line* span. Intercept it before the
+        // mutate/apply machinery, exactly like `Filter`. The range is a content
+        // range (see `operator::charwise_range`), so its start/end lines are
+        // the fold's bounds.
+        if operator == Operator::Fold {
+            let (start, end) = range.normalized();
+            let bid = self.current;
+            if let Some(line) = self.folds.entry(bid).or_default().create(start.line, end.line) {
+                self.cursor = self.current_buffer().clamp(Position::new(line, 0));
+            }
+            self.mode = Mode::Normal;
+            self.discard_dot();
+            return Ok(EditorResponse::Continue);
+        }
         let enters_insert = operator.enters_insert();
         if operator.mutates() {
             self.begin_insert_group();
@@ -1947,6 +1977,162 @@ impl Editor {
                 self.commit_dot();
             }
             Ok(EditorResponse::Continue)
+        }
+    }
+
+    /// Resolves a bare cursor motion, made fold-aware.
+    ///
+    /// For the two pure vertical motions `j`/`k` ([`Motion::Down`]/
+    /// [`Motion::Up`]) a closed fold counts as a *single* line: `j` on a fold
+    /// header steps past the entire fold, and `k` from below lands back on the
+    /// header. These are resolved by stepping through [`fold::FoldRows`]'s
+    /// visible rows instead of adding to the line number, `count` times.
+    ///
+    /// Every other motion resolves normally and is then snapped: if it landed
+    /// on a line hidden inside a closed fold, the cursor moves to that fold's
+    /// header (matching vim — a `G`, `}`, or search that lands in a closed fold
+    /// puts the cursor on the fold's first line). With no folds, this is a thin
+    /// wrapper over [`Motion::apply`].
+    fn fold_aware_move(&mut self, motion: Motion, count: Option<usize>) -> Position {
+        let rows = self.fold_rows();
+        if rows.is_empty() {
+            return motion.apply(self.current_buffer(), self.cursor, count);
+        }
+        let n = count.unwrap_or(1).max(1);
+        let last = self.current_buffer().line_count().saturating_sub(1);
+        match motion {
+            Motion::Down => {
+                let mut line = rows.header_of(self.cursor.line);
+                for _ in 0..n {
+                    line = rows.next_visible(line, last);
+                }
+                self.current_buffer().clamp(Position::new(line, self.cursor.col))
+            }
+            Motion::Up => {
+                let mut line = rows.header_of(self.cursor.line);
+                for _ in 0..n {
+                    line = rows.prev_visible(line);
+                }
+                self.current_buffer().clamp(Position::new(line, self.cursor.col))
+            }
+            _ => {
+                let landed = motion.apply(self.current_buffer(), self.cursor, count);
+                let header = rows.header_of(landed.line);
+                if header == landed.line {
+                    landed
+                } else {
+                    self.current_buffer().clamp(Position::new(header, landed.col))
+                }
+            }
+        }
+    }
+
+    // ---- manual folds --------------------------------------------------------
+
+    /// The active buffer's fold set (read-only). Empty (`None`-equivalent) when
+    /// the buffer has never had a fold created — the callers all treat a
+    /// missing set as "no folds", so this returns an owned empty set in that
+    /// case via [`fold::FoldRows`] rather than forcing a lazy insert on a read.
+    pub fn fold_rows(&self) -> fold::FoldRows {
+        self.folds.get(&self.current).map(|f| f.collapsed()).unwrap_or_default()
+    }
+
+    /// The collapsed fold ranges for an arbitrary buffer, for the render seam
+    /// (a split may show a buffer other than the active one). See
+    /// [`crate::ui::event::EditorHost::collapsed_folds`].
+    pub fn collapsed_folds_for(&self, id: BufferId) -> Vec<(usize, usize)> {
+        self.folds.get(&id).map(|f| f.collapsed().ranges().to_vec()).unwrap_or_default()
+    }
+
+    /// The fold set for the active buffer, creating an empty one on demand.
+    fn folds_mut(&mut self) -> &mut fold::FoldSet {
+        self.folds.entry(self.current).or_default()
+    }
+
+    /// Executes a no-argument fold command ([`FoldOp`]) at the cursor line.
+    /// The navigation ops (`zj`/`zk`/`[z`/`]z`) move the cursor; the rest edit
+    /// the fold table. After any op that could leave the cursor on a now-hidden
+    /// line, the cursor is snapped back to a visible row (vim never parks the
+    /// cursor inside a closed fold).
+    fn apply_fold_op(&mut self, op: FoldOp) {
+        let line = self.cursor.line;
+        match op {
+            FoldOp::OpenOne => {
+                self.folds_mut().open_one(line);
+            }
+            FoldOp::CloseOne => {
+                if let Some(start) = self.folds_mut().close_one(line) {
+                    self.cursor = Position::new(start, 0);
+                }
+            }
+            FoldOp::ToggleOne => {
+                if let Some(start) = self.folds_mut().toggle_one(line) {
+                    self.cursor = Position::new(start, 0);
+                }
+            }
+            FoldOp::OpenRecursive => {
+                self.folds_mut().open_recursive(line);
+            }
+            FoldOp::ViewCursor => {
+                self.folds_mut().view_cursor(line);
+            }
+            FoldOp::CloseRecursive => {
+                if let Some(start) = self.folds_mut().close_recursive(line) {
+                    self.cursor = Position::new(start, 0);
+                }
+            }
+            FoldOp::ToggleRecursive => {
+                if let Some(start) = self.folds_mut().toggle_recursive(line) {
+                    self.cursor = Position::new(start, 0);
+                }
+            }
+            FoldOp::OpenAll => self.folds_mut().open_all(),
+            FoldOp::CloseAll => self.folds_mut().close_all(),
+            FoldOp::Delete => {
+                self.folds_mut().delete_at(line);
+            }
+            FoldOp::DeleteAll => self.folds_mut().delete_all(),
+            FoldOp::Disable => self.folds_mut().disable(),
+            FoldOp::Enable => self.folds_mut().enable(),
+            FoldOp::ToggleEnable => {
+                self.folds_mut().toggle_enabled();
+            }
+            FoldOp::MoveNext => {
+                if let Some(start) = self.folds_mut().next_fold_start(line) {
+                    self.cursor = self.current_buffer().clamp(Position::new(start, 0));
+                }
+            }
+            FoldOp::MovePrev => {
+                if let Some(end) = self.folds_mut().prev_fold_end(line) {
+                    self.cursor = self.current_buffer().clamp(Position::new(end, 0));
+                }
+            }
+            FoldOp::MoveStart => {
+                if let Some(start) = self.folds_mut().current_fold_start(line) {
+                    self.cursor = self.current_buffer().clamp(Position::new(start, 0));
+                }
+            }
+            FoldOp::MoveEnd => {
+                if let Some(end) = self.folds_mut().current_fold_end(line) {
+                    self.cursor = self.current_buffer().clamp(Position::new(end, 0));
+                }
+            }
+        }
+        self.snap_cursor_out_of_fold();
+    }
+
+    /// If the cursor has landed on a line hidden inside a closed fold, moves it
+    /// to that fold's header line — the one visible row standing in for the
+    /// whole fold. A no-op when the cursor is already on a visible line, so it
+    /// is cheap to call after any cursor move.
+    fn snap_cursor_out_of_fold(&mut self) {
+        let rows = self.fold_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let header = rows.header_of(self.cursor.line);
+        if header != self.cursor.line {
+            self.cursor = self.current_buffer().clamp(Position::new(header, self.cursor.col));
         }
     }
 
@@ -3920,6 +4106,80 @@ mod tests {
         let mut ed = editor_with(initial);
         feed(&mut ed, keys);
         ed.buffer().text()
+    }
+
+    // -----------------------------------------------------------------
+    // Manual folds (foldmethod=manual): the z-fold family.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn zfj_creates_a_two_line_closed_fold() {
+        let mut ed = editor_with("a\nb\nc\nd");
+        feed(&mut ed, "zfj"); // fold lines 0..=1
+        let rows = ed.fold_rows();
+        assert_eq!(rows.ranges(), &[(0, 1)], "zfj folds the cursor line and one below");
+        // The fold is closed and the cursor sits on its header.
+        assert_eq!(ed.cursor().line, 0);
+    }
+
+    #[test]
+    fn zf3j_folds_four_lines() {
+        let mut ed = editor_with("l0\nl1\nl2\nl3\nl4\nl5");
+        feed(&mut ed, "zf3j");
+        assert_eq!(ed.fold_rows().ranges(), &[(0, 3)]);
+    }
+
+    #[test]
+    fn j_skips_a_closed_fold_and_zo_reveals_it() {
+        let mut ed = editor_with("a\nb\nc\nd\ne");
+        feed(&mut ed, "jzfj"); // cursor to line 1, fold 1..=2 closed
+        assert_eq!(ed.fold_rows().ranges(), &[(1, 2)]);
+        // From line 0, `j` lands on the header (line 1)...
+        feed(&mut ed, "gg"); // back to top
+        feed(&mut ed, "j");
+        assert_eq!(ed.cursor().line, 1);
+        // ...and another `j` skips the whole closed fold to line 3.
+        feed(&mut ed, "j");
+        assert_eq!(ed.cursor().line, 3, "j treats the closed fold as one line");
+        // `k` lands back on the fold header (line 1), and `zo` reveals it.
+        feed(&mut ed, "k");
+        assert_eq!(ed.cursor().line, 1, "k lands on the fold header");
+        feed(&mut ed, "zo");
+        assert!(ed.fold_rows().is_empty(), "zo opened the fold");
+    }
+
+    #[test]
+    fn zr_and_zm_open_and_close_all() {
+        let mut ed = editor_with("a\nb\nc\nd\ne\nf");
+        feed(&mut ed, "zfj");      // fold 0..=1
+        feed(&mut ed, "Gzfk");     // fold 4..=5 (G to last line, then zfk)
+        assert_eq!(ed.fold_rows().ranges().len(), 2);
+        feed(&mut ed, "zR");       // open all
+        assert!(ed.fold_rows().is_empty());
+        feed(&mut ed, "zM");       // close all
+        assert_eq!(ed.fold_rows().ranges().len(), 2);
+    }
+
+    #[test]
+    fn zd_removes_the_fold_under_the_cursor() {
+        let mut ed = editor_with("a\nb\nc\nd");
+        feed(&mut ed, "zfj");
+        assert_eq!(ed.fold_rows().ranges(), &[(0, 1)]);
+        feed(&mut ed, "zd");
+        assert!(ed.fold_rows().is_empty());
+    }
+
+    #[test]
+    fn za_toggles_and_cursor_snaps_out_of_a_closed_fold() {
+        let mut ed = editor_with("a\nb\nc\nd");
+        feed(&mut ed, "jzfj"); // fold 1..=2, cursor on header line 1
+        // za on the header opens it.
+        feed(&mut ed, "za");
+        assert!(ed.fold_rows().is_empty());
+        // za again closes it; cursor lands on the header.
+        feed(&mut ed, "za");
+        assert_eq!(ed.fold_rows().ranges(), &[(1, 2)]);
+        assert_eq!(ed.cursor().line, 1);
     }
 
     // -----------------------------------------------------------------

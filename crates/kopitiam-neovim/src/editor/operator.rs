@@ -36,6 +36,15 @@ pub enum Operator {
     /// the operator-pending grammar — counts, motions, text objects and the
     /// `!!` doubled-key line form all compose for free.
     Filter,
+    /// `zf{motion}` / visual `zf` — the manual-fold-create operator. Like
+    /// [`Operator::Filter`] it never edits text in [`Operator::apply`]: it
+    /// resolves a motion/object to a *line* range, which
+    /// [`super::Editor::run_operator`] intercepts to create a closed fold over
+    /// those lines (see [`super::fold::FoldSet::create`]). Modelled as an
+    /// operator so `zf` inherits the whole operator-pending grammar — counts
+    /// (`zf3j`), motions (`zfG`, `zf}`) and text objects (`zfip`, `zfa{`) all
+    /// compose for free, exactly as they do for `d`/`y`/`!`.
+    Fold,
 }
 
 impl Operator {
@@ -45,9 +54,10 @@ impl Operator {
     }
 
     /// `true` for operators that must be wrapped in a single undo group
-    /// (i.e. they mutate the buffer at all — `Yank` does not).
+    /// (i.e. they mutate the buffer at all — `Yank`, and `Fold` which only
+    /// touches the fold table, do not).
     pub fn mutates(self) -> bool {
-        !matches!(self, Operator::Yank)
+        !matches!(self, Operator::Yank | Operator::Fold)
     }
 }
 
@@ -225,6 +235,9 @@ impl Operator {
             // is ever reached (it opens a command line rather than editing), so
             // this arm exists only to keep the match exhaustive.
             Operator::Filter => unreachable!("the filter operator is handled in Editor::run_operator, never applied"),
+            // Like `Filter`, `Fold` is intercepted in `Editor::run_operator`
+            // before `apply` is reached (it edits the fold table, not the text).
+            Operator::Fold => unreachable!("the fold operator is handled in Editor::run_operator, never applied"),
         }
     }
 }

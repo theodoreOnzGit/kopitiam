@@ -130,6 +130,13 @@ pub enum GrammarCommand {
     SearchWord { forward: bool },
     /// `zz`/`zt`/`zb`: reposition the viewport around the cursor.
     Scroll(crate::core::ViewportScroll),
+    /// A no-argument manual-fold command (`zo`, `zc`, `za`, `zR`, `zM`, `zd`,
+    /// `zj`, ...). `zf` is *not* here — it takes a motion and rides the
+    /// operator grammar as [`super::operator::Operator::Fold`]. Resolved by
+    /// [`super::Editor`], which owns the per-buffer [`super::fold::FoldSet`]
+    /// (`Pending` has no buffer or fold state — see the module docs). See
+    /// [`FoldOp`].
+    Fold(FoldOp),
     /// `gv`: reselect the last visual selection.
     ReselectVisual,
     /// `ZZ`: write the buffer if modified, then quit (same as `:x`).
@@ -156,6 +163,75 @@ pub enum GrammarCommand {
     /// Resolved by `Editor` because the marks live in the buffer, which
     /// `Pending` cannot see (see the module docs).
     JumpBracketMark { forward: bool, exact: bool },
+}
+
+/// A no-argument manual-fold command — every `z`-fold key except `zf` (which
+/// takes a motion; see [`GrammarCommand::Fold`]). Each maps one-to-one onto a
+/// [`super::fold::FoldSet`] method that [`super::Editor`] calls at the cursor
+/// line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldOp {
+    /// `zo`: open one fold level under the cursor.
+    OpenOne,
+    /// `zc`: close one fold level under the cursor.
+    CloseOne,
+    /// `za`: toggle one fold level under the cursor.
+    ToggleOne,
+    /// `zO`: open recursively — reveal the cursor line fully.
+    OpenRecursive,
+    /// `zC`: close recursively — every fold containing the cursor.
+    CloseRecursive,
+    /// `zA`: toggle recursively.
+    ToggleRecursive,
+    /// `zv`: view cursor — open just enough folds to show the cursor line.
+    ViewCursor,
+    /// `zR`: open every fold in the buffer.
+    OpenAll,
+    /// `zM`: close every fold in the buffer.
+    CloseAll,
+    /// `zd`: delete the fold under the cursor.
+    Delete,
+    /// `zE`: eliminate every fold in the buffer.
+    DeleteAll,
+    /// `zn`: disable folding (`foldenable` off).
+    Disable,
+    /// `zN`: enable folding (`foldenable` on).
+    Enable,
+    /// `zi`: toggle `foldenable`.
+    ToggleEnable,
+    /// `zj`: move to the start of the next fold.
+    MoveNext,
+    /// `zk`: move to the end of the previous fold.
+    MovePrev,
+    /// `[z`: move to the start of the current fold.
+    MoveStart,
+    /// `]z`: move to the end of the current fold.
+    MoveEnd,
+}
+
+/// Maps a `z`-fold key (after the leading `z`) to its [`FoldOp`], or `None` for
+/// a key that is not a no-argument fold command. `zf` (create) is handled
+/// separately — it takes a motion — and so is not in this table.
+fn fold_command_for(key: Key) -> Option<FoldOp> {
+    Some(match key.as_char()? {
+        'o' => FoldOp::OpenOne,
+        'c' => FoldOp::CloseOne,
+        'a' => FoldOp::ToggleOne,
+        'O' => FoldOp::OpenRecursive,
+        'C' => FoldOp::CloseRecursive,
+        'A' => FoldOp::ToggleRecursive,
+        'v' => FoldOp::ViewCursor,
+        'R' => FoldOp::OpenAll,
+        'M' => FoldOp::CloseAll,
+        'd' => FoldOp::Delete,
+        'E' => FoldOp::DeleteAll,
+        'n' => FoldOp::Disable,
+        'N' => FoldOp::Enable,
+        'i' => FoldOp::ToggleEnable,
+        'j' => FoldOp::MoveNext,
+        'k' => FoldOp::MovePrev,
+        _ => return None,
+    })
 }
 
 /// Where `i a I A o O` place the cursor before switching to Insert mode.
@@ -635,11 +711,28 @@ impl Pending {
 
     fn feed_z(&mut self, key: Key) -> FeedResult {
         use crate::core::ViewportScroll;
+        // `zz`/`zt`/`zb` are viewport scrolls; every other `z` key belongs to
+        // the manual-fold family. The one special case is `zf`, which takes a
+        // *motion* — so rather than resolve here, it plants `Operator::Fold`
+        // and drops back to the fresh grammar, letting the ordinary
+        // operator+motion machinery finish the job (`zf3j`, `zfip`, `zfG`).
+        // See [`Operator::Fold`] for why that reuse is possible.
+        if key.code == KeyCode::Char('f') {
+            // `set_operator` drops the state back to Fresh for us, so the next
+            // key is parsed as an ordinary motion against `Operator::Fold`.
+            return self.set_operator(super::operator::Operator::Fold);
+        }
         let req = match key.code {
             KeyCode::Char('z') => ViewportScroll::CenterCursor,
             KeyCode::Char('t') => ViewportScroll::CursorToTop,
             KeyCode::Char('b') => ViewportScroll::CursorToBottom,
-            _ => return self.invalid(),
+            _ => {
+                if let Some(op) = fold_command_for(key) {
+                    self.reset();
+                    return FeedResult::Complete(GrammarCommand::Fold(op));
+                }
+                return self.invalid();
+            }
         };
         self.reset();
         FeedResult::Complete(GrammarCommand::Scroll(req))
@@ -665,6 +758,15 @@ impl Pending {
             let exact = c == '`';
             self.reset();
             return FeedResult::Complete(GrammarCommand::JumpBracketMark { forward, exact });
+        }
+        // `[z`/`]z`: move to the start/end of the current fold. Like the mark
+        // jumps above these need the fold table, which lives on the buffer and
+        // `Pending` cannot see (see the module docs), so they resolve to a
+        // fold command rather than a `Motion`.
+        if c == 'z' {
+            self.reset();
+            let op = if forward { FoldOp::MoveEnd } else { FoldOp::MoveStart };
+            return FeedResult::Complete(GrammarCommand::Fold(op));
         }
         let motion = match (forward, c) {
             (false, '[') => Motion::SectionBackward,
