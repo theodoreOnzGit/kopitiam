@@ -28,6 +28,14 @@ pub enum Operator {
     LowerCase,
     UpperCase,
     ToggleCase,
+    /// `!{motion}` / `!!` — the shell-filter operator. Unlike every other
+    /// operator it never edits text in [`Operator::apply`]: it only resolves a
+    /// motion/object to a line range, which
+    /// [`super::Editor::run_operator`] intercepts to open a prefilled
+    /// `:{range}!` command line. Modelled as an operator purely so it inherits
+    /// the operator-pending grammar — counts, motions, text objects and the
+    /// `!!` doubled-key line form all compose for free.
+    Filter,
 }
 
 impl Operator {
@@ -213,6 +221,10 @@ impl Operator {
                 let cursor = buf.apply(Edit::replace(range, transformed))?;
                 Ok(OperatorOutcome { cursor, register_write: None })
             }
+            // `Filter` is intercepted in `Editor::run_operator` before `apply`
+            // is ever reached (it opens a command line rather than editing), so
+            // this arm exists only to keep the match exhaustive.
+            Operator::Filter => unreachable!("the filter operator is handled in Editor::run_operator, never applied"),
         }
     }
 }

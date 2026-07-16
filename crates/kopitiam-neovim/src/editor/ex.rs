@@ -166,6 +166,23 @@ pub enum ExCommand {
     /// scratch buffer. `topic` is the optional `:help <topic>` argument that
     /// jumps to a section (see [`super::help`]); `None` opens at the top.
     Help { topic: Option<String> },
+    /// `:!{cmd}` — run a shell command and show its combined stdout+stderr in a
+    /// scratch buffer. This is the *no-range* bang; `:{range}!{cmd}` parses to
+    /// [`ExCommand::Filter`] instead, because a range turns `:!` from "run and
+    /// show" into "filter these lines". `cmd` is the raw remainder after the
+    /// `!`, kept verbatim so the shell sees exactly what was typed.
+    ShellRun { cmd: String },
+    /// `:{range}!{cmd}` (and the `!{motion}` operator's command line) — filter
+    /// the range's lines through `cmd`: feed them as the command's stdin and
+    /// replace them with its stdout. The classic `:%!sort`, `:'<,'>!column -t`.
+    /// Applied as one buffer edit (hence one undo step). See
+    /// [`super::Editor::execute_ex`] for the non-zero-exit safety rule.
+    Filter { range: LineRange, cmd: String },
+    /// `:r !{cmd}` / `:{line}r !{cmd}` (a.k.a. `:read !{cmd}`) — run `cmd` and
+    /// insert its stdout into the buffer *below* the addressed line (the current
+    /// line when no range is given), matching vim. `range`'s last line is the
+    /// insertion point.
+    ReadShell { range: LineRange, cmd: String },
     /// The quickfix / location-list family (`:grep`, `:copen`, `:cnext`, …).
     /// Every one of these is recognised by the editor but *performed* by the UI,
     /// which owns the search root, the list windows and the jumps — the editor
@@ -300,6 +317,19 @@ pub fn parse(input: &str) -> ExCommand {
         return shift;
     }
 
+    // The shell bang (`:!cmd`, `:{range}!cmd`) also has a non-alphabetic name,
+    // so it too is caught before the alphabetic-name path. A leading `!` here is
+    // unambiguous: the *force* `!` that other commands carry only ever appears
+    // *after* an alphabetic name (`:w!`), never as the first character past the
+    // range. Presence of a range is what splits the two meanings — vim's `:!cmd`
+    // runs and shows output, while `:.!cmd`/`:%!cmd` filter the range in place.
+    if let Some(cmd) = rest.strip_prefix('!') {
+        return match range {
+            LineRange::None => ExCommand::ShellRun { cmd: cmd.to_string() },
+            _ => ExCommand::Filter { range, cmd: cmd.to_string() },
+        };
+    }
+
     let name_len = rest.chars().take_while(|c| c.is_ascii_alphabetic()).count();
     let name: String = rest.chars().take(name_len).collect();
     let mut after = &rest[name_len..];
@@ -373,6 +403,12 @@ pub fn parse(input: &str) -> ExCommand {
         Some(CommandId::Only) => ExCommand::Only,
         Some(CommandId::Close) => ExCommand::Close,
         Some(CommandId::Terminal) => ExCommand::Terminal,
+        // `:r`/`:read` currently supports only the shell form `:r !{cmd}` (and
+        // its no-space `:r!{cmd}`). `force` is `true` when the `!` sat directly
+        // against the name (`:r!cmd`), in which case `after` is already the
+        // command; otherwise the `!` (if any) is still the first non-space
+        // character of `arg`. The plain `:r {file}` form is a filed follow-up.
+        Some(CommandId::Read) => parse_read(range, force, after),
         Some(CommandId::Help) => ExCommand::Help { topic: opt_arg(arg) },
 
         // Quickfix (global) and location (`l`-prefixed) list commands. The two
@@ -524,6 +560,31 @@ fn parse_shift(range: LineRange, rest: &str) -> Option<ExCommand> {
     };
     let count = rest.chars().take_while(|&c| c == first).count();
     Some(ExCommand::Shift { range, right, count })
+}
+
+/// `:r !{cmd}` / `:{line}r !{cmd}` (`:read` too). Two spellings reach the same
+/// [`ExCommand::ReadShell`]:
+///
+/// * `:r!cmd` — the `!` abuts the name, so the generic parser already peeled it
+///   off as `force == true` and `after` is the command itself.
+/// * `:r !cmd` — a space separates them, so the `!` is still the leading
+///   character of `after` and is stripped here.
+///
+/// Anything else (`:r file`, bare `:r`) is not yet supported — vim's file-read
+/// form is a filed follow-up — so it returns [`ExCommand::Unknown`] rather than
+/// guessing.
+fn parse_read(range: LineRange, force: bool, after: &str) -> ExCommand {
+    let cmd = if force {
+        // `:r!cmd`: the `!` was consumed as force; the rest is the command.
+        after.trim_start()
+    } else {
+        // `:r !cmd`: strip the leading `!` (after trimming the separating space).
+        match after.trim_start().strip_prefix('!') {
+            Some(rest) => rest.trim_start(),
+            None => return ExCommand::Unknown(format!("r{after}")),
+        }
+    };
+    ExCommand::ReadShell { range, cmd: cmd.to_string() }
 }
 
 fn parse_set(arg: &str) -> ExCommand {
@@ -1040,6 +1101,38 @@ mod tests {
         );
         // An empty command is an error.
         assert!(matches!(parse("cdo"), ExCommand::Unknown(_)));
+    }
+
+    #[test]
+    fn parses_shell_bang_forms() {
+        // `:!cmd` with no range: run and show.
+        assert_eq!(parse("!ls -l"), ExCommand::ShellRun { cmd: "ls -l".into() });
+        // A range turns `:!` into a filter.
+        assert_eq!(parse("%!sort"), ExCommand::Filter { range: LineRange::All, cmd: "sort".into() });
+        assert_eq!(
+            parse("2,4!column -t"),
+            ExCommand::Filter { range: LineRange::Pair(LineSpec::Number(2), LineSpec::Number(4)), cmd: "column -t".into() }
+        );
+        assert_eq!(parse(".!rev"), ExCommand::Filter { range: LineRange::Single(LineSpec::Current), cmd: "rev".into() });
+        // A leading `!` must never be mistaken for the force flag other commands
+        // carry (that only appears after an alphabetic name, e.g. `:w!`).
+        assert_eq!(parse("w!"), ExCommand::Write { path: None, then_quit: false, force: true });
+    }
+
+    #[test]
+    fn parses_read_shell_forms() {
+        // `:r !cmd`, `:r!cmd`, and the long `:read !cmd` all reach ReadShell.
+        assert_eq!(parse("r !echo hi"), ExCommand::ReadShell { range: LineRange::None, cmd: "echo hi".into() });
+        assert_eq!(parse("r!echo hi"), ExCommand::ReadShell { range: LineRange::None, cmd: "echo hi".into() });
+        assert_eq!(parse("read !date"), ExCommand::ReadShell { range: LineRange::None, cmd: "date".into() });
+        // A line address rides along for the insertion point.
+        assert_eq!(
+            parse("3r !echo hi"),
+            ExCommand::ReadShell { range: LineRange::Single(LineSpec::Number(3)), cmd: "echo hi".into() }
+        );
+        // The plain file-read form is not supported yet — an honest Unknown,
+        // not a silent guess.
+        assert!(matches!(parse("r somefile.txt"), ExCommand::Unknown(_)));
     }
 
     #[test]

@@ -342,6 +342,15 @@ impl Pending {
             KeyCode::Char('<') if self.operator == Some(Operator::Dedent) => self.complete_lines(Operator::Dedent),
             KeyCode::Char('<') => self.set_operator(Operator::Dedent),
 
+            // `!` is the shell-filter operator: `!{motion}` (e.g. `!ip`, `!5j`,
+            // `!G`) and the doubled `!!` (the current line). Like `dd`/`>>` its
+            // doubled form is recognised by seeing the operator already pending;
+            // a `!` after any *other* operator (`d!`) is invalid and falls
+            // through to the motion path, which rejects it. See
+            // [`Operator::Filter`] for why it rides the operator grammar.
+            KeyCode::Char('!') if self.operator == Some(Operator::Filter) => self.complete_lines(Operator::Filter),
+            KeyCode::Char('!') if self.operator.is_none() => self.set_operator(Operator::Filter),
+
             KeyCode::Char('i') | KeyCode::Char('a') if self.operator.is_some() => {
                 let scope = if key.code == KeyCode::Char('i') { ObjectScope::Inner } else { ObjectScope::Around };
                 self.state_ = Some(State::AwaitingTextObject(scope));

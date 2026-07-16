@@ -41,6 +41,7 @@ pub mod pending;
 pub mod quickfix;
 pub mod register;
 pub mod search;
+pub mod shell;
 pub mod text_object;
 
 use std::collections::{BTreeMap, HashMap};
@@ -60,6 +61,7 @@ use cmdline::{CmdlineBuffer, History};
 use pending::{FeedResult, Pending};
 use register::{RegisterContent, Registers};
 use clipboard::{ClipboardProvider, SystemClipboard};
+use shell::{CommandRunner, ShellRunner};
 use text_object::ObjectScope;
 
 /// Which shape the current visual selection has. A separate type from
@@ -210,6 +212,13 @@ pub struct Editor {
     /// terminal / platform I/O they need stays swappable (real one in
     /// production, a test double in unit tests). See [`clipboard`].
     clipboard: Box<dyn ClipboardProvider>,
+
+    /// Runs external shell commands for the `:!`/`:r !`/`:{range}!`/`!{motion}`
+    /// surfaces, kept behind a trait for the same reason as [`Self::clipboard`]:
+    /// the process I/O it needs stays swappable, so the editor's shell logic is
+    /// tested against a scripted runner rather than the host's real shell. See
+    /// [`shell`].
+    command_runner: Box<dyn CommandRunner>,
 
     /// The text most recently typed in Insert mode, for the read-only `".`
     /// register (paste and `<C-r>.`). Committed from [`Self::insert_accumulator`]
@@ -389,6 +398,7 @@ impl Editor {
             pending: Pending::new(),
             registers: Registers::new(),
             clipboard: Box::new(SystemClipboard::new()),
+            command_runner: Box::new(ShellRunner::new()),
             last_insert: String::new(),
             insert_accumulator: String::new(),
             last_ex_command: None,
@@ -1902,6 +1912,13 @@ impl Editor {
     }
 
     fn run_operator(&mut self, operator: Operator, range: Range, granularity: Granularity, register: Option<char>) -> crate::Result<EditorResponse> {
+        // The filter operator (`!{motion}`/`!!`) does not mutate here — it opens
+        // a prefilled `:{range}!` command line and lets the user type the shell
+        // command. Intercept it before any of the mutate/apply machinery below
+        // (and before `Operator::apply`, which has no meaningful arm for it).
+        if operator == Operator::Filter {
+            return self.begin_filter(range);
+        }
         let enters_insert = operator.enters_insert();
         if operator.mutates() {
             self.begin_insert_group();
@@ -2174,6 +2191,14 @@ impl Editor {
     #[cfg(test)]
     fn set_clipboard(&mut self, provider: Box<dyn ClipboardProvider>) {
         self.clipboard = provider;
+    }
+
+    /// Swap in a command runner — tests only, so the shell surfaces
+    /// (`:!`/`:r !`/`:{range}!`/`!{motion}`) can be exercised against a scripted
+    /// runner instead of spawning the host's real shell. See [`shell::FnRunner`].
+    #[cfg(test)]
+    fn set_command_runner(&mut self, runner: Box<dyn CommandRunner>) {
+        self.command_runner = runner;
     }
 
     fn put(&mut self, register: Option<char>, count: usize, before: bool, cursor_after: bool) -> crate::Result<EditorResponse> {
@@ -3252,6 +3277,15 @@ impl Editor {
                 self.cursor = self.current_buffer().clamp(Position::new(line, 0));
                 Ok(EditorResponse::Continue)
             }
+            // The shell surfaces. Unlike `:w`/`:q`, these run their process I/O
+            // inline through the injectable `command_runner` (see `shell`) — the
+            // same pattern `clipboard` uses, and safe because the runner is a
+            // swappable trait, so tests never spawn a real shell. `:!` shows
+            // output in a scratch buffer; `:{range}!` and `:r !` edit the buffer
+            // directly, exactly as every other buffer-mutating ex command does.
+            ex::ExCommand::ShellRun { cmd } => self.shell_run(&cmd),
+            ex::ExCommand::Filter { range, cmd } => self.shell_filter(range, &cmd),
+            ex::ExCommand::ReadShell { range, cmd } => self.shell_read(range, &cmd),
             // The quickfix / location-list family is recognised here but
             // performed by the UI (it owns the search root, the list windows and
             // the jumps). Hand the parsed command straight back — see
@@ -3259,6 +3293,141 @@ impl Editor {
             ex::ExCommand::Quickfix(cmd) => Ok(EditorResponse::Quickfix(cmd)),
             ex::ExCommand::Unknown(s) => Err(crate::Error::UnknownCommand(s)),
         }
+    }
+
+    /// `:!{cmd}` — run a shell command and show its combined stdout+stderr in a
+    /// fresh scratch buffer, the way vim pipes `:!` output to a pager. kvim has
+    /// no pager, so the scratch buffer (the same machinery `:term`/`:help` use)
+    /// is the read-only view. A command that produces no output echoes its exit
+    /// status on the statusline instead of opening a blank buffer.
+    fn shell_run(&mut self, cmd: &str) -> crate::Result<EditorResponse> {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return Ok(EditorResponse::Message("no command to run".to_string()));
+        }
+        let output = match self.command_runner.run(cmd, "") {
+            Ok(o) => o,
+            Err(e) => return Ok(EditorResponse::Message(format!("cannot run shell: {e}"))),
+        };
+        // stderr is appended after stdout so a command that writes to both is
+        // shown whole — vim likewise mixes them into the one pager view.
+        let mut text = output.stdout.clone();
+        text.push_str(&output.stderr);
+        if text.trim().is_empty() {
+            let note = if output.is_success() { "shell command produced no output".to_string() } else { output.failure_message() };
+            return Ok(EditorResponse::Message(note));
+        }
+        self.new_buffer();
+        self.current_buffer_mut().apply(Edit::insert(Position::ORIGIN, text))?;
+        self.cursor = Position::ORIGIN;
+        Ok(EditorResponse::Continue)
+    }
+
+    /// `:{range}!{cmd}` — filter the range's lines through `cmd`: feed them as
+    /// its stdin, replace them with its stdout, as one undo step. The `:%!sort`
+    /// workhorse.
+    ///
+    /// # Non-zero exit is left non-destructive
+    ///
+    /// If the command exits non-zero the buffer is left untouched and the error
+    /// is reported. This is deliberately *safer* than vim, which replaces the
+    /// range with whatever (often empty) output a failed command emitted — the
+    /// brief asks for a filter failure not to corrupt the buffer. A concrete
+    /// consequence: `:%!grep foo` when nothing matches (grep exits 1) leaves the
+    /// buffer as-is rather than deleting every line.
+    fn shell_filter(&mut self, range: ex::LineRange, cmd: &str) -> crate::Result<EditorResponse> {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return Ok(EditorResponse::Message("no filter command".to_string()));
+        }
+        let content = ex::content_line_count(self.current_buffer());
+        if content == 0 {
+            return Ok(EditorResponse::Continue);
+        }
+        let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
+        let last = last.min(content - 1);
+        let first = first.min(last);
+
+        // The range's lines, each newline-terminated, are the command's stdin —
+        // line tools (`sort`, `column -t`, `fmt`) expect well-formed lines.
+        let mut stdin = String::new();
+        for line in first..=last {
+            if let Some(t) = self.current_buffer().line(line) {
+                stdin.push_str(&t);
+                stdin.push('\n');
+            }
+        }
+
+        let output = match self.command_runner.run(cmd, &stdin) {
+            Ok(o) => o,
+            Err(e) => return Ok(EditorResponse::Message(format!("cannot run shell: {e}"))),
+        };
+        if !output.is_success() {
+            return Ok(EditorResponse::Message(output.failure_message()));
+        }
+
+        // The command's trailing newline is dropped: the content span we replace
+        // carries no trailing newline of its own, and the buffer supplies the
+        // line separators. Without this every filter would grow a blank line.
+        let replacement = shell::strip_one_trailing_newline(&output.stdout).to_string();
+        let content_range = operator::linewise_content_range(self.current_buffer(), first, last);
+        self.current_buffer_mut().apply(Edit::replace(content_range, replacement))?;
+        let col = operator::first_non_blank_col(self.current_buffer(), first);
+        self.cursor = self.current_buffer().clamp(Position::new(first, col));
+        Ok(EditorResponse::Continue)
+    }
+
+    /// `:r !{cmd}` / `:{line}r !{cmd}` — run `cmd` and insert its stdout into the
+    /// buffer *below* the addressed line (the current line by default), matching
+    /// vim's `:read !`. Empty output (or a spawn failure) is reported without
+    /// touching the buffer.
+    fn shell_read(&mut self, range: ex::LineRange, cmd: &str) -> crate::Result<EditorResponse> {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return Ok(EditorResponse::Message("no command to read".to_string()));
+        }
+        let output = match self.command_runner.run(cmd, "") {
+            Ok(o) => o,
+            Err(e) => return Ok(EditorResponse::Message(format!("cannot run shell: {e}"))),
+        };
+        let text = shell::strip_one_trailing_newline(&output.stdout);
+        if text.is_empty() {
+            let note = if output.is_success() { "command produced no output".to_string() } else { output.failure_message() };
+            return Ok(EditorResponse::Message(note));
+        }
+
+        // `:r` inserts *below* the addressed line; with no range that is the
+        // current line, so a single-line `range` resolves to its own last line.
+        let (_, at_line) = range.resolve(self.cursor.line, self.current_buffer().line_count());
+        let insert_pos = Position::new(at_line, self.current_buffer().line_len(at_line));
+        self.current_buffer_mut().apply(Edit::insert(insert_pos, format!("\n{text}")))?;
+        let first_inserted = at_line + 1;
+        let col = operator::first_non_blank_col(self.current_buffer(), first_inserted);
+        self.cursor = self.current_buffer().clamp(Position::new(first_inserted, col));
+        Ok(EditorResponse::Continue)
+    }
+
+    /// `!{motion}` / `!!` — the filter *operator*. `range` is the (linewise)
+    /// span the motion or text object resolved to; this drops the user into a
+    /// prefilled `:{first},{last}!` command line and waits for them to type the
+    /// command, exactly like vim. Executing that line runs [`Self::shell_filter`].
+    ///
+    /// Intercepted in [`Self::run_operator`] before any buffer edit, because the
+    /// filter operator does not itself mutate — it only *composes a command
+    /// line*. Reusing the operator-motion machinery is what gives `!ip`, `!5j`,
+    /// `!G` and `!!` for free: they are ordinary motions/objects/doubled-key
+    /// lines resolved to a range, with `!` as the operator.
+    fn begin_filter(&mut self, range: Range) -> crate::Result<EditorResponse> {
+        let (start, end) = range.normalized();
+        // 1-based, inclusive — the addresses ex commands speak.
+        let (first, last) = (start.line + 1, end.line + 1);
+        self.mode = Mode::Command;
+        self.command_kind = CommandKind::Ex;
+        self.cmdline.clear();
+        self.cmdline.insert_str(&format!("{first},{last}!"));
+        self.command_register_pending = false;
+        self.discard_dot();
+        Ok(EditorResponse::Continue)
     }
 
     /// `<C-g>`: a one-line summary of the current buffer — its name, whether
@@ -5520,5 +5689,135 @@ mod tests {
         assert_eq!(ed.buffer().text(), "bar\nfoo\nfoo");
         feed(&mut ed, "g&"); // now every line
         assert_eq!(ed.buffer().text(), "bar\nbar\nbar");
+    }
+
+    // -----------------------------------------------------------------
+    // Shell integration (kopitiam-cj0.21): `:!`, `:r !`, `:{range}!`, and
+    // the `!{motion}` filter operator. Every editor-level test injects a
+    // scripted `FnRunner` so the assertions are deterministic and never
+    // depend on which tools are installed — see `shell::FnRunner`.
+    // -----------------------------------------------------------------
+
+    /// A runner that sorts stdin lines for `sort`, upper-cases for `tr a-z A-Z`,
+    /// echoes a fixed string for `echo ...`, and fails for `false`. Enough to
+    /// exercise every shell surface hermetically.
+    fn scripted_runner() -> Box<dyn CommandRunner> {
+        use shell::CommandOutput;
+        Box::new(shell::FnRunner(|cmd: &str, stdin: &str| {
+            let cmd = cmd.trim();
+            if cmd == "sort" {
+                let mut lines: Vec<&str> = stdin.lines().collect();
+                lines.sort();
+                let mut out = lines.join("\n");
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                Ok(CommandOutput::ok(out))
+            } else if cmd == "tr a-z A-Z" {
+                Ok(CommandOutput::ok(stdin.to_uppercase()))
+            } else if let Some(rest) = cmd.strip_prefix("echo ") {
+                Ok(CommandOutput::ok(format!("{rest}\n")))
+            } else if cmd == "false" {
+                Ok(CommandOutput { stdout: String::new(), stderr: "boom\n".to_string(), code: Some(1) })
+            } else {
+                Ok(CommandOutput::ok(String::new()))
+            }
+        }))
+    }
+
+    fn shell_editor(text: &str) -> Editor {
+        let mut ed = editor_with(text);
+        ed.set_command_runner(scripted_runner());
+        ed
+    }
+
+    #[test]
+    fn filter_whole_buffer_through_sort_reorders_lines() {
+        let mut ed = shell_editor("banana\napple\ncherry\n");
+        ed.execute_ex("%!sort").unwrap();
+        assert_eq!(ed.buffer().text(), "apple\nbanana\ncherry\n");
+    }
+
+    #[test]
+    fn filter_range_only_touches_that_range() {
+        let mut ed = shell_editor("z\nb\na\nq\n");
+        // Sort just lines 2..=3 (1-based), leaving the first and last put.
+        ed.execute_ex("2,3!sort").unwrap();
+        assert_eq!(ed.buffer().text(), "z\na\nb\nq\n");
+    }
+
+    #[test]
+    fn filter_leaves_buffer_untouched_on_nonzero_exit() {
+        let mut ed = shell_editor("keep\nme\n");
+        let resp = ed.execute_ex("%!false").unwrap();
+        // The buffer must be unchanged, and the tool's stderr surfaced.
+        assert_eq!(ed.buffer().text(), "keep\nme\n");
+        assert_eq!(resp, EditorResponse::Message("boom".to_string()));
+    }
+
+    #[test]
+    fn read_shell_inserts_command_output_below_the_cursor_line() {
+        let mut ed = shell_editor("first\nsecond\n");
+        // Cursor on line 0; `:r !echo hi` inserts "hi" below it.
+        ed.execute_ex("r !echo hi").unwrap();
+        assert_eq!(ed.buffer().text(), "first\nhi\nsecond\n");
+        // Cursor lands on the newly-read line.
+        assert_eq!(ed.cursor.line, 1);
+    }
+
+    #[test]
+    fn read_shell_no_space_form_also_works() {
+        let mut ed = shell_editor("a\nb\n");
+        ed.execute_ex("r!echo hi").unwrap();
+        assert_eq!(ed.buffer().text(), "a\nhi\nb\n");
+    }
+
+    #[test]
+    fn read_shell_respects_a_line_address() {
+        let mut ed = shell_editor("a\nb\nc\n");
+        // `:2r !echo X` reads below line 2.
+        ed.execute_ex("2r !echo X").unwrap();
+        assert_eq!(ed.buffer().text(), "a\nb\nX\nc\n");
+    }
+
+    #[test]
+    fn bang_run_puts_output_in_a_scratch_buffer() {
+        let mut ed = shell_editor("original\n");
+        let before = ed.current;
+        ed.execute_ex("!echo hello").unwrap();
+        // A new buffer was opened (the original is untouched, shown elsewhere).
+        assert_ne!(ed.current, before);
+        // The scratch view shows the command's output verbatim, trailing
+        // newline and all — it is a pager, not a filtered edit.
+        assert_eq!(ed.buffer().text(), "hello\n");
+    }
+
+    #[test]
+    fn bang_operator_double_bang_filters_the_current_line() {
+        let mut ed = shell_editor("hello\nworld\n");
+        // `!!` opens `:.,.!` — here `:1,1!` — waiting for the command.
+        feed(&mut ed, "!!");
+        assert_eq!(ed.mode(), Mode::Command);
+        assert_eq!(ed.command_line(), Some("1,1!"));
+        // Finish it: uppercase this one line.
+        feed(&mut ed, "tr a-z A-Z<CR>");
+        assert_eq!(ed.buffer().text(), "HELLO\nworld\n");
+    }
+
+    #[test]
+    fn bang_operator_over_a_motion_prefills_the_range() {
+        let mut ed = shell_editor("a\nb\nc\nd\n");
+        // `!2j` filters the current line plus two below -> lines 1..=3.
+        feed(&mut ed, "!2j");
+        assert_eq!(ed.mode(), Mode::Command);
+        assert_eq!(ed.command_line(), Some("1,3!"));
+    }
+
+    #[test]
+    fn bang_operator_over_a_text_object_prefills_the_paragraph_range() {
+        let mut ed = shell_editor("one\ntwo\n\nfour\n");
+        // `!ip` on the first paragraph (lines 1..=2).
+        feed(&mut ed, "!ip");
+        assert_eq!(ed.command_line(), Some("1,2!"));
     }
 }

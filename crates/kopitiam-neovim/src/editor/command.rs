@@ -112,6 +112,9 @@ pub enum CommandId {
     Close,
     /// `:term`/`:terminal`.
     Terminal,
+    /// `:r`/`:read` — read a shell command's output into the buffer
+    /// (`:r !{cmd}`). The file-read form is not yet implemented.
+    Read,
     /// `:h`/`:help`.
     Help,
 
@@ -217,6 +220,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::Only, names: &["on", "only"], arg: ArgKind::None, help: "close all other windows" },
     CommandSpec { id: CommandId::Close, names: &["clo", "close"], arg: ArgKind::None, help: "close this window" },
     CommandSpec { id: CommandId::Terminal, names: &["term", "terminal"], arg: ArgKind::None, help: "open a terminal buffer" },
+    CommandSpec { id: CommandId::Read, names: &["r", "read"], arg: ArgKind::None, help: "read shell command output into buffer" },
     CommandSpec { id: CommandId::Help, names: &["h", "help"], arg: ArgKind::File, help: "open the help manual" },
 
     // Quickfix list (global) — project search + navigate + iterate.
