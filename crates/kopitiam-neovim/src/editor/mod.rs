@@ -28,6 +28,7 @@
 //!   `:d`); effects requiring real I/O come back out through
 //!   [`EditorResponse`] instead of happening inline.
 
+pub mod clipboard;
 pub mod cmdline;
 pub mod command;
 pub mod ex;
@@ -55,7 +56,8 @@ use motion::{FindKind, Motion};
 use operator::Operator;
 use cmdline::{CmdlineBuffer, History};
 use pending::{FeedResult, Pending};
-use register::Registers;
+use register::{RegisterContent, Registers};
+use clipboard::{ClipboardProvider, SystemClipboard};
 use text_object::ObjectScope;
 
 /// Which shape the current visual selection has. A separate type from
@@ -174,6 +176,26 @@ pub struct Editor {
 
     pending: Pending,
     registers: Registers,
+    /// The system-clipboard registers `"+`/`"*`, kept behind a trait so the
+    /// terminal / platform I/O they need stays swappable (real one in
+    /// production, a test double in unit tests). See [`clipboard`].
+    clipboard: Box<dyn ClipboardProvider>,
+
+    /// The text most recently typed in Insert mode, for the read-only `".`
+    /// register (paste and `<C-r>.`). Committed from [`Self::insert_accumulator`]
+    /// when Insert mode is left. Persists across inserts like vim's `".`.
+    last_insert: String,
+    /// The text being typed in the *current* Insert session, accumulated so
+    /// [`Self::last_insert`] can be set on exit. See [`Self::note_inserted`].
+    /// Best-effort: it tracks typed characters (and backspace/`<C-w>`/`<C-u>`
+    /// deletions), which covers ordinary typing; it does *not* try to reflect
+    /// autoindent or an in-insert `<C-r>` paste — `".` is documented as the
+    /// text you typed, and getting fancy here would add state for little gain.
+    insert_accumulator: String,
+    /// The most recent `:` command line executed, for the read-only `":`
+    /// register (`@:` repeat is a separate, filed follow-up — this is only the
+    /// register).
+    last_ex_command: Option<String>,
 
     macros: HashMap<char, Vec<Key>>,
     recording: Option<(char, Vec<Key>)>,
@@ -293,6 +315,10 @@ impl Editor {
             visual_object_pending: None,
             pending: Pending::new(),
             registers: Registers::new(),
+            clipboard: Box::new(SystemClipboard::new()),
+            last_insert: String::new(),
+            insert_accumulator: String::new(),
+            last_ex_command: None,
             macros: HashMap::new(),
             recording: None,
             last_played_macro: None,
@@ -1005,7 +1031,7 @@ impl Editor {
                 let text = self.current_buffer().slice(range);
                 self.begin_insert_group();
                 let cursor = self.current_buffer_mut().apply(Edit::delete(range))?;
-                self.registers.write_delete(register, text, Granularity::Charwise);
+                self.write_register(false, register, text, Granularity::Charwise);
                 self.cursor = cursor;
                 self.mode = Mode::Insert;
                 Ok(EditorResponse::Continue)
@@ -1405,11 +1431,7 @@ impl Editor {
         let outcome = outcome?;
 
         if let Some((text, gran)) = outcome.register_write {
-            if operator == Operator::Yank {
-                self.registers.write_yank(register, text, gran);
-            } else {
-                self.registers.write_delete(register, text, gran);
-            }
+            self.write_register(operator == Operator::Yank, register, text, gran);
         }
         self.cursor = self.current_buffer().clamp(outcome.cursor);
 
@@ -1449,7 +1471,7 @@ impl Editor {
         let cursor = self.current_buffer_mut().apply(Edit::delete(range));
         self.current_buffer_mut().end_undo_group();
         let cursor = cursor?;
-        self.registers.write_delete(register, text, Granularity::Charwise);
+        self.write_register(false, register, text, Granularity::Charwise);
         self.cursor = self.current_buffer().clamp(cursor);
         self.mode = Mode::Normal;
         self.commit_dot();
@@ -1557,8 +1579,115 @@ impl Editor {
         Ok(EditorResponse::Continue)
     }
 
+    // ---------------------------------------------------------------
+    // Register routing across all families
+    //
+    // Three register families exist, and only the first is plain storage:
+    //
+    //   * stored — unnamed, `a`-`z`, `"0`-`"9`, `"-` — owned by [`Registers`];
+    //   * the blackhole `"_` — a write sink that discards;
+    //   * the system clipboard `"+`/`"*` — terminal / OS I/O ([`clipboard`]);
+    //   * read-only — `"%` filename, `".` last insert, `":` last ex command,
+    //     `"/` last search — *computed* from editor state, never stored.
+    //
+    // [`Self::read_register`] and [`Self::write_register`] are the single doors
+    // every yank/delete/put/`<C-r>` goes through so this routing lives in one
+    // place instead of being re-derived at each call site.
+    // ---------------------------------------------------------------
+
+    /// Resolve a register for *writing* (the result of a yank or a delete),
+    /// routing to the blackhole, the clipboard and the stored registers as the
+    /// name (and the `clipboard` option) dictate. `is_yank` selects vim's
+    /// `"0`-vs-delete-ring semantics inside [`Registers`].
+    fn write_register(&mut self, is_yank: bool, register: Option<char>, text: String, granularity: Granularity) {
+        // Blackhole: `"_` discards outright and touches nothing else — this is
+        // the whole point of `"_dd` (delete without clobbering the unnamed
+        // register). It must short-circuit before any mirror happens.
+        if register == Some('_') {
+            return;
+        }
+        // Clipboard: an explicit `"+`/`"*` copies to the OS clipboard; a plain
+        // (register-less) edit copies too when `clipboard` is `unnamed`/
+        // `unnamedplus` (the neovim mirror). Either way the stored registers
+        // still update below, matching vim — `"+y` also fills the unnamed
+        // register, and an `unnamedplus` yank still fills `"0`.
+        let clipboard_target = match register {
+            Some(c) => clipboard::register_selection(c),
+            None => self.options.clipboard_sync_register().and_then(clipboard::register_selection),
+        };
+        if let Some(sel) = clipboard_target {
+            self.clipboard.copy(sel, &text);
+        }
+        if is_yank {
+            self.registers.write_yank(register, text, granularity);
+        } else {
+            self.registers.write_delete(register, text, granularity);
+        }
+    }
+
+    /// Resolve a register for *reading* (put, `<C-r>`), spanning all families.
+    /// Returns owned [`RegisterContent`] because the clipboard and read-only
+    /// registers are computed on demand rather than stored. `None` means "the
+    /// register is empty or unreadable" — the caller turns that into a no-op
+    /// (or, for the clipboard, a one-line note).
+    fn read_register(&mut self, name: Option<char>) -> Option<RegisterContent> {
+        // A register-less put/`<C-r>` reads the clipboard instead when
+        // `clipboard` is `unnamed`/`unnamedplus`, mirroring neovim.
+        let effective = match name {
+            None => self.options.clipboard_sync_register(),
+            some => some,
+        };
+        match effective {
+            Some(c) if clipboard::register_selection(c).is_some() => {
+                let sel = clipboard::register_selection(c).expect("guarded by the match arm");
+                match self.clipboard.paste(sel) {
+                    Some(text) => Some(charwise_register(text)),
+                    // Clipboard unreadable. If this was a *plain* put that
+                    // `unnamedplus` rerouted here, fall back to the internal
+                    // unnamed register so `p` still pastes something. An
+                    // explicit `"+p` returns None so the caller can say so.
+                    None if name.is_none() => self.registers.read(None).cloned(),
+                    None => None,
+                }
+            }
+            Some('%') => self
+                .current_buffer()
+                .path()
+                .map(|p| charwise_register(p.display().to_string())),
+            Some('.') => (!self.last_insert.is_empty()).then(|| charwise_register(self.last_insert.clone())),
+            Some(':') => self.last_ex_command.clone().map(charwise_register),
+            Some('/') => self.last_search.as_ref().map(|(pattern, _)| charwise_register(pattern.clone())),
+            other => self.registers.read(other).cloned(),
+        }
+    }
+
+    /// Note text just typed in Insert mode, for the read-only `".` register.
+    /// See [`Self::insert_accumulator`] for the accuracy caveats.
+    fn note_inserted(&mut self, text: &str) {
+        self.insert_accumulator.push_str(text);
+    }
+
+    /// Undo the tail of [`Self::insert_accumulator`] to match a within-insert
+    /// deletion (`Backspace`, `<C-w>`, `<C-u>`), so `".` reflects what actually
+    /// survived to the end of the insert rather than everything ever typed.
+    /// `chars` is the number of characters removed from the buffer.
+    fn unnote_inserted(&mut self, chars: usize) {
+        for _ in 0..chars {
+            if self.insert_accumulator.pop().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Swap in a clipboard provider — tests only, so register-routing tests can
+    /// assert clipboard traffic without spawning tools or emitting escapes.
+    #[cfg(test)]
+    fn set_clipboard(&mut self, provider: Box<dyn ClipboardProvider>) {
+        self.clipboard = provider;
+    }
+
     fn put(&mut self, register: Option<char>, count: usize, before: bool) -> crate::Result<EditorResponse> {
-        let Some(content) = self.registers.read(register).cloned() else {
+        let Some(content) = self.read_register(register) else {
             self.mode = Mode::Normal;
             self.discard_dot();
             return Ok(EditorResponse::Continue);
@@ -1648,6 +1777,13 @@ impl Editor {
     }
 
     fn leave_insert(&mut self) {
+        // Commit the just-typed run to the read-only `".` register. vim keeps
+        // `".` across inserts, so an insert that typed nothing (a bare `i<Esc>`)
+        // leaves the previous value in place.
+        let typed = std::mem::take(&mut self.insert_accumulator);
+        if !typed.is_empty() {
+            self.last_insert = typed;
+        }
         self.current_buffer_mut().end_undo_group();
         // vim moves the cursor one grapheme left when leaving Insert mode
         // (so it lands *on* the last typed character, not past it).
@@ -1669,7 +1805,11 @@ impl Editor {
             self.insert_register_pending = false;
             if let Some(c) = key.as_char() {
                 let reg = if c == '"' { None } else { Some(c) };
-                if let Some(content) = self.registers.read(reg).cloned() {
+                if let Some(content) = self.read_register(reg) {
+                    // `<C-r>` inserts register text as typed text, so it also
+                    // feeds `".` — matching vim, where the pasted run is part of
+                    // "the last inserted text".
+                    self.note_inserted(&content.text);
                     let cur = self.cursor;
                     let landed = self.current_buffer_mut().apply(Edit::insert(cur, content.text))?;
                     self.cursor = landed;
@@ -1708,6 +1848,7 @@ impl Editor {
                 let cur = self.cursor;
                 let pos = self.current_buffer_mut().apply(Edit::insert(cur, "\n".to_string()))?;
                 self.cursor = pos;
+                self.note_inserted("\n");
                 Ok(EditorResponse::Continue)
             }
             KeyCode::Backspace => {
@@ -1715,6 +1856,7 @@ impl Editor {
                 if let Some(prev) = motion::step_left(self.current_buffer(), cur) {
                     let pos = self.current_buffer_mut().apply(Edit::delete(Range::new(prev, cur)))?;
                     self.cursor = pos;
+                    self.unnote_inserted(1);
                 }
                 Ok(EditorResponse::Continue)
             }
@@ -1729,8 +1871,9 @@ impl Editor {
             KeyCode::Tab => {
                 let cur = self.cursor;
                 let text = if self.options.expandtab { " ".repeat(self.options.shiftwidth.resolve(self.options.tabstop)) } else { "\t".to_string() };
-                let pos = self.current_buffer_mut().apply(Edit::insert(cur, text))?;
+                let pos = self.current_buffer_mut().apply(Edit::insert(cur, text.clone()))?;
                 self.cursor = pos;
+                self.note_inserted(&text);
                 Ok(EditorResponse::Continue)
             }
             // Arrow keys and Home/End move the insertion point, clamped to the
@@ -1777,6 +1920,7 @@ impl Editor {
                     let cur = self.cursor;
                     let pos = self.current_buffer_mut().apply(Edit::insert(cur, c.to_string()))?;
                     self.cursor = pos;
+                    self.note_inserted(c.encode_utf8(&mut [0u8; 4]));
                 }
                 Ok(EditorResponse::Continue)
             }
@@ -1788,8 +1932,11 @@ impl Editor {
         let cur = self.cursor;
         let target = motion::word_back_for_delete(self.current_buffer(), cur);
         if target != cur {
+            // Keep `".` in step: drop the same characters from the accumulator.
+            let removed = self.current_buffer().slice(Range::new(target, cur)).chars().count();
             let pos = self.current_buffer_mut().apply(Edit::delete(Range::new(target, cur)))?;
             self.cursor = pos;
+            self.unnote_inserted(removed);
         }
         Ok(EditorResponse::Continue)
     }
@@ -1805,8 +1952,10 @@ impl Editor {
         let target_col = if cur.col > fnb { fnb } else { 0 };
         if target_col < cur.col {
             let start = Position::new(line, target_col);
+            let removed = self.current_buffer().slice(Range::new(start, cur)).chars().count();
             let pos = self.current_buffer_mut().apply(Edit::delete(Range::new(start, cur)))?;
             self.cursor = pos;
+            self.unnote_inserted(removed);
         }
         Ok(EditorResponse::Continue)
     }
@@ -1873,9 +2022,8 @@ impl Editor {
             self.command_register_pending = false;
             if let Some(c) = key.as_char() {
                 let reg = if c == '"' { None } else { Some(c) };
-                if let Some(content) = self.registers.read(reg) {
-                    let text = content.text.clone();
-                    self.cmdline.insert_str(&text);
+                if let Some(content) = self.read_register(reg) {
+                    self.cmdline.insert_str(&content.text);
                 }
             }
             return Ok(EditorResponse::Continue);
@@ -2086,6 +2234,11 @@ impl Editor {
     /// Parses and runs one `:` command line (without its leading `:`). See
     /// [`ex`]'s module docs for the parse/execute split.
     pub fn execute_ex(&mut self, line: &str) -> crate::Result<EditorResponse> {
+        // The read-only `":` register is the last executed command line. An
+        // empty line does not count (there was no command), matching vim.
+        if !line.trim().is_empty() {
+            self.last_ex_command = Some(line.to_string());
+        }
         let cmd = ex::parse(line);
         match cmd {
             ex::ExCommand::Empty => Ok(EditorResponse::Continue),
@@ -2504,7 +2657,7 @@ impl Editor {
     /// `p`/`P` over a visual selection: replace it with the unnamed
     /// register's contents, as one undo step.
     fn visual_paste(&mut self) -> crate::Result<EditorResponse> {
-        let Some(content) = self.registers.read(None).cloned() else {
+        let Some(content) = self.read_register(None) else {
             self.exit_visual();
             return Ok(EditorResponse::Continue);
         };
@@ -2528,6 +2681,15 @@ impl Default for Editor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Wrap computed text (a filename, the last insert, a search pattern) as a
+/// [`RegisterContent`]. The read-only and clipboard registers are always
+/// charwise: they hold a run of text with no line/block structure, so a `p`
+/// from them insert inline, exactly as pasting the same text from the OS
+/// clipboard would.
+fn charwise_register(text: String) -> RegisterContent {
+    RegisterContent { text, granularity: Granularity::Charwise }
 }
 
 /// `cw`/`cW` behave like `ce`/`cE` when the cursor sits on a non-blank
@@ -2849,6 +3011,169 @@ mod tests {
         // register) only touches the unnamed register, so "ap must still
         // paste what was yanked, not what was deleted.
         assert_eq!(run("foo\nbar\nbaz", "\"ayyjdd\"ap"), "foo\nbaz\nfoo");
+    }
+
+    // -----------------------------------------------------------------
+    // Numbered ring, blackhole, "0, and the read-only registers, driven
+    // through the whole editor rather than the Registers struct alone.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn blackhole_delete_does_not_clobber_the_unnamed_register() {
+        // Yank "foo", then `"_dd` the next line into the blackhole. A later `p`
+        // must paste the yanked "foo", proving the blackhole discarded rather
+        // than overwrote the unnamed register.
+        assert_eq!(run("foo\nbar\nbaz", "yyj\"_ddp"), "foo\nbaz\nfoo");
+    }
+
+    #[test]
+    fn a_plain_put_after_a_delete_pastes_the_deleted_line() {
+        // Sanity anchor for the blackhole test above: without `"_`, the delete
+        // *does* feed the unnamed register.
+        assert_eq!(run("foo\nbar\nbaz", "yyjddp"), "foo\nbaz\nbar");
+    }
+
+    #[test]
+    fn the_numbered_ring_lets_you_reach_an_older_delete() {
+        // Delete three lines in turn; `"3p` reaches the first one deleted.
+        // After `dddddd`, buffer is "d"; ring is "1=ccc "2=bbb "3=aaa.
+        let mut ed = editor_with("aaa\nbbb\nccc\nddd");
+        feed(&mut ed, "dddddd"); // delete aaa, then bbb, then ccc
+        assert_eq!(ed.read_register(Some('1')).unwrap().text, "ccc\n");
+        assert_eq!(ed.read_register(Some('2')).unwrap().text, "bbb\n");
+        assert_eq!(ed.read_register(Some('3')).unwrap().text, "aaa\n");
+        // And "1p pastes the same as a plain p right after a big delete.
+        feed(&mut ed, "\"2p");
+        assert_eq!(ed.buffer().text(), "ddd\nbbb");
+    }
+
+    #[test]
+    fn register_zero_holds_the_last_yank_across_an_intervening_delete() {
+        // Yank "keep", delete another line, then `"0p` — the yank survives in
+        // "0 even though the unnamed register followed the delete.
+        assert_eq!(run("keep\ntrash\nend", "yyj dd \"0p"), "keep\nend\nkeep");
+    }
+
+    #[test]
+    fn a_small_delete_leaves_the_numbered_ring_alone() {
+        let mut ed = editor_with("hello\nworld");
+        feed(&mut ed, "dd"); // big delete -> "1
+        feed(&mut ed, "x"); // small delete -> "-, must not touch "1
+        assert_eq!(ed.read_register(Some('1')).unwrap().text, "hello\n");
+        assert_eq!(ed.read_register(Some('-')).unwrap().text, "w");
+    }
+
+    #[test]
+    fn last_search_pattern_is_readable_as_the_slash_register() {
+        let mut ed = editor_with("alpha beta gamma");
+        feed(&mut ed, "/beta<CR>");
+        assert_eq!(ed.read_register(Some('/')).unwrap().text, "beta");
+    }
+
+    #[test]
+    fn last_ex_command_is_readable_as_the_colon_register() {
+        let mut ed = editor_with("x");
+        let _ = ed.execute_ex("set number");
+        assert_eq!(ed.read_register(Some(':')).unwrap().text, "set number");
+    }
+
+    #[test]
+    fn last_inserted_text_is_readable_as_the_dot_register() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "ihello");
+        feed(&mut ed, "<Esc>");
+        assert_eq!(ed.read_register(Some('.')).unwrap().text, "hello");
+    }
+
+    #[test]
+    fn backspace_within_an_insert_is_reflected_in_the_dot_register() {
+        let mut ed = editor_with("");
+        // Type "helxo", backspace over "xo"... actually type helloX then rub out X.
+        feed(&mut ed, "ihelloX");
+        feed(&mut ed, "<Backspace>");
+        feed(&mut ed, "<Esc>");
+        assert_eq!(ed.read_register(Some('.')).unwrap().text, "hello");
+    }
+
+    #[test]
+    fn a_nameless_buffer_has_an_empty_percent_register() {
+        // `editor_with` never assigns a path, so `"%` resolves to nothing and
+        // a paste from it is a documented no-op rather than a panic.
+        let mut ed = editor_with("body");
+        assert!(ed.read_register(Some('%')).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // System-clipboard registers, driven with a recording mock so no real
+    // clipboard, terminal escape or subprocess is touched.
+    // -----------------------------------------------------------------
+
+    /// A clipboard double that records every copy and hands back a canned
+    /// paste. Shares its state through `Rc<RefCell<..>>` so a test can inspect
+    /// it after it has been moved into the editor.
+    #[derive(Clone, Default)]
+    struct MockClipboard {
+        copies: std::rc::Rc<std::cell::RefCell<Vec<(clipboard::Selection, String)>>>,
+        paste_value: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    }
+
+    impl clipboard::ClipboardProvider for MockClipboard {
+        fn copy(&mut self, selection: clipboard::Selection, text: &str) -> bool {
+            self.copies.borrow_mut().push((selection, text.to_string()));
+            true
+        }
+        fn paste(&mut self, _selection: clipboard::Selection) -> Option<String> {
+            self.paste_value.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn explicit_plus_yank_copies_to_the_clipboard() {
+        let mut ed = editor_with("copy me\n");
+        let mock = MockClipboard::default();
+        ed.set_clipboard(Box::new(mock.clone()));
+        feed(&mut ed, "\"+yy");
+        assert_eq!(&*mock.copies.borrow(), &[(clipboard::Selection::Clipboard, "copy me\n".to_string())]);
+        // The unnamed register still mirrors the yank (vim: "+y also fills it).
+        assert_eq!(ed.read_register(None).unwrap().text, "copy me\n");
+    }
+
+    #[test]
+    fn explicit_plus_put_pastes_from_the_clipboard() {
+        let mut ed = editor_with("line\n");
+        let mock = MockClipboard::default();
+        *mock.paste_value.borrow_mut() = Some("PASTED".to_string());
+        ed.set_clipboard(Box::new(mock));
+        feed(&mut ed, "\"+p");
+        assert_eq!(ed.buffer().text(), "lPASTEDine\n");
+    }
+
+    #[test]
+    fn plus_put_with_no_clipboard_tool_is_a_no_op_not_a_crash() {
+        let mut ed = editor_with("body");
+        // Default MockClipboard.paste returns None (no tool available).
+        ed.set_clipboard(Box::new(MockClipboard::default()));
+        feed(&mut ed, "\"+p");
+        assert_eq!(ed.buffer().text(), "body");
+    }
+
+    #[test]
+    fn unnamedplus_makes_plain_yank_and_put_use_the_clipboard() {
+        let mut cfg = crate::config::Config::default();
+        cfg.options.clipboard = "unnamedplus".to_string();
+        let mut ed = Editor::with_config(cfg);
+        let id = ed.current;
+        ed.buffers.insert(id, Buffer::from_str("grab\n"));
+        ed.cursor = Position::ORIGIN;
+        let mock = MockClipboard::default();
+        ed.set_clipboard(Box::new(mock.clone()));
+        // Plain yank goes to the clipboard because clipboard=unnamedplus.
+        feed(&mut ed, "yy");
+        assert_eq!(&*mock.copies.borrow(), &[(clipboard::Selection::Clipboard, "grab\n".to_string())]);
+        // Plain put reads the clipboard back.
+        *mock.paste_value.borrow_mut() = Some("FROMSYS".to_string());
+        feed(&mut ed, "p");
+        assert_eq!(ed.buffer().text(), "gFROMSYSrab\n");
     }
 
     // -----------------------------------------------------------------

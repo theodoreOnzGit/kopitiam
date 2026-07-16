@@ -53,6 +53,44 @@ pub struct Options {
     pub syntax: bool,
     /// Expand tabs to spaces on insert.
     pub expandtab: bool,
+    /// `vim.opt.clipboard`. Neovim treat this as a comma list; the two value
+    /// kopitiam care about are `unnamed` (sync plain yank/delete/put with the
+    /// selection register `"*`) and `unnamedplus` (sync with the system
+    /// clipboard `"+`). Empty string — vim's default — mean plain `y`/`d`/`p`
+    /// stay on the internal registers, and `"+y`/`"+p` are the explicit way to
+    /// reach the OS clipboard. Very common neovim configs set `"unnamedplus"`
+    /// so that `y` and `p` just talk to the desktop clipboard; kopitiam mirror
+    /// that when it is set. See [`Options::clipboard_sync_register`].
+    pub clipboard: String,
+}
+
+impl Options {
+    /// The register that plain (register-less) `y`/`d`/`c`/`x`/`p` should
+    /// *also* route through because of the `clipboard` option, or `None` when
+    /// `clipboard` is empty and the internal unnamed register stand alone.
+    ///
+    /// Neovim's rule: `unnamedplus` win and map to `"+` (the system
+    /// clipboard); a plain `unnamed` (without plus) map to `"*` (the primary
+    /// selection). When both are listed, `unnamedplus` still decide where a
+    /// *yank* lands, so `"+` is returned. Kopitiam follow the same precedence.
+    pub fn clipboard_sync_register(&self) -> Option<char> {
+        let mut plus = false;
+        let mut star = false;
+        for item in self.clipboard.split(',') {
+            match item.trim() {
+                "unnamedplus" => plus = true,
+                "unnamed" => star = true,
+                _ => {}
+            }
+        }
+        if plus {
+            Some('+')
+        } else if star {
+            Some('*')
+        } else {
+            None
+        }
+    }
 }
 
 /// `vim.opt.background`.
@@ -102,6 +140,11 @@ impl Default for Options {
             // change every file they edit, so it is called out rather than
             // quietly "improved" to spaces.
             expandtab: false,
+            // Their config never sets clipboard, so vim's default (empty)
+            // stand: plain `y`/`p` stay internal, `"+y`/`"+p` reach the OS
+            // clipboard explicitly. Flip this to "unnamedplus" and every plain
+            // yank/put talk to the desktop clipboard instead.
+            clipboard: String::new(),
         }
     }
 }
