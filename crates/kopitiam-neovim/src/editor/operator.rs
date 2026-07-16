@@ -245,7 +245,7 @@ pub(crate) fn first_non_blank_col(buf: &Buffer, line: usize) -> usize {
 /// Shifts a single `line` by one shiftwidth, in the given direction
 /// (`>>`/`<<`/`>{motion}`/`<{motion}` all bottom out here, one call per line
 /// in the range).
-fn indent_line(buf: &mut Buffer, line: usize, shiftwidth: usize, expandtab: bool, indent: bool) -> crate::Result<()> {
+pub(crate) fn indent_line(buf: &mut Buffer, line: usize, shiftwidth: usize, expandtab: bool, indent: bool) -> crate::Result<()> {
     let Some(text) = buf.line(line) else { return Ok(()) };
     if indent {
         let fill = if expandtab { " ".repeat(shiftwidth) } else { "\t".to_string() };

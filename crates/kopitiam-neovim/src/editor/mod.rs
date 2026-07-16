@@ -31,6 +31,7 @@
 pub mod clipboard;
 pub mod cmdline;
 pub mod command;
+pub mod digraph;
 pub mod ex;
 pub mod help;
 pub mod key;
@@ -159,6 +160,26 @@ pub enum CommandKind {
 /// a half-page scroll move zero lines — a silent no-op that looks like a bug in
 /// the keymap rather than a missing viewport.
 pub const DEFAULT_VIEWPORT_LINES: usize = 24;
+
+/// In-flight state of an insert-mode `<C-v>` literal / by-code insert
+/// (vim's `i_CTRL-V`). `<C-v>` alone arms [`LiteralInsert::Start`]; the key
+/// after it either inserts literally or, if it is a base marker (`u`/`U`/`x`/
+/// `o`) or a decimal digit, opens a [`LiteralInsert::Number`] that accumulates
+/// digits until it is full or a non-digit terminates it. See
+/// [`Editor::handle_literal_insert`].
+enum LiteralInsert {
+    /// `<C-v>` just pressed — waiting for the character that decides literal
+    /// versus numeric.
+    Start,
+    /// Accumulating a character code. `base` is 10 (decimal), 8 (`o`), or 16
+    /// (`x`/`u`/`U`); `max` is how many digits vim allows for that form (3 for
+    /// decimal and octal, 2 for `x`, 4 for `u`, 8 for `U`); `digits` is what
+    /// has been typed so far. The code auto-inserts once `digits` reaches
+    /// `max`, or the moment a character that is not a valid digit for `base`
+    /// arrives — that terminator is then processed as an ordinary insert key,
+    /// exactly like vim.
+    Number { base: u32, max: usize, digits: String },
+}
 
 /// The modal editing engine. One `Editor` owns every open buffer, the
 /// current mode, registers, macros, and the operator-pending grammar state
@@ -296,6 +317,16 @@ pub struct Editor {
     /// Insert-mode `<C-o>` runs exactly one Normal-mode command and then
     /// returns to Insert; this is set while that one command is in flight.
     insert_one_shot: bool,
+    /// Insert-mode `<C-v>` (`i_CTRL-V`) is a literal / by-code insert whose
+    /// remaining keys arrive one at a time; this holds the state machine while
+    /// it is in flight. `None` when no `<C-v>` is pending. See
+    /// [`LiteralInsert`] and [`Self::handle_literal_insert`].
+    insert_literal: Option<LiteralInsert>,
+    /// Insert-mode `<C-k>` (`i_CTRL-K`) is a two-character digraph. The outer
+    /// `Option` is "a `<C-k>` is pending"; the inner is the first digraph
+    /// character once it has been typed (`None` while still waiting for it).
+    /// See [`Self::handle_insert_digraph`] and [`digraph`].
+    insert_digraph: Option<Option<char>>,
 
     /// Text lines currently visible in the window, kept up to date by the UI
     /// via `set_viewport_height`. Only Ctrl+D/U/F/B need it — see that method.
@@ -384,6 +415,8 @@ impl Editor {
             last_insert_pos: None,
             insert_register_pending: false,
             insert_one_shot: false,
+            insert_literal: None,
+            insert_digraph: None,
             viewport_height: DEFAULT_VIEWPORT_LINES,
             keymaps,
             keymap_descs,
@@ -2296,6 +2329,18 @@ impl Editor {
     // ---------------------------------------------------------------
 
     fn handle_insert_key(&mut self, key: Key) -> crate::Result<EditorResponse> {
+        // A `<C-v>` literal / by-code insert in flight consumes this key. Taken
+        // out first so the key is interpreted as part of the sequence and not
+        // as a fresh insert command (a digit typed into `<C-v>065` is a code
+        // digit, not a `0`).
+        if let Some(state) = self.insert_literal.take() {
+            return self.handle_literal_insert(state, key);
+        }
+        // A `<C-k>` digraph in flight: this key is one of its two characters.
+        if let Some(first) = self.insert_digraph.take() {
+            return self.handle_insert_digraph(first, key);
+        }
+
         // `<C-r>{reg}`: the register name arrives as the key *after* `<C-r>`.
         if self.insert_register_pending {
             self.insert_register_pending = false;
@@ -2329,6 +2374,35 @@ impl Editor {
                     // return to Insert (see the wrapper in `handle_key`).
                     self.insert_one_shot = true;
                     self.mode = Mode::Normal;
+                    return Ok(EditorResponse::Continue);
+                }
+                // `<C-t>`/`<C-d>` (`i_CTRL-T`/`i_CTRL-D`): indent / dedent the
+                // current line by one shiftwidth, cursor staying on the same
+                // text. These are the *insert-mode* meanings — the normal-mode
+                // `<C-d>`/`<C-u>` half-page scrolls never reach here (they are
+                // Normal-mode keys), so there is no conflict.
+                KeyCode::Char('t') => return self.insert_shift_line(true),
+                KeyCode::Char('d') => return self.insert_shift_line(false),
+                // `<C-a>` (`i_CTRL-A`): re-insert the text of the previous
+                // insert session (the `".` register).
+                KeyCode::Char('a') => return self.insert_previous_inserted(),
+                // `<C-e>`/`<C-y>` (`i_CTRL-E`/`i_CTRL-Y`): copy the character
+                // directly below / above the cursor. The UI's completion layer
+                // claims these two only while its popup is open (accept /
+                // cancel); with no popup they fall through to here, which is
+                // exactly vim's split of meaning. Again distinct from the
+                // Normal-mode `<C-e>`/`<C-y>` scrolls.
+                KeyCode::Char('e') => return self.insert_char_from_adjacent_line(1),
+                KeyCode::Char('y') => return self.insert_char_from_adjacent_line(-1),
+                // `<C-v>` (`i_CTRL-V`): the next key(s) are a literal or a
+                // character code — arm the state machine and wait.
+                KeyCode::Char('v') => {
+                    self.insert_literal = Some(LiteralInsert::Start);
+                    return Ok(EditorResponse::Continue);
+                }
+                // `<C-k>` (`i_CTRL-K`): a two-character digraph follows.
+                KeyCode::Char('k') => {
+                    self.insert_digraph = Some(None);
                     return Ok(EditorResponse::Continue);
                 }
                 _ => {}
@@ -2454,6 +2528,221 @@ impl Editor {
             self.unnote_inserted(removed);
         }
         Ok(EditorResponse::Continue)
+    }
+
+    /// Insert `text` at the cursor and advance past it, recording it in the
+    /// `".` accumulator like ordinary typing. The single funnel every
+    /// programmatic insert-mode insertion (`<C-a>`, `<C-e>`/`<C-y>`, `<C-v>`,
+    /// `<C-k>`) routes through, so `".` and the cursor stay consistent without
+    /// each call re-deriving the bookkeeping.
+    fn insert_text_at_cursor(&mut self, text: &str) -> crate::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let cur = self.cursor;
+        let landed = self.current_buffer_mut().apply(Edit::insert(cur, text.to_string()))?;
+        self.cursor = landed;
+        self.note_inserted(text);
+        Ok(())
+    }
+
+    /// `<C-t>` (indent) / `<C-d>` (dedent) in Insert mode: shift the current
+    /// line by one shiftwidth without moving off the text under the cursor.
+    ///
+    /// The shift itself reuses [`operator::indent_line`] — the same primitive
+    /// `>>`/`<<` bottom out in — so insert-mode and normal-mode indenting can
+    /// never drift apart. The cursor's column is then nudged by the change in
+    /// the line's leading-whitespace length (measured in grapheme clusters,
+    /// kvim's column unit) so it rides along with its character rather than
+    /// staying at a fixed column, matching vim. Unlike typed text, the added or
+    /// removed indent is *not* fed to `".`: `<C-t>`/`<C-d>` re-format the line,
+    /// they are not part of "the text you inserted".
+    fn insert_shift_line(&mut self, indent: bool) -> crate::Result<EditorResponse> {
+        let line = self.cursor.line;
+        let sw = self.options.shiftwidth.resolve(self.options.tabstop);
+        let expandtab = self.options.expandtab;
+        let before = self.current_buffer().line_len(line);
+        operator::indent_line(self.current_buffer_mut(), line, sw, expandtab, indent)?;
+        let after = self.current_buffer().line_len(line);
+        let delta = after as isize - before as isize;
+        let col = (self.cursor.col as isize + delta).max(0) as usize;
+        self.cursor = self.current_buffer().clamp(Position::new(line, col.min(after)));
+        Ok(EditorResponse::Continue)
+    }
+
+    /// `<C-a>` (`i_CTRL-A`): insert the text of the previous insert session —
+    /// the read-only `".` register — at the cursor. A no-op when nothing has
+    /// been inserted yet this session. The re-inserted run becomes part of the
+    /// *current* insert too (it flows through [`Self::insert_text_at_cursor`]),
+    /// so it will itself be what `".` holds after this insert is left, exactly
+    /// as in vim.
+    fn insert_previous_inserted(&mut self) -> crate::Result<EditorResponse> {
+        if let Some(content) = self.read_register(Some('.')) {
+            self.insert_text_at_cursor(&content.text)?;
+        }
+        Ok(EditorResponse::Continue)
+    }
+
+    /// `<C-e>` (`dir == 1`, char below) / `<C-y>` (`dir == -1`, char above) in
+    /// Insert mode: copy the single character sitting at the cursor's column on
+    /// the adjacent line and insert it here. A no-op when there is no such line
+    /// (top/bottom of buffer) or that line is too short to have a character at
+    /// this column — vim beeps and inserts nothing, so do we.
+    ///
+    /// "Same column" is measured in grapheme clusters, kvim's column unit,
+    /// rather than in display cells; the two differ only on lines mixing tabs
+    /// or wide characters with the cursor past them, an edge vim itself handles
+    /// by display column. Documented simplification, not an oversight.
+    fn insert_char_from_adjacent_line(&mut self, dir: isize) -> crate::Result<EditorResponse> {
+        let target = self.cursor.line as isize + dir;
+        if target < 0 {
+            return Ok(EditorResponse::Continue);
+        }
+        let target = target as usize;
+        let col = self.cursor.col;
+        let grapheme = self
+            .current_buffer()
+            .line(target)
+            .and_then(|text| UnicodeSegmentation::graphemes(text.as_str(), true).nth(col).map(str::to_string));
+        if let Some(g) = grapheme {
+            self.insert_text_at_cursor(&g)?;
+        }
+        Ok(EditorResponse::Continue)
+    }
+
+    /// Drives one keystroke of an in-flight `<C-v>` literal / by-code insert
+    /// (`i_CTRL-V`). Supported forms:
+    ///
+    /// * `<C-v>{char}` — insert the next character literally (e.g. `<C-v><Tab>`
+    ///   inserts a real tab, `<C-v>|` a literal `|`).
+    /// * `<C-v>{ddd}` — up to three decimal digits: a character by code point
+    ///   (`<C-v>065` → `A`).
+    /// * `<C-v>o{ooo}` — up to three octal digits.
+    /// * `<C-v>x{hh}` — up to two hex digits (a byte).
+    /// * `<C-v>u{hhhh}` — up to four hex digits (a BMP code point, `<C-v>u00e4`
+    ///   → `ä`).
+    /// * `<C-v>U{hhhhhhhh}` — up to eight hex digits (any code point).
+    ///
+    /// A numeric form completes and inserts as soon as it has its maximum digit
+    /// count, or the moment a character that is not a valid digit for the base
+    /// arrives — in which case that terminator is fed back through
+    /// [`Self::handle_insert_key`] as an ordinary keystroke, so no input is
+    /// swallowed (`<C-v>u41x` inserts `A` then `x`). This mirrors vim.
+    fn handle_literal_insert(&mut self, state: LiteralInsert, key: Key) -> crate::Result<EditorResponse> {
+        match state {
+            LiteralInsert::Start => {
+                // Non-character keys insert their literal control byte. Only the
+                // ones with a sensible textual form are handled; the rest are a
+                // no-op rather than smuggling stray control codes into a buffer.
+                match key.code {
+                    KeyCode::Tab => {
+                        self.insert_text_at_cursor("\t")?;
+                        return Ok(EditorResponse::Continue);
+                    }
+                    KeyCode::Enter => {
+                        // vim's `<C-v><CR>` inserts a carriage return (`^M`),
+                        // not a newline — the literal byte, as asked.
+                        self.insert_text_at_cursor("\r")?;
+                        return Ok(EditorResponse::Continue);
+                    }
+                    KeyCode::Esc => {
+                        self.insert_text_at_cursor("\u{1b}")?;
+                        return Ok(EditorResponse::Continue);
+                    }
+                    _ => {}
+                }
+                let Some(c) = key.as_char() else {
+                    // Some other special key (an arrow, say): nothing to insert.
+                    return Ok(EditorResponse::Continue);
+                };
+                // A leading base marker opens a numeric code; a leading decimal
+                // digit *is* the first digit of a decimal code; anything else is
+                // taken literally.
+                let numeric = match c {
+                    'u' => Some((16u32, 4usize, String::new())),
+                    'U' => Some((16, 8, String::new())),
+                    'x' | 'X' => Some((16, 2, String::new())),
+                    'o' | 'O' => Some((8, 3, String::new())),
+                    d if d.is_ascii_digit() => Some((10, 3, d.to_string())),
+                    _ => None,
+                };
+                match numeric {
+                    Some((base, max, digits)) => {
+                        // A single-digit decimal that is already "full" (max 3)
+                        // never is, so this always parks and waits for more.
+                        self.insert_literal = Some(LiteralInsert::Number { base, max, digits });
+                        Ok(EditorResponse::Continue)
+                    }
+                    None => {
+                        self.insert_text_at_cursor(c.encode_utf8(&mut [0u8; 4]))?;
+                        Ok(EditorResponse::Continue)
+                    }
+                }
+            }
+            LiteralInsert::Number { base, max, mut digits } => {
+                if let Some(c) = key.as_char()
+                    && c.is_digit(base)
+                {
+                    digits.push(c);
+                    if digits.len() >= max {
+                        self.finish_literal_number(base, &digits)?;
+                    } else {
+                        self.insert_literal = Some(LiteralInsert::Number { base, max, digits });
+                    }
+                    return Ok(EditorResponse::Continue);
+                }
+                // A non-digit terminates the code: insert what we have, then let
+                // the terminating key take its ordinary insert-mode meaning.
+                self.finish_literal_number(base, &digits)?;
+                self.handle_insert_key(key)
+            }
+        }
+    }
+
+    /// Parses the accumulated `<C-v>` code `digits` in `base` into a Unicode
+    /// scalar and inserts it. Empty `digits` (a bare `<C-v>u` with no hex after
+    /// it, terminated early) inserts nothing; a value that is not a valid
+    /// Unicode scalar (e.g. a surrogate from `<C-v>ud800`) is dropped rather
+    /// than erroring — there is no character to insert.
+    fn finish_literal_number(&mut self, base: u32, digits: &str) -> crate::Result<()> {
+        if digits.is_empty() {
+            return Ok(());
+        }
+        if let Ok(code) = u32::from_str_radix(digits, base)
+            && let Some(ch) = char::from_u32(code)
+        {
+            self.insert_text_at_cursor(ch.encode_utf8(&mut [0u8; 4]))?;
+        }
+        Ok(())
+    }
+
+    /// Drives one keystroke of an in-flight `<C-k>` digraph (`i_CTRL-K`).
+    ///
+    /// `first` is `None` while waiting for the first of the two digraph
+    /// characters and `Some(c)` once it has been typed. On the second character
+    /// the pair is looked up in [`digraph`]; a hit is inserted, a miss inserts
+    /// nothing (vim beeps). `<Esc>` at either point aborts the digraph without
+    /// inserting, matching vim.
+    fn handle_insert_digraph(&mut self, first: Option<char>, key: Key) -> crate::Result<EditorResponse> {
+        if key.code == KeyCode::Esc {
+            return Ok(EditorResponse::Continue);
+        }
+        let Some(c) = key.as_char() else {
+            // A non-character key aborts the digraph rather than being consumed.
+            return Ok(EditorResponse::Continue);
+        };
+        match first {
+            None => {
+                self.insert_digraph = Some(Some(c));
+                Ok(EditorResponse::Continue)
+            }
+            Some(first_char) => {
+                if let Some(result) = digraph::lookup(first_char, c) {
+                    self.insert_text_at_cursor(result.encode_utf8(&mut [0u8; 4]))?;
+                }
+                Ok(EditorResponse::Continue)
+            }
+        }
     }
 
     /// `R`: overwrite mode. A simplified model of vim's Replace mode —
@@ -3743,6 +4032,128 @@ mod tests {
         feed(&mut ed, "<Backspace>");
         feed(&mut ed, "<Esc>");
         assert_eq!(ed.read_register(Some('.')).unwrap().text, "hello");
+    }
+
+    // -----------------------------------------------------------------
+    // Insert-mode editing keys: <C-t>/<C-d> indent, <C-a> re-insert,
+    // <C-e>/<C-y> copy adjacent char, <C-v> literal/by-code, <C-k> digraph.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn insert_ctrl_t_indents_the_current_line_by_one_shiftwidth() {
+        let mut ed = editor_with("foo");
+        ed.options.expandtab = true; // spaces, so the assertion is exact
+        feed(&mut ed, "i<C-t>");
+        assert_eq!(ed.buffer().text(), "    foo");
+        // Cursor rode along with the text: still sitting on `f`, now at col 4.
+        assert_eq!(ed.cursor, Position::new(0, 4));
+    }
+
+    #[test]
+    fn insert_ctrl_d_dedents_the_current_line_by_one_shiftwidth() {
+        let mut ed = editor_with("        foo"); // two shiftwidths of spaces
+        ed.options.expandtab = true;
+        feed(&mut ed, "i<C-d>");
+        assert_eq!(ed.buffer().text(), "    foo");
+    }
+
+    #[test]
+    fn insert_ctrl_t_uses_a_tab_when_expandtab_is_off() {
+        // Default options: expandtab off, so `<C-t>` inserts a literal tab.
+        let mut ed = editor_with("foo");
+        feed(&mut ed, "i<C-t>");
+        assert_eq!(ed.buffer().text(), "\tfoo");
+    }
+
+    #[test]
+    fn insert_ctrl_a_reinserts_the_previous_insert() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "ihello<Esc>");
+        // A fresh insert whose body is `<C-a>` replays "hello".
+        feed(&mut ed, "o<C-a><Esc>");
+        assert_eq!(ed.buffer().text(), "hello\nhello");
+        // The replayed run is what `".` now holds, like vim.
+        assert_eq!(ed.read_register(Some('.')).unwrap().text, "hello");
+    }
+
+    #[test]
+    fn insert_ctrl_e_copies_the_character_below_the_cursor() {
+        let mut ed = editor_with("abc\nxyz");
+        feed(&mut ed, "i<C-e>"); // cursor at (0,0); char below is 'x'
+        assert_eq!(ed.buffer().text(), "xabc\nxyz");
+    }
+
+    #[test]
+    fn insert_ctrl_y_copies_the_character_above_the_cursor() {
+        let mut ed = editor_with("abc\nxyz");
+        feed(&mut ed, "ji<C-y>"); // move to line below, cursor (1,0); char above is 'a'
+        assert_eq!(ed.buffer().text(), "abc\naxyz");
+    }
+
+    #[test]
+    fn insert_ctrl_e_is_a_noop_at_the_bottom_of_the_buffer() {
+        let mut ed = editor_with("only");
+        feed(&mut ed, "i<C-e>"); // no line below
+        assert_eq!(ed.buffer().text(), "only");
+    }
+
+    #[test]
+    fn insert_ctrl_v_u_hex_inserts_a_unicode_codepoint() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-v>u00e4<Esc>");
+        assert_eq!(ed.buffer().text(), "ä");
+    }
+
+    #[test]
+    fn insert_ctrl_v_decimal_inserts_by_code() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-v>065<Esc>"); // 65 == 'A'
+        assert_eq!(ed.buffer().text(), "A");
+    }
+
+    #[test]
+    fn insert_ctrl_v_tab_inserts_a_literal_tab_even_with_expandtab() {
+        let mut ed = editor_with("");
+        ed.options.expandtab = true; // a *typed* Tab would expand; `<C-v><Tab>` must not
+        feed(&mut ed, "i<C-v><Tab><Esc>");
+        assert_eq!(ed.buffer().text(), "\t");
+    }
+
+    #[test]
+    fn insert_ctrl_v_literal_next_char_inserts_it_verbatim() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-v>|<Esc>");
+        assert_eq!(ed.buffer().text(), "|");
+    }
+
+    #[test]
+    fn insert_ctrl_v_number_terminated_early_still_inserts_then_reprocesses() {
+        // `<C-v>u41` then `z`: the `z` is not hex, so it finalizes the two-digit
+        // code (0x41 == 'A') and is then typed as an ordinary character.
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-v>u41z<Esc>");
+        assert_eq!(ed.buffer().text(), "Az");
+    }
+
+    #[test]
+    fn insert_ctrl_k_digraph_inserts_a_special_character() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-k>a:<Esc>"); // a: -> ä
+        assert_eq!(ed.buffer().text(), "ä");
+    }
+
+    #[test]
+    fn insert_ctrl_k_arrow_digraph_inserts_an_arrow() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-k>-><Esc>"); // -> arrow
+        assert_eq!(ed.buffer().text(), "→");
+    }
+
+    #[test]
+    fn insert_ctrl_k_unknown_digraph_inserts_nothing() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "i<C-k>zq<Esc>");
+        assert_eq!(ed.buffer().text(), "");
     }
 
     #[test]
