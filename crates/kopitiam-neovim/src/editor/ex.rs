@@ -147,6 +147,11 @@ pub enum ExCommand {
     /// silently doing the wrong thing. See bead kopitiam-cj0.47.
     TimeTravel { count: Option<usize>, redo: bool },
     Delete { range: LineRange },
+    /// `:{range}fold` — create a closed manual fold over the range's lines.
+    /// The fold state lives on the editor (see [`crate::editor::fold`]), so
+    /// like [`ExCommand::Delete`] the executor resolves the range against the
+    /// buffer and creates the fold.
+    Fold { range: LineRange },
     NoHighlight,
     Set { key: String, value: Option<String> },
     GotoLine(LineSpec),
@@ -394,6 +399,7 @@ pub fn parse(input: &str) -> ExCommand {
         Some(CommandId::Earlier) => ExCommand::TimeTravel { count: parse_count_arg(arg), redo: false },
         Some(CommandId::Later) => ExCommand::TimeTravel { count: parse_count_arg(arg), redo: true },
         Some(CommandId::Delete) => ExCommand::Delete { range },
+        Some(CommandId::Fold) => ExCommand::Fold { range },
         Some(CommandId::NoHighlight) => ExCommand::NoHighlight,
         Some(CommandId::Set) => parse_set(arg),
         Some(CommandId::Split) => ExCommand::Split { vertical: false, file: opt_arg(arg), scratch: false },
@@ -899,6 +905,8 @@ mod tests {
     #[test]
     fn parses_delete_range_and_bare_line_number() {
         assert_eq!(parse("2,4d"), ExCommand::Delete { range: LineRange::Pair(LineSpec::Number(2), LineSpec::Number(4)) });
+        assert_eq!(parse("2,4fold"), ExCommand::Fold { range: LineRange::Pair(LineSpec::Number(2), LineSpec::Number(4)) });
+        assert_eq!(parse("1,3fo"), ExCommand::Fold { range: LineRange::Pair(LineSpec::Number(1), LineSpec::Number(3)) });
         assert_eq!(parse("42"), ExCommand::GotoLine(LineSpec::Number(42)));
     }
 

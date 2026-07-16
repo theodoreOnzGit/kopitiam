@@ -94,6 +94,8 @@ pub enum CommandId {
     Later,
     /// `:d`/`:delete`.
     Delete,
+    /// `:fold`/`:fo` — create a manual fold over the range.
+    Fold,
     /// `:noh`/`:nohlsearch`.
     NoHighlight,
     /// `:set`.
@@ -211,6 +213,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::Earlier, names: &["ea", "earlier"], arg: ArgKind::None, help: "go back N undo states" },
     CommandSpec { id: CommandId::Later, names: &["lat", "later"], arg: ArgKind::None, help: "go forward N redo states" },
     CommandSpec { id: CommandId::Delete, names: &["d", "delete"], arg: ArgKind::None, help: "delete lines in range" },
+    CommandSpec { id: CommandId::Fold, names: &["fo", "fold"], arg: ArgKind::None, help: "create a manual fold over the range" },
     CommandSpec { id: CommandId::NoHighlight, names: &["noh", "nohlsearch"], arg: ArgKind::None, help: "clear search highlight" },
     CommandSpec { id: CommandId::Set, names: &["set"], arg: ArgKind::None, help: "set an option" },
     CommandSpec { id: CommandId::Split, names: &["sp", "split"], arg: ArgKind::File, help: "split window horizontally" },

@@ -204,6 +204,11 @@ pub struct Editor {
     // `Pending` (its grammar genuinely differs: operators act immediately
     // on the selection rather than waiting for a motion).
     visual_g_pending: bool,
+    /// `true` after a `z` in visual mode, waiting for the fold key (`zf` folds
+    /// the selection). A one-key lookahead like [`Self::visual_g_pending`];
+    /// visual mode's grammar is deliberately not `Pending` (see
+    /// `handle_visual_key`'s docs).
+    visual_z_pending: bool,
     visual_find_pending: Option<FindKind>,
     visual_object_pending: Option<ObjectScope>,
 
@@ -401,6 +406,7 @@ impl Editor {
             visual_anchor: Position::ORIGIN,
             visual_kind: VisualKind::Charwise,
             visual_g_pending: false,
+            visual_z_pending: false,
             visual_find_pending: None,
             visual_object_pending: None,
             pending: Pending::new(),
@@ -3405,6 +3411,15 @@ impl Editor {
                 self.cursor = self.current_buffer().clamp(pos);
                 Ok(EditorResponse::Continue)
             }
+            ex::ExCommand::Fold { range } => {
+                // `:{range}fold` — create a closed manual fold over the range.
+                let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
+                let bid = self.current;
+                if let Some(line) = self.folds.entry(bid).or_default().create(first, last) {
+                    self.cursor = self.current_buffer().clamp(Position::new(line, 0));
+                }
+                Ok(EditorResponse::Continue)
+            }
             ex::ExCommand::NoHighlight => {
                 // `:noh`/`:nohlsearch`: dismiss the *current* highlight but don't
                 // forget the pattern, so `n`/`/`/`*` can bring it back. The
@@ -3742,6 +3757,24 @@ impl Editor {
             return Ok(EditorResponse::Continue);
         }
 
+        if self.visual_z_pending {
+            self.visual_z_pending = false;
+            // Visual `zf`: fold the selected lines. Any other key after `z` is
+            // ignored (vim's other visual `z` commands are out of scope here).
+            if key.code == KeyCode::Char('f') {
+                let (start, end) = self.selection().unwrap_or((self.cursor, self.cursor));
+                let bid = self.current;
+                if let Some(line) = self.folds.entry(bid).or_default().create(start.line, end.line) {
+                    self.exit_visual();
+                    self.cursor = self.current_buffer().clamp(Position::new(line, 0));
+                    self.snap_cursor_out_of_fold();
+                    return Ok(EditorResponse::Continue);
+                }
+            }
+            self.exit_visual();
+            return Ok(EditorResponse::Continue);
+        }
+
         if self.visual_g_pending {
             self.visual_g_pending = false;
             match key.code {
@@ -3791,6 +3824,10 @@ impl Editor {
             }
             KeyCode::Char('g') => {
                 self.visual_g_pending = true;
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Char('z') => {
+                self.visual_z_pending = true;
                 Ok(EditorResponse::Continue)
             }
             KeyCode::Char('i') => {
@@ -3850,6 +3887,7 @@ impl Editor {
         self.last_visual = Some((self.visual_anchor, self.cursor, self.visual_kind));
         self.mode = Mode::Normal;
         self.visual_g_pending = false;
+        self.visual_z_pending = false;
         self.visual_find_pending = None;
         self.visual_object_pending = None;
     }
@@ -4180,6 +4218,22 @@ mod tests {
         feed(&mut ed, "za");
         assert_eq!(ed.fold_rows().ranges(), &[(1, 2)]);
         assert_eq!(ed.cursor().line, 1);
+    }
+
+    #[test]
+    fn ex_range_fold_creates_a_fold() {
+        let mut ed = editor_with("a\nb\nc\nd\ne");
+        ed.execute_ex("2,4fold").unwrap(); // fold lines 2..=4 (1-based) -> 1..=3
+        assert_eq!(ed.fold_rows().ranges(), &[(1, 3)]);
+    }
+
+    #[test]
+    fn visual_zf_folds_the_selection() {
+        let mut ed = editor_with("a\nb\nc\nd\ne");
+        feed(&mut ed, "Vjjzf"); // V-line select 3 lines (0..=2), then zf
+        assert_eq!(ed.fold_rows().ranges(), &[(0, 2)]);
+        assert_eq!(ed.mode(), Mode::Normal, "zf leaves visual mode");
+        assert_eq!(ed.cursor().line, 0, "cursor lands on the fold header");
     }
 
     // -----------------------------------------------------------------
