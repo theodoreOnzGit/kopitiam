@@ -51,7 +51,7 @@ use crate::lsp::{Location as LspLocation, LspClient};
 use crate::ui::completion_menu::{anchored_rect, menu_rect, Anchor, CompletionMenu as CompletionMenuWidget};
 use crate::ui::lsp_ui::{centered_rect, InfoBox};
 use crate::ui::snippet::SnippetSession;
-use crate::ui::cmdline::{Cmdline, CmdlineState, PromptKind, StatusMessage};
+use crate::ui::cmdline::{Cmdline, CmdlineState, PromptKind, StatusMessage, Wildmenu};
 use crate::ui::event::{map_crossterm_key, BufferView, EditorHost, HostResponse, Key, KeyPress};
 use crate::ui::filetree::FileTreePanel;
 use crate::ui::gutter::LineNumberMode;
@@ -1804,6 +1804,10 @@ impl<H: EditorHost> App<H> {
         self.render_windows(frame, windows_area);
         self.render_statusline(frame, statusline_area);
         self.render_cmdline(frame, cmdline_area);
+        // The `<Tab>` completion wildmenu, when open, sits in the status-line
+        // row (just above the command line) exactly as vim's does, painted over
+        // the statusline for as long as the cycle lasts.
+        self.render_wildmenu(frame, statusline_area);
         if let Some(rect) = overlay_area {
             self.render_overlay(frame, rect);
             // The `WinSeparator` between the sidebar and the editor lives in the
@@ -2184,17 +2188,32 @@ impl<H: EditorHost> App<H> {
             // The prompt kind (`:` vs `/` vs `?`) now comes from the editor via
             // `command_prompt()`: search landed, so this is the line that grew,
             // exactly as the previous comment here predicted it would.
-            Some(input) => CmdlineState {
-                kind: self.host.command_prompt(),
-                cursor: input.graphemes(true).count(),
-                input: input.to_string(),
-                message: StatusMessage::None,
-            },
+            Some(input) => {
+                // The cursor now comes from the editor too: the command line is
+                // a real line editor, so the caret can sit anywhere, not just at
+                // the end. `command_cursor()` defaults to end-of-text for a host
+                // that only appends, so the fallback is still correct.
+                let cursor = self.host.command_cursor().unwrap_or_else(|| input.graphemes(true).count());
+                let (completions, completion_selected) = match self.host.command_completions() {
+                    Some((items, sel)) => (items, sel),
+                    None => (Vec::new(), 0),
+                };
+                CmdlineState {
+                    kind: self.host.command_prompt(),
+                    cursor,
+                    input: input.to_string(),
+                    message: StatusMessage::None,
+                    completions,
+                    completion_selected,
+                }
+            }
             None => CmdlineState {
                 kind: PromptKind::None,
                 input: String::new(),
                 cursor: 0,
                 message: self.message.clone(),
+                completions: Vec::new(),
+                completion_selected: 0,
             },
         }
     }
@@ -2208,6 +2227,17 @@ impl<H: EditorHost> App<H> {
             frame.set_cursor_position((x, area.y));
         }
         frame.render_widget(cmdline, area);
+    }
+
+    /// Paints the `<Tab>` completion wildmenu over `area` (the status-line row)
+    /// while a completion cycle is open, and nothing otherwise.
+    fn render_wildmenu(&self, frame: &mut Frame, area: Rect) {
+        let state = self.cmdline_state();
+        if state.completions.is_empty() {
+            return;
+        }
+        let menu = Wildmenu { items: &state.completions, selected: state.completion_selected, theme: &self.theme };
+        frame.render_widget(menu, area);
     }
 }
 
@@ -2820,6 +2850,49 @@ mod tests {
         app.host.command_line = None;
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(terminal.get_cursor_position().unwrap().y, 0, "and back in the text afterwards");
+    }
+
+    #[test]
+    fn the_command_line_caret_follows_a_mid_line_cursor() {
+        // The line editor can put the caret anywhere now, not just at the end.
+        // Paint `:hello` with the caret two graphemes in, and assert the screen
+        // caret lands on the right column: `:` at col 0, `he` at cols 1-2, caret
+        // after two graphemes -> col 3.
+        let mut app = app_with(vec!["x"]);
+        app.host.mode = Mode::Command;
+        app.host.command_line = Some("hello".to_string());
+        app.host.command_cursor = Some(2);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let pos = terminal.get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (3, 23), "caret sits after ':he'");
+        // And the text itself is on the row.
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..6).map(|x| buffer.cell((x, 23)).unwrap().symbol().to_string()).collect();
+        assert_eq!(row, ":hello");
+    }
+
+    #[test]
+    fn the_tab_completion_wildmenu_paints_above_the_command_line() {
+        // A completion cycle open on `:w` offers a few candidates; the wildmenu
+        // strip paints them in the status-line row (just above the `:` line),
+        // with the selected one highlighted the way vim's WildMenu is.
+        let mut app = app_with(vec!["x"]);
+        let theme = app.theme;
+        app.host.mode = Mode::Command;
+        app.host.command_line = Some("wa".to_string());
+        app.host.command_completions = Some((vec!["w".to_string(), "wa".to_string(), "write".to_string()], 1));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // The wildmenu sits on row 22 (statusline row); the cmdline is row 23.
+        let menu_row: String = (0..12).map(|x| buffer.cell((x, 22)).unwrap().symbol().to_string()).collect();
+        assert!(menu_row.starts_with("w wa write"), "wildmenu row was {menu_row:?}");
+        // The selected candidate "wa" (cols 2-3) is highlighted.
+        let selected_cell = buffer.cell((2, 22)).unwrap();
+        assert_eq!(selected_cell.style().bg, Some(theme.yellow_bright), "selected candidate highlighted");
+        // The unselected "w" (col 0) is not.
+        assert_ne!(buffer.cell((0, 22)).unwrap().style().bg, Some(theme.yellow_bright));
     }
 
     /// The painted-cell proof for `:help`: a real [`crate::editor::Editor`]

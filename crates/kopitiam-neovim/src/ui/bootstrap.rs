@@ -227,6 +227,14 @@ impl EditorHost for crate::editor::Editor {
         crate::editor::Editor::command_line(self)
     }
 
+    fn command_cursor(&self) -> Option<usize> {
+        crate::editor::Editor::command_cursor(self)
+    }
+
+    fn command_completions(&self) -> Option<(Vec<String>, usize)> {
+        crate::editor::Editor::command_completions(self).map(|(items, sel)| (items.to_vec(), sel))
+    }
+
     fn selection(&self) -> Option<(Position, Position)> {
         crate::editor::Editor::selection(self)
     }

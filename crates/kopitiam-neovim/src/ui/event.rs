@@ -284,6 +284,24 @@ pub trait EditorHost {
         None
     }
 
+    /// Where the caret sits within the command line, as a **grapheme** offset,
+    /// or `None` when no prompt is open. Paired with [`Self::command_line`] to
+    /// render the caret at the right column now that it can move (`<Left>`,
+    /// `<C-w>`, history recall). Defaults to "end of the typed text" so a host
+    /// that only appends need not implement it — which is exactly where an
+    /// append-only prompt's caret is.
+    fn command_cursor(&self) -> Option<usize> {
+        use unicode_segmentation::UnicodeSegmentation;
+        self.command_line().map(|line| line.graphemes(true).count())
+    }
+
+    /// The `<Tab>` completion candidates currently being cycled and the index of
+    /// the selected one, for a wildmenu strip, or `None` when nothing is being
+    /// completed. Defaults to `None` — a host with no completion shows no menu.
+    fn command_completions(&self) -> Option<(Vec<String>, usize)> {
+        None
+    }
+
     /// The visual selection as `(start, end)` in document order, or `None` when
     /// not in a visual mode. Pair it with [`EditorHost::mode`] to know *which*
     /// visual mode: the three select genuinely different things, and expanding

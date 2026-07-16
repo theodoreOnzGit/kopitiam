@@ -23,6 +23,7 @@ use regex::Regex;
 use crate::core::{Edit, Position, Range};
 use crate::text::Buffer;
 
+use super::command::{self, CommandId};
 use super::operator;
 
 /// A line reference as written in a command line, resolved to a concrete
@@ -87,6 +88,11 @@ pub enum ExCommand {
     NextBuffer,
     PrevBuffer,
     GotoBuffer(usize),
+    /// `:b {name}` — go to the buffer whose name matches `{name}`. vim lets
+    /// `:b` take a (unique-substring) name as well as a number; kvim resolves
+    /// the name in `Editor::execute_ex`, where the buffer table lives. This is
+    /// what makes `:b`-name completion land on a command that actually runs.
+    GotoBufferName(String),
     /// `:bd`/`:bdelete` (`wipe == false`) and `:bw`/`:bwipeout`
     /// (`wipe == true`): chuck away the current buffer. Without `!` this must
     /// refuse if the buffer got unsaved changes — same guard `:q` uses. With
@@ -161,56 +167,60 @@ pub fn parse(input: &str) -> ExCommand {
     }
     let arg = after.trim();
 
-    match name.as_str() {
-        "w" | "write" => ExCommand::Write {
-            path: if arg.is_empty() { None } else { Some(arg.to_string()) },
-            then_quit: false,
-            force,
-        },
-        "q" | "quit" => ExCommand::Quit { force },
-        // The quit-all / write-all family. Kept as their own commands (not `q`
-        // with a count) because "all windows" is a fundamentally different
-        // action from "this window": `qa` exits the editor unconditionally
-        // across every split, where `q` closes one. vim's abbreviations all map
-        // to the same four intents.
-        "qa" | "qall" | "quita" | "quitall" => ExCommand::QuitAll { force },
-        "wa" | "wall" => ExCommand::WriteAll { then_quit: false, force },
-        "wqa" | "wqall" => ExCommand::WriteAll { then_quit: true, force },
+    // Resolve the name to a command *group* via the shared registry
+    // (`super::command`), then do this command's own argument parsing. The
+    // registry owns the alias list; this match owns the argument grammar. See
+    // `command.rs`'s module docs for why the two were split.
+    //
+    // The quit-all / write-all family stays its own set of groups (not `q` with
+    // a count) because "all windows" is a fundamentally different action from
+    // "this window": `qa` exits the editor unconditionally across every split,
+    // where `q` closes one.
+    match command::lookup(&name).map(|spec| spec.id) {
+        Some(CommandId::Write) => ExCommand::Write { path: opt_arg(arg), then_quit: false, force },
+        Some(CommandId::WriteQuit) => ExCommand::Write { path: opt_arg(arg), then_quit: true, force },
+        // `:x`/`:xit` differ from `:wq` in real vim only by skipping the write
+        // when the buffer is unmodified. `Editor::execute_ex` checks
+        // `is_modified` itself before honoring `then_quit`'s implied write, so
+        // treating `x` as `wq` here is exact, not an approximation.
+        Some(CommandId::Xit) => ExCommand::Write { path: None, then_quit: true, force: true },
+        Some(CommandId::Quit) => ExCommand::Quit { force },
+        Some(CommandId::QuitAll) => ExCommand::QuitAll { force },
+        Some(CommandId::WriteAll) => ExCommand::WriteAll { then_quit: false, force },
+        Some(CommandId::WriteQuitAll) => ExCommand::WriteAll { then_quit: true, force },
         // `:xa`/`:xall` is `:wqa` — write all, then quit all. (vim's `:x` skips
         // the write when a buffer is unmodified; the write-all executor already
         // writes only modified buffers, so `xa` and `wqa` coincide exactly.)
-        "xa" | "xall" => ExCommand::WriteAll { then_quit: true, force: true },
-        "wq" => ExCommand::Write {
-            path: if arg.is_empty() { None } else { Some(arg.to_string()) },
-            then_quit: true,
-            force,
-        },
-        // `:x`/`:xit` differ from `:wq` in real vim only by skipping the
-        // write when the buffer is unmodified. `Editor::execute_ex` checks
-        // `is_modified` itself before honoring `then_quit`'s implied write,
-        // so treating `x` as `wq` here is exact, not an approximation.
-        "x" | "xit" => ExCommand::Write { path: None, then_quit: true, force: true },
-        "e" | "edit" => ExCommand::Edit { path: arg.to_string() },
-        "bn" | "bnext" => ExCommand::NextBuffer,
-        "bp" | "bprev" | "bprevious" => ExCommand::PrevBuffer,
-        "b" | "buffer" => arg.parse::<usize>().map(ExCommand::GotoBuffer).unwrap_or_else(|_| ExCommand::Unknown(input.to_string())),
-        "bd" | "bdel" | "bdelete" => ExCommand::DeleteBuffer { force, wipe: false },
-        "bw" | "bwipe" | "bwipeout" => ExCommand::DeleteBuffer { force, wipe: true },
-        "ls" | "buffers" | "files" => ExCommand::ListBuffers,
-        "s" | "substitute" => parse_substitute(range, after),
-        "g" | "global" => parse_global(after),
-        "d" | "delete" => ExCommand::Delete { range },
-        "noh" | "nohlsearch" => ExCommand::NoHighlight,
-        "set" => parse_set(arg),
-        "sp" | "split" => ExCommand::Split { vertical: false, file: opt_arg(arg), scratch: false },
-        "vs" | "vsp" | "vsplit" => ExCommand::Split { vertical: true, file: opt_arg(arg), scratch: false },
-        "new" => ExCommand::Split { vertical: false, file: None, scratch: true },
-        "vnew" | "vne" => ExCommand::Split { vertical: true, file: None, scratch: true },
-        "on" | "only" => ExCommand::Only,
-        "clo" | "close" => ExCommand::Close,
-        "term" | "terminal" => ExCommand::Terminal,
-        "h" | "help" => ExCommand::Help { topic: opt_arg(arg) },
-        _ => ExCommand::Unknown(input.to_string()),
+        Some(CommandId::XitAll) => ExCommand::WriteAll { then_quit: true, force: true },
+        Some(CommandId::Edit) => ExCommand::Edit { path: arg.to_string() },
+        Some(CommandId::NextBuffer) => ExCommand::NextBuffer,
+        Some(CommandId::PrevBuffer) => ExCommand::PrevBuffer,
+        Some(CommandId::Buffer) => {
+            if arg.is_empty() {
+                ExCommand::Unknown(input.to_string())
+            } else if let Ok(n) = arg.parse::<usize>() {
+                ExCommand::GotoBuffer(n)
+            } else {
+                ExCommand::GotoBufferName(arg.to_string())
+            }
+        }
+        Some(CommandId::DeleteBuffer) => ExCommand::DeleteBuffer { force, wipe: false },
+        Some(CommandId::WipeBuffer) => ExCommand::DeleteBuffer { force, wipe: true },
+        Some(CommandId::ListBuffers) => ExCommand::ListBuffers,
+        Some(CommandId::Substitute) => parse_substitute(range, after),
+        Some(CommandId::Global) => parse_global(after),
+        Some(CommandId::Delete) => ExCommand::Delete { range },
+        Some(CommandId::NoHighlight) => ExCommand::NoHighlight,
+        Some(CommandId::Set) => parse_set(arg),
+        Some(CommandId::Split) => ExCommand::Split { vertical: false, file: opt_arg(arg), scratch: false },
+        Some(CommandId::VSplit) => ExCommand::Split { vertical: true, file: opt_arg(arg), scratch: false },
+        Some(CommandId::New) => ExCommand::Split { vertical: false, file: None, scratch: true },
+        Some(CommandId::VNew) => ExCommand::Split { vertical: true, file: None, scratch: true },
+        Some(CommandId::Only) => ExCommand::Only,
+        Some(CommandId::Close) => ExCommand::Close,
+        Some(CommandId::Terminal) => ExCommand::Terminal,
+        Some(CommandId::Help) => ExCommand::Help { topic: opt_arg(arg) },
+        None => ExCommand::Unknown(input.to_string()),
     }
 }
 

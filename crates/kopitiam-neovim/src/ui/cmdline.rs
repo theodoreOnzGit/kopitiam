@@ -76,6 +76,10 @@ pub struct CmdlineState {
     /// docs on why graphemes, not bytes or chars).
     pub cursor: usize,
     pub message: StatusMessage,
+    /// The `<Tab>` completion candidates being cycled and the selected index,
+    /// for the wildmenu strip. Empty when nothing is being completed.
+    pub completions: Vec<String>,
+    pub completion_selected: usize,
 }
 
 /// The command-line/message-area widget: a single terminal row.
@@ -142,6 +146,57 @@ impl<'a> Widget for Cmdline<'a> {
         buf.set_style(area, Style::default().bg(self.theme.bg));
         let text = self.text();
         buf.set_stringn(area.x, area.y, &text, area.width as usize, style);
+    }
+}
+
+/// The `<Tab>` completion strip, vim's "wildmenu": a single horizontal row of
+/// candidates with the selected one highlighted, drawn just above the command
+/// line while a completion cycle is open. Modelled on vim, where the wildmenu
+/// occupies the status-line row and disappears the moment the cycle ends.
+pub struct Wildmenu<'a> {
+    /// The candidate strings, in cycle order.
+    pub items: &'a [String],
+    /// Which candidate is currently selected (the one the command line shows).
+    pub selected: usize,
+    pub theme: &'a Theme,
+}
+
+impl<'a> Wildmenu<'a> {
+    /// The rendered row as `(text, selected_byte_range)` — split out from
+    /// [`Widget::render`] so a test can assert the exact string and which slice
+    /// is highlighted without a `Buffer`.
+    pub fn line(&self) -> String {
+        self.items.join(" ")
+    }
+}
+
+impl<'a> Widget for Wildmenu<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || self.items.is_empty() {
+            return;
+        }
+        buf.set_style(area, Style::default().bg(self.theme.bg));
+        // Paint each candidate, space-separated, highlighting the selected one
+        // with reversed colours the way vim's `WildMenu` highlight does.
+        let mut col = area.x;
+        let right = area.x + area.width;
+        for (i, item) in self.items.iter().enumerate() {
+            if col >= right {
+                break;
+            }
+            let style = if i == self.selected {
+                Style::default().fg(self.theme.bg).bg(self.theme.yellow_bright)
+            } else {
+                Style::default().fg(self.theme.fg).bg(self.theme.bg)
+            };
+            let remaining = (right - col) as usize;
+            let (end_col, _) = buf.set_stringn(col, area.y, item, remaining, style);
+            col = end_col;
+            if col < right {
+                let (end_col, _) = buf.set_stringn(col, area.y, " ", (right - col) as usize, Style::default().bg(self.theme.bg));
+                col = end_col;
+            }
+        }
     }
 }
 

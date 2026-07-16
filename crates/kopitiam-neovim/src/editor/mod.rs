@@ -28,6 +28,8 @@
 //!   `:d`); effects requiring real I/O come back out through
 //!   [`EditorResponse`] instead of happening inline.
 
+pub mod cmdline;
+pub mod command;
 pub mod ex;
 pub mod help;
 pub mod key;
@@ -51,6 +53,7 @@ pub use pending::{GrammarCommand, InsertPos};
 
 use motion::{FindKind, Motion};
 use operator::Operator;
+use cmdline::{CmdlineBuffer, History};
 use pending::{FeedResult, Pending};
 use register::Registers;
 use text_object::ObjectScope;
@@ -189,10 +192,24 @@ pub struct Editor {
 
     last_find: Option<(FindKind, char)>,
 
-    command_line: String,
+    /// The editable command-line buffer (text + grapheme cursor + in-flight
+    /// history/completion state). Meaningful only while `mode == Mode::Command`;
+    /// entering command mode [`CmdlineBuffer::clear`]s it. See
+    /// [`cmdline::CmdlineBuffer`] for why the prompt needs a real line editor
+    /// and not the bare `String` this used to be.
+    cmdline: CmdlineBuffer,
     /// Which prompt (`:`, `/`, `?`) the command line is serving — see
     /// [`CommandKind`]. Meaningful only while `mode == Mode::Command`.
     command_kind: CommandKind,
+    /// vim keeps the `:` history and the `/`?` history apart; these are the two
+    /// rings `<Up>`/`<Down>` walk, picked by `command_kind`. Session-scoped for
+    /// now — cross-session persistence (vim's `viminfo`) is a filed follow-up.
+    ex_history: History,
+    search_history: History,
+    /// Command-line `<C-r>{reg}` is a two-key sequence (`<C-r>` then a register
+    /// name); this remembers we are between the two, mirroring
+    /// [`Self::insert_register_pending`] for insert mode.
+    command_register_pending: bool,
     /// The last `/`/`?`/`*`/`#` search, as `(pattern, forward)`, so `n`/`N`
     /// can repeat it. `n` reuses `forward`; `N` inverts it.
     last_search: Option<(String, bool)>,
@@ -283,8 +300,11 @@ impl Editor {
             dot: None,
             replaying: 0,
             last_find: None,
-            command_line: String::new(),
+            cmdline: CmdlineBuffer::new(),
             command_kind: CommandKind::Ex,
+            ex_history: History::new(),
+            search_history: History::new(),
+            command_register_pending: false,
             last_search: None,
             jumps: Vec::new(),
             jump_index: 0,
@@ -546,7 +566,29 @@ impl Editor {
     /// A textbook seam bug: the editor half was right, the renderer half was
     /// right, and nothing joined them.
     pub fn command_line(&self) -> Option<&str> {
-        (self.mode == Mode::Command).then_some(self.command_line.as_str())
+        (self.mode == Mode::Command).then_some(self.cmdline.text())
+    }
+
+    /// Where the caret sits within the command line, as a grapheme offset, or
+    /// `None` when not in [`Mode::Command`].
+    ///
+    /// This is the other half of making the command line a real line editor:
+    /// the text alone was enough while the cursor could only ever be at the end
+    /// (append-only typing), but now that `<Left>`/`<C-w>`/`<Home>` move it, the
+    /// renderer has to be told where it actually is rather than assuming "the
+    /// end". Grapheme units, to match [`crate::core::Position`] and the
+    /// renderer's own [`crate::ui::cmdline::CmdlineState::cursor`].
+    pub fn command_cursor(&self) -> Option<usize> {
+        (self.mode == Mode::Command).then(|| self.cmdline.cursor())
+    }
+
+    /// The `<Tab>` completion candidates currently being cycled and which one is
+    /// selected, for a wildmenu-style display, or `None` when no cycle is open.
+    pub fn command_completions(&self) -> Option<(&[String], usize)> {
+        if self.mode != Mode::Command {
+            return None;
+        }
+        self.cmdline.active_completions()
     }
 
     /// The current visual selection as `(start, end)` in document order, or
@@ -1016,7 +1058,8 @@ impl Editor {
             GrammarCommand::EnterCommandLine => {
                 self.mode = Mode::Command;
                 self.command_kind = CommandKind::Ex;
-                self.command_line.clear();
+                self.cmdline.clear();
+                self.command_register_pending = false;
                 self.discard_dot();
                 Ok(EditorResponse::Continue)
             }
@@ -1052,7 +1095,8 @@ impl Editor {
             GrammarCommand::StartSearch { forward } => {
                 self.mode = Mode::Command;
                 self.command_kind = if forward { CommandKind::SearchForward } else { CommandKind::SearchBackward };
-                self.command_line.clear();
+                self.cmdline.clear();
+                self.command_register_pending = false;
                 self.discard_dot();
                 Ok(EditorResponse::Continue)
             }
@@ -1813,20 +1857,87 @@ impl Editor {
     // Command-line (`:`) mode
     // ---------------------------------------------------------------
 
+    /// Handles one keystroke while the `:`/`/`/`?` prompt is open.
+    ///
+    /// This is the command line's full line editor. It supports the vim
+    /// command-line keys — cursor movement, the word/line deletes, `<C-r>`
+    /// register insertion, `<Up>`/`<Down>` history, and `<Tab>` completion —
+    /// on top of the text-editing primitives in [`cmdline::CmdlineBuffer`]. The
+    /// buffer owns the text-and-cursor mechanics; this method owns the *policy*
+    /// that needs the wider editor (which history ring to walk, what candidates
+    /// `<Tab>` should offer, what Enter *does* with the finished line).
     fn handle_command_key(&mut self, key: Key) -> crate::Result<EditorResponse> {
+        // `<C-r>{reg}`: the register name arrives as the key *after* `<C-r>`,
+        // exactly like insert mode's `<C-r>` (see `handle_insert_key`).
+        if self.command_register_pending {
+            self.command_register_pending = false;
+            if let Some(c) = key.as_char() {
+                let reg = if c == '"' { None } else { Some(c) };
+                if let Some(content) = self.registers.read(reg) {
+                    let text = content.text.clone();
+                    self.cmdline.insert_str(&text);
+                }
+            }
+            return Ok(EditorResponse::Continue);
+        }
+
+        // Ctrl-modified command-line shortcuts, matched before the plain-char
+        // path so they are not typed literally.
+        if key.mods.ctrl {
+            match key.code {
+                KeyCode::Char('w') => {
+                    self.cmdline.delete_word_back();
+                    return Ok(EditorResponse::Continue);
+                }
+                KeyCode::Char('u') => {
+                    self.cmdline.delete_to_start();
+                    return Ok(EditorResponse::Continue);
+                }
+                KeyCode::Char('h') => {
+                    // `<C-h>` is Backspace; share its empty-line-cancels rule.
+                    return Ok(self.command_backspace());
+                }
+                KeyCode::Char('b') => {
+                    self.cmdline.move_home();
+                    return Ok(EditorResponse::Continue);
+                }
+                KeyCode::Char('e') => {
+                    self.cmdline.move_end();
+                    return Ok(EditorResponse::Continue);
+                }
+                KeyCode::Char('p') => {
+                    self.command_history_prev();
+                    return Ok(EditorResponse::Continue);
+                }
+                KeyCode::Char('n') => {
+                    self.command_history_next();
+                    return Ok(EditorResponse::Continue);
+                }
+                KeyCode::Char('r') => {
+                    self.command_register_pending = true;
+                    return Ok(EditorResponse::Continue);
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => {
-                self.command_line.clear();
+                self.cmdline.clear();
                 self.mode = Mode::Normal;
                 Ok(EditorResponse::Continue)
             }
             KeyCode::Enter => {
-                let line = std::mem::take(&mut self.command_line);
+                let line = self.cmdline.take();
                 self.mode = Mode::Normal;
                 match self.command_kind {
-                    CommandKind::Ex => self.execute_ex(&line),
+                    CommandKind::Ex => {
+                        self.ex_history.push(line.clone());
+                        self.execute_ex(&line)
+                    }
                     CommandKind::SearchForward | CommandKind::SearchBackward => {
                         let forward = self.command_kind == CommandKind::SearchForward;
+                        self.search_history.push(line.clone());
                         // An empty search line repeats the last pattern (vim's
                         // behaviour), in the direction just typed.
                         let pattern = if line.is_empty() {
@@ -1838,17 +1949,138 @@ impl Editor {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                self.command_line.pop();
+            KeyCode::Backspace => Ok(self.command_backspace()),
+            KeyCode::Delete => {
+                self.cmdline.delete_forward();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Left => {
+                self.cmdline.move_left();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Right => {
+                self.cmdline.move_right();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Home => {
+                self.cmdline.move_home();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::End => {
+                self.cmdline.move_end();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Up => {
+                self.command_history_prev();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Down => {
+                self.command_history_next();
+                Ok(EditorResponse::Continue)
+            }
+            KeyCode::Tab => {
+                // The editor models `<S-Tab>` as Tab + shift (see the UI's
+                // key mapping), so the modifier picks the cycle direction.
+                self.command_complete(!key.mods.shift);
                 Ok(EditorResponse::Continue)
             }
             _ => {
                 if let Some(c) = key.as_char() {
-                    self.command_line.push(c);
+                    self.cmdline.insert_char(c);
                 }
                 Ok(EditorResponse::Continue)
             }
         }
+    }
+
+    /// Backspace on the command line, with vim's rule that a backspace on an
+    /// already-empty prompt cancels the command line (leaves `Mode::Command`).
+    fn command_backspace(&mut self) -> EditorResponse {
+        if self.cmdline.text().is_empty() && self.cmdline.cursor() == 0 {
+            self.cmdline.clear();
+            self.mode = Mode::Normal;
+        } else {
+            self.cmdline.backspace();
+        }
+        EditorResponse::Continue
+    }
+
+    /// `<Up>`/`<C-p>`: walk the current prompt's history ring backward. `:` uses
+    /// the ex ring, `/`?` the search ring — kept apart the way vim keeps them.
+    fn command_history_prev(&mut self) {
+        // Match on kind so `cmdline` and the chosen ring are borrowed as two
+        // disjoint fields (a `&History` helper would borrow all of `self`).
+        match self.command_kind {
+            CommandKind::Ex => self.cmdline.history_prev(&self.ex_history),
+            CommandKind::SearchForward | CommandKind::SearchBackward => self.cmdline.history_prev(&self.search_history),
+        }
+    }
+
+    fn command_history_next(&mut self) {
+        match self.command_kind {
+            CommandKind::Ex => self.cmdline.history_next(&self.ex_history),
+            CommandKind::SearchForward | CommandKind::SearchBackward => self.cmdline.history_next(&self.search_history),
+        }
+    }
+
+    /// `<Tab>`/`<S-Tab>`: complete the token under the cursor, or advance an
+    /// already-open completion cycle. Only the `:` prompt completes — `/`?`
+    /// search has no command/file grammar to complete against, so `<Tab>` there
+    /// is a no-op (vim inserts a literal tab; a no-op is the safer default and
+    /// avoids a stray tab in a regex).
+    fn command_complete(&mut self, forward: bool) {
+        if self.command_kind != CommandKind::Ex {
+            return;
+        }
+        // If a cycle is already running, just step it.
+        if self.cmdline.cycle_completion(forward) {
+            return;
+        }
+        let ctx = self.cmdline.completion_context();
+        let candidates = self.command_completion_candidates(&ctx);
+        self.cmdline.begin_completion(ctx.start, candidates);
+    }
+
+    /// Turns a [`cmdline::CompletionContext`] into the concrete candidate
+    /// strings `<Tab>` should cycle. This is where the editor's own resources
+    /// come in — the command registry, the filesystem (for file args) and the
+    /// buffer table (for `:b`) — which is why candidate *generation* lives here
+    /// rather than in the terminal-free `cmdline` module.
+    fn command_completion_candidates(&self, ctx: &cmdline::CompletionContext) -> Vec<String> {
+        match &ctx.command {
+            // No command word yet -> completing the command name itself.
+            None => command::complete_names(&ctx.prefix),
+            Some(name) => match command::lookup(name).map(|spec| spec.arg) {
+                Some(command::ArgKind::File) => {
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let mut items: Vec<String> = crate::lsp::completion::path_candidates(&ctx.prefix, &cwd)
+                        .into_iter()
+                        .map(|item| item.insert_text)
+                        .collect();
+                    items.sort();
+                    items
+                }
+                Some(command::ArgKind::Buffer) => self.buffer_name_candidates(&ctx.prefix),
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// Open-buffer names (basenames) starting with `prefix`, for `:b`
+    /// completion. Unnamed buffers contribute nothing (there is no name to
+    /// offer). Sorted and de-duplicated for a stable cycle order.
+    fn buffer_name_candidates(&self, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .buffer_order
+            .iter()
+            .filter_map(|id| self.buffers.get(id))
+            .filter_map(|b| b.path())
+            .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Parses and runs one `:` command line (without its leading `:`). See
@@ -1909,6 +2141,33 @@ impl Editor {
                     self.cursor = *self.saved_cursor.get(&id).unwrap_or(&Position::ORIGIN);
                 }
                 Ok(EditorResponse::Continue)
+            }
+            ex::ExCommand::GotoBufferName(name) => {
+                // vim resolves `:b {name}` to the buffer whose name uniquely
+                // contains `{name}`, preferring an exact basename match. kvim
+                // does the same: try an exact file-name hit first, then fall
+                // back to the first buffer whose path contains the string.
+                let target = self
+                    .buffer_order
+                    .iter()
+                    .find(|&&id| self.buffers.get(&id).and_then(|b| b.path()).and_then(|p| p.file_name()).map(|f| f.to_string_lossy() == name).unwrap_or(false))
+                    .or_else(|| {
+                        self.buffer_order
+                            .iter()
+                            .find(|&&id| self.buffers.get(&id).and_then(|b| b.path()).map(|p| p.to_string_lossy().contains(&name)).unwrap_or(false))
+                    })
+                    .copied();
+                if let Some(id) = target {
+                    if id != self.current {
+                        self.alternate = Some(self.current);
+                    }
+                    self.saved_cursor.insert(self.current, self.cursor);
+                    self.current = id;
+                    self.cursor = *self.saved_cursor.get(&id).unwrap_or(&Position::ORIGIN);
+                    Ok(EditorResponse::Continue)
+                } else {
+                    Err(crate::Error::UnknownCommand(format!("b {name}")))
+                }
             }
             ex::ExCommand::DeleteBuffer { force, wipe } => {
                 let (deleted, replacement) = self.delete_buffer(force, wipe)?;
@@ -2873,6 +3132,148 @@ mod tests {
         // Write-all is not gated by the unsaved guard — writing is the point.
         feed(&mut ed, "ix<Esc>");
         assert_eq!(ed.execute_ex("wa").unwrap(), EditorResponse::WriteAll { then_quit: false });
+    }
+
+    // -----------------------------------------------------------------
+    // Command-line line editor: history, editing keys, completion.
+    // These drive the whole editor through `feed` (the real key path),
+    // not `CmdlineBuffer` in isolation — that unit coverage lives in
+    // `cmdline.rs`. Here we prove the wiring: which ring a prompt walks,
+    // that `<Tab>` reaches the registry, that Enter records history.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn command_line_history_recalls_previous_ex_commands_newest_first() {
+        let mut ed = editor_with("hello");
+        feed(&mut ed, ":noh<CR>");
+        feed(&mut ed, ":ls<CR>");
+        feed(&mut ed, ":");
+        assert_eq!(ed.command_line(), Some(""), "fresh prompt");
+        feed(&mut ed, "<Up>");
+        assert_eq!(ed.command_line(), Some("ls"), "newest first");
+        feed(&mut ed, "<Up>");
+        assert_eq!(ed.command_line(), Some("noh"));
+        feed(&mut ed, "<Up>"); // oldest already -> stays
+        assert_eq!(ed.command_line(), Some("noh"));
+        feed(&mut ed, "<Down>");
+        assert_eq!(ed.command_line(), Some("ls"));
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn ctrl_p_and_ctrl_n_walk_history_like_the_arrows() {
+        let mut ed = editor_with("hello");
+        feed(&mut ed, ":noh<CR>");
+        feed(&mut ed, ":<C-p>");
+        assert_eq!(ed.command_line(), Some("noh"));
+        feed(&mut ed, "<C-n>"); // back to the empty draft
+        assert_eq!(ed.command_line(), Some(""));
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn ex_and_search_histories_stay_separate() {
+        let mut ed = editor_with("foo bar");
+        feed(&mut ed, ":noh<CR>");
+        feed(&mut ed, "/bar<CR>"); // records "bar" in the SEARCH ring only
+        // The `:` prompt recalls the ex command, never the search.
+        feed(&mut ed, ":<Up>");
+        assert_eq!(ed.command_line(), Some("noh"));
+        feed(&mut ed, "<Esc>");
+        // The `/` prompt recalls the search, never the ex command.
+        feed(&mut ed, "/<Up>");
+        assert_eq!(ed.command_line(), Some("bar"));
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn command_line_cursor_moves_and_inserts_mid_line() {
+        let mut ed = editor_with("x");
+        feed(&mut ed, ":abc");
+        assert_eq!((ed.command_line(), ed.command_cursor()), (Some("abc"), Some(3)));
+        feed(&mut ed, "<Left><Left>");
+        assert_eq!(ed.command_cursor(), Some(1));
+        feed(&mut ed, "Z");
+        assert_eq!(ed.command_line(), Some("aZbc"));
+        feed(&mut ed, "<Home>");
+        assert_eq!(ed.command_cursor(), Some(0));
+        feed(&mut ed, "<End>");
+        assert_eq!(ed.command_cursor(), Some(4));
+        feed(&mut ed, "<Del>"); // nothing to the right at end -> no-op
+        assert_eq!(ed.command_line(), Some("aZbc"));
+        feed(&mut ed, "<Home><Del>"); // delete the 'a'
+        assert_eq!(ed.command_line(), Some("Zbc"));
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn ctrl_w_and_ctrl_u_delete_word_and_to_start() {
+        let mut ed = editor_with("x");
+        feed(&mut ed, ":edit foo");
+        feed(&mut ed, "<C-w>");
+        assert_eq!(ed.command_line(), Some("edit "));
+        feed(&mut ed, "<C-u>");
+        assert_eq!(ed.command_line(), Some(""));
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn backspace_on_an_empty_command_line_cancels_it() {
+        let mut ed = editor_with("x");
+        feed(&mut ed, ":");
+        assert_eq!(ed.mode(), Mode::Command);
+        feed(&mut ed, "<BS>");
+        assert_eq!(ed.mode(), Mode::Normal, "backspace on an empty prompt leaves command mode");
+        assert_eq!(ed.command_line(), None);
+    }
+
+    #[test]
+    fn ctrl_r_inserts_a_register_into_the_command_line() {
+        let mut ed = editor_with("hello world\n");
+        feed(&mut ed, "yw"); // yank "hello " into the unnamed register
+        feed(&mut ed, ":");
+        feed(&mut ed, "<C-r>\"");
+        assert!(ed.command_line().unwrap().contains("hello"), "got {:?}", ed.command_line());
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn tab_completes_and_cycles_ex_command_names() {
+        let mut ed = editor_with("x");
+        feed(&mut ed, ":w<Tab>");
+        assert_eq!(ed.command_line(), Some("w"), "first candidate (sorted) is the bare name");
+        assert!(ed.command_completions().is_some(), "the wildmenu list is exposed");
+        feed(&mut ed, "<Tab>");
+        assert_eq!(ed.command_line(), Some("wa"));
+        // <S-Tab> is Tab+shift (the editor has no distinct BackTab code — the
+        // UI maps it this way), so build it directly rather than via key::parse,
+        // which has no notation for it. It cycles backward, wrapping to "w".
+        let shift_tab = Key::new(KeyCode::Tab, Modifiers { shift: true, ..Default::default() });
+        ed.handle_key(shift_tab).unwrap();
+        assert_eq!(ed.command_line(), Some("w"));
+        feed(&mut ed, "x"); // a keystroke ends the cycle
+        assert!(ed.command_completions().is_none());
+        feed(&mut ed, "<Esc>");
+    }
+
+    #[test]
+    fn tab_completes_a_buffer_name_for_colon_b() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha.txt");
+        std::fs::write(&path, "hi").unwrap();
+        let mut ed = Editor::new();
+        ed.open(&path).unwrap();
+        feed(&mut ed, ":b al<Tab>");
+        assert_eq!(ed.command_line(), Some("b alpha.txt"));
+        feed(&mut ed, "<CR>"); // resolving the name goes to that buffer, no error
+    }
+
+    #[test]
+    fn tab_is_inert_on_the_search_prompt() {
+        let mut ed = editor_with("foo");
+        feed(&mut ed, "/ba<Tab>");
+        assert_eq!(ed.command_line(), Some("ba"), "search has nothing to complete against");
+        feed(&mut ed, "<Esc>");
     }
 
     // -----------------------------------------------------------------

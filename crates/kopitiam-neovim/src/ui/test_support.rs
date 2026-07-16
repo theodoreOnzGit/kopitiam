@@ -90,6 +90,13 @@ pub struct FakeHost {
     /// [`FakeHost::mode`] to [`Mode::Command`], and the renderer must paint it —
     /// which is the assertion that was missing when `:Neotree` echoed nothing.
     pub command_line: Option<String>,
+    /// The command-line caret position (grapheme offset) the editor would
+    /// report. `None` falls back to end-of-text, so most tests can ignore it;
+    /// the mid-line-cursor test sets it to prove the caret follows.
+    pub command_cursor: Option<usize>,
+    /// The `<Tab>` completion candidates + selected index the editor would
+    /// report, for the wildmenu strip. `None` means no cycle is open.
+    pub command_completions: Option<(Vec<String>, usize)>,
     /// The visual selection the editor would report. Set it alongside a visual
     /// [`FakeHost::mode`] to test the highlight.
     pub selection: Option<(Position, Position)>,
@@ -105,6 +112,8 @@ impl FakeHost {
             opened: Vec::new(),
             next_response: None,
             command_line: None,
+            command_cursor: None,
+            command_completions: None,
             selection: None,
         }
     }
@@ -186,6 +195,17 @@ impl EditorHost for FakeHost {
 
     fn command_line(&self) -> Option<&str> {
         self.command_line.as_deref()
+    }
+
+    fn command_cursor(&self) -> Option<usize> {
+        // Mirror the real editor: a caret only exists while a prompt is open.
+        self.command_line.as_ref().map(|line| {
+            self.command_cursor.unwrap_or_else(|| line.graphemes(true).count())
+        })
+    }
+
+    fn command_completions(&self) -> Option<(Vec<String>, usize)> {
+        self.command_completions.clone()
     }
 
     fn selection(&self) -> Option<(Position, Position)> {
