@@ -60,10 +60,10 @@ From `nv_cmds[]`. kvim catches these ahead of the vi grammar in
 | `<C-v>` | enter visual-block | Have |
 | `<C-w>` | window command prefix | Partial (see §11) |
 | `<C-c>` | interrupt → back to Normal | Partial (Esc-like; no "interrupt" semantics) |
-| `<C-g>` | show file info / cursor position | **Missing** |
+| `<C-g>` | show file info / cursor position | Have (cj0.41) |
 | `<C-l>` | redraw screen | **Missing** |
-| `<C-]>` | jump to tag / goto-definition under cursor | **Missing** (LSP `gd` is the intended path, not `<C-]>` yet) |
-| `<C-^>` | edit alternate file (`#`) | **Missing** |
+| `<C-]>` | jump to tag / goto-definition under cursor | Have (routed to LSP go-to-definition; cj0.41) |
+| `<C-^>` | edit alternate file (`#`) | Have (`<C-6>` too; cj0.41) |
 | `<C-t>` | pop tag stack | **Missing** |
 | `<C-z>` | suspend to shell | **Missing** (arguably N/A for the TUI) |
 | `<C-\>` | (leave to command / null) | **Missing** (niche) |
@@ -82,28 +82,28 @@ The action keys from `nv_cmds[]` that are not pure motions.
 | `i a I A o O` | enter Insert at various positions | Have |
 | `x` `X` | delete char forward / backward | Have |
 | `s` | substitute char (delete + insert) | Have |
-| `S` | substitute whole line | **Missing** (only `cc` gives the same) |
+| `S` | substitute whole line | Have (`= cc`; cj0.41) |
 | `r{c}` | replace one char | Have |
 | `R` | Replace (overtype) mode | Have |
 | `~` | toggle case under cursor | Have |
 | `J` | join lines | Have |
 | `gJ` | join without inserting space | **Missing** (see §8) |
 | `p` `P` | put after / before | Have |
-| `C` | change to end of line (`c$`) | **Missing** (as a standalone key) |
-| `D` | delete to end of line (`d$`) | **Missing** (as a standalone key) |
-| `Y` | yank line (`yy`) | **Missing** (as a standalone key) |
+| `C` | change to end of line (`c$`) | Have (cj0.41) |
+| `D` | delete to end of line (`d$`) | Have (cj0.41) |
+| `Y` | yank to end of line (`y$`, neovim default) | Have (cj0.41) |
 | `u` | undo | Have |
-| `U` | undo all changes on one line | **Missing** |
+| `U` | undo all changes on one line | **Missing** (deferred — needs a line-snapshot the undo tree doesn't keep; cj0.42) |
 | `<C-r>` | redo | Have |
 | `.` | repeat last change | Have |
-| `&` | repeat last `:s` | **Missing** |
+| `&` | repeat last `:s` | Have (cj0.41) |
 | `q{reg}` / `q` | record / stop macro | Have |
 | `@{reg}` / `@@` | play macro / replay last | Have |
 | `Q` | Ex mode / repeat last recorded register | **Missing** |
 | `m{a-z}` | set mark | Have |
 | `` `{m} `` / `'{m}` | jump to mark (exact / line) | Have |
-| `ZZ` | write + quit | **Missing** (`:x` works) |
-| `ZQ` | quit without saving | **Missing** (`:q!` works) |
+| `ZZ` | write + quit | Have (cj0.41) |
+| `ZQ` | quit without saving | Have (cj0.41) |
 | `:` | command line | Have |
 | `/` `?` `n` `N` `*` `#` | search family | Have |
 | `K` | keyword lookup (`keywordprg` / LSP hover) | **Missing** as `K` (LSP hover is elsewhere) |
@@ -127,7 +127,7 @@ itself is mature (`d2w`, `"ay3j`, `ci(` all compose from the same slots).
 | `y` | yank | Have |
 | `>` `<` | indent / dedent | Have |
 | `gu` `gU` `g~` | lowercase / uppercase / toggle-case | Have |
-| `=` | reindent / format via `equalprg` | **Missing** (no `Format` operator variant) |
+| `=` | reindent / format via `equalprg` | **Missing** (no indenter/formatter engine yet; deferred cj0.43) |
 | `!` | filter through external command | **Missing** (bead cj0.21) |
 | `gq` `gw` | reflow / format text width | **Missing** (bead cj0.22) |
 | `zf` | create fold over motion | **Missing** (no fold engine) |
@@ -151,9 +151,9 @@ beads except `=`.
 | `ge gE` | backward word-end | Have |
 | `0 ^ $` | line start / first-non-blank / line end | Have |
 | `g_` | last non-blank | Have |
-| `-` `+` / `<CR>` | first-non-blank of prev / next line | **Missing** |
-| `_` | first-non-blank, `count-1` lines down | **Missing** |
-| `\|` | go to column `count` | **Missing** |
+| `-` `+` / `<CR>` | first-non-blank of prev / next line | Have (cj0.41) |
+| `_` | first-non-blank, `count-1` lines down | Have (cj0.41) |
+| `\|` | go to column `count` | Have (cj0.41) |
 | `f F t T` | find char on line | Have |
 | `; ,` | repeat / reverse last `f/F/t/T` | Have |
 | `{ }` | paragraph back / forward | Have |
@@ -163,9 +163,9 @@ beads except `=`.
 | `gg G` | file start / end | Have |
 | `gj gk` | display-line down/up | Have (== `j`/`k` with `wrap=false`) |
 | `gm gM g0 g$ g^` | display-line column motions | **Missing** (see §8) |
-| `[[ ]] [] ][` | section / brace motions | **Missing** (see §10) |
-| `[( ]) [{ ]}` | unmatched-bracket motions | **Missing** (see §10) |
-| `[m ]m [M ]M` | method start/end | **Missing** (see §10) |
+| `[[ ]] [] ][` | section / brace motions | Have (brace-in-col-0; cj0.35) |
+| `[( ]) [{ ]}` | unmatched-bracket motions | Have (cj0.35) |
+| `[m ]m [M ]M` | method start/end | Have (brace-scan approximation; cj0.35) |
 
 Core motions all Have. The stragglers are the line-oriented `+`/`-`/`_`/`|`
 motions and the whole bracket-motion family (§10).
@@ -336,19 +336,25 @@ especially is a whole missing subsystem, not just a keybind.
 
 ## 10. Bracket `[` `]` commands (`nv_brackets()`)
 
-**Entire group Missing.** kvim's `pending.rs` handles `i[`/`a[` as text objects,
-but `[`/`]` as a *motion prefix* is not dispatched at all — no `AwaitingBracket`
-state exists.
+**Core motions now Have (cj0.35).** `pending.rs` gained an `AwaitingBracket`
+state, so `[`/`]` dispatch as motion prefixes and compose with operators/counts
+(`d]}`, `y[[`, `2]m`). All are charwise-exclusive, matching neovim's
+`nv_brackets`. One UI wrinkle fixed alongside: the app-level `]`/`[`
+interception for `]d`/`[d` diagnostics used to *drop* the bracket for any
+non-`d` second key; it now replays it into the editor grammar (see
+`ui/app.rs`). The mark jumps land through a dedicated `JumpBracketMark`
+command (marks live in the buffer, which the buffer-free `Pending` cannot
+read).
 
 | Key | What it does (vim) | kvim status |
 |---|---|---|
-| `[[ ]]` | section backward / forward (to `{` in col 1) | **Missing** |
-| `[] ][` | section end backward / forward | **Missing** |
-| `[( ])` | unmatched `(` back / `)` forward | **Missing** |
-| `[{ ]}` | unmatched `{` back / `}` forward | **Missing** |
-| `[m ]m [M ]M` | method start / end (Java-ish) | **Missing** |
-| `[p ]p [P ]P` | put with indent adjust | **Missing** |
-| `['` `` [` `` / `]'` `` ]` `` | prev / next lowercase mark | **Missing** |
+| `[[ ]]` | section backward / forward (to `{` in col 1) | Have (brace-in-col-0) |
+| `[] ][` | section end backward / forward (to `}` in col 1) | Have |
+| `[( ])` | unmatched `(` back / `)` forward | Have |
+| `[{ ]}` | unmatched `{` back / `}` forward | Have |
+| `[m ]m [M ]M` | method start / end (Java-ish) | Have (prev/next brace approximation) |
+| `[p ]p [P ]P` | put with indent adjust | **Missing** (deferred — a put variant, not a motion; cj0.44) |
+| `['` `` [` `` / `]'` `` ]` `` | prev / next lowercase mark | Have (cj0.35) |
 | `[z ]z` | move to start / end of open fold | **Missing** (no folds) |
 | `[c ]c` | prev / next diff change | **Missing** (no diff mode) |
 | `[d ]d [D ]D` | show / jump to macro define | **Missing** |
