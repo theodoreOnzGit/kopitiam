@@ -19,7 +19,7 @@
 //! interactive searches are single-line, and lifting the limit later is a
 //! change to this one module, not to the cursor model.
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::core::Position;
@@ -30,17 +30,59 @@ fn byte_to_col(line: &str, byte: usize) -> usize {
     line.grapheme_indices(true).take_while(|(b, _)| *b < byte).count()
 }
 
+/// Compile `pattern` into a [`Regex`], applying vim's `'ignorecase'` /
+/// `'smartcase'` case rules, or `None` if the pattern is not a valid regex.
+///
+/// This is the one place case-folding is decided, so the motion (`n`/`N`/`/`)
+/// and the search-match *highlight* (hlsearch) can never disagree about which
+/// text match — both of them funnel through here. Vim's rule:
+///
+/// * `ignorecase` off → case-sensitive, always.
+/// * `ignorecase` on, `smartcase` off → case-insensitive, always.
+/// * `ignorecase` on **and** `smartcase` on → case-insensitive *only while the
+///   pattern is all-lowercase*; the moment the user type an uppercase letter,
+///   the search snap back to case-sensitive. That one is what make `/foo` match
+///   `Foo` but `/Foo` match only `Foo`.
+pub fn build_regex(pattern: &str, ignorecase: bool, smartcase: bool) -> Option<Regex> {
+    let has_upper = pattern.chars().any(|c| c.is_uppercase());
+    let case_insensitive = ignorecase && !(smartcase && has_upper);
+    RegexBuilder::new(pattern).case_insensitive(case_insensitive).build().ok()
+}
+
+/// Every match of `re` on `line`, as inclusive-start / exclusive-end **grapheme
+/// column** ranges (`(start, end)`), left to right.
+///
+/// Grapheme columns, not byte offsets, because that one is the coordinate kvim's
+/// cursor and its renderer both speak (see this module header on why search work
+/// line-by-line). The renderer convert these to *display* columns with the
+/// line's text in hand — a tab is one grapheme and several cells — same like it
+/// does for a visual selection.
+///
+/// Zero-width matches kena dropped: a pattern like `x*` match the empty string
+/// between characters, and got nothing on screen to paint for that one. Keeping
+/// them also can make `find_iter` no progress; skip them so the highlight only
+/// cover spans a user can actually see.
+pub fn line_match_cols(line: &str, re: &Regex) -> Vec<(usize, usize)> {
+    re.find_iter(line)
+        .filter(|m| m.start() != m.end())
+        .map(|m| (byte_to_col(line, m.start()), byte_to_col(line, m.end())))
+        .collect()
+}
+
 /// Finds the next match of `pattern` starting strictly after `from` when
 /// `forward`, or strictly before it when searching backward, wrapping around
 /// the buffer once. Returns the match's start [`Position`], or `None` if the
 /// pattern is invalid or matches nowhere.
 ///
+/// `ignorecase`/`smartcase` are threaded straight to [`build_regex`], so the
+/// jump and the highlight share one notion of what match.
+///
 /// "Strictly after/before the cursor" is what makes `n` advance rather than
 /// re-finding the match the cursor is already sitting on; the wrap is what
 /// makes a search from the last match cycle back to the first, exactly as
 /// vim's `/` does (kvim does not implement `'wrapscan' off`).
-pub fn find(buf: &Buffer, from: Position, pattern: &str, forward: bool) -> Option<Position> {
-    let re = Regex::new(pattern).ok()?;
+pub fn find(buf: &Buffer, from: Position, pattern: &str, forward: bool, ignorecase: bool, smartcase: bool) -> Option<Position> {
+    let re = build_regex(pattern, ignorecase, smartcase)?;
     let line_count = buf.line_count();
     if forward {
         find_forward(buf, &re, from, line_count)
@@ -144,14 +186,14 @@ mod tests {
     #[test]
     fn forward_search_finds_the_next_match_after_the_cursor() {
         let buf = Buffer::from_str("foo bar foo baz");
-        let p = find(&buf, Position::new(0, 0), "foo", true).unwrap();
+        let p = find(&buf, Position::new(0, 0), "foo", true, false, false).unwrap();
         assert_eq!(p, Position::new(0, 8), "must skip the match the cursor is on");
     }
 
     #[test]
     fn forward_search_wraps_to_the_top() {
         let buf = Buffer::from_str("foo\nbar\nbaz");
-        let p = find(&buf, Position::new(2, 0), "foo", true).unwrap();
+        let p = find(&buf, Position::new(2, 0), "foo", true, false, false).unwrap();
         assert_eq!(p, Position::new(0, 0), "wraps around the end of the buffer");
     }
 
@@ -160,17 +202,17 @@ mod tests {
         let buf = Buffer::from_str("foo bar foo baz");
         // From col 12 ("baz"), the nearest match starting before the cursor is
         // the second "foo" at col 8 — not the first, which is further back.
-        let p = find(&buf, Position::new(0, 12), "foo", false).unwrap();
+        let p = find(&buf, Position::new(0, 12), "foo", false, false, false).unwrap();
         assert_eq!(p, Position::new(0, 8));
         // From the start of the second match, the previous one is the first.
-        let p = find(&buf, Position::new(0, 8), "foo", false).unwrap();
+        let p = find(&buf, Position::new(0, 8), "foo", false, false, false).unwrap();
         assert_eq!(p, Position::new(0, 0));
     }
 
     #[test]
     fn backward_search_wraps_to_the_bottom() {
         let buf = Buffer::from_str("foo\nbar\nfoo");
-        let p = find(&buf, Position::new(0, 0), "foo", false).unwrap();
+        let p = find(&buf, Position::new(0, 0), "foo", false, false, false).unwrap();
         assert_eq!(p, Position::new(2, 0));
     }
 
@@ -191,5 +233,44 @@ mod tests {
         // "中" is 3 bytes, 1 grapheme; a match at byte 3 is at column 1.
         let line = "中x";
         assert_eq!(byte_to_col(line, 3), 1);
+    }
+
+    #[test]
+    fn line_match_cols_reports_every_match_in_grapheme_columns() {
+        let re = build_regex("foo", false, false).unwrap();
+        // Two matches: cols 0..3 and 8..11.
+        assert_eq!(line_match_cols("foo bar foo baz", &re), vec![(0, 3), (8, 11)]);
+    }
+
+    #[test]
+    fn line_match_cols_counts_graphemes_not_bytes() {
+        let re = build_regex("x", false, false).unwrap();
+        // "中" is 3 bytes, 1 grapheme, so the "x" after it is at grapheme col 1.
+        assert_eq!(line_match_cols("中x中x", &re), vec![(1, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn line_match_cols_drops_zero_width_matches() {
+        // `o*` matches the empty string at every gap; only the real "oo" run
+        // should be painted.
+        let re = build_regex("o*", false, false).unwrap();
+        assert_eq!(line_match_cols("foo", &re), vec![(1, 3)]);
+    }
+
+    #[test]
+    fn ignorecase_folds_case_only_when_set() {
+        // Case-sensitive by default: "foo" does not match "Foo".
+        assert!(!build_regex("foo", false, false).unwrap().is_match("Foo"));
+        // ignorecase on: it does.
+        assert!(build_regex("foo", true, false).unwrap().is_match("Foo"));
+    }
+
+    #[test]
+    fn smartcase_stays_sensitive_once_the_pattern_has_an_uppercase() {
+        // ignorecase + smartcase: an all-lowercase pattern folds case...
+        assert!(build_regex("foo", true, true).unwrap().is_match("FOO"));
+        // ...but the moment the pattern carries an uppercase letter it does not.
+        assert!(!build_regex("Foo", true, true).unwrap().is_match("foo"));
+        assert!(build_regex("Foo", true, true).unwrap().is_match("Foo"));
     }
 }

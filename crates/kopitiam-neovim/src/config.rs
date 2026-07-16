@@ -53,6 +53,24 @@ pub struct Options {
     pub syntax: bool,
     /// Expand tabs to spaces on insert.
     pub expandtab: bool,
+    /// `vim.opt.hlsearch`: keep every match of the last search pattern
+    /// highlighted across the viewport until `:noh` (or a new search). Neovim
+    /// ship this **on** by default (plain vim ship it off); kvim follow Neovim,
+    /// since that one is the frontend the maintainer config target.
+    pub hlsearch: bool,
+    /// `vim.opt.incsearch`: while you typing a `/` or `?` pattern, highlight the
+    /// matches of whatever got typed so far. On by default, same for both vim
+    /// and Neovim.
+    pub incsearch: bool,
+    /// `vim.opt.ignorecase`: fold case when searching. Off by default (vim and
+    /// Neovim default like that also), so search stay case-sensitive unless you
+    /// ask otherwise — see [`crate::editor::search::build_regex`] for the exact
+    /// rule.
+    pub ignorecase: bool,
+    /// `vim.opt.smartcase`: when `ignorecase` also on, an all-lowercase pattern
+    /// fold case but a pattern carrying any uppercase letter don't. Off by
+    /// default. No effect unless `ignorecase` is on, same like vim.
+    pub smartcase: bool,
     /// `vim.opt.clipboard`. Neovim treat this as a comma list; the two value
     /// kopitiam care about are `unnamed` (sync plain yank/delete/put with the
     /// selection register `"*`) and `unnamedplus` (sync with the system
@@ -140,6 +158,13 @@ impl Default for Options {
             // change every file they edit, so it is called out rather than
             // quietly "improved" to spaces.
             expandtab: false,
+            // Neovim's search defaults: highlight-all and incremental-search
+            // both on, case-folding off. A plain-vim user who wants the older
+            // "no persistent highlight" feel sets `nohlsearch`.
+            hlsearch: true,
+            incsearch: true,
+            ignorecase: false,
+            smartcase: false,
             // Their config never sets clipboard, so vim's default (empty)
             // stand: plain `y`/`p` stay internal, `"+y`/`"+p` reach the OS
             // clipboard explicitly. Flip this to "unnamedplus" and every plain

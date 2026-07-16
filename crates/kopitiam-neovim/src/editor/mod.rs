@@ -235,6 +235,14 @@ pub struct Editor {
     /// The last `/`/`?`/`*`/`#` search, as `(pattern, forward)`, so `n`/`N`
     /// can repeat it. `n` reuses `forward`; `N` inverts it.
     last_search: Option<(String, bool)>,
+    /// Whether the last search's matches should be highlighted right now
+    /// (`'hlsearch'`). Set the moment any search run; cleared by `:noh` — which
+    /// hide the highlight *without* forgetting [`Self::last_search`], so the next
+    /// `n`/`/`/`*` light it up again, same like vim's transient `:nohlsearch`.
+    /// Not the same as the persistent `'hlsearch'` *option*
+    /// ([`crate::config::Options::hlsearch`]): the option say "highlight at all",
+    /// this flag say "right now". See [`Self::search_highlight`].
+    search_highlight_visible: bool,
 
     /// The jump history for `<C-o>`/`<C-i>` and `` `` `` — see the module
     /// docs on [`Self::record_jump`]. `jump_index == jumps.len()` means "at
@@ -332,6 +340,7 @@ impl Editor {
             search_history: History::new(),
             command_register_pending: false,
             last_search: None,
+            search_highlight_visible: false,
             jumps: Vec::new(),
             jump_index: 0,
             last_jump_from: None,
@@ -1297,8 +1306,11 @@ impl Editor {
             return EditorResponse::Continue;
         }
         self.last_search = Some((pattern.to_string(), forward));
+        // A confirmed search lights the highlight, even after a prior `:noh`.
+        self.search_highlight_visible = true;
         self.record_jump();
-        match search::find(self.current_buffer(), self.cursor, pattern, forward) {
+        let (ic, scs) = (self.options.ignorecase, self.options.smartcase);
+        match search::find(self.current_buffer(), self.cursor, pattern, forward, ic, scs) {
             Some(pos) => {
                 self.cursor = self.current_buffer().clamp(pos);
                 EditorResponse::Continue
@@ -1314,14 +1326,57 @@ impl Editor {
             return EditorResponse::Message("no previous search".to_string());
         };
         let dir = forward ^ reverse;
+        // `n`/`N` re-arm the highlight too — pressing `n` after `:noh` brings
+        // the matches back, matching vim.
+        self.search_highlight_visible = true;
         self.record_jump();
-        match search::find(self.current_buffer(), self.cursor, &pattern, dir) {
+        let (ic, scs) = (self.options.ignorecase, self.options.smartcase);
+        match search::find(self.current_buffer(), self.cursor, &pattern, dir, ic, scs) {
             Some(pos) => {
                 self.cursor = self.current_buffer().clamp(pos);
                 EditorResponse::Continue
             }
             None => EditorResponse::Message(format!("pattern not found: {pattern}")),
         }
+    }
+
+    /// The regex whose matches the viewport should paint as search highlights
+    /// right now, or `None` when nothing should be lit.
+    ///
+    /// This is the one query the renderer ask; it fold together the two vim
+    /// behaviours that put text on screen highlighted:
+    ///
+    /// * **incsearch** — while a `/` or `?` prompt is open and `'incsearch'` on,
+    ///   the *in-progress* pattern (whatever got typed so far) is lit live, so
+    ///   you can see where a search will land before you press Enter. This one
+    ///   take precedence over hlsearch while you still typing.
+    /// * **hlsearch** — otherwise, when `'hlsearch'` on and the highlight not yet
+    ///   dismissed by `:noh`, the last confirmed search's pattern stay lit
+    ///   ([`Self::search_highlight_visible`]).
+    ///
+    /// The regex is built through [`search::build_regex`] with the editor's
+    /// `'ignorecase'`/`'smartcase'`, so the cells this light are exactly the ones
+    /// `n`/`N` would jump between — the highlight can never drift from the
+    /// motion. An invalid in-progress regex (mid-typing a `[`, say) give `None`
+    /// instead of an error: no highlight until the pattern parse properly.
+    pub fn search_highlight(&self) -> Option<regex::Regex> {
+        let (ic, scs) = (self.options.ignorecase, self.options.smartcase);
+        if self.options.incsearch
+            && self.mode == Mode::Command
+            && matches!(self.command_kind, CommandKind::SearchForward | CommandKind::SearchBackward)
+        {
+            let typed = self.cmdline.text();
+            if !typed.is_empty() {
+                return search::build_regex(typed, ic, scs);
+            }
+        }
+        if self.options.hlsearch
+            && self.search_highlight_visible
+            && let Some((pattern, _)) = &self.last_search
+        {
+            return search::build_regex(pattern, ic, scs);
+        }
+        None
     }
 
     /// `*`/`#`: search for the keyword under the cursor.
@@ -2349,7 +2404,14 @@ impl Editor {
                 self.cursor = self.current_buffer().clamp(pos);
                 Ok(EditorResponse::Continue)
             }
-            ex::ExCommand::NoHighlight => Ok(EditorResponse::Continue),
+            ex::ExCommand::NoHighlight => {
+                // `:noh`/`:nohlsearch`: dismiss the *current* highlight but don't
+                // forget the pattern, so `n`/`/`/`*` can bring it back. The
+                // persistent `'hlsearch'` option kena left alone — that one is
+                // what `:set nohlsearch` is for, not this.
+                self.search_highlight_visible = false;
+                Ok(EditorResponse::Continue)
+            }
             ex::ExCommand::Set { key, value } => {
                 self.apply_set_option(&key, value.as_deref());
                 Ok(EditorResponse::Continue)
@@ -2459,6 +2521,18 @@ impl Editor {
             "wrap" => self.options.wrap = on,
             "spell" => self.options.spell = on,
             "expandtab" | "et" => self.options.expandtab = on,
+            // `:set hlsearch`/`:set nohlsearch` toggle the persistent option.
+            // Turn it back on also show the current highlight again, same like
+            // vim (`:set hls` after `:noh` re-light the matches).
+            "hlsearch" | "hls" => {
+                self.options.hlsearch = on;
+                if on {
+                    self.search_highlight_visible = true;
+                }
+            }
+            "incsearch" | "is" => self.options.incsearch = on,
+            "ignorecase" | "ic" => self.options.ignorecase = on,
+            "smartcase" | "scs" => self.options.smartcase = on,
             "tabstop" | "ts" => {
                 if let Some(v) = value.and_then(|v| v.parse().ok()) {
                     self.options.tabstop = v;
@@ -3068,6 +3142,70 @@ mod tests {
         let mut ed = editor_with("alpha beta gamma");
         feed(&mut ed, "/beta<CR>");
         assert_eq!(ed.read_register(Some('/')).unwrap().text, "beta");
+    }
+
+    #[test]
+    fn a_confirmed_search_arms_the_hlsearch_highlight() {
+        let mut ed = editor_with("foo bar foo");
+        assert!(ed.search_highlight().is_none(), "nothing lit before any search");
+        feed(&mut ed, "/foo<CR>");
+        let re = ed.search_highlight().expect("hlsearch lit after a search");
+        assert!(re.is_match("foo"));
+    }
+
+    #[test]
+    fn noh_clears_the_highlight_but_keeps_the_pattern() {
+        let mut ed = editor_with("foo bar foo");
+        feed(&mut ed, "/foo<CR>");
+        assert!(ed.search_highlight().is_some());
+        let _ = ed.execute_ex("noh");
+        assert!(ed.search_highlight().is_none(), ":noh must clear the highlight");
+        // The pattern is remembered, so `n` brings it back.
+        feed(&mut ed, "n");
+        assert!(ed.search_highlight().is_some(), "n after :noh re-lights the matches");
+    }
+
+    #[test]
+    fn star_arms_the_hlsearch_highlight_for_the_word_under_the_cursor() {
+        let mut ed = editor_with("foo bar foo");
+        feed(&mut ed, "*");
+        let re = ed.search_highlight().expect("* lights the word it searched");
+        assert!(re.is_match("foo"));
+    }
+
+    #[test]
+    fn incsearch_lights_the_in_progress_pattern_while_typing() {
+        let mut ed = editor_with("foo bar foo");
+        // Open the `/` prompt and type — no <CR> yet.
+        feed(&mut ed, "/fo");
+        let re = ed.search_highlight().expect("incsearch lights while typing");
+        assert!(re.is_match("foo"));
+        // An empty prompt lights nothing.
+        feed(&mut ed, "<BS><BS>");
+        assert!(ed.search_highlight().is_none(), "empty pattern lights nothing");
+    }
+
+    #[test]
+    fn nohlsearch_option_off_suppresses_the_highlight_entirely() {
+        let mut ed = editor_with("foo bar foo");
+        feed(&mut ed, "/foo<CR>");
+        assert!(ed.search_highlight().is_some());
+        let _ = ed.execute_ex("set nohlsearch");
+        assert!(ed.search_highlight().is_none(), "'nohlsearch' turns the highlight off");
+        // Turning it back on re-lights the remembered pattern.
+        let _ = ed.execute_ex("set hlsearch");
+        assert!(ed.search_highlight().is_some());
+    }
+
+    #[test]
+    fn smartcase_search_highlight_matches_the_motion() {
+        let mut ed = editor_with("Foo foo FOO");
+        let _ = ed.execute_ex("set ignorecase");
+        let _ = ed.execute_ex("set smartcase");
+        // All-lowercase pattern: case-insensitive, so it matches every case.
+        feed(&mut ed, "/foo<CR>");
+        let re = ed.search_highlight().unwrap();
+        assert!(re.is_match("Foo") && re.is_match("FOO") && re.is_match("foo"));
     }
 
     #[test]

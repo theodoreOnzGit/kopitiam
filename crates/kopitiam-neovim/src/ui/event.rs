@@ -315,6 +315,19 @@ pub trait EditorHost {
         None
     }
 
+    /// The regex whose matches the viewport should paint as search highlights
+    /// (`'hlsearch'`/`'incsearch'`), or `None` when nothing should be lit.
+    ///
+    /// Returned already-compiled, with the host's case rules baked in, so the
+    /// renderer just paint matches and never need to know about
+    /// `'ignorecase'`/`'smartcase'` — and so the lit cells sure to be the same
+    /// ones `n`/`N` would land on. See
+    /// [`crate::editor::Editor::search_highlight`]. Default `None` for a host
+    /// with no search (a fake, the placeholder).
+    fn search_highlight(&self) -> Option<regex::Regex> {
+        None
+    }
+
     /// The which-key rows for the key sequence buffered so far, or empty when
     /// no multi-key mapping is pending. See [`crate::ui::whichkey`] — the popup
     /// is a passive heads-up display, so this is a pure read of editor state

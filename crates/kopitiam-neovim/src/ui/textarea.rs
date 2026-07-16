@@ -245,6 +245,17 @@ pub struct TextArea<'a, B: BufferView> {
     /// both its syntax colour and visibly selected). See
     /// [`crate::ui::highlight`].
     pub language: Option<Language>,
+    /// The compiled search pattern whose matches should be highlighted across
+    /// this viewport (`'hlsearch'`/`'incsearch'`), or `None` for no search
+    /// highlight. Borrowed: the regex kena compiled once per frame by the caller
+    /// (see [`crate::ui::app::App::render_windows`]) and shared by every window,
+    /// so it live one level up instead of being rebuilt here per line.
+    ///
+    /// Painted as a render pass **under** [`Self::selection`] (a selected match
+    /// show the selection colour, not the search colour — the selection win the
+    /// cell) but **over** the syntax pass, following vim's highlight precedence.
+    /// See the `render` body.
+    pub search: Option<&'a regex::Regex>,
 }
 
 impl<'a, B: BufferView> TextArea<'a, B> {
@@ -349,6 +360,52 @@ impl<'a, B: BufferView> TextArea<'a, B> {
         }
         Some(map)
     }
+
+    /// Paint every search match on this line with the theme's search colours,
+    /// clipped to the horizontal scroll. Each match is one contiguous run of
+    /// cells, so — not like the visual selection, which is one span per line — a
+    /// line can carry a few.
+    ///
+    /// A search match set both foreground and background (vim's `Search` group
+    /// do like that), which is why this recolour whole cells instead of only
+    /// tinting the background the way the selection pass do: bright-yellow-on-
+    /// cream cannot read, so the text flip to dark over the fill. The selection
+    /// pass run *after* this one and only touch the background, so where a
+    /// selection overlap a match the selection background win while the dark
+    /// match foreground stay — can lah, and the selection is still clearly the
+    /// boss highlight.
+    fn paint_search(
+        &self,
+        re: &regex::Regex,
+        line: &str,
+        buf: &mut Buffer,
+        text_x: u16,
+        y: u16,
+        text_width: usize,
+    ) {
+        let search_bg = self.theme.search_bg();
+        let search_fg = self.theme.search_fg();
+        for (first, last) in crate::editor::search::line_match_cols(line, re) {
+            // `last` is an exclusive grapheme end; convert both edges to display
+            // columns with the line in hand (a tab is one grapheme, several
+            // cells), then clip into the scrolled viewport — same arithmetic
+            // `selection_rect` use.
+            let start_col = display_col_of_grapheme(line, first, self.tabstop);
+            let end_col = display_col_of_grapheme(line, last, self.tabstop);
+            let visible_start = start_col.max(self.scroll.left);
+            let visible_end = end_col.min(self.scroll.left + text_width);
+            if visible_end <= visible_start {
+                continue;
+            }
+            for col in visible_start..visible_end {
+                let x = text_x + (col - self.scroll.left) as u16;
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(search_bg);
+                    cell.set_fg(search_fg);
+                }
+            }
+        }
+    }
 }
 
 impl<'a, B: BufferView> Widget for TextArea<'a, B> {
@@ -426,6 +483,14 @@ impl<'a, B: BufferView> Widget for TextArea<'a, B> {
                     }
                 }
 
+                // Search-match highlight (hlsearch/incsearch): painted over the
+                // syntax pass but under the selection, so a match keep its own
+                // colour everywhere except where a visual selection cover it —
+                // over there the selection win (see `paint_search`).
+                if let Some(re) = self.search {
+                    self.paint_search(re, &line, buf, text_x, y, text_width);
+                }
+
                 // Selection highlight, painted over the text as a background
                 // change so the characters underneath stay legible — a selection
                 // that replaced the text's colours would fight syntax
@@ -496,6 +561,7 @@ mod tests {
                     theme: &th,
                     selection: Some(selection),
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -636,6 +702,7 @@ mod tests {
                         mode: Mode::Visual,
                     }),
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -680,6 +747,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -688,6 +756,151 @@ mod tests {
         for x in 0..10 {
             assert_eq!(buf.cell((x, 0)).unwrap().style().bg, Some(th.bg));
         }
+    }
+
+    /// Renders `lines` with `pattern` as the active search highlight and, for
+    /// each row, returns the display columns painted in the search background.
+    ///
+    /// The search-highlight analogue of [`selected_columns`]: it asserts on the
+    /// *painted cell*, because "the search jumped but highlighted nothing" is
+    /// exactly the bug this feature fixes, and only a painted-cell assertion can
+    /// see it.
+    fn searched_columns(lines: &[&str], pattern: &str, width: u16) -> (Theme, Vec<Vec<u16>>) {
+        let fb = FakeBuffer::new(lines.iter().map(|l| l.to_string()).collect());
+        let height = lines.len() as u16;
+        let re = crate::editor::search::build_regex(pattern, false, false).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let th = theme();
+        terminal
+            .draw(|frame| {
+                let ta = TextArea {
+                    buffer: &fb,
+                    cursor: Position::ORIGIN,
+                    mode: Mode::Normal,
+                    scroll: Scroll::default(),
+                    line_numbers: LineNumberMode::none(),
+                    colorcolumn: None,
+                    tabstop: 4,
+                    theme: &th,
+                    selection: None,
+                    language: None,
+                    search: Some(&re),
+                };
+                frame.render_widget(ta, frame.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cols = (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter(|&x| buf.cell((x, y)).unwrap().style().bg == Some(th.search_bg()))
+                    .collect()
+            })
+            .collect();
+        (th, cols)
+    }
+
+    /// hlsearch lights **every** occurrence on the visible lines, not just the
+    /// one the cursor jumped to — the whole point of `'hlsearch'`.
+    #[test]
+    fn hlsearch_paints_every_match_on_the_visible_lines() {
+        let (_th, painted) = searched_columns(&["foo bar foo", "baz foo qux"], "foo", 20);
+        // Line 0: "foo" at 0..3 and 8..11.
+        assert_eq!(painted[0], vec![0, 1, 2, 8, 9, 10]);
+        // Line 1: "foo" at 4..7.
+        assert_eq!(painted[1], vec![4, 5, 6]);
+    }
+
+    /// A search match sets both colours (vim's `Search` group): a bright fill
+    /// with dark text on top, so the match stays readable.
+    #[test]
+    fn a_search_match_paints_dark_text_on_the_search_background() {
+        let fb = FakeBuffer::new(vec!["a foo b".to_string()]);
+        let re = crate::editor::search::build_regex("foo", false, false).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        let th = theme();
+        terminal
+            .draw(|frame| {
+                let ta = TextArea {
+                    buffer: &fb,
+                    cursor: Position::ORIGIN,
+                    mode: Mode::Normal,
+                    scroll: Scroll::default(),
+                    line_numbers: LineNumberMode::none(),
+                    colorcolumn: None,
+                    tabstop: 4,
+                    theme: &th,
+                    selection: None,
+                    language: None,
+                    search: Some(&re),
+                };
+                frame.render_widget(ta, frame.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // "foo" begins at column 2; its text stays legible and the character is
+        // still there.
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "f");
+        assert_eq!(buf.cell((2, 0)).unwrap().style().bg, Some(th.search_bg()));
+        assert_eq!(buf.cell((2, 0)).unwrap().style().fg, Some(th.search_fg()));
+        // The space just before it is untouched — ordinary background.
+        assert_eq!(buf.cell((1, 0)).unwrap().style().bg, Some(th.bg));
+    }
+
+    /// Where a visual selection covers a search match, the **selection** wins the
+    /// cell's background — search highlight sits under it (vim's precedence).
+    #[test]
+    fn the_selection_wins_over_the_search_highlight_where_they_overlap() {
+        let fb = FakeBuffer::new(vec!["foofoo".to_string()]);
+        let re = crate::editor::search::build_regex("foo", false, false).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        let th = theme();
+        terminal
+            .draw(|frame| {
+                let ta = TextArea {
+                    buffer: &fb,
+                    cursor: Position::new(0, 2),
+                    mode: Mode::Visual,
+                    scroll: Scroll::default(),
+                    line_numbers: LineNumberMode::none(),
+                    colorcolumn: None,
+                    tabstop: 4,
+                    theme: &th,
+                    // Select columns 0..=2 — over the first "foo" match.
+                    selection: Some(Selection {
+                        start: Position::new(0, 0),
+                        end: Position::new(0, 2),
+                        mode: Mode::Visual,
+                    }),
+                    language: None,
+                    search: Some(&re),
+                };
+                frame.render_widget(ta, frame.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Columns 0..=2 are selected: selection background wins, even though a
+        // search match also covers them.
+        for x in 0..=2 {
+            assert_eq!(
+                buf.cell((x, 0)).unwrap().style().bg,
+                Some(th.selection_bg()),
+                "selection must win the cell at {x}"
+            );
+        }
+        // Columns 3..=5 are the second match, unselected: search background.
+        for x in 3..=5 {
+            assert_eq!(buf.cell((x, 0)).unwrap().style().bg, Some(th.search_bg()));
+        }
+    }
+
+    /// Search highlight is measured in display columns: a match after a tab lands
+    /// past the tab's expansion, not at its grapheme index.
+    #[test]
+    fn the_search_highlight_is_measured_in_display_columns_not_graphemes() {
+        // The tab occupies display columns 0..=3, so "foo" is at 4..=6.
+        let (_th, painted) = searched_columns(&["\tfoo"], "foo", 12);
+        assert_eq!(painted[0], vec![4, 5, 6]);
     }
 
     /// Syntax highlighting recolours the right cells: a Rust keyword's cells
@@ -711,6 +924,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: Some(Language::Rust),
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -756,6 +970,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: Some(Language::Rust),
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -806,6 +1021,7 @@ mod tests {
             theme: &theme(),
             selection: None,
             language: None,
+            search: None,
         };
         let area = Rect { x: 0, y: 0, width: 40, height: 10 };
         // gutter_width(10 lines) = 3 digits floor + 1 pad = 4.
@@ -836,6 +1052,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -869,6 +1086,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -899,6 +1117,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })
@@ -935,6 +1154,7 @@ mod tests {
                     theme: &th,
                     selection: None,
                     language: None,
+                    search: None,
                 };
                 frame.render_widget(ta, frame.area());
             })

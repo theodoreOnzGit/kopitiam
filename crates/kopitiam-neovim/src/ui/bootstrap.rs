@@ -239,6 +239,10 @@ impl EditorHost for crate::editor::Editor {
         crate::editor::Editor::selection(self)
     }
 
+    fn search_highlight(&self) -> Option<regex::Regex> {
+        crate::editor::Editor::search_highlight(self)
+    }
+
     /// Maps the editor's [`crate::editor::WhichKeyItem`]s to the UI's
     /// [`crate::ui::whichkey::WhichKeyRow`] — the one place these two
     /// vocabularies meet, kept in this adapter so neither `editor` nor the

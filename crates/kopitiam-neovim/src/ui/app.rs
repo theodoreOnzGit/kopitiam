@@ -1963,6 +1963,14 @@ impl<H: EditorHost> App<H> {
         // later render pass) can anchor at it. Reset each frame.
         let mut cursor_screen: Option<(u16, u16)> = None;
 
+        // The search-match highlight (hlsearch/incsearch) pattern, compiled once
+        // per frame and shared by every window — the pattern is global search
+        // state, not per-window, and vim's `'hlsearch'` light matches in every
+        // window that show the text. `None` when got nothing to highlight (no
+        // active search, or `:noh` already dismiss it). See
+        // [`crate::editor::Editor::search_highlight`].
+        let search_re = self.host.search_highlight();
+
         for (id, rect) in layout {
             let is_active = id == active_id;
             let Some(win) = windows.iter().find(|w| w.id == id).copied() else { continue };
@@ -2044,6 +2052,7 @@ impl<H: EditorHost> App<H> {
                     })
                     .flatten(),
                 language,
+                search: search_re.as_ref(),
             };
 
             // The terminal cursor belongs to whatever has focus. With the file

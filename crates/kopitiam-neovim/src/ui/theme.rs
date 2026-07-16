@@ -135,6 +135,30 @@ impl Theme {
         self.bg2
     }
 
+    /// The background a search match (`'hlsearch'`/`'incsearch'`) kena painted
+    /// in.
+    ///
+    /// Gruvbox's own `Search` group is `bg = yellow, fg = bg0` — a bright fill
+    /// with dark text on top — and that one is what this return for the fill (the
+    /// renderer pair it with [`Self::search_fg`] for the text). Bright yellow is
+    /// deliberately not the same as [`Self::selection_bg`]'s muted `bg2`: the two
+    /// must be tell-apart-able at a glance where a search match sit inside a
+    /// visual selection, and the selection is the one that win the cell. `yellow`
+    /// (`#d79921`), not the brighter `yellow_bright`, keep it from vibrating
+    /// against gruvbox's cream foreground on nearby unmatched text.
+    pub fn search_bg(&self) -> Color {
+        self.yellow
+    }
+
+    /// The foreground a search match's text kena drawn in, over
+    /// [`Self::search_bg`]. Gruvbox put dark text (`bg`, `#282828`) on the yellow
+    /// fill so the match stay legible — a search highlight replace the cell's
+    /// colours outright (not like a selection, which only tint the background),
+    /// because vim's `Search` group set both.
+    pub fn search_fg(&self) -> Color {
+        self.bg
+    }
+
     /// Looks up a theme by the name used in [`crate::config::Config::theme`]
     /// (case-insensitive). Falls back to [`Theme::gruvbox_dark`] for any
     /// unrecognised name — `Config::theme` is a plain `String`, so a typo'd
