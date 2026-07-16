@@ -45,6 +45,37 @@ pub enum Operator {
     /// (`zf3j`), motions (`zfG`, `zf}`) and text objects (`zfip`, `zfa{`) all
     /// compose for free, exactly as they do for `d`/`y`/`!`.
     Fold,
+    /// `={motion}` / `==` / visual `=` — the reindent/format operator. Always
+    /// operates on whole *lines* (the lines the range touches), like vim's `=`.
+    ///
+    /// # Which path runs: fallback today, LSP later
+    ///
+    /// vim routes `=` to `equalprg`/`indentexpr` when set, else its built-in
+    /// C-style indenter. kvim's intended routing is **LSP
+    /// `textDocument/rangeFormatting` when a server is ready, else this
+    /// deterministic fallback** (the "native Rust before local AI before cloud"
+    /// order in `CLAUDE.md`). The LSP leg is *not yet wired*: it needs a
+    /// `range_formatting` request on `kopitiam-semantic`'s session — a crate
+    /// outside this change's owned directory, so the LSP leg was deferred with
+    /// its full rationale recorded on bead `kopitiam-cj0.57` (an AI-decision
+    /// review item: why deferred, where it goes, what would make it wrong).
+    /// Until that lands, `=` **always** runs the fallback below. The fallback is
+    /// applied here in [`Operator::apply`]; when the LSP leg arrives it belongs
+    /// in [`super::Editor::run_operator`] (an `EditorResponse::Action`, as
+    /// `<C-]>` does for go-to-definition), falling through to this same `apply`
+    /// when the server is absent or still starting.
+    ///
+    /// # The fallback: a light, brace-depth C-style reindent
+    ///
+    /// Each line is aligned to `shiftwidth * depth`, where `depth` is the count
+    /// of unclosed `{`/`(`/`[` seen so far (a line beginning with a closer is
+    /// dedented one level, so a `}` lines up under its opener). It is
+    /// deliberately simple and predictable — it does not parse strings,
+    /// character literals, comments or continuation lines, so a brace inside a
+    /// string will skew the depth. A real language-aware indenter is filed as
+    /// bead `kopitiam-cj0.58`; this is the "keep it simple, respect
+    /// `shiftwidth`/`expandtab`" brief.
+    Format,
 }
 
 impl Operator {
@@ -220,6 +251,12 @@ impl Operator {
                 let cursor = Position::new(first, first_non_blank_col(buf, first));
                 Ok(OperatorOutcome { cursor: buf.clamp(cursor), register_write: None })
             }
+            Operator::Format => {
+                let (first, last) = (start.line, end.line);
+                reindent_c_style(buf, first, last, shiftwidth, expandtab)?;
+                let cursor = Position::new(first, first_non_blank_col(buf, first));
+                Ok(OperatorOutcome { cursor: buf.clamp(cursor), register_write: None })
+            }
             Operator::LowerCase | Operator::UpperCase | Operator::ToggleCase => {
                 let text = buf.slice(range);
                 let transformed = match self {
@@ -240,6 +277,67 @@ impl Operator {
             Operator::Fold => unreachable!("the fold operator is handled in Editor::run_operator, never applied"),
         }
     }
+}
+
+/// The net bracket depth change across `s`: `+1` per opening `{`/`(`/`[`, `-1`
+/// per closing `}`/`)`/`]`. No string/comment awareness — see
+/// [`Operator::Format`]'s docs for that deliberate simplification.
+fn net_bracket_delta(s: &str) -> i32 {
+    let mut d = 0;
+    for c in s.chars() {
+        match c {
+            '{' | '(' | '[' => d += 1,
+            '}' | ')' | ']' => d -= 1,
+            _ => {}
+        }
+    }
+    d
+}
+
+/// Reindents lines `first..=last` to a brace-nesting depth, the fallback path
+/// of the `=` operator ([`Operator::Format`]). The starting depth is derived by
+/// scanning every line *above* `first`, so a reindented block nests correctly
+/// inside its surroundings. A line whose first non-blank grapheme is a closer
+/// (`}`/`)`/`]`) is pulled out one level so it aligns under its opener. Blank
+/// lines are emptied of trailing indent and do not affect depth.
+fn reindent_c_style(buf: &mut Buffer, first: usize, last: usize, shiftwidth: usize, expandtab: bool) -> crate::Result<()> {
+    let mut depth: i32 = 0;
+    for line in 0..first {
+        depth += net_bracket_delta(&buf.line(line).unwrap_or_default());
+    }
+    for line in first..=last {
+        let content = buf.line(line).unwrap_or_default();
+        let trimmed = content.trim_start();
+        // Existing leading-whitespace width in *graphemes* — whitespace is
+        // one grapheme per char, so a char count is exact here and lets us
+        // replace exactly the current indent run.
+        let lead = content.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+        if trimmed.is_empty() {
+            // Strip a blank line's stray indentation; depth is unchanged.
+            if lead > 0 {
+                buf.apply(Edit::delete(Range::new(Position::new(line, 0), Position::new(line, lead))))?;
+            }
+            continue;
+        }
+        let closes_first = matches!(trimmed.chars().next(), Some('}') | Some(')') | Some(']'));
+        let this_depth = if closes_first { (depth - 1).max(0) } else { depth.max(0) };
+        let want = if expandtab {
+            " ".repeat(this_depth as usize * shiftwidth)
+        } else {
+            "\t".repeat(this_depth as usize)
+        };
+        // Only rewrite when the indent actually differs, to avoid churning the
+        // undo group with no-op edits on already-correct lines.
+        let current_lead: String = content.chars().take(lead).collect();
+        if current_lead != want {
+            buf.apply(Edit::replace(Range::new(Position::new(line, 0), Position::new(line, lead)), want))?;
+        }
+        depth += net_bracket_delta(&content);
+        if depth < 0 {
+            depth = 0;
+        }
+    }
+    Ok(())
 }
 
 fn toggle_case(s: &str) -> String {

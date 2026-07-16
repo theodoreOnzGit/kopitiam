@@ -3885,6 +3885,7 @@ impl Editor {
             KeyCode::Char('y') => self.run_visual_operator(Operator::Yank),
             KeyCode::Char('>') => self.run_visual_operator(Operator::Indent),
             KeyCode::Char('<') => self.run_visual_operator(Operator::Dedent),
+            KeyCode::Char('=') => self.run_visual_operator(Operator::Format),
             KeyCode::Char('u') => self.run_visual_operator(Operator::LowerCase),
             KeyCode::Char('U') => self.run_visual_operator(Operator::UpperCase),
             KeyCode::Char('~') => self.run_visual_operator(Operator::ToggleCase),
@@ -4354,6 +4355,59 @@ mod tests {
         feed(&mut ed, "yyj"); // yank indented line, move to "x"
         feed(&mut ed, "]P");
         assert_eq!(ed.buffer().text(), "        deep\ndeep\nx", "]P puts before, reindented");
+    }
+
+    // -----------------------------------------------------------------
+    // `=` — reindent/format operator (fallback brace-depth reindent; the
+    // LSP rangeFormatting leg is a documented follow-up, see AID-0033).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn equal_equal_reindents_the_current_line() {
+        // A mis-indented line inside a one-level block: `==` aligns it to sw*1.
+        let mut ed = editor_spaces("fn f() {\nx\n}");
+        feed(&mut ed, "j=="); // reindent line 1 ("x")
+        assert_eq!(ed.buffer().text(), "fn f() {\n    x\n}", "== indents the line to brace depth 1");
+    }
+
+    #[test]
+    fn equal_ip_reindents_a_whole_paragraph() {
+        let mut ed = editor_spaces("fn f() {\nx\ny\n}");
+        feed(&mut ed, "=ip"); // reindent the whole contiguous block
+        assert_eq!(ed.buffer().text(), "fn f() {\n    x\n    y\n}", "opener stays at 0, body at 1, closer back to 0");
+    }
+
+    #[test]
+    fn equal_motion_reindents_nested_braces() {
+        // Two levels of nesting exercise the depth counter and the
+        // closer-dedent rule on both `}` lines.
+        let mut ed = editor_spaces("fn f() {\nif x {\ny\n}\n}");
+        feed(&mut ed, "=G"); // reindent from line 0 to end of file
+        assert_eq!(ed.buffer().text(), "fn f() {\n    if x {\n        y\n    }\n}");
+    }
+
+    #[test]
+    fn equal_respects_noexpandtab_with_tabs() {
+        // With expandtab off (the maintainer's default), indent is tabs.
+        let mut ed = editor_with("fn f() {\nx\n}"); // expandtab defaults off
+        feed(&mut ed, "j==");
+        assert_eq!(ed.buffer().text(), "fn f() {\n\tx\n}", "one tab per depth level when noexpandtab");
+    }
+
+    #[test]
+    fn visual_equal_reindents_the_selection() {
+        let mut ed = editor_spaces("fn f() {\nx\ny\n}");
+        feed(&mut ed, "VG="); // linewise-select all, reindent
+        assert_eq!(ed.buffer().text(), "fn f() {\n    x\n    y\n}");
+    }
+
+    #[test]
+    fn equal_is_undoable_as_one_step() {
+        let mut ed = editor_spaces("fn f() {\nx\ny\n}");
+        feed(&mut ed, "=ip");
+        assert_eq!(ed.buffer().text(), "fn f() {\n    x\n    y\n}");
+        feed(&mut ed, "u");
+        assert_eq!(ed.buffer().text(), "fn f() {\nx\ny\n}", "the whole reindent undoes in one step");
     }
 
     // -----------------------------------------------------------------

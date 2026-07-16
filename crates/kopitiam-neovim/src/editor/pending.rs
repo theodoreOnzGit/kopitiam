@@ -427,6 +427,12 @@ impl Pending {
             KeyCode::Char('<') if self.operator == Some(Operator::Dedent) => self.complete_lines(Operator::Dedent),
             KeyCode::Char('<') => self.set_operator(Operator::Dedent),
 
+            // `=` is the reindent/format operator: `={motion}` and the doubled
+            // `==` (current line), recognised like `>>`/`<<` by seeing the
+            // operator already pending. See [`Operator::Format`].
+            KeyCode::Char('=') if self.operator == Some(Operator::Format) => self.complete_lines(Operator::Format),
+            KeyCode::Char('=') if self.operator.is_none() => self.set_operator(Operator::Format),
+
             // `!` is the shell-filter operator: `!{motion}` (e.g. `!ip`, `!5j`,
             // `!G`) and the doubled `!!` (the current line). Like `dd`/`>>` its
             // doubled form is recognised by seeing the operator already pending;
