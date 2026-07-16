@@ -60,6 +60,7 @@ pub mod core;
 pub mod editor;
 pub mod icons;
 pub mod lsp;
+pub mod luaconfig;
 pub mod plugins;
 pub mod text;
 pub mod tmux;

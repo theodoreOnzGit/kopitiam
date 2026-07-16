@@ -41,6 +41,13 @@ kopitiam-snippet.workspace = true
 # KOPITIAM app.
 kopitiam-config.workspace = true
 
+# The pure-Rust Lua 5.1 interpreter. This is what lets kvim EXECUTE the
+# init.lua it already discovers, through the `vim.*` shim in `luaconfig`,
+# instead of only reporting the files. See AID-0003 (why a pure-Rust VM) and
+# AID-0007 (why it is a bytecode VM). No C, no bindings — the Pure Rust Core
+# promise survive.
+kopitiam-lua.workspace = true
+
 # Text engine. `ropey` is pure Rust, is the rope behind Helix, and is O(log n)
 # for the index/edit operations an editor performs constantly.
 ropey = "1.6"

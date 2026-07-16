@@ -232,6 +232,19 @@ pub enum Action {
     EasyAlign,
     /// Run an ex command verbatim.
     Command(String),
+    /// Feed a raw key sequence, exactly as if the user typed it — vim's
+    /// `nnoremap lhs rhs` where `rhs` is keys, not an ex command. The string is
+    /// in vim notation (`ciw`, `<Esc>`, `dd`). Produced by the `vim.*` shim when
+    /// `vim.keymap.set(mode, lhs, rhs)` is handed a plain string that is not an
+    /// `<cmd>...<cr>` / `:...` ex invocation.
+    FeedKeys(String),
+    /// Call a Lua function bound as a keymap's right-hand side. The `usize` is an
+    /// index into the live [`crate::luaconfig::LuaRuntime`]'s callback registry —
+    /// the function value itself cannot live in `Config` because a Lua closure is
+    /// neither `Serialize` nor `PartialEq`, so the config stores only the handle
+    /// and the runtime owns the closure. Produced by the `vim.*` shim when
+    /// `vim.keymap.set(mode, lhs, function() ... end)` is given a function `rhs`.
+    LuaKeymap(usize),
 }
 
 /// The complete kvim configuration.
