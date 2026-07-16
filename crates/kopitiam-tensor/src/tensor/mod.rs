@@ -265,6 +265,25 @@ impl Tensor {
         Ok(self.logical_offsets().map(|i| data[i]).collect())
     }
 
+    /// Copies this view's elements out as a plain `Vec<i32>` in row-major
+    /// order. The `i32` twin of [`Tensor::to_vec_f32`]: needs
+    /// `dtype() == DType::I32`, errors [`Error::DTypeMismatch`] otherwise.
+    ///
+    /// This is how you read the *output* of an index-producing op — namely
+    /// [`Tensor::argmax`], whose result is the token ids a greedy sampler
+    /// hands back to the runtime. Without it argmax would be a dead end: you
+    /// could compute the winning indices but never get them out as plain
+    /// numbers. (There's deliberately no `i32 <-> f32` cast anywhere in this
+    /// crate — see [`Tensor::to_dtype`] — so this accessor is the *only* way
+    /// I32 data leaves a tensor, same as `to_vec_f32` is for F32.)
+    pub fn to_vec_i32(&self) -> Result<Vec<i32>> {
+        self.require_dtype(DType::I32)?;
+        let Storage::I32(data) = self.storage.as_ref() else {
+            unreachable!("require_dtype(I32) guarantees Storage::I32")
+        };
+        Ok(self.logical_offsets().map(|i| data[i]).collect())
+    }
+
     /// Returns a tensor equal to `self` but guaranteed contiguous, copying
     /// only if `self` is not already contiguous (in which case it is a
     /// cheap `Arc` clone).
