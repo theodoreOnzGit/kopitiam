@@ -102,7 +102,7 @@ kopitiam-config = { path = "crates/kopitiam-config", version = "0.1.1" }
 # A pure-Rust Lua 5.1 interpreter (no C, no mlua -- see AID-0003 and AID-0007).
 # kvim consumes it to execute the user's Lua config, which it can already
 # discover but not run.
-kopitiam-lua = { path = "crates/kopitiam-lua", version = "0.1.0" }
+kopitiam-lua = { path = "crates/kopitiam-lua", version = "0.1.1" }
 kopitiam-syntax = { path = "crates/kopitiam-syntax", version = "0.1.1" }
 kopitiam-snippet = { path = "crates/kopitiam-snippet", version = "0.1.1" }
 
