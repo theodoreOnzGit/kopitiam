@@ -69,11 +69,16 @@ pub enum GrammarCommand {
     /// leading whitespace stripped off the joined-in line). See
     /// [`super::Editor::join_lines`] for the exact whitespace rule each takes.
     JoinLines { count: Option<usize>, space: bool },
-    /// `p`/`P`, and their `gp`/`gP` cousins. `before` picks paste-before
-    /// (`P`/`gP`) over paste-after (`p`/`gp`); `cursor_after` is the `g`
-    /// variants' one difference — leave the cursor *after* the pasted text
-    /// rather than on its last (charwise) / first (linewise) grapheme.
-    Put { register: Option<char>, count: Option<usize>, before: bool, cursor_after: bool },
+    /// `p`/`P`, their `gp`/`gP` cousins, and the indent-adjusting
+    /// `]p`/`[p`/`[P`/`]P`. `before` picks paste-before (`P`/`gP`/`[p`/`[P`/`]P`)
+    /// over paste-after (`p`/`gp`/`]p`); `cursor_after` is the `g` variants' one
+    /// difference — leave the cursor *after* the pasted text rather than on its
+    /// last (charwise) / first (linewise) grapheme. `reindent` is set by the
+    /// bracket forms (`]p` etc.): a *linewise* register is re-indented so its
+    /// first line matches the current line's indent (vim's `PUT_FIXINDENT`),
+    /// the rest shifting with it. A charwise register ignores `reindent` and
+    /// pastes as a plain put — see [`super::Editor::put`].
+    Put { register: Option<char>, count: Option<usize>, before: bool, cursor_after: bool, reindent: bool },
     /// `i a I A o O`, plus `gi` ([`InsertPos::LastInsert`]) and `gI`
     /// ([`InsertPos::FirstColumn`]).
     EnterInsert(InsertPos),
@@ -506,8 +511,8 @@ impl Pending {
             KeyCode::Char('s') if self.operator.is_none() => self.finish(GrammarCommand::SubstituteChar { register: self.register, count: self.effective_count() }),
             KeyCode::Char('~') if self.operator.is_none() => self.finish(GrammarCommand::ToggleCaseUnderCursor { count: self.effective_count() }),
             KeyCode::Char('J') if self.operator.is_none() => self.finish(GrammarCommand::JoinLines { count: self.effective_count(), space: true }),
-            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: false }),
-            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: false }),
+            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: false, reindent: false }),
+            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: false, reindent: false }),
             KeyCode::Char('u') if self.operator.is_none() => self.finish(GrammarCommand::Undo),
             // `U`: line-undo. A top-level command only (an uppercase letter
             // after a pending operator is not one of these), like `u`.
@@ -673,8 +678,8 @@ impl Pending {
             KeyCode::Char('J') if self.operator.is_none() => self.finish(GrammarCommand::JoinLines { count: self.effective_count(), space: false }),
 
             // `gp`/`gP`: put, then leave the cursor after the pasted text.
-            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: true }),
-            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: true }),
+            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: true, reindent: false }),
+            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: true, reindent: false }),
 
             // `g;`/`g,`: walk the changelist backward/forward.
             KeyCode::Char(';') if self.operator.is_none() => self.finish(GrammarCommand::ChangelistJump { count: self.effective_count(), forward: false }),
@@ -765,6 +770,21 @@ impl Pending {
             let exact = c == '`';
             self.reset();
             return FeedResult::Complete(GrammarCommand::JumpBracketMark { forward, exact });
+        }
+        // `]p`/`[p`/`[P`/`]P`: put with indent adjusted to the current line.
+        // These are *not* motions (they don't compose with an operator — vim
+        // treats them as their own put commands, PUT_FIXINDENT), so they
+        // resolve to a `Put` here rather than through `complete_motion`.
+        //   `]p` — like `p` (put after), reindented.
+        //   `[p` — like `P` (put before), reindented.
+        //   `[P` / `]P` — also like `P` (put before), reindented.
+        if c == 'p' || c == 'P' {
+            let register = self.register;
+            let count = self.effective_count();
+            // Only `]p` puts *after*; every other bracket-put puts before.
+            let before = !(forward && c == 'p');
+            self.reset();
+            return FeedResult::Complete(GrammarCommand::Put { register, count, before, cursor_after: false, reindent: true });
         }
         // `[z`/`]z`: move to the start/end of the current fold. Like the mark
         // jumps above these need the fold table, which lives on the buffer and

@@ -1201,7 +1201,7 @@ impl Editor {
             GrammarCommand::ReplaceChar { count, ch } => self.replace_char(count, ch),
             GrammarCommand::ToggleCaseUnderCursor { count } => self.toggle_case_under_cursor(count),
             GrammarCommand::JoinLines { count, space } => self.join_lines(count, space),
-            GrammarCommand::Put { register, count, before, cursor_after } => self.put(register, count.unwrap_or(1).max(1), before, cursor_after),
+            GrammarCommand::Put { register, count, before, cursor_after, reindent } => self.put(register, count.unwrap_or(1).max(1), before, cursor_after, reindent),
             GrammarCommand::EnterInsert(pos) => self.enter_insert_at(pos),
             GrammarCommand::Undo => {
                 self.cursor = self.current_buffer_mut().undo()?;
@@ -2405,7 +2405,14 @@ impl Editor {
         self.command_runner = runner;
     }
 
-    fn put(&mut self, register: Option<char>, count: usize, before: bool, cursor_after: bool) -> crate::Result<EditorResponse> {
+    /// `p`/`P`/`gp`/`gP` and the indent-adjusting `]p`/`[p`/`[P`/`]P`.
+    ///
+    /// `reindent` (set only by the bracket forms) re-indents a **linewise**
+    /// register so its first line's indent matches the current line's, the
+    /// remaining lines shifting by the same amount — vim's `PUT_FIXINDENT`. A
+    /// charwise (or blockwise) register ignores `reindent` and pastes exactly
+    /// like a plain put, matching vim: `]p` on a charwise register is just `p`.
+    fn put(&mut self, register: Option<char>, count: usize, before: bool, cursor_after: bool, reindent: bool) -> crate::Result<EditorResponse> {
         let Some(content) = self.read_register(register) else {
             self.mode = Mode::Normal;
             self.discard_dot();
@@ -2416,7 +2423,14 @@ impl Editor {
             self.discard_dot();
             return Ok(EditorResponse::Continue);
         }
-        let repeated = content.text.repeat(count);
+        let mut repeated = content.text.repeat(count);
+        // Re-indent a linewise register to the current line's indent before it
+        // is inserted (charwise/blockwise are left untouched — see the doc).
+        if reindent && content.granularity == Granularity::Linewise {
+            let tabstop = self.options.tabstop;
+            let target_cols = indent_width(&self.current_buffer().line(self.cursor.line).unwrap_or_default(), tabstop);
+            repeated = reindent_block(&repeated, target_cols, tabstop, self.options.expandtab);
+        }
         self.begin_insert_group();
         let result = self.put_inner(&repeated, content.granularity, before, cursor_after);
         self.current_buffer_mut().end_undo_group();
@@ -3993,6 +4007,70 @@ fn adjust_change_word_motion(operator: Operator, motion: Motion, buf: &Buffer, p
     }
 }
 
+/// The indent width of `line` in screen columns, counting a tab as advancing
+/// to the next `tabstop` boundary (vim's own indent measure). Stops at the
+/// first non-whitespace grapheme. Used by the `]p`/`[p` put-with-indent forms.
+fn indent_width(line: &str, tabstop: usize) -> usize {
+    let ts = tabstop.max(1);
+    let mut w = 0;
+    for c in line.chars() {
+        match c {
+            ' ' => w += 1,
+            '\t' => w += ts - (w % ts),
+            _ => break,
+        }
+    }
+    w
+}
+
+/// Builds a leading-whitespace string `cols` screen-columns wide, honoring
+/// `expandtab` (all spaces) vs. tabs-then-spaces at width `tabstop`.
+fn make_indent(cols: usize, tabstop: usize, expandtab: bool) -> String {
+    if expandtab {
+        " ".repeat(cols)
+    } else {
+        let ts = tabstop.max(1);
+        let tabs = cols / ts;
+        let spaces = cols % ts;
+        format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces))
+    }
+}
+
+/// Re-indents a linewise register's `text` so its first non-blank line's indent
+/// becomes `target_cols`, every other line shifting by the same column delta —
+/// vim's `PUT_FIXINDENT`, the behaviour behind `]p`/`[p`/`[P`/`]P`.
+///
+/// Relative indentation within the block is preserved (a delta is applied
+/// uniformly, clamped at column 0), blank lines are emptied, and the trailing
+/// newline a linewise register always carries is retained so the result is
+/// still a well-formed linewise payload.
+fn reindent_block(text: &str, target_cols: usize, tabstop: usize, expandtab: bool) -> String {
+    // A linewise register ends in '\n'; split off that terminator so the empty
+    // final segment doesn't become a spurious blank line, then restore it.
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let lines: Vec<&str> = body.split('\n').collect();
+    let first_cols = lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| indent_width(l, tabstop))
+        .unwrap_or(0);
+    let delta = target_cols as isize - first_cols as isize;
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.trim().is_empty() {
+            continue; // blank line stays blank
+        }
+        let new_cols = (indent_width(line, tabstop) as isize + delta).max(0) as usize;
+        out.push_str(&make_indent(new_cols, tabstop, expandtab));
+        out.push_str(line.trim_start());
+    }
+    out.push('\n');
+    out
+}
+
 fn step_back_one(buf: &Buffer, pos: Position) -> Position {
     if pos.col > 0 {
         Position::new(pos.line, pos.col - 1)
@@ -4209,6 +4287,73 @@ mod tests {
         let mut ed = editor_with("untouched");
         feed(&mut ed, "U");
         assert_eq!(ed.buffer().line(0).as_deref(), Some("untouched"));
+    }
+
+    // -----------------------------------------------------------------
+    // `]p`/`[p`/`[P`/`]P` — put with indent adjusted to the current line.
+    // -----------------------------------------------------------------
+
+    /// A fresh editor over `text` with spaces-for-indent so indent assertions
+    /// are deterministic (the maintainer's real default is `noexpandtab`).
+    fn editor_spaces(text: &str) -> Editor {
+        let mut ed = editor_with(text);
+        ed.options.expandtab = true;
+        ed.options.tabstop = 4;
+        ed
+    }
+
+    #[test]
+    fn bracket_put_after_reindents_to_the_current_line() {
+        // Yank an indented line, move to an unindented line, `]p` after it: the
+        // pasted copy takes the current line's (zero) indent.
+        let mut ed = editor_spaces("def\n    body");
+        feed(&mut ed, "jyy"); // yank "    body\n" linewise
+        feed(&mut ed, "k"); // back to line 0 ("def", indent 0)
+        feed(&mut ed, "]p");
+        assert_eq!(ed.buffer().text(), "def\nbody\n    body", "pasted line reindented to indent 0");
+    }
+
+    #[test]
+    fn bracket_put_before_reindents_to_the_current_line() {
+        // `[p` puts before the current line, reindented to it.
+        let mut ed = editor_spaces("        deep\nx");
+        feed(&mut ed, "yy"); // yank "        deep\n" (indent 8)
+        feed(&mut ed, "j"); // to line 1 ("x", indent 0)
+        feed(&mut ed, "[p");
+        assert_eq!(ed.buffer().text(), "        deep\ndeep\nx", "pasted-before line reindented to indent 0");
+    }
+
+    #[test]
+    fn bracket_put_preserves_relative_indent_across_lines() {
+        // A two-line block keeps its internal +2 step, shifted so the first
+        // line matches the current line's indent.
+        let mut ed = editor_spaces("  a\n    b\n        here");
+        feed(&mut ed, "Vjy"); // linewise-yank the two-line block "  a\n    b\n"
+        feed(&mut ed, "G"); // to "        here" (indent 8)
+        feed(&mut ed, "]p");
+        // first block line -> indent 8, second -> 8 + (4-2) = 10.
+        assert_eq!(ed.buffer().text(), "  a\n    b\n        here\n        a\n          b");
+    }
+
+    #[test]
+    fn bracket_put_on_a_charwise_register_is_a_plain_put() {
+        // vim: `]p` of a charwise register behaves exactly like `p`.
+        let mut ed = editor_spaces("word rest");
+        feed(&mut ed, "yw"); // charwise yank "word " ... actually "word"
+        feed(&mut ed, "$"); // end of line
+        feed(&mut ed, "]p");
+        // charwise put-after inserts inline after the cursor grapheme, no
+        // reindent, no new line.
+        assert_eq!(ed.buffer().line_count(), 1, "charwise ]p must not add a line");
+    }
+
+    #[test]
+    fn bracket_put_uppercase_p_always_puts_before() {
+        // `]P` and `[P` both put *before*, reindented — only `]p` puts after.
+        let mut ed = editor_spaces("        deep\nx");
+        feed(&mut ed, "yyj"); // yank indented line, move to "x"
+        feed(&mut ed, "]P");
+        assert_eq!(ed.buffer().text(), "        deep\ndeep\nx", "]P puts before, reindented");
     }
 
     // -----------------------------------------------------------------
