@@ -408,6 +408,14 @@ pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
     }
 
     let mut app = App::new(editor, options, theme, icons, leader);
+    // Once the App exists but before the terminal is taken over: if kvim is
+    // running inside a multiplexer, work out whether tmux would eat its
+    // `<C-h/j/k/l>` (the vim-tmux-navigator `is_vim` problem) and arm the
+    // consent popup if so. Reads the environment and the user's tmux.conf, so
+    // it lives here — in `run`, next to the other startup detection — and not
+    // in `App::new`, which must stay pure enough to build in a unit test. See
+    // `crate::tmux`.
+    app.apply_startup_advice(crate::tmux::startup_advice());
 
     let mut guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(io::stdout());

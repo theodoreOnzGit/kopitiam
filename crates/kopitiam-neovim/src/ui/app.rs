@@ -187,6 +187,15 @@ pub struct App<H: EditorHost> {
     /// reason [`crate::icons`] is: the environment does not change under a
     /// running process, and a syscall per focus key is waste.
     in_tmux: bool,
+    /// A pending, unanswered offer to fix the user's tmux `is_vim` config, if
+    /// kvim noticed the vim-tmux-navigator problem at startup (see
+    /// [`crate::tmux`]). While `Some`, it is a modal consent popup: it owns the
+    /// keyboard before anything else, paints over the buffer, and is dismissed
+    /// only by `y` (apply the fix) or `n`/`Esc`/`q` (decline, and remember not
+    /// to nag). Nothing is written to the user's dotfile until they press `y` —
+    /// that is the whole safety point of routing this through a popup rather
+    /// than editing on sight.
+    tmux_prompt: Option<crate::tmux::TmuxOffer>,
     /// Test-only record of the `tmux select-pane` hand-offs that
     /// [`Self::tmux_select_pane`] *would* have spawned. A tmux hand-off is an
     /// external side effect with no painted cells to assert on, so under
@@ -290,6 +299,10 @@ impl<H: EditorHost> App<H> {
             snippet: None,
             last_cursor_screen: None,
             in_tmux: std::env::var_os("TMUX").is_some(),
+            // Detected once, by `run()`, right after construction — not here,
+            // so building an `App` in a unit test never reads the environment
+            // or the filesystem. See `App::apply_startup_advice`.
+            tmux_prompt: None,
             #[cfg(test)]
             tmux_calls: Vec::new(),
         }
@@ -300,6 +313,77 @@ impl<H: EditorHost> App<H> {
     /// processes behind.
     pub fn shutdown_lsp(&mut self) {
         self.lsp.shutdown_all();
+    }
+
+    /// Acts on the multiplexer advice [`crate::tmux::startup_advice`] computed
+    /// at startup.
+    ///
+    /// Kept separate from [`Self::new`] on purpose: the advice is derived from
+    /// the environment and the real filesystem, which a unit test constructing
+    /// an `App` must not trigger. `run()` computes it once and hands it here; a
+    /// test can pass a fabricated [`crate::tmux::StartupAdvice`] to exercise the
+    /// popup with no tmux and no dotfile in sight.
+    ///
+    /// * A [`crate::tmux::StartupAdvice::Note`] (screen / zellij) becomes a
+    ///   one-line status message — non-modal, gone on the first keypress.
+    /// * A [`crate::tmux::StartupAdvice::OfferFix`] arms the consent popup.
+    pub fn apply_startup_advice(&mut self, advice: crate::tmux::StartupAdvice) {
+        use crate::tmux::StartupAdvice;
+        match advice {
+            StartupAdvice::Nothing => {}
+            StartupAdvice::Note(note) => self.message = StatusMessage::Info(note),
+            StartupAdvice::OfferFix(offer) => self.tmux_prompt = Some(*offer),
+        }
+    }
+
+    /// Handles a key while the tmux consent popup is up. This popup is modal: it
+    /// owns the keyboard until answered, so keys never reach the editor.
+    ///
+    /// * `y`/`Y` → apply the fix (backing up the conf first), then show the one
+    ///   follow-up the user must run themselves — kvim deliberately does **not**
+    ///   run `tmux source-file` for them, exactly as `--install-font` leaves the
+    ///   font-cache reload to the user.
+    /// * `n`/`N`/`Esc`/`q` → decline, and remember it so kvim dun ask again.
+    /// * anything else → ignored; the popup stay up until it get a clear answer.
+    fn handle_tmux_prompt_key(&mut self, kp: KeyPress) -> LoopAction {
+        match kp.key {
+            Key::Char('y') | Key::Char('Y') => {
+                let offer = self.tmux_prompt.take().expect("prompt is open");
+                match offer.apply() {
+                    Ok(backup) => {
+                        let where_to = offer.path.display();
+                        let backup_note = match backup {
+                            Some(bak) => format!(" (backup at {})", bak.display()),
+                            None => String::new(),
+                        };
+                        self.message = StatusMessage::Info(format!(
+                            "kvim fixed {where_to}{backup_note}. Now you run this yourself to load it: \
+                             tmux source-file {where_to}  (or just restart tmux)."
+                        ));
+                    }
+                    Err(e) => {
+                        self.message = StatusMessage::Error(format!(
+                            "Alamak, kvim cannot write {}: {e}. Nothing changed.",
+                            offer.path.display()
+                        ));
+                    }
+                }
+                LoopAction::Redraw
+            }
+            Key::Char('n') | Key::Char('N') | Key::Char('q') | Key::Escape => {
+                self.tmux_prompt = None;
+                crate::tmux::remember_decline();
+                self.message = StatusMessage::Info(
+                    "Ok, kvim leave your tmux.conf alone. (Delete kvim's marker file if you change \
+                     your mind — see `:help tmux`.)"
+                        .to_string(),
+                );
+                LoopAction::Redraw
+            }
+            // Not a yes/no: keep the modal up rather than let a stray key slip
+            // through to the editor behind it.
+            _ => LoopAction::Continue,
+        }
     }
 
     /// Where keystrokes are currently going.
@@ -362,6 +446,13 @@ impl<H: EditorHost> App<H> {
                 let Some(kp) = map_crossterm_key(key_event) else {
                     return LoopAction::Continue;
                 };
+                // The tmux consent popup is the outermost modal: while it is up,
+                // it owns every key (it is asking a yes/no question about editing
+                // the user's dotfile), so it is checked before focus, window
+                // commands, and everything else.
+                if self.tmux_prompt.is_some() {
+                    return self.handle_tmux_prompt_key(kp);
+                }
                 // A `<C-w>` window command owns the *next* key no matter what
                 // currently has focus — that is how `<C-w>l` moves focus out of
                 // the file tree and `<C-w>h` moves it back in. Checked before the
@@ -1738,6 +1829,9 @@ impl<H: EditorHost> App<H> {
         // The completion popup sits on top of everything, anchored at the cursor
         // captured during `render_windows`.
         self.render_completion_menu(frame, windows_area);
+        // The tmux consent popup is outermost of all: it is a modal question
+        // that must sit above whatever the editor happens to be showing.
+        self.render_tmux_prompt(frame, windows_area);
     }
 
     /// Draws the insert-mode completion popup at the cursor, when one is open.
@@ -1795,6 +1889,19 @@ impl<H: EditorHost> App<H> {
                 rect,
             );
         }
+    }
+
+    /// Draws the tmux consent popup, when one is armed. A passive render pass —
+    /// the yes/no keystrokes are handled in [`Self::handle_tmux_prompt_key`].
+    fn render_tmux_prompt(&self, frame: &mut Frame, area: Rect) {
+        let Some(offer) = &self.tmux_prompt else { return };
+        let lines = tmux_prompt_lines(offer);
+        let title = "kvim + tmux — fix your <C-h/j/k/l>?";
+        let rect = popup_rect_for(area, &lines, 84, title);
+        frame.render_widget(
+            InfoBox { title, lines: &lines, selected: None, theme: &self.theme, scroll: 0 },
+            rect,
+        );
     }
 
     /// Draws the which-key popup when the editor has a key prefix pending.
@@ -2279,6 +2386,62 @@ fn display_path(path: &Path) -> String {
 /// for the longest line (capped at `max_width`), tall enough for every line
 /// (capped to the area), and centred. `title` widens the minimum so the title
 /// is never clipped.
+/// Builds the Singlish body of the tmux consent popup from an offer.
+///
+/// Kept a free function (not a method) so the exact wording, and the promise it
+/// makes about what will change, can be asserted in a painted-cell test without
+/// standing up a whole `App`. The popup always shows the user three things
+/// before asking: *what* is broken, the *exact file* kvim will touch, and the
+/// *exact line(s)* it will write — never a vague "let me fix it".
+fn tmux_prompt_lines(offer: &crate::tmux::TmuxOffer) -> Vec<String> {
+    use crate::tmux::FixKind;
+
+    let mut lines = vec![
+        "Eh, you running kvim inside tmux.".to_string(),
+        "Your <C-h/j/k/l> pane-switch confirm cannot work: tmux's is_vim check".to_string(),
+        "dunno \"kvim\", so it eats the keys before kvim can even see them.".to_string(),
+        String::new(),
+    ];
+
+    match offer.edit.kind {
+        FixKind::ExtendRegex => {
+            lines.push(format!("Let kvim fix this line in {}?", offer.path.display()));
+            lines.push(String::new());
+            if let Some(old) = &offer.edit.old_line {
+                lines.push("  now:  ".to_string());
+                lines.push(format!("    {old}"));
+            }
+            lines.push("  after:".to_string());
+            for l in &offer.edit.new_lines {
+                lines.push(format!("    {l}"));
+            }
+        }
+        FixKind::AppendBlock => {
+            lines.push(format!("Let kvim add this block to {}?", offer.path.display()));
+            lines.push(String::new());
+            for l in &offer.edit.new_lines {
+                lines.push(format!("    {l}"));
+            }
+        }
+        FixKind::CreateFile => {
+            lines.push(format!("You got no tmux.conf. Let kvim create {} with:", offer.path.display()));
+            lines.push(String::new());
+            for l in &offer.edit.new_lines {
+                lines.push(format!("    {l}"));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    if offer.existed {
+        lines.push("kvim back up your conf first (.kvim-bak). Nothing else kena touch.".to_string());
+    } else {
+        lines.push("Nothing existing kena touch — this is a brand-new file.".to_string());
+    }
+    lines.push("[y] yes, fix lah      [n] no, leave it alone".to_string());
+    lines
+}
+
 fn popup_rect_for(area: Rect, lines: &[String], max_width: u16, title: &str) -> Rect {
     let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let width = (longest.max(title.len()) as u16 + 4).min(max_width);
@@ -3536,5 +3699,80 @@ mod tests {
             cy,
             "the hover box's bottom border must be the row directly above the live cursor (cx={cx}, cy={cy}), box at ({bx},{by})..={bottom}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // tmux consent popup (kopitiam-cj0.31): the offer paints, `y` applies
+    // the fix and backs the conf up, `n` leaves everything untouched.
+    // ------------------------------------------------------------------
+
+    const CONF_MISSING_KVIM: &str = "is_vim=\"ps | grep -iqE '(view|n?vim?x?|fzf)'\"\n";
+
+    /// An app with a tmux consent popup armed against a real temp conf that has
+    /// an `is_vim` regex missing `kvim`. Returns the app and the conf path so a
+    /// test can inspect the file after answering.
+    fn app_with_tmux_prompt() -> (tempfile::TempDir, App<Editor>, PathBuf) {
+        let (dir, mut app) = real_app_one_file("hello\n");
+        let conf = dir.path().join("tmux.conf");
+        std::fs::write(&conf, CONF_MISSING_KVIM).unwrap();
+        let edit = crate::tmux::compute_fix(Some(CONF_MISSING_KVIM)).unwrap();
+        app.tmux_prompt = Some(crate::tmux::TmuxOffer { path: conf.clone(), existed: true, edit });
+        (dir, app, conf)
+    }
+
+    #[test]
+    fn tmux_consent_popup_paints_the_question_and_the_exact_change() {
+        let (_dir, mut app, _conf) = app_with_tmux_prompt();
+        let rows = real_screen(&mut app, 90, 24);
+        let screen = rows.join("\n");
+        assert!(screen.contains("inside tmux"), "the popup explains the tmux problem: {screen}");
+        // The exact fixed regex line is shown before any edit happens.
+        assert!(screen.contains("kvim|"), "the popup shows the exact change: {screen}");
+        assert!(screen.contains("[y]") && screen.contains("[n]"), "the popup offers a yes/no: {screen}");
+    }
+
+    #[test]
+    fn pressing_n_leaves_the_conf_untouched_and_dismisses_the_popup() {
+        let (_dir, mut app, conf) = app_with_tmux_prompt();
+        let action = app.handle_event(key_event('n'));
+        assert_eq!(action, LoopAction::Redraw);
+        assert!(app.tmux_prompt.is_none(), "n dismisses the popup");
+        // The conf on disk is byte-for-byte what it was: no edit, no backup.
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), CONF_MISSING_KVIM);
+        let bak = conf.with_file_name("tmux.conf.kvim-bak");
+        assert!(!bak.exists(), "declining must not write a backup either");
+    }
+
+    #[test]
+    fn pressing_y_applies_the_fix_and_writes_a_backup() {
+        let (_dir, mut app, conf) = app_with_tmux_prompt();
+        let action = app.handle_event(key_event('y'));
+        assert_eq!(action, LoopAction::Redraw);
+        assert!(app.tmux_prompt.is_none(), "y dismisses the popup");
+        // The conf now recognises kvim.
+        let written = std::fs::read_to_string(&conf).unwrap();
+        assert!(written.contains("kvim|"), "the fix was applied: {written}");
+        // A backup of the original was made.
+        let bak = conf.with_file_name("tmux.conf.kvim-bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), CONF_MISSING_KVIM, "backup holds the original");
+    }
+
+    #[test]
+    fn an_unrelated_key_keeps_the_modal_up() {
+        let (_dir, mut app, conf) = app_with_tmux_prompt();
+        // A key that is neither yes nor no must not fall through to the editor,
+        // and must not answer the question.
+        let action = app.handle_event(key_event('j'));
+        assert_eq!(action, LoopAction::Continue);
+        assert!(app.tmux_prompt.is_some(), "the popup stays until a clear yes/no");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), CONF_MISSING_KVIM, "nothing edited");
+    }
+
+    #[test]
+    fn a_screen_note_becomes_a_non_modal_status_message() {
+        let (_dir, mut app) = real_app_one_file("hi\n");
+        app.apply_startup_advice(crate::tmux::StartupAdvice::Note("you inside screen".to_string()));
+        assert!(app.tmux_prompt.is_none(), "a note arms no modal popup");
+        assert_eq!(app.message, StatusMessage::Info("you inside screen".to_string()));
     }
 }

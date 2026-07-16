@@ -45,6 +45,9 @@
 //! * [`config`] — configuration, whose defaults *are* the maintainer's Neovim
 //!   config, ported.
 //! * [`icons`] — devicons, with a three-tier fallback and an embedded font.
+//! * [`tmux`] — multiplexer detection and the tmux `is_vim` auto-fix: kvim
+//!   notices when tmux would eat its `<C-h/j/k/l>` and offers, with consent, to
+//!   patch the user's `tmux.conf`.
 //!
 //! # Status
 //!
@@ -59,6 +62,7 @@ pub mod icons;
 pub mod lsp;
 pub mod plugins;
 pub mod text;
+pub mod tmux;
 pub mod ui;
 
 pub use config::Config;

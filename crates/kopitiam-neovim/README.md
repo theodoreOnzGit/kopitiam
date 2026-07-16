@@ -136,32 +136,69 @@ at if you want to override or extend the keymap in `config.json`.
 
 ## tmux integration
 
-kvim uses `<C-h/j/k/l>` to move focus between splits, and at the edge of its
-own layout it hands off to the adjacent **tmux** pane (running `tmux
-select-pane -L/-D/-U/-R`), the vim-tmux-navigator contract. For that to work
-seamlessly in both directions, tmux must send those keys *through* to kvim
-instead of consuming them for its own pane navigation.
+kvim use `<C-h/j/k/l>` to move focus between splits, and at the edge of its
+own layout it hand off to the adjacent **tmux** pane (running `tmux
+select-pane -L/-D/-U/-R`), the vim-tmux-navigator contract. For this to work
+both direction, tmux must send those keys *through* to kvim instead of
+grabbing them for its own pane navigation.
 
-If you use christoomey/vim-tmux-navigator's tmux side (or any config built on
-its `is_vim` check), add `kvim` to the process regex so tmux recognises it as
-a vim-like client. In `~/.tmux.conf`:
+The catch: vim-tmux-navigator's tmux side decide whether to forward the keys
+by running an `is_vim` check — a `grep` over the running process name against a
+regex of vim-like editors (`vim`, `nvim`, `view`, `fzf`). That list **dun
+include `kvim`**, so out of the box tmux dun recognise kvim, eats
+`<C-h/j/k/l>` before kvim can see them, and kvim's split navigation go quietly
+dead.
+
+### kvim can fix this for you (with consent)
+
+When kvim start up inside tmux, it check your `tmux.conf` for this exact
+problem. If it find your `is_vim` regex dunno `kvim`, it pop up and *ask*
+whether it may patch the conf for you — showing you the exact file and the
+exact line(s) it will change **before** you say yes:
+
+- press `y` → kvim back up your conf first (`tmux.conf.kvim-bak`), then make
+  the minimal change: slot `kvim` into your existing `is_vim` regex, or — if
+  you got no vim-tmux-navigator setup at all — append a fresh, commented block
+  (and create `~/.config/tmux/tmux.conf` if you dun have one yet). After that
+  kvim tell you the one thing you must run yourself: `tmux source-file <path>`
+  (or just restart tmux). kvim **never** run that for you.
+- press `n` → kvim leave your conf completely alone and dun ask again. To get
+  the offer back, delete kvim's marker file at
+  `~/.kopitiam/kopitiam-neovim/.tmux-autoconfig-declined`.
+
+kvim look for your conf in the usual places, in order:
+`$XDG_CONFIG_HOME/tmux/tmux.conf`, `~/.config/tmux/tmux.conf`, `~/.tmux.conf`.
+It **never** touch anything without you pressing `y` first — same hard line as
+kvim never writing `~/.config/nvim`.
+
+If you inside `screen` or `zellij` instead, kvim just show a one-line note:
+the pane hand-off is tmux-only, so there `<C-h/j/k/l>` only move kvim's own
+splits.
+
+### Doing it by hand
+
+Prefer to edit it yourself? Add `kvim` to the `is_vim` regex — this is the
+exact block kvim would add for you:
 
 ```tmux
-# Treat kvim like vim/nvim: let it own <C-h/j/k/l> so its splits and the
-# tmux edge hand-off line up. Note the `k?vim` covers vim, nvim, and kvim.
+# ── kvim / vim-tmux-navigator ──────────────────────────────────────────
+# Let vim-like apps own <C-h/j/k/l> so their splits and tmux's panes
+# navigate as one thing. The `kvim` in the regex is the load-bearing bit.
 is_vim="ps -o state= -o comm= -t '#{pane_tty}' \
-    | grep -iqE '^[^TXZ ]+ +(\\S+\\/)?g?(k?vim?x?|fzf)(diff)?$'"
+    | grep -iqE '^[^TXZ ]+ +(\\S+\\/)?g?(view|kvim|n?vim?x?|fzf)(diff)?$'"
 bind-key -n 'C-h' if-shell "$is_vim" 'send-keys C-h' 'select-pane -L'
 bind-key -n 'C-j' if-shell "$is_vim" 'send-keys C-j' 'select-pane -D'
 bind-key -n 'C-k' if-shell "$is_vim" 'send-keys C-k' 'select-pane -U'
 bind-key -n 'C-l' if-shell "$is_vim" 'send-keys C-l' 'select-pane -R'
+# ───────────────────────────────────────────────────────────────────────
 ```
 
-The load-bearing part is the `k?vim` in the regex: without it tmux treats
-kvim as a non-vim program and eats `<C-h/j/k/l>` before kvim ever sees them,
-so intra-kvim split navigation silently stops working. When kvim is *not*
-running inside tmux (`$TMUX` unset) the edge hand-off is simply a no-op, as
-in plain vim.
+The load-bearing part is the `kvim` in the alternation: without it tmux treat
+kvim as a non-vim program and eat `<C-h/j/k/l>` before kvim ever see them, so
+intra-kvim split navigation silently stop working. The double backslashes
+(`\\S`, `\\/`) are correct — inside the double-quoted `is_vim="..."` string
+tmux collapse `\\` to `\`, so grep receive `\S`/`\/`. When kvim is *not* inside
+tmux (`$TMUX` unset) the edge hand-off is simply a no-op, like plain vim.
 
 ## Editing
 
