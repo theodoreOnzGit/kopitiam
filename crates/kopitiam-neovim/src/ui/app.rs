@@ -138,6 +138,13 @@ pub struct App<H: EditorHost> {
     /// Set after `<C-w>` in Normal mode: the *next* key is a window command
     /// (`h`/`j`/`k`/`l`/`w`/`s`/`v`/…), not text. See [`App::handle_event`].
     awaiting_window_key: bool,
+    /// A numeric prefix typed *between* `<C-w>` and its command letter — vim's
+    /// `[count]` for the resize/exchange family (`<C-w>10>` widens by ten
+    /// steps, `<C-w>2x` swaps with window two). Digits accumulate here while
+    /// [`Self::awaiting_window_key`] stays armed; the command consumes and
+    /// clears it. `None` means "no count given", which resize reads as 1 and
+    /// exchange reads as "the next window", two genuinely different defaults.
+    pending_window_count: Option<u32>,
     /// The window area painted on the last frame, so spatial `<C-w>h/j/k/l`
     /// (which needs geometry) and hop (which needs the active window's rect)
     /// can be resolved between frames, when there is no live `Frame` to ask.
@@ -387,6 +394,7 @@ impl<H: EditorHost> App<H> {
             focus: Focus::Buffer,
             hop: None,
             awaiting_window_key: false,
+            pending_window_count: None,
             last_windows_area: Rect::default(),
             lsp: LspClient::new(),
             lsp_hover: None,
@@ -2309,8 +2317,29 @@ impl<H: EditorHost> App<H> {
     /// Handles the key *after* `<C-w>` in Normal mode. Anything unrecognised
     /// is dropped (vim beeps); the deferred motions (`H`/`J`/`K`/`L` move,
     /// `T` to a new tab) report honestly rather than doing something else.
+    ///
+    /// A digit here is not a command but a `[count]` prefix for the resize and
+    /// exchange keys (`<C-w>10>`, `<C-w>2x`): it accumulates into
+    /// [`Self::pending_window_count`] and re-arms the window state for the next
+    /// key. A leading `0` is not a count (vim reserves bare `0` for start-of-
+    /// line), and there is no `<C-w>0` command, so it simply falls through and
+    /// is dropped.
     fn handle_window_key(&mut self, kp: KeyPress) -> LoopAction {
+        if let Key::Char(c @ '0'..='9') = kp.key
+            && !(c == '0' && self.pending_window_count.is_none())
+        {
+            let acc = self.pending_window_count.unwrap_or(0);
+            self.pending_window_count =
+                Some(acc.saturating_mul(10).saturating_add((c as u8 - b'0') as u32));
+            self.awaiting_window_key = true; // stay armed for the next digit or the command
+            return LoopAction::Continue;
+        }
         self.awaiting_window_key = false;
+        // Consume the accumulated `[count]`. `count` is the repeat/height for
+        // the resize keys (default 1); `count_opt` preserves the "no count at
+        // all" case that `<C-w>x` needs to tell "next window" from "window 1".
+        let count_opt = self.pending_window_count.take().map(|n| n as usize);
+        let count = count_opt.unwrap_or(1).max(1);
         // `<C-w><C-h>` and `<C-w>h` mean the same thing, so the ctrl bit on
         // the second key is ignored for the letter commands.
         match kp.key {
@@ -2343,12 +2372,15 @@ impl<H: EditorHost> App<H> {
                 self.windows.equalize();
                 LoopAction::Redraw
             }
-            Key::Char('+') => self.resize_window(false, true),
-            Key::Char('-') => self.resize_window(false, false),
-            Key::Char('>') => self.resize_window(true, true),
-            Key::Char('<') => self.resize_window(true, false),
-            Key::Char('x') => self.exchange_window(),
-            Key::Char('r') => self.rotate_windows(),
+            Key::Char('+') => self.resize_window(false, true, count),
+            Key::Char('-') => self.resize_window(false, false, count),
+            Key::Char('>') => self.resize_window(true, true, count),
+            Key::Char('<') => self.resize_window(true, false, count),
+            Key::Char('_') => self.maximize_window(false),
+            Key::Char('|') => self.maximize_window(true),
+            Key::Char('x') => self.exchange_window(count_opt),
+            Key::Char('r') => self.rotate_windows(true),
+            Key::Char('R') => self.rotate_windows(false),
             // Deferred: moving a window to an edge (H/J/K/L) restructures the
             // tree, and `T` needs tab pages, which kvim does not have. Say so
             // rather than silently doing the wrong thing.
@@ -2465,21 +2497,35 @@ impl<H: EditorHost> App<H> {
         LoopAction::Redraw
     }
 
-    fn resize_window(&mut self, vertical: bool, grow: bool) -> LoopAction {
-        self.windows.resize_active(vertical, grow);
+    /// `<C-w>+`/`-`/`<`/`>`: grow or shrink the active pane by `count` steps.
+    /// Pure layout — no cursor sync needed, so it does not touch the editor.
+    fn resize_window(&mut self, vertical: bool, grow: bool, count: usize) -> LoopAction {
+        self.windows.resize_active(vertical, grow, count);
         LoopAction::Redraw
     }
 
-    fn exchange_window(&mut self) -> LoopAction {
+    /// `<C-w>_` (maximise height) / `<C-w>|` (maximise width).
+    fn maximize_window(&mut self, vertical: bool) -> LoopAction {
+        self.windows.maximize_active(vertical);
+        LoopAction::Redraw
+    }
+
+    /// `<C-w>x`: exchange the active pane with another (`None` = the next one).
+    /// The active window's live cursor is flushed into the tree first and the
+    /// swapped-in one loaded after, so the editor edits the pane that followed
+    /// the swap — see [`WindowTree::exchange`].
+    fn exchange_window(&mut self, count: Option<usize>) -> LoopAction {
         self.sync_active_window();
-        self.windows.exchange();
+        self.windows.exchange(count);
         self.load_active_window();
         LoopAction::Redraw
     }
 
-    fn rotate_windows(&mut self) -> LoopAction {
+    /// `<C-w>r` (`forward == true`) / `<C-w>R` (`forward == false`): rotate the
+    /// panes' contents. Same cursor sync/load dance as [`Self::exchange_window`].
+    fn rotate_windows(&mut self, forward: bool) -> LoopAction {
         self.sync_active_window();
-        self.windows.rotate();
+        self.windows.rotate(forward);
         self.load_active_window();
         LoopAction::Redraw
     }
@@ -4646,6 +4692,110 @@ mod tests {
         // `:q` on the last window quits.
         feed_str(&mut app, ":q");
         assert_eq!(app.handle_event(enter_event()), LoopAction::Quit);
+    }
+
+    /// The char column of the vertical divider `│` in a painted row, or `None`
+    /// if there is no divider on that row.
+    fn divider_col(row: &str) -> Option<usize> {
+        row.chars().position(|c| c == '│')
+    }
+
+    #[test]
+    fn ctrl_w_gt_widens_the_active_pane_and_ctrl_w_eq_re_equalises() {
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        // Force a paint so `last_windows_area` is populated, then read where the
+        // divider sits with the panes evenly split.
+        let even = divider_col(&real_screen(&mut app, 40, 6)[0]).expect("a vertical split paints a divider");
+
+        // `<C-w>>` three times grows the active (left) pane, so the divider
+        // marches right.
+        for _ in 0..3 {
+            app.handle_event(ctrl_event('w'));
+            app.handle_event(key_event('>'));
+        }
+        let widened = divider_col(&real_screen(&mut app, 40, 6)[0]).expect("divider still painted");
+        assert!(widened > even, "the split boundary should have moved right: {even} -> {widened}");
+
+        // `<C-w>=` puts it back to the even split.
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('='));
+        let back = divider_col(&real_screen(&mut app, 40, 6)[0]).expect("divider still painted");
+        assert_eq!(back, even, "equalise should restore the even divider column");
+    }
+
+    #[test]
+    fn ctrl_w_count_gt_widens_more_than_a_single_press() {
+        // `<C-w>3>` in one go should move the divider further than `<C-w>>`
+        // once — the digit is consumed as a count, not typed into the buffer.
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        let even = divider_col(&real_screen(&mut app, 40, 6)[0]).unwrap();
+
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('1'));
+        app.handle_event(key_event('>'));
+        let one = divider_col(&real_screen(&mut app, 40, 6)[0]).unwrap();
+
+        // Reset, then apply a count of three at once.
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('='));
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('3'));
+        app.handle_event(key_event('>'));
+        let three = divider_col(&real_screen(&mut app, 40, 6)[0]).unwrap();
+
+        assert!(one > even, "a single step still widens");
+        assert!(three > one, "count 3 must widen further than count 1: {one} vs {three}");
+        // The digit must not have leaked into the buffer.
+        assert_eq!(app.host.buffer().text(), "BBBBBBBB\nBBBBBBBB\n", "the count digit is not text");
+    }
+
+    #[test]
+    fn ctrl_w_x_exchanges_the_two_panes_buffers() {
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        // Before: left pane shows b.txt, right pane shows a.txt.
+        let before = real_screen(&mut app, 40, 6);
+        assert!(before[0].starts_with("BBBBBBBB"), "left starts as b.txt, got {:?}", before[0]);
+
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('x'));
+
+        let after = real_screen(&mut app, 40, 6);
+        assert!(after[0].starts_with("AAAAAAAA"), "left pane now shows a.txt, got {:?}", after[0]);
+        let right: String = after[0].chars().skip(20).collect();
+        assert!(right.contains("BBBBBBBB"), "right pane now shows b.txt, got {right:?}");
+    }
+
+    #[test]
+    fn ctrl_w_r_rotates_which_buffer_sits_where() {
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        // Two panes: left b.txt, right a.txt. A rotate swaps their contents.
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('r'));
+        let rows = real_screen(&mut app, 40, 6);
+        assert!(rows[0].starts_with("AAAAAAAA"), "rotate moved a.txt to the left, got {:?}", rows[0]);
+        let right: String = rows[0].chars().skip(20).collect();
+        assert!(right.contains("BBBBBBBB"), "rotate moved b.txt to the right, got {right:?}");
+    }
+
+    #[test]
+    fn ctrl_w_pipe_maximises_the_active_pane_width() {
+        let (_dir, mut app, b) = real_app_two_files();
+        feed_str(&mut app, &format!(":vs {}", b.display()));
+        app.handle_event(enter_event());
+        let even = divider_col(&real_screen(&mut app, 40, 6)[0]).unwrap();
+
+        app.handle_event(ctrl_event('w'));
+        app.handle_event(key_event('|'));
+        let maxed = divider_col(&real_screen(&mut app, 40, 6)[0]).expect("divider stays: sibling keeps a sliver");
+        assert!(maxed > even, "maximise should push the divider well right of even: {even} -> {maxed}");
     }
 
     // ------------------------------------------------------------------

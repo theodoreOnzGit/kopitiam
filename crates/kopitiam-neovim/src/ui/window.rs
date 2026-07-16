@@ -36,6 +36,21 @@ use ratatui::layout::Rect;
 
 use crate::core::{BufferId, Direction, Position, WindowId};
 
+/// One `<C-w>+`/`-`/`<`/`>` nudge, in percentage points of the enclosing
+/// split's ratio. vim resizes in whole lines/columns; the tree stores ratios,
+/// not sizes (see [`WindowTree::resize_active`]), so a step is a fixed slice of
+/// the split instead. Eight points is a visible-but-not-jarring move that takes
+/// a handful of presses to run a pane from even to the [`RESIZE_FLOOR`]/
+/// [`RESIZE_CEIL`] clamp.
+const RESIZE_STEP: i32 = 8;
+
+/// The smallest / largest share a split child may hold, in percent. Clamping
+/// keeps both panes on screen: a window shrunk to `RESIZE_FLOOR` still shows a
+/// sliver of buffer plus its border and statusline, the same intent as vim's
+/// `winminheight`/`winminwidth`. `<C-w>_`/`|` maximise to exactly these bounds.
+const RESIZE_FLOOR: i32 = 10;
+const RESIZE_CEIL: i32 = 90;
+
 /// Which way a split divides the screen, named after the vim command.
 ///
 /// * `Horizontal` = `:split`/`:sp` — draws a horizontal divider line,
@@ -511,12 +526,20 @@ impl WindowTree {
     }
 
     /// `<C-w>+`/`-` (`vertical == false`, height) and `<C-w>>`/`<` (`vertical
-    /// == true`, width): grow or shrink the active window by nudging the
-    /// nearest enclosing split of the matching orientation.
-    pub fn resize_active(&mut self, vertical: bool, grow: bool) {
+    /// == true`, width): grow or shrink the active window by `count` steps,
+    /// nudging the nearest enclosing split of the matching orientation.
+    ///
+    /// `count` is vim's `[count]` prefix (default 1). vim counts in whole
+    /// lines/columns; kvim stores each split as a percentage ratio, not an
+    /// absolute size, so one step is [`RESIZE_STEP`] percent and `count`
+    /// multiplies it. The exact line-for-line vim feel would need the tree to
+    /// know the painted area at resize time — it does not, and does not need to
+    /// for a nudge — so a percentage step is the honest model here.
+    pub fn resize_active(&mut self, vertical: bool, grow: bool, count: usize) {
         let kind = if vertical { SplitKind::Vertical } else { SplitKind::Horizontal };
         let active = self.active;
-        Self::resize_node(&mut self.root, active, kind, grow);
+        let steps = count.max(1) as i32;
+        Self::resize_node(&mut self.root, active, kind, grow, steps);
     }
 
     /// Returns `true` when `target` was found in `node` but has **not** yet
@@ -524,35 +547,77 @@ impl WindowTree {
     /// still being looked for further up. Returns `false` once handled (or if
     /// `target` is not in this subtree), so the walk adjusts the split nearest
     /// the active leaf and no other.
-    fn resize_node(node: &mut Node, target: WindowId, kind: SplitKind, grow: bool) -> bool {
+    fn resize_node(node: &mut Node, target: WindowId, kind: SplitKind, grow: bool, steps: i32) -> bool {
         let Node::Split { kind: k, first_percent, first, second } = node else {
             return matches!(node, Node::Leaf(w) if w.id == target);
         };
         let in_first = Self::contains(first, target);
         let child = if in_first { first.as_mut() } else { second.as_mut() };
-        if !Self::resize_node(child, target, kind, grow) {
+        if !Self::resize_node(child, target, kind, grow, steps) {
             return false; // not found below, or already handled deeper
         }
         if *k == kind {
-            const STEP: i32 = 8;
+            let magnitude = RESIZE_STEP * steps;
             // Growing the active window enlarges whichever side holds it: the
             // first child's percentage rises when active is in `first`.
-            let delta = if in_first == grow { STEP } else { -STEP };
-            *first_percent = (*first_percent as i32 + delta).clamp(10, 90) as u16;
+            let delta = if in_first == grow { magnitude } else { -magnitude };
+            *first_percent = (*first_percent as i32 + delta).clamp(RESIZE_FLOOR, RESIZE_CEIL) as u16;
             return false; // handled here; don't let an outer split move too
         }
         true // found but this split is the wrong orientation; keep looking up
     }
 
-    /// `<C-w>x`: exchange the active window's contents with the next window's,
-    /// and follow the swap (the other window becomes active), matching vim.
-    pub fn exchange(&mut self) {
+    /// `<C-w>_` (`vertical == false`, height) and `<C-w>|` (`vertical == true`,
+    /// width): give the active window as much of the matching dimension as the
+    /// layout allows. Every enclosing split of the matching orientation swings
+    /// fully toward the branch holding the active window.
+    ///
+    /// Neighbours shrink to [`RESIZE_FLOOR`] percent rather than to zero — vim
+    /// keeps a `winminheight`/`winminwidth` sliver too, and leaving the sibling
+    /// one-clamp-step wide means its buffer, border and statusline all still
+    /// render, so the maximise stays reversible with `<C-w>=`.
+    pub fn maximize_active(&mut self, vertical: bool) {
+        let kind = if vertical { SplitKind::Vertical } else { SplitKind::Horizontal };
+        let active = self.active;
+        Self::maximize_node(&mut self.root, active, kind);
+    }
+
+    fn maximize_node(node: &mut Node, target: WindowId, kind: SplitKind) -> bool {
+        let Node::Split { kind: k, first_percent, first, second } = node else {
+            return matches!(node, Node::Leaf(w) if w.id == target);
+        };
+        let in_first = Self::contains(first, target);
+        let child = if in_first { first.as_mut() } else { second.as_mut() };
+        let found = Self::maximize_node(child, target, kind);
+        if found && *k == kind {
+            *first_percent = if in_first { RESIZE_CEIL as u16 } else { RESIZE_FLOOR as u16 };
+        }
+        found
+    }
+
+    /// `<C-w>x`: exchange the active window's contents with another window's,
+    /// then follow the swap (the other window becomes active), matching vim.
+    ///
+    /// Without a count (`count == None`) the partner is the **next** window in
+    /// traversal order — or the **previous** one when the active window is
+    /// already last, exactly as vim does rather than wrapping round to the
+    /// first. With a count it is the `count`-th window, 1-based and wrapping
+    /// from the last back to the first. Exchanging a window with itself (a
+    /// count that lands on the active window, or a lone window) is a no-op.
+    pub fn exchange(&mut self, count: Option<usize>) {
         let ids: Vec<WindowId> = self.windows().iter().map(|w| w.id).collect();
         if ids.len() < 2 {
             return;
         }
         let Some(pos) = ids.iter().position(|&i| i == self.active) else { return };
-        let other = ids[(pos + 1) % ids.len()];
+        let other = match count {
+            Some(n) => ids[n.saturating_sub(1) % ids.len()],
+            None if pos + 1 < ids.len() => ids[pos + 1],
+            None => ids[pos - 1], // active is last: swap with the previous window
+        };
+        if other == self.active {
+            return;
+        }
         let a = *self.find(self.active).expect("active is live");
         let b = *self.find(other).expect("other is live");
         Self::copy_contents(self.find_mut(self.active).expect("active is live"), &b);
@@ -560,9 +625,12 @@ impl WindowTree {
         self.set_active(other);
     }
 
-    /// `<C-w>r`: rotate every window's contents one place forward (the last
-    /// window's contents wrap to the first), leaving the layout itself fixed.
-    pub fn rotate(&mut self) {
+    /// `<C-w>r` (`forward == true`, rotate downwards/rightwards) and `<C-w>R`
+    /// (`forward == false`, rotate upwards/leftwards): rotate every window's
+    /// contents one place around the traversal order, leaving the layout itself
+    /// fixed. `r` shifts each window's contents into the next slot (the last
+    /// wraps to the first); `R` is its exact inverse.
+    pub fn rotate(&mut self, forward: bool) {
         let ids: Vec<WindowId> = self.windows().iter().map(|w| w.id).collect();
         if ids.len() < 2 {
             return;
@@ -570,7 +638,7 @@ impl WindowTree {
         let contents: Vec<Window> = self.windows().iter().map(|&&w| w).collect();
         let n = contents.len();
         for (i, &id) in ids.iter().enumerate() {
-            let src = contents[(i + n - 1) % n];
+            let src = if forward { contents[(i + n - 1) % n] } else { contents[(i + 1) % n] };
             Self::copy_contents(self.find_mut(id).expect("id from live traversal"), &src);
         }
     }
@@ -738,5 +806,106 @@ mod tests {
         assert_eq!(tree.windows().len(), 2);
         assert!(tree.close_active());
         assert_eq!(tree.windows().len(), 1);
+    }
+
+    const AREA: Rect = Rect { x: 0, y: 0, width: 80, height: 40 };
+
+    /// The active leaf's painted rectangle within [`AREA`].
+    fn active_rect(tree: &WindowTree) -> Rect {
+        let active = tree.active_id();
+        tree.layout(AREA).into_iter().find(|(id, _)| *id == active).map(|(_, r)| r).unwrap()
+    }
+
+    #[test]
+    fn growing_width_widens_the_active_pane_and_equalize_undoes_it() {
+        let mut tree = WindowTree::single(BufferId(1));
+        tree.split(SplitKind::Vertical); // active is the left (first) pane
+        let before = active_rect(&tree).width;
+        tree.resize_active(true, true, 1); // <C-w>>
+        assert!(active_rect(&tree).width > before, "the active pane should have widened");
+        tree.equalize(); // <C-w>=
+        assert_eq!(active_rect(&tree).width, before, "equalize restores the even split");
+    }
+
+    #[test]
+    fn a_count_scales_the_resize_step() {
+        let mut one = WindowTree::single(BufferId(1));
+        one.split(SplitKind::Vertical);
+        one.resize_active(true, true, 1);
+
+        let mut three = WindowTree::single(BufferId(1));
+        three.split(SplitKind::Vertical);
+        three.resize_active(true, true, 3);
+
+        assert!(
+            active_rect(&three).width > active_rect(&one).width,
+            "a count of 3 should grow the pane more than a count of 1"
+        );
+    }
+
+    #[test]
+    fn resize_clamps_so_both_panes_stay_on_screen() {
+        let mut tree = WindowTree::single(BufferId(1));
+        tree.split(SplitKind::Vertical);
+        for _ in 0..50 {
+            tree.resize_active(true, true, 9); // slam it against the ceiling
+        }
+        let active = active_rect(&tree).width;
+        // The sibling still holds a sliver (RESIZE_FLOOR), so the active pane
+        // never swallows the whole area.
+        let total_pane_width: u16 = tree.layout(AREA).iter().map(|(_, r)| r.width).sum();
+        assert!(active < total_pane_width, "the sibling pane must survive the clamp, got {active}");
+    }
+
+    #[test]
+    fn maximize_width_favours_the_active_pane() {
+        let mut tree = WindowTree::single(BufferId(1));
+        tree.split(SplitKind::Vertical);
+        let before = active_rect(&tree).width;
+        tree.maximize_active(true); // <C-w>|
+        let after = active_rect(&tree);
+        assert!(after.width > before, "maximise should widen the active pane");
+        // Sibling still visible (floor), so panes plus divider still tile AREA.
+        let total: u16 = tree.layout(AREA).iter().map(|(_, r)| r.width).sum::<u16>()
+            + tree.separators(AREA).iter().map(|s| s.rect.width).sum::<u16>();
+        assert_eq!(total, AREA.width, "the layout must still tile the area exactly");
+    }
+
+    #[test]
+    fn exchange_swaps_the_two_panes_buffers_and_follows_the_swap() {
+        let mut tree = WindowTree::single(BufferId(10));
+        tree.split(SplitKind::Vertical); // both show buffer 10
+        // Give the two windows distinct buffers so the swap is observable.
+        let ids: Vec<WindowId> = tree.windows().iter().map(|w| w.id).collect();
+        let active = tree.active_id();
+        let other = *ids.iter().find(|&&i| i != active).unwrap();
+        tree.find_mut(active).unwrap().buffer = BufferId(1);
+        tree.find_mut(other).unwrap().buffer = BufferId(2);
+
+        tree.exchange(None); // <C-w>x
+        assert_eq!(tree.active_id(), other, "focus follows the exchange");
+        assert_eq!(tree.find(other).unwrap().buffer, BufferId(1), "buffer 1 moved into the other slot");
+        assert_eq!(tree.find(active).unwrap().buffer, BufferId(2), "buffer 2 moved into the old slot");
+    }
+
+    #[test]
+    fn rotate_forward_and_back_are_inverses() {
+        let mut tree = WindowTree::single(BufferId(1));
+        tree.split(SplitKind::Horizontal); // 2 windows
+        tree.split(SplitKind::Horizontal); // 3 windows
+        // Label each window's buffer by its slot so a rotation is visible.
+        let ids: Vec<WindowId> = tree.windows().iter().map(|w| w.id).collect();
+        for (i, &id) in ids.iter().enumerate() {
+            tree.find_mut(id).unwrap().buffer = BufferId(i as u32);
+        }
+        let original: Vec<BufferId> = tree.windows().iter().map(|w| w.buffer).collect();
+
+        tree.rotate(true); // <C-w>r
+        let rotated: Vec<BufferId> = tree.windows().iter().map(|w| w.buffer).collect();
+        assert_ne!(rotated, original, "a forward rotate must move the buffers");
+
+        tree.rotate(false); // <C-w>R undoes it
+        let restored: Vec<BufferId> = tree.windows().iter().map(|w| w.buffer).collect();
+        assert_eq!(restored, original, "R is the inverse of r");
     }
 }
