@@ -233,6 +233,16 @@ pub struct Editor {
     keymap_descs: Vec<(Vec<Key>, String)>,
     keymap_buffer: Vec<Key>,
 
+    /// The last `:s` (substitute) as `(pattern, replacement, global)`, so `&`
+    /// can repeat it on the current line. `None` until the first `:s` runs.
+    last_substitution: Option<(String, String, bool)>,
+
+    /// The "alternate file" (`#`): the buffer `<C-^>`/`<C-6>` toggles back to.
+    /// Set to whatever buffer we just left whenever the active buffer changes
+    /// (`:e`, `:b{n}`, `:bn`/`:bp`, window focus, `<C-^>` itself). `None` until
+    /// a second buffer has ever been visited.
+    alternate: Option<BufferId>,
+
     options: crate::config::Options,
 }
 
@@ -286,6 +296,8 @@ impl Editor {
             keymaps,
             keymap_descs,
             keymap_buffer: Vec::new(),
+            last_substitution: None,
+            alternate: None,
             options: config.options,
         }
     }
@@ -302,6 +314,7 @@ impl Editor {
         self.buffers.insert(id, buf);
         self.buffer_order.push(id);
         self.saved_cursor.insert(self.current, self.cursor);
+        self.alternate = Some(self.current);
         self.current = id;
         self.cursor = Position::ORIGIN;
         Ok(id)
@@ -386,6 +399,9 @@ impl Editor {
         if !self.buffers.contains_key(&buffer) {
             return;
         }
+        if buffer != self.current {
+            self.alternate = Some(self.current);
+        }
         self.saved_cursor.insert(self.current, self.cursor);
         self.current = buffer;
         self.cursor = self.current_buffer().clamp(cursor);
@@ -431,6 +447,7 @@ impl Editor {
         self.buffers.insert(id, Buffer::new());
         self.buffer_order.push(id);
         self.saved_cursor.insert(self.current, self.cursor);
+        self.alternate = Some(self.current);
         self.current = id;
         self.cursor = Position::ORIGIN;
         id
@@ -736,6 +753,15 @@ impl Editor {
                 Increment(i64),
                 JumpBack,
                 View(ViewportScroll),
+                /// `<C-g>`: echo the file name, line count and cursor position.
+                FileInfo,
+                /// `<C-^>`/`<C-6>`: switch to the alternate (`#`) buffer.
+                AlternateFile,
+                /// `<C-]>`: jump to the definition of the symbol under the
+                /// cursor. kvim has no ctags, so this routes to the LSP
+                /// go-to-definition the editor already provides (the `gd`
+                /// path), not a tag stack.
+                GotoDefinition,
             }
             let cmd = match key.code {
                 KeyCode::Char('d') => Some(CtrlCmd::Scroll(half)),
@@ -747,6 +773,11 @@ impl Editor {
                 KeyCode::Char('o') => Some(CtrlCmd::JumpBack),
                 KeyCode::Char('e') => Some(CtrlCmd::View(ViewportScroll::LineDown)),
                 KeyCode::Char('y') => Some(CtrlCmd::View(ViewportScroll::LineUp)),
+                KeyCode::Char('g') => Some(CtrlCmd::FileInfo),
+                // In a terminal Ctrl+^ and Ctrl+6 send the same byte; accept
+                // both so either keyboard reflex reaches the alternate file.
+                KeyCode::Char('^') | KeyCode::Char('6') => Some(CtrlCmd::AlternateFile),
+                KeyCode::Char(']') => Some(CtrlCmd::GotoDefinition),
                 _ => None,
             };
             if let Some(cmd) = cmd {
@@ -773,6 +804,18 @@ impl Editor {
                     CtrlCmd::View(v) => {
                         self.discard_dot();
                         EditorResponse::Scroll(v)
+                    }
+                    CtrlCmd::FileInfo => {
+                        self.discard_dot();
+                        EditorResponse::Message(self.file_info())
+                    }
+                    CtrlCmd::AlternateFile => {
+                        self.discard_dot();
+                        self.edit_alternate()
+                    }
+                    CtrlCmd::GotoDefinition => {
+                        self.discard_dot();
+                        EditorResponse::Action(crate::config::Action::LspDefinition)
                     }
                 });
             }
@@ -1042,7 +1085,71 @@ impl Editor {
                 }
                 Ok(EditorResponse::Continue)
             }
+            // `ZZ` = `:x` (write if modified, then quit). The caller performs
+            // the disk I/O, same as every other write path — see
+            // `EditorResponse::WriteThenQuit`.
+            GrammarCommand::WriteQuit => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                Ok(EditorResponse::WriteThenQuit { path: None })
+            }
+            // `ZQ` = `:q!`: quit unconditionally, discarding changes. No
+            // unsaved-changes guard, unlike a plain `:q`.
+            GrammarCommand::QuitForce => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                Ok(EditorResponse::Quit)
+            }
+            GrammarCommand::RepeatSubstitute => {
+                self.mode = Mode::Normal;
+                self.repeat_substitution()
+            }
+            GrammarCommand::JumpBracketMark { forward, exact } => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                self.jump_bracket_mark(forward, exact);
+                Ok(EditorResponse::Continue)
+            }
         }
+    }
+
+    /// `&`: re-run the last `:s` on the current line, dropping its flags (so
+    /// only the first match on the line is replaced, matching vim). A no-op
+    /// with a friendly note when no substitution has been run yet — the same
+    /// thing vim's `E33: No previous substitute regular expression` guards
+    /// against, phrased as a statusline message rather than an error.
+    fn repeat_substitution(&mut self) -> crate::Result<EditorResponse> {
+        self.discard_dot();
+        let Some((pattern, replacement, _)) = self.last_substitution.clone() else {
+            return Ok(EditorResponse::Message("no previous substitute".to_string()));
+        };
+        let line = self.cursor.line;
+        let n = ex::substitute(self.current_buffer_mut(), line, line, &pattern, &replacement, false)?;
+        self.cursor = self.current_buffer().clamp(self.cursor);
+        Ok(EditorResponse::Message(format!("{n} substitution(s)")))
+    }
+
+    /// `['`/`` [` ``/`]'`/`` ]` ``: jump to the previous/next lowercase mark by
+    /// buffer position. `exact` lands on the mark's column (back-tick forms);
+    /// otherwise on the first non-blank of the mark's line (apostrophe forms).
+    /// Records a jump so `<C-o>` returns here. A no-op when there is no mark in
+    /// the requested direction.
+    fn jump_bracket_mark(&mut self, forward: bool, exact: bool) {
+        let cursor = self.cursor;
+        let mut marks = self.current_buffer().lowercase_marks();
+        marks.sort_by_key(|&(_, pos)| pos);
+        let target = if forward {
+            marks.iter().map(|&(_, p)| p).find(|&p| p > cursor)
+        } else {
+            marks.iter().map(|&(_, p)| p).rev().find(|&p| p < cursor)
+        };
+        let Some(pos) = target else { return };
+        self.record_jump();
+        self.cursor = if exact {
+            self.current_buffer().clamp(pos)
+        } else {
+            Position::new(pos.line, operator::first_non_blank_col(self.current_buffer(), pos.line))
+        };
     }
 
     // ---------------------------------------------------------------
@@ -1794,6 +1901,9 @@ impl Editor {
             }
             ex::ExCommand::GotoBuffer(n) => {
                 if let Some(&id) = self.buffer_order.get(n.saturating_sub(1)) {
+                    if id != self.current {
+                        self.alternate = Some(self.current);
+                    }
                     self.saved_cursor.insert(self.current, self.cursor);
                     self.current = id;
                     self.cursor = *self.saved_cursor.get(&id).unwrap_or(&Position::ORIGIN);
@@ -1812,6 +1922,8 @@ impl Editor {
                 let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
                 let n = ex::substitute(self.current_buffer_mut(), first, last, &pattern, &replacement, global)?;
                 self.cursor = self.current_buffer().clamp(self.cursor);
+                // Remember it so `&` (and a future bare `:s`) can repeat it.
+                self.last_substitution = Some((pattern, replacement, global));
                 Ok(EditorResponse::Message(format!("{n} substitution(s)")))
             }
             ex::ExCommand::Global { pattern, cmd } => {
@@ -1880,11 +1992,48 @@ impl Editor {
         }
     }
 
+    /// `<C-g>`: a one-line summary of the current buffer — its name, whether
+    /// it has unsaved changes, its line count and the cursor's line as a
+    /// percentage through the file. Roughly vim's own `<C-g>` echo,
+    /// `"name" [Modified] N lines --P%--`.
+    fn file_info(&self) -> String {
+        let buf = self.current_buffer();
+        let name = buf.path().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".to_string());
+        let modified = if buf.is_modified() { " [Modified]" } else { "" };
+        let lines = buf.line_count();
+        let cur = self.cursor.line + 1;
+        let pct = (cur * 100).checked_div(lines).unwrap_or(0);
+        format!("\"{name}\"{modified} {lines} line(s) --{pct}%--")
+    }
+
+    /// `<C-^>`/`<C-6>`: swap to the alternate (`#`) buffer and make the buffer
+    /// we left the new alternate, so the key toggles between the two. Restores
+    /// the alternate's saved cursor. A friendly note (not an error) when there
+    /// is no alternate yet or it has since been closed.
+    fn edit_alternate(&mut self) -> EditorResponse {
+        let Some(alt) = self.alternate else {
+            return EditorResponse::Message("no alternate file".to_string());
+        };
+        if alt == self.current || !self.buffers.contains_key(&alt) {
+            return EditorResponse::Message("no alternate file".to_string());
+        }
+        self.saved_cursor.insert(self.current, self.cursor);
+        self.alternate = Some(self.current);
+        self.current = alt;
+        let restored = *self.saved_cursor.get(&alt).unwrap_or(&Position::ORIGIN);
+        self.cursor = self.current_buffer().clamp(restored);
+        self.mode = Mode::Normal;
+        EditorResponse::Continue
+    }
+
     fn switch_buffer(&mut self, delta: i32) {
         let Some(idx) = self.buffer_order.iter().position(|&id| id == self.current) else { return };
         let len = self.buffer_order.len() as i32;
         let next = (idx as i32 + delta).rem_euclid(len.max(1)) as usize;
         let Some(&id) = self.buffer_order.get(next) else { return };
+        if id != self.current {
+            self.alternate = Some(self.current);
+        }
         self.saved_cursor.insert(self.current, self.cursor);
         self.current = id;
         self.cursor = *self.saved_cursor.get(&id).unwrap_or(&Position::ORIGIN);
@@ -3095,5 +3244,217 @@ mod tests {
         }
         assert_eq!(resp, EditorResponse::Scroll(crate::core::ViewportScroll::CenterCursor));
         assert_eq!(ed.buffer().text(), before, "zz must not change the buffer");
+    }
+
+    // -----------------------------------------------------------------
+    // cj0.41: one-key reflexes C / D / Y / S and the ZZ / ZQ quit pair.
+    // -----------------------------------------------------------------
+
+    /// Feeds `keys` and returns the response of the *last* keystroke — the
+    /// harness for the commands whose observable effect is a response variant
+    /// (quit, message, LSP action) rather than a buffer edit.
+    fn feed_last(ed: &mut Editor, keys: &str) -> EditorResponse {
+        let mut resp = EditorResponse::Continue;
+        for k in key::parse(keys) {
+            resp = ed.handle_key(k).unwrap();
+        }
+        resp
+    }
+
+    #[test]
+    fn big_d_deletes_to_end_of_line_like_d_dollar() {
+        assert_eq!(run("hello world", "5lD"), "hello");
+        assert_eq!(run("hello world", "D"), "");
+    }
+
+    #[test]
+    fn inclusive_to_eol_motions_do_not_swallow_the_newline() {
+        // `D`/`d$` on a non-final line must leave the line break intact
+        // (leaving an empty line here), not pull the next line up — the EOL
+        // fix in `operator::charwise_range`.
+        assert_eq!(run("foo\nbar", "D"), "\nbar");
+        assert_eq!(run("foo\nbar", "d$"), "\nbar");
+        // Cross-line inclusive motions (`%`) are untouched by the fix: the
+        // matching `)` is mid-line, so the range still extends onto it.
+        assert_eq!(run("(a\nb)c", "d%"), "c");
+    }
+
+    #[test]
+    fn big_c_changes_to_end_of_line_and_enters_insert() {
+        assert_eq!(run("hello world", "5lCthere<Esc>"), "hellothere");
+    }
+
+    #[test]
+    fn big_y_yanks_to_end_of_line_neovim_default_not_the_whole_line() {
+        // Neovim's `Y` is `y$`, not `yy`: it grabs the line's text charwise,
+        // so `P` pastes it inline before the cursor rather than opening a new
+        // line. A linewise `yy` would instead have duplicated the whole line
+        // (two lines). `Y` must behave exactly like `y$`.
+        assert_eq!(run("foo", "YP"), "foofoo");
+        assert_eq!(run("foo", "YP"), run("foo", "y$P"), "Y must equal y$");
+    }
+
+    #[test]
+    fn big_s_substitutes_the_whole_line_like_cc() {
+        // `S` is an exact alias of `cc` — same operator, same code path — so
+        // the two must produce identical results whatever `cc` does.
+        assert_eq!(run("foo\nbar\nbaz", "jShi<Esc>"), run("foo\nbar\nbaz", "jcchi<Esc>"));
+    }
+
+    #[test]
+    fn zz_writes_then_quits_and_zq_quits_unconditionally() {
+        let mut ed = editor_with("some text");
+        assert_eq!(feed_last(&mut ed, "ZZ"), EditorResponse::WriteThenQuit { path: None });
+        let mut ed = editor_with("dirty");
+        feed(&mut ed, "xxx"); // make it modified
+        assert!(ed.buffer().is_modified());
+        // ZQ must quit even with unsaved changes — no guard, unlike `:q`.
+        assert_eq!(feed_last(&mut ed, "ZQ"), EditorResponse::Quit);
+    }
+
+    // -----------------------------------------------------------------
+    // cj0.41: column / line motions | + - _ <CR>.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bar_goes_to_column_count_one_based() {
+        // `3|` -> column 2 (exclusive), so `d3|` removes the first two chars.
+        assert_eq!(run("hello", "d3|"), "llo");
+        // bare `|` is column 1 == start of line: `d|` from column 1 removes
+        // just the first char.
+        assert_eq!(run("hello", "ld|"), "ello");
+    }
+
+    #[test]
+    fn plus_cr_minus_underscore_are_linewise_first_non_blank_motions() {
+        // `+` / `<CR>`: this line plus the next, linewise.
+        assert_eq!(run("a\nb\nc", "d+"), "c");
+        assert_eq!(run("a\nb\nc", "d<CR>"), "c");
+        // `-`: this line plus the previous.
+        assert_eq!(run("a\nb\nc", "jjd-"), "a");
+        // `_`: bare `_` is the current line (`dd`); `2_` reaches one down.
+        assert_eq!(run("a\nb", "d_"), "b");
+        assert_eq!(run("a\nb\nc", "d2_"), "c");
+    }
+
+    // -----------------------------------------------------------------
+    // cj0.41: & repeats the last :s, <C-g> echoes file info,
+    // <C-]> routes to LSP go-to-definition.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ampersand_repeats_the_last_substitution_on_the_current_line() {
+        let mut ed = editor_with("foo\nfoo\nfoo");
+        ed.execute_ex("s/foo/bar/").unwrap(); // line 0 -> bar
+        feed(&mut ed, "j&"); // repeat on line 1
+        assert_eq!(ed.buffer().text(), "bar\nbar\nfoo");
+    }
+
+    #[test]
+    fn ampersand_without_a_prior_substitution_is_a_friendly_no_op() {
+        let mut ed = editor_with("foo");
+        assert_eq!(feed_last(&mut ed, "&"), EditorResponse::Message("no previous substitute".to_string()));
+        assert_eq!(ed.buffer().text(), "foo");
+    }
+
+    #[test]
+    fn ctrl_g_echoes_file_info_without_editing() {
+        let mut ed = editor_with("a\nb\nc");
+        let EditorResponse::Message(msg) = feed_last(&mut ed, "<C-g>") else {
+            panic!("<C-g> must report a message");
+        };
+        assert!(msg.contains("[No Name]"), "unsaved buffer reports [No Name]: {msg}");
+        assert!(msg.contains("line(s)"), "message reports a line count: {msg}");
+    }
+
+    #[test]
+    fn ctrl_bracket_routes_to_lsp_go_to_definition() {
+        let mut ed = editor_with("fn main() {}");
+        assert_eq!(feed_last(&mut ed, "<C-]>"), EditorResponse::Action(crate::config::Action::LspDefinition));
+    }
+
+    // -----------------------------------------------------------------
+    // cj0.35: bracket [ ] motion family.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unmatched_brace_forward_and_back_skip_balanced_pairs() {
+        // Cursor inside the outer braces; `]}` lands on the outer close,
+        // stepping over the inner balanced pair, and `[{` on the outer open.
+        let mut ed = editor_with("{\n  { inner }\n  body\n}");
+        feed(&mut ed, "jj]}"); // from "  body" to the final "}"
+        assert_eq!(ed.cursor(), Position::new(3, 0));
+        feed(&mut ed, "[{"); // back to the opening "{"
+        assert_eq!(ed.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn unmatched_paren_motions_count_nesting_on_one_line() {
+        // "(a(b)c)": from 'b' (index 3), `])` reaches the inner ')' at 4,
+        // `[(` the enclosing '(' at 2.
+        let mut ed = editor_with("(a(b)c)");
+        feed(&mut ed, "3l])");
+        assert_eq!(ed.cursor(), Position::new(0, 4));
+        // Fresh cursor on 'b' again for the backward direction.
+        let mut ed = editor_with("(a(b)c)");
+        feed(&mut ed, "3l[(");
+        assert_eq!(ed.cursor(), Position::new(0, 2));
+    }
+
+    #[test]
+    fn section_motions_jump_between_braces_in_column_zero() {
+        let mut ed = editor_with("{\n body\n{\n more\n}");
+        feed(&mut ed, "j]]"); // from " body" to the next col-0 '{'
+        assert_eq!(ed.cursor(), Position::new(2, 0));
+        feed(&mut ed, "[["); // back to the first col-0 '{'
+        assert_eq!(ed.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn bracket_motions_compose_with_an_operator() {
+        // `d]}` deletes up to but not including the unmatched close brace
+        // (the motion is charwise-exclusive, like neovim's).
+        assert_eq!(run("(abc)", "l])"), "(abc)"); // sanity: motion alone doesn't edit
+        assert_eq!(run("{ab}", "ld]}"), "{}");
+    }
+
+    #[test]
+    fn method_motions_land_on_the_nearest_brace() {
+        let mut ed = editor_with("fn a() {\n}\nfn b() {\n}");
+        feed(&mut ed, "]m"); // next '{'
+        assert_eq!(ed.cursor(), Position::new(0, 7));
+        feed(&mut ed, "]M"); // next '}'
+        assert_eq!(ed.cursor(), Position::new(1, 0));
+    }
+
+    #[test]
+    fn bracket_mark_motions_jump_to_the_next_and_previous_lowercase_mark() {
+        let mut ed = editor_with("a\nb\nc\nd\ne");
+        feed(&mut ed, "jma"); // mark 'a' on line 1
+        feed(&mut ed, "jjmb"); // mark 'b' on line 3
+        feed(&mut ed, "gg"); // back to the top
+        feed(&mut ed, "]'"); // next mark's line -> line 1
+        assert_eq!(ed.cursor().line, 1);
+        feed(&mut ed, "]'"); // next mark's line -> line 3
+        assert_eq!(ed.cursor().line, 3);
+        feed(&mut ed, "['"); // previous mark's line -> line 1
+        assert_eq!(ed.cursor().line, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // cj0.41: <C-^> edits the alternate file.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ctrl_caret_toggles_between_the_two_most_recent_buffers() {
+        let mut ed = editor_with("first");
+        let first = ed.buffer_id();
+        let second = ed.new_buffer();
+        ed.buffer_mut().apply(Edit::insert(Position::ORIGIN, "second".to_string())).unwrap();
+        assert_eq!(ed.buffer_id(), second);
+        feed_last(&mut ed, "<C-^>"); // back to the alternate (first)
+        assert_eq!(ed.buffer_id(), first);
+        feed_last(&mut ed, "<C-6>"); // and forward again (same key, other byte)
+        assert_eq!(ed.buffer_id(), second);
     }
 }

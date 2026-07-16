@@ -409,14 +409,24 @@ impl<H: EditorHost> App<H> {
                             return self.handle_hop_key(kp);
                         }
                         // `]d`/`[d` diagnostic navigation: `]`/`[` in Normal mode
-                        // arms the motion, `d` completes it. A following key that
-                        // isn't `d` falls through to the editor (kvim has no other
-                        // `]`/`[` motions, so the bracket is simply dropped).
+                        // arms the motion, `d` completes it. `d` is the one key
+                        // the UI claims for itself here (diagnostics are a UI
+                        // concern the editor knows nothing about); every other
+                        // second key belongs to the editor's own bracket-motion
+                        // grammar (`]}`, `[[`, `]m`, `` ]` ``, ...), so we replay
+                        // the swallowed bracket back into the editor first, then
+                        // feed the current key. Before the editor grew that
+                        // grammar the bracket was just dropped here — that is no
+                        // longer correct (kopitiam-cj0.35).
                         if let Some(bracket) = self.pending_bracket.take() {
                             if kp.key == Key::Char('d') {
                                 return self.jump_diagnostic(bracket == ']');
                             }
-                            return self.handle_host_key(kp);
+                            let bracket_kp = KeyPress::plain(Key::Char(bracket));
+                            if self.handle_host_key(bracket_kp) == LoopAction::Quit {
+                                return LoopAction::Quit;
+                            }
+                            return self.host_key_then_refresh_completion(kp);
                         }
                         if self.host.mode() == Mode::Normal
                             && matches!(kp.key, Key::Char(']') | Key::Char('['))
@@ -2663,6 +2673,24 @@ mod tests {
         }
         assert!(screen.contains("LSP"), "the LSP section must be on screen; screen was:\n{screen}");
         assert!(screen.contains("<leader>gd"), "the go-to-definition binding must be painted");
+    }
+
+    /// Regression for kopitiam-cj0.35: the app-level `]`/`[` interception
+    /// (which arms `]d`/`[d` diagnostic navigation) must **replay** the
+    /// bracket into the editor when the second key is not `d`, so the
+    /// editor's own bracket-motion grammar (`]}`, `[[`, `]m`, ...) still
+    /// runs. Before the fix the `]` was silently dropped and `]}` degraded to
+    /// a bare `}` (paragraph-forward), landing miles from the target.
+    #[test]
+    fn app_replays_a_dropped_bracket_into_the_editor_motion_grammar() {
+        let mut editor = crate::editor::Editor::new();
+        editor.buffer_mut().apply(crate::core::Edit::insert(crate::core::Position::ORIGIN, "{\n  body\n}\ntail".to_string())).unwrap();
+        editor.move_cursor(crate::core::Position::new(1, 0)); // on "  body"
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        // `]}` must land the cursor on the unmatched close brace at line 2.
+        app.handle_event(key_event(']'));
+        app.handle_event(key_event('}'));
+        assert_eq!(app.host.cursor(), crate::core::Position::new(2, 0), "the bracket motion must reach the unmatched brace, not fall through as a bare paragraph motion");
     }
 
     #[test]

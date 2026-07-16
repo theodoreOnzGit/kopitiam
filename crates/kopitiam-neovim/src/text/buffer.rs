@@ -336,6 +336,19 @@ impl Buffer {
         self.marks.get(&name).map(|&offset| self.char_to_position(offset))
     }
 
+    /// Every set lowercase (`a`–`z`) mark, as `(name, position)` pairs in no
+    /// particular order — the file-local marks the `['`/`]'`/`` [` ``/`` ]` ``
+    /// motions navigate between. Uppercase (global) and special marks are
+    /// excluded, matching vim's "next mark" commands, which only visit
+    /// lowercase marks.
+    pub fn lowercase_marks(&self) -> Vec<(char, Position)> {
+        self.marks
+            .iter()
+            .filter(|(name, _)| name.is_ascii_lowercase())
+            .map(|(&name, &offset)| (name, self.char_to_position(offset)))
+            .collect()
+    }
+
     /// Clamps `pos` into the buffer: the line is capped to the last valid
     /// line, and the column to that line's length in graphemes (i.e. the
     /// valid end-of-line position). Never panics, regardless of how far out

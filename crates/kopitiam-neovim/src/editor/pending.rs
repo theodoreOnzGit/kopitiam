@@ -104,6 +104,24 @@ pub enum GrammarCommand {
     Scroll(crate::core::ViewportScroll),
     /// `gv`: reselect the last visual selection.
     ReselectVisual,
+    /// `ZZ`: write the buffer if modified, then quit (same as `:x`).
+    WriteQuit,
+    /// `ZQ`: quit without writing, discarding any changes (same as `:q!`).
+    QuitForce,
+    /// `&`: repeat the last `:s` (substitute) on the current line, dropping
+    /// its flags — vim's classic "do that substitution again here" key. Like
+    /// [`GrammarCommand::RepeatSearch`], `Pending` has no memory of *what* the
+    /// last substitution was (only `Editor` does), so this resolves to a
+    /// command for `Editor` to fill in.
+    RepeatSubstitute,
+    /// `['`/`` [` ``/`]'`/`` ]` ``: jump to the previous (`forward == false`)
+    /// or next (`forward == true`) lowercase mark, by buffer position. `exact`
+    /// is `true` for the back-tick forms (land on the mark's exact column) and
+    /// `false` for the apostrophe forms (land on the first non-blank of the
+    /// mark's line) — the same distinction [`GrammarCommand::JumpMark`] draws.
+    /// Resolved by `Editor` because the marks live in the buffer, which
+    /// `Pending` cannot see (see the module docs).
+    JumpBracketMark { forward: bool, exact: bool },
 }
 
 /// Where `i a I A o O` place the cursor before switching to Insert mode.
@@ -159,6 +177,13 @@ enum State {
     AwaitingMarkJump { exact: bool },
     /// After `z`: waiting for `z`/`t`/`b` (viewport reposition).
     AwaitingZ,
+    /// After `Z`: waiting for the second `Z` (`ZZ` = write+quit) or `Q`
+    /// (`ZQ` = quit without saving).
+    AwaitingBigZ,
+    /// After `[` (`forward == false`) or `]` (`forward == true`): waiting for
+    /// the bracket-motion's second key (`[`, `]`, `(`, `)`, `{`, `}`, `m`,
+    /// `M`, `'`, `` ` ``). See [`Pending::feed_bracket`].
+    AwaitingBracket { forward: bool },
 }
 
 /// The accumulator itself. See the module docs for the grammar it parses.
@@ -226,6 +251,8 @@ impl Pending {
             State::AwaitingMarkSet => self.feed_mark_set(key),
             State::AwaitingMarkJump { exact } => self.feed_mark_jump(key, exact),
             State::AwaitingZ => self.feed_z(key),
+            State::AwaitingBigZ => self.feed_big_z(key),
+            State::AwaitingBracket { forward } => self.feed_bracket(key, forward),
             State::Fresh => self.feed_fresh(key),
         }
     }
@@ -285,6 +312,39 @@ impl Pending {
             KeyCode::Char('A') if self.operator.is_none() => self.finish(GrammarCommand::EnterInsert(InsertPos::LineEnd)),
             KeyCode::Char('o') if self.operator.is_none() => self.finish(GrammarCommand::EnterInsert(InsertPos::NewLineBelow)),
             KeyCode::Char('O') if self.operator.is_none() => self.finish(GrammarCommand::EnterInsert(InsertPos::NewLineAbove)),
+
+            // The classic one-key reflexes, each an alias for its operator+
+            // motion long form: `D`=`d$`, `C`=`c$`, `S`=`cc`. `Y` is `y$`
+            // here, matching **neovim's** default (neovim remapped `Y` to
+            // `y$` in 0.6; older vim's `Y`==`yy` linewise). They only fire at
+            // the top level — with an operator already pending, an uppercase
+            // letter is not one of these.
+            KeyCode::Char('D') if self.operator.is_none() => self.complete_operator_motion(Operator::Delete, Motion::LineEnd),
+            KeyCode::Char('C') if self.operator.is_none() => self.complete_operator_motion(Operator::Change, Motion::LineEnd),
+            KeyCode::Char('Y') if self.operator.is_none() => self.complete_operator_motion(Operator::Yank, Motion::LineEnd),
+            KeyCode::Char('S') if self.operator.is_none() => self.complete_lines(Operator::Change),
+
+            // `Z` opens the two-key quit family: `ZZ` (write + quit) / `ZQ`
+            // (quit, discard). `<C-6>`/`<C-^>`/`<C-g>`/`<C-]>` are Ctrl-keys
+            // caught in `Editor` before the grammar, not here.
+            KeyCode::Char('Z') if self.operator.is_none() => {
+                self.state_ = Some(State::AwaitingBigZ);
+                FeedResult::Continue
+            }
+
+            // Bracket `[`/`]` motion prefixes (`[[`, `]}`, `]m`, `` [` ``, ...).
+            // Unconditional (no `operator.is_none()` guard) so they compose as
+            // motions after an operator too — `d]}`, `y[[`. The one exception
+            // is the `['`/`]'`-style mark jumps, which `feed_bracket` resolves
+            // to a standalone jump (see there).
+            KeyCode::Char('[') => {
+                self.state_ = Some(State::AwaitingBracket { forward: false });
+                FeedResult::Continue
+            }
+            KeyCode::Char(']') => {
+                self.state_ = Some(State::AwaitingBracket { forward: true });
+                FeedResult::Continue
+            }
 
             KeyCode::Char('f') => {
                 self.state_ = Some(State::AwaitingFind(FindKind::To));
@@ -358,6 +418,9 @@ impl Pending {
             KeyCode::Char('N') if self.operator.is_none() => self.finish(GrammarCommand::RepeatSearch { reverse: true }),
             KeyCode::Char('*') if self.operator.is_none() => self.finish(GrammarCommand::SearchWord { forward: true }),
             KeyCode::Char('#') if self.operator.is_none() => self.finish(GrammarCommand::SearchWord { forward: false }),
+            // `&`: redo the last `:s` on this line (flags dropped) — vim's
+            // shorthand for `:s`.
+            KeyCode::Char('&') if self.operator.is_none() => self.finish(GrammarCommand::RepeatSubstitute),
             KeyCode::Char('z') if self.operator.is_none() => {
                 self.state_ = Some(State::AwaitingZ);
                 FeedResult::Continue
@@ -397,6 +460,17 @@ impl Pending {
         let count = self.effective_count();
         self.reset();
         FeedResult::Complete(GrammarCommand::OperatorLines { register, count, operator: op })
+    }
+
+    /// Completes an operator+motion pair directly, without the motion having
+    /// arrived as a separate key — the shared tail of the one-key `D`/`C`/`Y`
+    /// shortcuts (`d$`/`c$`/`y$`). Carries whatever count/register the user
+    /// typed, exactly as if they had spelled the long form.
+    fn complete_operator_motion(&mut self, operator: Operator, motion: Motion) -> FeedResult {
+        let register = self.register;
+        let count = self.effective_count();
+        self.reset();
+        FeedResult::Complete(GrammarCommand::OperatorMotion { register, count, operator, motion })
     }
 
     fn complete_motion(&mut self, motion: Motion) -> FeedResult {
@@ -470,6 +544,45 @@ impl Pending {
         FeedResult::Complete(GrammarCommand::Scroll(req))
     }
 
+    fn feed_big_z(&mut self, key: Key) -> FeedResult {
+        match key.code {
+            KeyCode::Char('Z') => self.finish(GrammarCommand::WriteQuit),
+            KeyCode::Char('Q') => self.finish(GrammarCommand::QuitForce),
+            _ => self.invalid(),
+        }
+    }
+
+    /// The second key of a bracket `[`/`]` motion. `forward` is `true` for a
+    /// leading `]`, `false` for `[`; the second character then selects which
+    /// motion. `<CR>` and non-character keys are invalid here.
+    fn feed_bracket(&mut self, key: Key, forward: bool) -> FeedResult {
+        let Some(c) = key.as_char() else { return self.invalid() };
+        // The mark jumps (`['`/`` [` ``/`]'`/`` ]` ``) resolve to a standalone
+        // jump command rather than a `Motion`, because the mark table lives in
+        // the buffer and `Pending` cannot read it (see the module docs).
+        if c == '\'' || c == '`' {
+            let exact = c == '`';
+            self.reset();
+            return FeedResult::Complete(GrammarCommand::JumpBracketMark { forward, exact });
+        }
+        let motion = match (forward, c) {
+            (false, '[') => Motion::SectionBackward,
+            (true, ']') => Motion::SectionForward,
+            (false, ']') => Motion::SectionEndBackward,
+            (true, '[') => Motion::SectionEndForward,
+            (false, '(') => Motion::UnmatchedParenBack,
+            (true, ')') => Motion::UnmatchedParenForward,
+            (false, '{') => Motion::UnmatchedBraceBack,
+            (true, '}') => Motion::UnmatchedBraceForward,
+            (false, 'm') => Motion::MethodStartBack,
+            (true, 'm') => Motion::MethodStartForward,
+            (false, 'M') => Motion::MethodEndBack,
+            (true, 'M') => Motion::MethodEndForward,
+            _ => return self.invalid(),
+        };
+        self.complete_motion(motion)
+    }
+
     fn feed_find_char(&mut self, key: Key, kind: FindKind) -> FeedResult {
         let Some(c) = key.as_char() else { return self.invalid() };
         self.complete_motion(Motion::FindChar { kind, target: c })
@@ -536,6 +649,10 @@ pub(crate) fn simple_motion(key: Key) -> Option<Motion> {
         KeyCode::Down => return Some(Motion::Down),
         KeyCode::Home => return Some(Motion::LineStart),
         KeyCode::End => return Some(Motion::LineEnd),
+        // `<CR>` in Normal mode is the same motion as `+`: down to the first
+        // non-blank of the next line. Handling it here means `d<CR>` deletes
+        // two lines linewise, exactly like `d+`.
+        KeyCode::Enter => return Some(Motion::NextLineFirstNonBlank),
         _ => {}
     }
     let c = key.as_char()?;
@@ -553,6 +670,10 @@ pub(crate) fn simple_motion(key: Key) -> Option<Motion> {
         '0' => Motion::LineStart,
         '^' => Motion::FirstNonBlank,
         '$' => Motion::LineEnd,
+        '|' => Motion::ToColumn,
+        '+' => Motion::NextLineFirstNonBlank,
+        '-' => Motion::PrevLineFirstNonBlank,
+        '_' => Motion::LineDownFirstNonBlank,
         '{' => Motion::ParagraphBackward,
         '}' => Motion::ParagraphForward,
         '(' => Motion::SentenceBackward,

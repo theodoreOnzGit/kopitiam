@@ -117,6 +117,45 @@ pub enum Motion {
     ScreenHigh,
     ScreenMid,
     ScreenLow,
+    /// `|`: go to column `count` (1-based, so `1|` is column 0). Exclusive.
+    ToColumn,
+    /// `+` / `<CR>`: first non-blank of the line `count` lines *down*.
+    /// Linewise, same as vim.
+    NextLineFirstNonBlank,
+    /// `-`: first non-blank of the line `count` lines *up*. Linewise.
+    PrevLineFirstNonBlank,
+    /// `_`: first non-blank of the line `count-1` lines down (so bare `_`
+    /// stays on the current line's first non-blank). Linewise.
+    LineDownFirstNonBlank,
+    /// `]]`: forward to the next line whose first column is `{` (vim's
+    /// section/function-start motion for brace-style code). See
+    /// [`section_scan`] for why we match a brace in column 0 exactly, not a
+    /// nested one.
+    SectionForward,
+    /// `[[`: backward to the previous line whose first column is `{`.
+    SectionBackward,
+    /// `][`: forward to the next line whose first column is `}` (section end).
+    SectionEndForward,
+    /// `[]`: backward to the previous line whose first column is `}`.
+    SectionEndBackward,
+    /// `[(`: backward to the nearest *unmatched* `(`.
+    UnmatchedParenBack,
+    /// `])`: forward to the nearest *unmatched* `)`.
+    UnmatchedParenForward,
+    /// `[{`: backward to the nearest *unmatched* `{`.
+    UnmatchedBraceBack,
+    /// `]}`: forward to the nearest *unmatched* `}`.
+    UnmatchedBraceForward,
+    /// `[m`: backward to the previous method start (`{`). See [`brace_scan`]
+    /// for why this is a plain "previous `{`" scan rather than vim's full
+    /// Java-method heuristic.
+    MethodStartBack,
+    /// `]m`: forward to the next method start (`{`).
+    MethodStartForward,
+    /// `[M`: backward to the previous method end (`}`).
+    MethodEndBack,
+    /// `]M`: forward to the next method end (`}`).
+    MethodEndForward,
     FindChar { kind: FindKind, target: char },
 }
 
@@ -127,11 +166,19 @@ impl Motion {
         use Motion::*;
         match self {
             Left | Right | WordForward | WordForwardBig | WordBackward | WordBackwardBig | LineStart | FirstNonBlank
-            | ParagraphForward | ParagraphBackward | SentenceForward | SentenceBackward => MotionKind::Exclusive,
-            WordEnd | WordEndBig | WordEndBack | WordEndBackBig | LastNonBlank | LineEnd | MatchPair => MotionKind::Inclusive,
-            Up | Down | FileStart | FileEnd | ScreenHigh | ScreenMid | ScreenLow => {
-                MotionKind::Linewise
+            | ParagraphForward | ParagraphBackward | SentenceForward | SentenceBackward | ToColumn => MotionKind::Exclusive,
+            // The whole bracket `[`/`]` motion family is charwise-exclusive,
+            // matching neovim's `nv_brackets` (`motion_type = kMTCharWise;
+            // inclusive = false`). So `d]}` deletes up to but *not* including
+            // the unmatched `}`, the same as vim.
+            SectionForward | SectionBackward | SectionEndForward | SectionEndBackward | UnmatchedParenBack | UnmatchedParenForward
+            | UnmatchedBraceBack | UnmatchedBraceForward | MethodStartBack | MethodStartForward | MethodEndBack | MethodEndForward => {
+                MotionKind::Exclusive
             }
+            WordEnd | WordEndBig | WordEndBack | WordEndBackBig | LastNonBlank | LineEnd | MatchPair => MotionKind::Inclusive,
+            // `+`/`-`/`_` are linewise in vim: `d+` deletes two whole lines.
+            Up | Down | FileStart | FileEnd | ScreenHigh | ScreenMid | ScreenLow | NextLineFirstNonBlank | PrevLineFirstNonBlank
+            | LineDownFirstNonBlank => MotionKind::Linewise,
             FindChar { kind, .. } => match kind {
                 FindKind::To | FindKind::ToBack => MotionKind::Inclusive,
                 FindKind::Till | FindKind::TillBack => MotionKind::Inclusive,
@@ -289,6 +336,33 @@ impl Motion {
                 let last = buf.line_count().saturating_sub(1);
                 Position::new(last, first_non_blank(buf, last))
             }
+            // `|`: column `count` is 1-based, so `1|` lands on column 0.
+            ToColumn => buf.clamp(Position::new(pos.line, count.saturating_sub(1))),
+            NextLineFirstNonBlank => {
+                let line = (pos.line + count).min(buf.line_count().saturating_sub(1));
+                Position::new(line, first_non_blank(buf, line))
+            }
+            PrevLineFirstNonBlank => {
+                let line = pos.line.saturating_sub(count);
+                Position::new(line, first_non_blank(buf, line))
+            }
+            // `_`: bare `_` (count 1) stays on this line; `3_` goes two down.
+            LineDownFirstNonBlank => {
+                let line = (pos.line + count.saturating_sub(1)).min(buf.line_count().saturating_sub(1));
+                Position::new(line, first_non_blank(buf, line))
+            }
+            SectionForward => nth(count, pos, |p| section_scan(buf, p, '{', true)),
+            SectionBackward => nth(count, pos, |p| section_scan(buf, p, '{', false)),
+            SectionEndForward => nth(count, pos, |p| section_scan(buf, p, '}', true)),
+            SectionEndBackward => nth(count, pos, |p| section_scan(buf, p, '}', false)),
+            UnmatchedParenBack => nth(count, pos, |p| unmatched_bracket(buf, p, '(', ')', false)),
+            UnmatchedParenForward => nth(count, pos, |p| unmatched_bracket(buf, p, '(', ')', true)),
+            UnmatchedBraceBack => nth(count, pos, |p| unmatched_bracket(buf, p, '{', '}', false)),
+            UnmatchedBraceForward => nth(count, pos, |p| unmatched_bracket(buf, p, '{', '}', true)),
+            MethodStartBack => nth(count, pos, |p| brace_scan(buf, p, '{', false)),
+            MethodStartForward => nth(count, pos, |p| brace_scan(buf, p, '{', true)),
+            MethodEndBack => nth(count, pos, |p| brace_scan(buf, p, '}', false)),
+            MethodEndForward => nth(count, pos, |p| brace_scan(buf, p, '}', true)),
             FindChar { kind, target } => {
                 let mut p = pos;
                 for _ in 0..count {
@@ -665,6 +739,126 @@ fn sentence_forward(buf: &Buffer, pos: Position) -> Position {
 
 fn sentence_backward(buf: &Buffer, pos: Position) -> Position {
     sentence_starts(buf).into_iter().rfind(|&s| s < pos).unwrap_or(Position::ORIGIN)
+}
+
+/// Applies `step` `count` times, starting from `pos`, threading each result
+/// into the next — the shared "repeat me count times" wrapper the bracket
+/// motions use so each of them stays a single `(buf, pos) -> pos` scan. A
+/// scan that cannot move (returns its own input) short-circuits, so a count
+/// that overshoots the buffer stops at the last real target instead of
+/// spinning.
+fn nth(count: usize, pos: Position, mut step: impl FnMut(Position) -> Position) -> Position {
+    let mut p = pos;
+    for _ in 0..count {
+        let next = step(p);
+        if next == p {
+            break;
+        }
+        p = next;
+    }
+    p
+}
+
+/// The character at `pos`, if any.
+fn char_at(buf: &Buffer, pos: Position) -> Option<char> {
+    buf.grapheme_at(pos).and_then(|g| g.chars().next())
+}
+
+/// `[[`/`]]`/`[]`/`][`: scan for the nearest line, in the given direction,
+/// whose **first column** is `target` (`{` for a section start, `}` for a
+/// section end).
+///
+/// vim's real `[[`/`]]` also honours `'sections'` nroff macros and form-feed
+/// characters; kvim matches only the brace-in-column-0 case, which is what
+/// every C-like/Rust source file actually relies on. Documented approximation
+/// rather than a half-built nroff scanner. If nothing is found we fall off the
+/// respective end of the buffer, the same as vim.
+fn section_scan(buf: &Buffer, pos: Position, target: char, forward: bool) -> Position {
+    let last = buf.line_count().saturating_sub(1);
+    let starts_with_target = |line: usize| char_at(buf, Position::new(line, 0)) == Some(target);
+    if forward {
+        for line in (pos.line + 1)..=last {
+            if starts_with_target(line) {
+                return Position::new(line, 0);
+            }
+        }
+        Position::new(last, buf.line_len(last).saturating_sub(1))
+    } else {
+        for line in (0..pos.line).rev() {
+            if starts_with_target(line) {
+                return Position::new(line, 0);
+            }
+        }
+        Position::ORIGIN
+    }
+}
+
+/// `[(`/`])`/`[{`/`]}`: walk out to the nearest **unmatched** `open`/`close`
+/// bracket in the given direction, counting nesting so a fully-balanced pair
+/// in between is skipped. Forward looks for an unmatched *close*; backward
+/// looks for an unmatched *open* — mirroring vim's `findmatchlimit`. Returns
+/// `pos` unchanged when the cursor is not inside such a bracket.
+fn unmatched_bracket(buf: &Buffer, pos: Position, open: char, close: char, forward: bool) -> Position {
+    let mut depth = 0i32;
+    let mut p = pos;
+    if forward {
+        while let Some(next) = step_right(buf, p) {
+            p = next;
+            match char_at(buf, p) {
+                Some(c) if c == open => depth += 1,
+                Some(c) if c == close => {
+                    if depth == 0 {
+                        return p;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+    } else {
+        while let Some(prev) = step_left(buf, p) {
+            p = prev;
+            match char_at(buf, p) {
+                Some(c) if c == close => depth += 1,
+                Some(c) if c == open => {
+                    if depth == 0 {
+                        return p;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    pos
+}
+
+/// `[m`/`]m`/`[M`/`]M`: land on the nearest `{`/`}` in the given direction,
+/// regardless of nesting.
+///
+/// vim's real method motions run a Java-flavoured heuristic (find the class
+/// body, then the method brace inside it). kvim approximates them as a plain
+/// "previous/next brace" scan: for the brace-per-method style that dominates
+/// C, Rust, Java and friends this lands on the same place, and it degrades
+/// predictably (never wrongly) on other layouts. Documented approximation.
+fn brace_scan(buf: &Buffer, pos: Position, target: char, forward: bool) -> Position {
+    let mut p = pos;
+    if forward {
+        while let Some(next) = step_right(buf, p) {
+            p = next;
+            if char_at(buf, p) == Some(target) {
+                return p;
+            }
+        }
+    } else {
+        while let Some(prev) = step_left(buf, p) {
+            p = prev;
+            if char_at(buf, p) == Some(target) {
+                return p;
+            }
+        }
+    }
+    pos
 }
 
 /// `%`: jump to the matching bracket for the nearest bracket at or after the

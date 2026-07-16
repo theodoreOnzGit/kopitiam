@@ -13,8 +13,6 @@
 use crate::core::{Edit, Granularity, Position, Range};
 use crate::text::Buffer;
 
-use super::motion::step_right;
-
 /// The operators from the brief. `Delete`/`Yank`/`Change` share the same
 /// "grab this range" shape; `Indent`/`Dedent`/the three case operators are
 /// linewise- and charwise-capable respectively; `x`/`X`/`s`/`r`/`~`/`J` are
@@ -94,7 +92,20 @@ pub fn charwise_range(buf: &Buffer, start: Position, end: Position, kind: super:
         }
         MotionKind::Inclusive => {
             let (a, b) = if start <= end { (start, end) } else { (end, start) };
-            let after = step_right(buf, b).unwrap_or(Position::new(b.line, buf.line_len(b.line)));
+            // Extend one grapheme past `b` so the landing char is *included*
+            // (that is what "inclusive" means). But when `b` is already the
+            // last grapheme of its line, stop at end-of-line rather than
+            // stepping onto the next line's column 0 — otherwise the range
+            // would swallow the trailing newline and merge the two lines.
+            // That mattered the day `D`/`C`/`Y` (`d$`/`c$`/`y$`) landed: on a
+            // non-final line, `y$` used to yank `"foo\n"` and `D` used to pull
+            // the next line up, neither of which is what vim does. This is the
+            // one place that rule can live, since every inclusive motion
+            // (`$`, `e`, `f`, `t`, `%`) funnels through here. Cross-line
+            // inclusive motions like `%` are unaffected: their landing `b` is
+            // not the last char of its line, so the `b.col + 1` branch runs.
+            let line_len = buf.line_len(b.line);
+            let after = if b.col + 1 < line_len { Position::new(b.line, b.col + 1) } else { Position::new(b.line, line_len) };
             (Range::new(a, after), Granularity::Charwise)
         }
     }
