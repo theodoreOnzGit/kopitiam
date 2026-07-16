@@ -43,6 +43,33 @@ maintainer: "Are you on leave, or is it a public holiday?"
 The ask is per working-hours stretch, not per commit — once confirmed for the
 current session, keep the stamp on the commits made under it.
 
+### Agents pause at the boundary, resume after — never run through NUS hours
+
+Standing rule, hor: the working-hours ban is not only "don't start". **No agent
+work may run *inside* the NUS window** (Mon–Thu 08:30–18:00, Fri 08:30–17:30 SGT),
+full stop. Concretely:
+
+* **Don't launch** an agent whose run will spill past the 08:30 boundary. If you
+  only got a short runway before 08:30, either scope the agent to reach a
+  committed-green checkpoint and **halt before the boundary**, or don't start it
+  and defer instead.
+* **In-flight work checkpoints and stops at the boundary.** Any agent still going
+  as 08:30 approaches must reach a committed-green state and **stop** — never let
+  it keep grinding into working hours. A half-done, uncommitted tree left at the
+  boundary is a bug: commit what is green, or reset your own edits clean.
+* **Resume after hours end**, not through them. Deferred KOPITIAM agent work
+  restarts once the window closes — after **17:30 SGT on Friday**, after **18:00
+  SGT Mon–Thu**, or straight away on weekends and Singapore public holidays (no
+  NUS window those days). Schedule the relaunch for *after* the window (e.g. a
+  cron one-shot at 18:00), don't run a job across it.
+* The **leave / public-holiday exception above still applies**: if the maintainer
+  confirms leave or a holiday, agents may run through the window and the commits
+  get the SGT stamp.
+
+Beads carry whatever an agent didn't finish before it stopped, so a post-hours
+session (or the maintainer) can pick the work up cold. Losing 30 min of runway to
+a clean stop beats a tangled half-commit every time.
+
 ## HARD RULE: the maintainer stays out of the loop during sleep hours (23:30–06:00 SGT)
 
 This is a **hard safety rule, not a preference**. It protects the maintainer's
