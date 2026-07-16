@@ -32,7 +32,7 @@
 use ratatui::buffer::Buffer as Surface;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Widget};
 use ratatui::Frame;
 use std::path::PathBuf;
 
@@ -265,6 +265,12 @@ impl Widget for PickerView<'_> {
             .title(title)
             .title_style(Style::default().fg(self.theme.yellow_bright).bg(bg));
         let inner = block.inner(area);
+        // Wipe the cells under the box before we paint. `set_style` alone only
+        // change the bg colour but keep whatever symbol already sitting there —
+        // the buffer text underneath — so the text bleed through and the popup
+        // look see-through. `Clear` reset every cell to blank first, then we lay
+        // our gruvbox bg on top, so the box come out fully opaque.
+        Clear.render(area, buf);
         buf.set_style(area, Style::default().bg(bg));
         block.render(area, buf);
         if inner.width == 0 || inner.height == 0 {
@@ -431,5 +437,34 @@ mod tests {
         assert!(text.contains("> r"), "the prompt with the typed query must paint:\n{text}");
         // README.md is a strong "r" match and must be listed.
         assert!(text.contains("README.md"), "a matching candidate must paint:\n{text}");
+    }
+
+    /// The exact bug this widget's `Clear` fix is about: paint the whole screen
+    /// with `X` (stand-in for the buffer text under the picker), drop the picker
+    /// on top, then assert not one `X` survive inside its rect and every cell
+    /// there carry an opaque bg.
+    #[test]
+    fn picker_is_opaque_no_buffer_text_bleeds_through() {
+        let theme = Theme::gruvbox_dark();
+        let mut panel = PickerPanel::new("Find Files", rows());
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let fill = "X".repeat(area.width as usize);
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(0, y, &fill, Style::default());
+                }
+                panel.render(frame, area, &theme, IconSet::Ascii, true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let c = buf.cell((x, y)).unwrap();
+                assert_ne!(c.symbol(), "X", "buffer text bled through the picker at ({x},{y})");
+                assert!(c.style().bg.is_some(), "cell ({x},{y}) inside the picker is not opaque");
+            }
+        }
     }
 }

@@ -11,7 +11,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, Borders, Clear, Widget},
 };
 
 use crate::ui::theme::Theme;
@@ -42,6 +42,12 @@ impl Widget for InfoBox<'_> {
             .title(self.title)
             .title_style(Style::default().fg(self.theme.yellow_bright).bg(bg));
         let inner = block.inner(area);
+        // Wipe the cells under the box before we paint. `set_style` alone only
+        // change the bg colour but keep whatever symbol already sitting there —
+        // the buffer text underneath — so the text bleed through and the popup
+        // look see-through. `Clear` reset every cell to blank first, then we lay
+        // our gruvbox bg on top, so the box come out fully opaque.
+        Clear.render(area, buf);
         buf.set_style(area, Style::default().bg(bg));
         block.render(area, buf);
 
@@ -110,5 +116,39 @@ mod tests {
                 c.symbol() == "m" && c.style().bg == Some(theme.yellow_bright)
             });
         assert!(has_selected_bg, "the selected reference row should carry the highlight background");
+    }
+
+    /// The exact bug this widget's `Clear` fix is about (InfoBox is reused by
+    /// hover, references, quickfix, rename and `:help`): paint the whole screen
+    /// with `X` (stand-in for the buffer text under the box), drop the InfoBox on
+    /// top, then assert not one `X` survive inside its rect and every cell there
+    /// carry an opaque bg.
+    #[test]
+    fn info_box_is_opaque_no_buffer_text_bleeds_through() {
+        let theme = Theme::gruvbox_dark();
+        let lines = vec!["src/lib.rs:1:8".to_string()];
+        let area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        let rect = centered_rect(area, 30, 4);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let fill = "X".repeat(area.width as usize);
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(0, y, &fill, Style::default());
+                }
+                frame.render_widget(
+                    InfoBox { title: "hover", lines: &lines, selected: None, theme: &theme, scroll: 0 },
+                    rect,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        for y in rect.top()..rect.bottom() {
+            for x in rect.left()..rect.right() {
+                let c = buf.cell((x, y)).unwrap();
+                assert_ne!(c.symbol(), "X", "buffer text bled through the info box at ({x},{y})");
+                assert!(c.style().bg.is_some(), "cell ({x},{y}) inside the info box is not opaque");
+            }
+        }
     }
 }

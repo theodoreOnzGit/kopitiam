@@ -23,7 +23,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, Borders, Clear, Widget},
 };
 
 use crate::ui::theme::Theme;
@@ -70,7 +70,12 @@ impl Widget for WhichKey<'_> {
             .title("which-key")
             .title_style(Style::default().fg(self.theme.yellow_bright).bg(self.theme.bg1));
         let inner = block.inner(area);
-        // Fill the box background first so it reads as a panel over the text.
+        // Wipe the cells under the box before we paint. `set_style` alone only
+        // change the bg colour but keep whatever symbol already sitting there —
+        // the buffer text underneath — so the text bleed through and the popup
+        // look see-through. `Clear` reset every cell to blank first, then we lay
+        // our gruvbox bg on top, so the box read as a solid panel over the text.
+        Clear.render(area, buf);
         buf.set_style(area, Style::default().bg(self.theme.bg1));
         block.render(area, buf);
 
@@ -133,5 +138,38 @@ mod tests {
             .flat_map(|x| (0..5).map(move |y| (x, y)))
             .find(|&(x, y)| buf.cell((x, y)).unwrap().symbol() == "e" && buf.cell((x, y)).unwrap().style().fg == Some(theme.yellow_bright));
         assert!(e_cell.is_some(), "the key label should be painted in bright yellow");
+    }
+
+    /// The exact bug this widget's `Clear` fix is about: paint the whole screen
+    /// with `X` (stand-in for the buffer text under the popup), drop which-key on
+    /// top, then assert not one `X` survive inside its rect and every cell there
+    /// carry an opaque bg.
+    #[test]
+    fn which_key_is_opaque_no_buffer_text_bleeds_through() {
+        let rows = vec![
+            WhichKeyRow { keys: "e".into(), desc: "Toggle file explorer".into(), is_group: false },
+            WhichKeyRow { keys: "g".into(), desc: "+2 more".into(), is_group: true },
+        ];
+        let theme = Theme::gruvbox_dark();
+        let area = Rect { x: 0, y: 0, width: 40, height: 8 };
+        let rect = popup_rect(area, rows.len());
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let fill = "X".repeat(area.width as usize);
+                for y in 0..area.height {
+                    frame.buffer_mut().set_string(0, y, &fill, Style::default());
+                }
+                frame.render_widget(WhichKey { rows: &rows, theme: &theme }, rect);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        for y in rect.top()..rect.bottom() {
+            for x in rect.left()..rect.right() {
+                let c = buf.cell((x, y)).unwrap();
+                assert_ne!(c.symbol(), "X", "buffer text bled through which-key at ({x},{y})");
+                assert!(c.style().bg.is_some(), "cell ({x},{y}) inside which-key is not opaque");
+            }
+        }
     }
 }
