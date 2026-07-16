@@ -265,6 +265,31 @@ pub struct Editor {
     /// The last visual selection (`anchor`, `cursor`, kind), for `gv`.
     last_visual: Option<(Position, Position, VisualKind)>,
 
+    /// The changelist: the positions of recent edits, walked by `g;` (older)
+    /// and `g,` (newer). Recorded in [`Self::commit_dot`] — the one point every
+    /// buffer mutation funnels through when it completes — and deduplicated by
+    /// line, so a run of edits on one line collapses to a single entry, the
+    /// same as vim. `change_index == changes.len()` means "at the present, past
+    /// the newest change" (nothing to step `g,` forward into), mirroring the
+    /// [`Self::jumps`]/`jump_index` pair.
+    ///
+    /// Kept editor-global (an entry carries its [`BufferId`]) rather than
+    /// buffer-local as in vim. That is the same deliberate simplification the
+    /// jumplist already makes here: kvim edits one buffer with one cursor at a
+    /// time, so a global list matches the model without dragging buffer
+    /// identity into every mutation site — and `g;`/`g,` still land on the
+    /// right place because each entry restores its own buffer via
+    /// [`Self::goto_jump`].
+    changes: Vec<(BufferId, Position)>,
+    change_index: usize,
+
+    /// Where Insert mode was last left, for `gi` (vim's `` `^ `` mark). Set in
+    /// [`Self::leave_insert`] to the caret position *before* the leaving-insert
+    /// cursor-steps-left adjustment — i.e. the spot where typing would resume,
+    /// which is exactly what `gi` returns to. `None` until the first insert is
+    /// left.
+    last_insert_pos: Option<(BufferId, Position)>,
+
     /// Insert-mode `<C-r>` is a two-key sequence (`<C-r>` then a register
     /// name); this remembers we are between the two.
     insert_register_pending: bool,
@@ -354,6 +379,9 @@ impl Editor {
             jump_index: 0,
             last_jump_from: None,
             last_visual: None,
+            changes: Vec::new(),
+            change_index: 0,
+            last_insert_pos: None,
             insert_register_pending: false,
             insert_one_shot: false,
             viewport_height: DEFAULT_VIEWPORT_LINES,
@@ -773,6 +801,30 @@ impl Editor {
         if let Some(keys) = self.dot_recording.take() {
             self.dot = Some(keys);
         }
+        // A committed dot is exactly "a change just finished" — the natural
+        // point to record a changelist entry for `g;`/`g,`, without threading a
+        // record call through every one of the dozen mutation methods.
+        self.record_change();
+    }
+
+    /// Pushes the current cursor position onto the changelist for `g;`/`g,`,
+    /// collapsing a repeat edit on the same line into the existing entry (vim
+    /// keeps roughly one changelist entry per line), and re-arming the walk
+    /// pointer to the present so the next `g;` starts from the newest change.
+    fn record_change(&mut self) {
+        let entry = (self.current, self.cursor);
+        // Fold a same-line, same-buffer repeat into the last entry rather than
+        // growing the list — otherwise `xxxx` would leave four near-identical
+        // stops for `g;` to crawl through.
+        if let Some(&(buf, pos)) = self.changes.last()
+            && buf == entry.0
+            && pos.line == entry.1.line
+        {
+            *self.changes.last_mut().expect("just checked last()") = entry;
+        } else {
+            self.changes.push(entry);
+        }
+        self.change_index = self.changes.len();
     }
 
     fn discard_dot(&mut self) {
@@ -1056,8 +1108,8 @@ impl Editor {
             }
             GrammarCommand::ReplaceChar { count, ch } => self.replace_char(count, ch),
             GrammarCommand::ToggleCaseUnderCursor { count } => self.toggle_case_under_cursor(count),
-            GrammarCommand::JoinLines { count } => self.join_lines(count),
-            GrammarCommand::Put { register, count, before } => self.put(register, count.unwrap_or(1).max(1), before),
+            GrammarCommand::JoinLines { count, space } => self.join_lines(count, space),
+            GrammarCommand::Put { register, count, before, cursor_after } => self.put(register, count.unwrap_or(1).max(1), before, cursor_after),
             GrammarCommand::EnterInsert(pos) => self.enter_insert_at(pos),
             GrammarCommand::Undo => {
                 self.cursor = self.current_buffer_mut().undo()?;
@@ -1192,6 +1244,26 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.repeat_substitution()
             }
+            GrammarCommand::RepeatSubstituteGlobal => {
+                self.mode = Mode::Normal;
+                self.repeat_substitution_global()
+            }
+            GrammarCommand::GotoFile => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                self.goto_file_under_cursor()
+            }
+            GrammarCommand::ChangelistJump { count, forward } => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                Ok(self.changelist_jump(count.unwrap_or(1).max(1), forward))
+            }
+            GrammarCommand::SearchWordLoose { forward } => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                Ok(self.search_word_under_cursor_loose(forward))
+            }
+            GrammarCommand::SelectMatch { register, operator, forward } => self.select_match(register, operator, forward),
             GrammarCommand::JumpBracketMark { forward, exact } => {
                 self.discard_dot();
                 self.mode = Mode::Normal;
@@ -1215,6 +1287,78 @@ impl Editor {
         let n = ex::substitute(self.current_buffer_mut(), line, line, &pattern, &replacement, false)?;
         self.cursor = self.current_buffer().clamp(self.cursor);
         Ok(EditorResponse::Message(format!("{n} substitution(s)")))
+    }
+
+    /// `g&`: re-run the last `:s` over the **whole file**, keeping its original
+    /// flags — vim's `:%s//~/&`. The counterpart to `&`
+    /// ([`Self::repeat_substitution`]), which redoes it on the current line and
+    /// drops the flags. A friendly no-op when nothing has been substituted yet.
+    fn repeat_substitution_global(&mut self) -> crate::Result<EditorResponse> {
+        self.discard_dot();
+        let Some((pattern, replacement, global)) = self.last_substitution.clone() else {
+            return Ok(EditorResponse::Message("no previous substitute".to_string()));
+        };
+        let last = self.current_buffer().line_count().saturating_sub(1);
+        let n = ex::substitute(self.current_buffer_mut(), 0, last, &pattern, &replacement, global)?;
+        self.cursor = self.current_buffer().clamp(self.cursor);
+        Ok(EditorResponse::Message(format!("{n} substitution(s)")))
+    }
+
+    /// `gf`: open the file whose name sits under the cursor. The name is
+    /// resolved first against the current file's own directory, then against the
+    /// process working directory, then taken as-is (an absolute path), mirroring
+    /// how vim walks its `path` looking for the file. The first candidate that
+    /// exists is opened; if none do — or the cursor is not on anything
+    /// name-shaped — the buffer is left untouched and a Singlish note explains.
+    fn goto_file_under_cursor(&mut self) -> crate::Result<EditorResponse> {
+        let Some(name) = search::file_under_cursor(self.current_buffer(), self.cursor) else {
+            return Ok(EditorResponse::Message("no filename under cursor lah".to_string()));
+        };
+        // Build the search candidates in priority order: sibling of the current
+        // file, then cwd-relative / literal.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = self.current_buffer().path().and_then(|p| p.parent()) {
+            candidates.push(dir.join(&name));
+        }
+        candidates.push(PathBuf::from(&name));
+        let found = candidates.into_iter().find(|c| c.is_file());
+        match found {
+            Some(path) => {
+                self.open(&path)?;
+                Ok(EditorResponse::Message(format!("opened {name}")))
+            }
+            None => Ok(EditorResponse::Message(format!("cannot find file: {name} — sorry ah"))),
+        }
+    }
+
+    /// `g;` (`forward == false`) / `g,` (`forward == true`): step `count` entries
+    /// backward/forward through the changelist (see [`Self::record_change`]).
+    /// `g;` walks toward older edits, `g,` toward newer ones, exactly like vim.
+    /// A no-op with a note when the list is empty or the requested end is already
+    /// reached.
+    fn changelist_jump(&mut self, count: usize, forward: bool) -> EditorResponse {
+        if self.changes.is_empty() {
+            return EditorResponse::Message("changelist is empty".to_string());
+        }
+        if forward {
+            // `g,`: toward newer changes. `change_index` at (or past) the newest
+            // recorded change means there is nothing newer to step into.
+            if self.change_index + 1 >= self.changes.len() {
+                return EditorResponse::Message("at newest change".to_string());
+            }
+            self.change_index = (self.change_index + count).min(self.changes.len() - 1);
+        } else {
+            // `g;`: toward older changes. From the present (`change_index ==
+            // len`) the first step lands on the newest recorded change
+            // (`len - 1`); each further step walks one entry back.
+            if self.change_index == 0 {
+                return EditorResponse::Message("at oldest change".to_string());
+            }
+            self.change_index = self.change_index.saturating_sub(count);
+        }
+        let (buffer, pos) = self.changes[self.change_index];
+        self.goto_jump(buffer, pos);
+        EditorResponse::Continue
     }
 
     /// `['`/`` [` ``/`]'`/`` ]` ``: jump to the previous/next lowercase mark by
@@ -1395,6 +1539,62 @@ impl Editor {
         };
         let pattern = search::word_pattern(&word);
         self.do_search(&pattern, forward)
+    }
+
+    /// `g*`/`g#`: like `*`/`#`, but the keyword is searched without `\<...\>`
+    /// word boundaries, so it also matches inside longer words — `g*` on `foo`
+    /// finds `foobar`. The only difference from [`Self::search_word_under_cursor`]
+    /// is [`search::word_pattern_loose`] in place of [`search::word_pattern`].
+    fn search_word_under_cursor_loose(&mut self, forward: bool) -> EditorResponse {
+        let Some(word) = search::word_under_cursor(self.current_buffer(), self.cursor) else {
+            return EditorResponse::Continue;
+        };
+        let pattern = search::word_pattern_loose(&word);
+        self.do_search(&pattern, forward)
+    }
+
+    /// `gn`/`gN`: select the next (`forward`) / previous match of the last
+    /// search pattern. With no operator this drops into charwise Visual mode
+    /// over the match; with one (`cgn`, `dgn`, `ygn`) it runs the operator over
+    /// the match's range instead — and because kvim's dot-repeat replays raw
+    /// keys, `cgn` followed by `.` re-runs `c`, `g`, `n`, finds the *next* match
+    /// from wherever the last change left the cursor, and changes that one too.
+    /// That is the famous "change-then-dot" workflow, and it falls out of the
+    /// grammar for free rather than needing special repeat plumbing.
+    fn select_match(&mut self, register: Option<char>, operator: Option<Operator>, forward: bool) -> crate::Result<EditorResponse> {
+        let Some((pattern, _)) = self.last_search.clone() else {
+            self.discard_dot();
+            self.mode = Mode::Normal;
+            return Ok(EditorResponse::Message("no previous search".to_string()));
+        };
+        let (ic, scs) = (self.options.ignorecase, self.options.smartcase);
+        let Some((start, end)) = search::match_range(self.current_buffer(), self.cursor, &pattern, forward, ic, scs) else {
+            self.discard_dot();
+            self.mode = Mode::Normal;
+            return Ok(EditorResponse::Message(format!("pattern not found: {pattern}")));
+        };
+        match operator {
+            // Operator over the match: put the cursor on the match start and run
+            // the operator across the whole match as a charwise range. `Change`
+            // leaves Insert mode (that is `cgn`); the rest land back in Normal.
+            Some(operator) => {
+                self.cursor = start;
+                let range = Range::new(start, end);
+                self.run_operator(operator, range, Granularity::Charwise, register)
+            }
+            // No operator: select the match in charwise Visual mode. The anchor
+            // is the match start and the cursor the last grapheme of the match
+            // (visual selections are inclusive), so `gn` then `d` deletes exactly
+            // the match.
+            None => {
+                self.discard_dot();
+                self.visual_anchor = start;
+                self.cursor = self.current_buffer().clamp(Position::new(end.line, end.col.saturating_sub(1)));
+                self.visual_kind = VisualKind::Charwise;
+                self.mode = Mode::Visual;
+                Ok(EditorResponse::Continue)
+            }
+        }
     }
 
     /// `<C-a>`/`<C-x>`: increment/decrement the decimal number at or after the
@@ -1758,7 +1958,7 @@ impl Editor {
     /// the current line is empty or the joined-in line has no content —
     /// vim's own simplified rule (real vim additionally special-cases a
     /// joined-in line starting with `)`; not implemented here).
-    fn join_lines(&mut self, count: Option<usize>) -> crate::Result<EditorResponse> {
+    fn join_lines(&mut self, count: Option<usize>, space: bool) -> crate::Result<EditorResponse> {
         let joins = count.map(|n| n.saturating_sub(1)).unwrap_or(1).max(1);
         self.begin_insert_group();
         let mut landed = self.cursor;
@@ -1771,11 +1971,17 @@ impl Editor {
             let this_len = self.current_buffer().line_len(line);
             let next_text = self.current_buffer().line(line + 1).unwrap_or_default();
             let next_graphemes: Vec<&str> = next_text.graphemes(true).collect();
+            // `J` collapses the joined-in line's leading whitespace to a single
+            // space (unless one side is empty); `gJ` (space == false) inserts
+            // nothing and strips nothing — the two lines abut exactly as they
+            // were, so `skip` stays 0 and the joiner is empty.
             let mut skip = 0usize;
-            while skip < next_graphemes.len() && next_graphemes[skip].chars().next().map(char::is_whitespace).unwrap_or(false) {
-                skip += 1;
+            if space {
+                while skip < next_graphemes.len() && next_graphemes[skip].chars().next().map(char::is_whitespace).unwrap_or(false) {
+                    skip += 1;
+                }
             }
-            let needs_space = this_len > 0 && skip < next_graphemes.len();
+            let needs_space = space && this_len > 0 && skip < next_graphemes.len();
             let joiner = if needs_space { " " } else { "" };
             let del_range = Range::new(Position::new(line, this_len), Position::new(line + 1, skip));
             match self.current_buffer_mut().apply(Edit::replace(del_range, joiner.to_string())) {
@@ -1903,7 +2109,7 @@ impl Editor {
         self.clipboard = provider;
     }
 
-    fn put(&mut self, register: Option<char>, count: usize, before: bool) -> crate::Result<EditorResponse> {
+    fn put(&mut self, register: Option<char>, count: usize, before: bool, cursor_after: bool) -> crate::Result<EditorResponse> {
         let Some(content) = self.read_register(register) else {
             self.mode = Mode::Normal;
             self.discard_dot();
@@ -1916,7 +2122,7 @@ impl Editor {
         }
         let repeated = content.text.repeat(count);
         self.begin_insert_group();
-        let result = self.put_inner(&repeated, content.granularity, before);
+        let result = self.put_inner(&repeated, content.granularity, before, cursor_after);
         self.current_buffer_mut().end_undo_group();
         result?;
         self.mode = Mode::Normal;
@@ -1929,24 +2135,40 @@ impl Editor {
     /// that distinction exists at all. Factored out of [`Self::put`] so
     /// visual-mode paste-over-selection can reuse it without also reopening
     /// an undo group around a single call (see `handle_visual_key`).
-    fn put_inner(&mut self, text: &str, granularity: Granularity, before: bool) -> crate::Result<()> {
+    ///
+    /// `cursor_after` distinguishes `p`/`P` from `gp`/`gP`: when set, the cursor
+    /// is left *after* the pasted text — one grapheme past the last charwise
+    /// grapheme, or on the first column of the line below a linewise block —
+    /// rather than on the pasted text itself. That is the whole point of the
+    /// `g` variants: paste-and-keep-going, so a run of `gp`s stacks text.
+    fn put_inner(&mut self, text: &str, granularity: Granularity, before: bool, cursor_after: bool) -> crate::Result<()> {
         let cur = self.cursor;
         match granularity {
             Granularity::Linewise | Granularity::Blockwise => {
-                if before {
+                // How many lines the block occupies, so `gp` can land on the
+                // line *after* it. A linewise register's text ends in `\n`, so
+                // its newline count is its line count.
+                let pasted_lines = text.matches('\n').count().max(1);
+                let target = if before {
                     self.current_buffer_mut().apply(Edit::insert(Position::new(cur.line, 0), text.to_string()))?;
-                    self.cursor = Position::new(cur.line, operator::first_non_blank_col(self.current_buffer(), cur.line));
+                    cur.line
                 } else if cur.line + 1 < self.current_buffer().line_count() {
                     let target = cur.line + 1;
                     self.current_buffer_mut().apply(Edit::insert(Position::new(target, 0), text.to_string()))?;
-                    self.cursor = Position::new(target, operator::first_non_blank_col(self.current_buffer(), target));
+                    target
                 } else {
                     let pos = Position::new(cur.line, self.current_buffer().line_len(cur.line));
                     let insertion = format!("\n{}", text.trim_end_matches('\n'));
                     self.current_buffer_mut().apply(Edit::insert(pos, insertion))?;
-                    let target = cur.line + 1;
-                    self.cursor = Position::new(target, operator::first_non_blank_col(self.current_buffer(), target));
-                }
+                    cur.line + 1
+                };
+                self.cursor = if cursor_after {
+                    // The line just past the pasted block, first column, clamped
+                    // (a `gp` of the last lines in the buffer stays on the last).
+                    self.current_buffer().clamp(Position::new(target + pasted_lines, 0))
+                } else {
+                    Position::new(target, operator::first_non_blank_col(self.current_buffer(), target))
+                };
             }
             Granularity::Charwise => {
                 let insert_at = if before {
@@ -1956,7 +2178,14 @@ impl Editor {
                     Position::new(cur.line, (cur.col + 1).min(len))
                 };
                 let landed = self.current_buffer_mut().apply(Edit::insert(insert_at, text.to_string()))?;
-                self.cursor = self.current_buffer().clamp(Position::new(landed.line, landed.col.saturating_sub(1)));
+                self.cursor = if cursor_after {
+                    // `landed` is already the position one past the inserted
+                    // text; `clamp` permits col == line_len, so the cursor can
+                    // legitimately sit just beyond the last pasted grapheme.
+                    self.current_buffer().clamp(landed)
+                } else {
+                    self.current_buffer().clamp(Position::new(landed.line, landed.col.saturating_sub(1)))
+                };
             }
         }
         Ok(())
@@ -1967,6 +2196,14 @@ impl Editor {
     }
 
     fn enter_insert_at(&mut self, pos: InsertPos) -> crate::Result<EditorResponse> {
+        // `gi` resolves against remembered editor state, not the current cursor,
+        // so pull it out before the immutable buffer borrow below. A `gi` with
+        // no prior insert (nothing remembered), or one pointing at a different
+        // buffer than the active one, falls back to inserting at the cursor.
+        let last_insert = match (pos, self.last_insert_pos) {
+            (InsertPos::LastInsert, Some((buf_id, p))) if buf_id == self.current => Some(self.current_buffer().clamp(p)),
+            _ => None,
+        };
         let buf = self.current_buffer();
         let line = self.cursor.line;
         self.cursor = match pos {
@@ -1974,6 +2211,10 @@ impl Editor {
             InsertPos::After => Position::new(line, (self.cursor.col + 1).min(buf.line_len(line))),
             InsertPos::LineStart => Position::new(line, operator::first_non_blank_col(buf, line)),
             InsertPos::LineEnd => Position::new(line, buf.line_len(line)),
+            // `gI`: literally column 0, not the first non-blank `I` stops at.
+            InsertPos::FirstColumn => Position::new(line, 0),
+            // `gi`: the remembered post-insert spot, or the cursor if none.
+            InsertPos::LastInsert => last_insert.unwrap_or(self.cursor),
             InsertPos::NewLineBelow | InsertPos::NewLineAbove => self.cursor, // resolved below, after the edit.
         };
         self.begin_insert_group();
@@ -2001,6 +2242,10 @@ impl Editor {
         if !typed.is_empty() {
             self.last_insert = typed;
         }
+        // Remember where insert stopped for `gi` — captured here, before the
+        // cursor is nudged one grapheme left below, so `gi` resumes at the exact
+        // spot typing would have continued rather than one column back.
+        self.last_insert_pos = Some((self.current, self.cursor));
         self.current_buffer_mut().end_undo_group();
         // vim moves the cursor one grapheme left when leaving Insert mode
         // (so it lands *on* the last typed character, not past it).
@@ -2827,6 +3072,12 @@ impl Editor {
                 KeyCode::Char('u') => return self.run_visual_operator(Operator::LowerCase),
                 KeyCode::Char('U') => return self.run_visual_operator(Operator::UpperCase),
                 KeyCode::Char('~') => return self.run_visual_operator(Operator::ToggleCase),
+                // Visual `gJ`: join without inserting a space, the selection's
+                // counterpart to the plain `J` handled below.
+                KeyCode::Char('J') => {
+                    self.exit_visual();
+                    return self.join_lines(None, false);
+                }
                 _ => {}
             }
             return Ok(EditorResponse::Continue);
@@ -2898,7 +3149,7 @@ impl Editor {
             KeyCode::Char('~') => self.run_visual_operator(Operator::ToggleCase),
             KeyCode::Char('J') => {
                 self.exit_visual();
-                self.join_lines(None)
+                self.join_lines(None, true)
             }
             KeyCode::Char('p') | KeyCode::Char('P') => self.visual_paste(),
             // `o`/`O`: swap the cursor and the anchor, so the *other* end of
@@ -2967,7 +3218,7 @@ impl Editor {
         let result = (|| -> crate::Result<()> {
             let outcome = Operator::Delete.apply(self.current_buffer_mut(), range, granularity, 0, false)?;
             self.cursor = self.current_buffer().clamp(outcome.cursor);
-            self.put_inner(&content.text, content.granularity, true)
+            self.put_inner(&content.text, content.granularity, true, false)
         })();
         self.current_buffer_mut().end_undo_group();
         result?;
@@ -4670,5 +4921,159 @@ mod tests {
         let mut ed = editor_with("hi");
         let resp = ed.execute_ex("earlier 5m").unwrap();
         assert!(matches!(resp, EditorResponse::Message(m) if m.contains("count")));
+    }
+
+    // -----------------------------------------------------------------
+    // g-prefix commands (kopitiam-cj0.22 + cj0.40): gf, gJ, g*/g#, gp/gP,
+    // gi/gI, gn/gN (cgn+.), g;/g,, g&.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn g_join_joins_without_inserting_a_space() {
+        // Plain J inserts a space (see `j_joins_lines_with_a_single_space`);
+        // gJ butts the lines together with nothing between.
+        assert_eq!(run("foo\nbar", "gJ"), "foobar");
+    }
+
+    #[test]
+    fn g_join_keeps_the_joined_in_lines_leading_whitespace() {
+        // Unlike J, gJ strips no leading whitespace off the second line.
+        assert_eq!(run("foo\n    bar", "gJ"), "foo    bar");
+    }
+
+    #[test]
+    fn gf_opens_the_file_whose_path_is_under_the_cursor() {
+        let path = std::env::temp_dir().join(format!("kvim_gf_{}.txt", std::process::id()));
+        std::fs::write(&path, "opened by gf").unwrap();
+        // The buffer's sole line is the absolute path; the cursor starts on it.
+        let mut ed = editor_with(&path.display().to_string());
+        feed(&mut ed, "gf");
+        assert_eq!(ed.buffer().text(), "opened by gf", "gf switched to the file under the cursor");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn gf_reports_a_friendly_note_when_the_file_is_missing() {
+        let mut ed = editor_with("no_such_file_kvim.xyz");
+        let resp = feed_last(&mut ed, "gf");
+        assert!(matches!(resp, EditorResponse::Message(m) if m.contains("cannot find file")));
+    }
+
+    #[test]
+    fn g_star_matches_the_word_as_a_substring_unlike_star() {
+        // `foo` appears standalone at col 0 and inside `foobar` at col 4.
+        // `*` (word-boundaried) never lands inside `foobar`; `g*` does.
+        let mut ed = editor_with("foo foobar baz");
+        feed(&mut ed, "g*");
+        assert_eq!(ed.cursor(), Position::new(0, 4), "g* lands inside foobar");
+        // And `n` walks the same loose pattern to the next substring...
+        // wrapping back to the standalone foo at col 0.
+        feed(&mut ed, "n");
+        assert_eq!(ed.cursor(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn gp_charwise_leaves_the_cursor_after_the_pasted_text() {
+        let mut ed = editor_with("foo");
+        feed(&mut ed, "yiwgp"); // yank "foo", paste it after the cursor
+        assert_eq!(ed.buffer().text(), "ffoooo");
+        assert_eq!(ed.cursor(), Position::new(0, 4), "cursor sits just past the paste");
+        // Contrast plain p, which lands on the paste's last grapheme.
+        let mut ed = editor_with("foo");
+        feed(&mut ed, "yiwp");
+        assert_eq!(ed.cursor(), Position::new(0, 3));
+    }
+
+    #[test]
+    fn g_shift_p_charwise_pastes_before_and_leaves_the_cursor_after() {
+        let mut ed = editor_with("foo");
+        feed(&mut ed, "yiwgP");
+        assert_eq!(ed.buffer().text(), "foofoo");
+        assert_eq!(ed.cursor(), Position::new(0, 3));
+    }
+
+    #[test]
+    fn gp_linewise_leaves_the_cursor_on_the_line_after_the_block() {
+        let mut ed = editor_with("one\ntwo\nthree");
+        feed(&mut ed, "yygp"); // yank line "one", paste it below
+        assert_eq!(ed.buffer().text(), "one\none\ntwo\nthree");
+        assert_eq!(ed.cursor(), Position::new(2, 0), "cursor is on the line past the pasted block");
+    }
+
+    #[test]
+    fn gi_resumes_insert_at_the_last_insert_position() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "ihello<Esc>"); // last insert stopped just past 'o'
+        feed(&mut ed, "0"); // wander to the start of the line
+        feed(&mut ed, "giX<Esc>"); // gi returns to where insert stopped
+        assert_eq!(ed.buffer().text(), "helloX");
+    }
+
+    #[test]
+    fn g_shift_i_inserts_at_the_first_column_not_the_first_non_blank() {
+        // I stops at the first non-blank; gI goes to column 0.
+        assert_eq!(run("    foo", "gIX<Esc>"), "X    foo");
+    }
+
+    #[test]
+    fn gn_selects_the_match_under_the_cursor_visually() {
+        let mut ed = editor_with("foo bar foo");
+        feed(&mut ed, "/foo<CR>"); // jump to the second foo at col 8
+        feed(&mut ed, "gn");
+        assert_eq!(ed.mode(), Mode::Visual);
+        assert_eq!(ed.selection(), Some((Position::new(0, 8), Position::new(0, 10))), "the whole match is selected");
+    }
+
+    #[test]
+    fn cgn_then_dot_changes_successive_matches() {
+        // The famous workflow: change the next match, then `.` to change the
+        // one after it, and the one after that.
+        let mut ed = editor_with("foo foo foo");
+        feed(&mut ed, "/foo<CR>"); // to the second foo (col 4)
+        feed(&mut ed, "cgnbar<Esc>"); // change it
+        assert_eq!(ed.buffer().text(), "foo bar foo");
+        feed(&mut ed, "."); // repeat on the next match
+        assert_eq!(ed.buffer().text(), "foo bar bar");
+    }
+
+    #[test]
+    fn dgn_deletes_the_next_match() {
+        let mut ed = editor_with("keep drop keep");
+        feed(&mut ed, "/drop<CR>");
+        feed(&mut ed, "dgn");
+        assert_eq!(ed.buffer().text(), "keep  keep");
+    }
+
+    #[test]
+    fn changelist_g_semicolon_and_g_comma_walk_recent_edits() {
+        let mut ed = editor_with("a\nb\nc\nd\ne");
+        feed(&mut ed, "ix<Esc>"); // edit line 0
+        feed(&mut ed, "jjix<Esc>"); // edit line 2
+        feed(&mut ed, "jjix<Esc>"); // edit line 4
+        feed(&mut ed, "gg"); // park at the top, away from the newest change
+        feed(&mut ed, "g;"); // -> newest change, line 4
+        assert_eq!(ed.cursor().line, 4);
+        feed(&mut ed, "g;"); // older -> line 2
+        assert_eq!(ed.cursor().line, 2);
+        feed(&mut ed, "g;"); // older -> line 0
+        assert_eq!(ed.cursor().line, 0);
+        feed(&mut ed, "g,"); // newer -> line 2
+        assert_eq!(ed.cursor().line, 2);
+    }
+
+    #[test]
+    fn changelist_collapses_repeat_edits_on_one_line() {
+        let mut ed = editor_with("abc");
+        feed(&mut ed, "xxx"); // three deletes, all on line 0
+        assert_eq!(ed.changes.len(), 1, "same-line edits share one changelist entry");
+    }
+
+    #[test]
+    fn g_ampersand_repeats_the_last_substitution_over_the_whole_file() {
+        let mut ed = editor_with("foo\nfoo\nfoo");
+        ed.execute_ex("s/foo/bar/").unwrap(); // line 0 only
+        assert_eq!(ed.buffer().text(), "bar\nfoo\nfoo");
+        feed(&mut ed, "g&"); // now every line
+        assert_eq!(ed.buffer().text(), "bar\nbar\nbar");
     }
 }

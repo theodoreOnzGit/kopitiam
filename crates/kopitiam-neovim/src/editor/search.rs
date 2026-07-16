@@ -179,6 +179,114 @@ pub fn word_pattern(word: &str) -> String {
     format!(r"\b{}\b", regex::escape(word))
 }
 
+/// The `g*`/`g#` counterpart to [`word_pattern`]: the escaped keyword with
+/// **no** `\b` word boundaries, so the search matches the keyword as a
+/// substring (`g*` on `foo` also lands on `foobar`). That missing anchor is
+/// the whole difference between `*` and `g*`.
+pub fn word_pattern_loose(word: &str) -> String {
+    regex::escape(word)
+}
+
+/// The filename under (or after) the cursor on its line, for `gf`. A filename
+/// grapheme is one of vim's default `isfname` set: alphanumerics plus the
+/// path/URL punctuation `/._-~+#$%@` (kvim keeps it deliberately small — no
+/// spaces, no shell metacharacters — so a stray word in prose does not read as
+/// a path). Returns `None` when there is no such run at or after the cursor on
+/// the line. Mirrors [`word_under_cursor`]'s scan-forward-when-off-a-token
+/// behaviour so pressing `gf` with the cursor in the indent still finds the
+/// name.
+pub fn file_under_cursor(buf: &Buffer, pos: Position) -> Option<String> {
+    let text = buf.line(pos.line)?;
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let is_fname = |g: &str| g.chars().next().is_some_and(|c| c.is_alphanumeric() || "/._-~+#$%@".contains(c));
+
+    let mut start = pos.col.min(graphemes.len());
+    while start < graphemes.len() && !is_fname(graphemes[start]) {
+        start += 1;
+    }
+    if start >= graphemes.len() {
+        return None;
+    }
+    while start > 0 && is_fname(graphemes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = start;
+    while end < graphemes.len() && is_fname(graphemes[end]) {
+        end += 1;
+    }
+    Some(graphemes[start..end].concat())
+}
+
+/// The match of `pattern` that `gn`/`gN` should select, as an inclusive-start /
+/// exclusive-end grapheme-column [`Position`] pair (`(start, end)`), both on the
+/// same line (kvim searches never cross a newline — see the module header).
+///
+/// vim's rule, and ours: if the cursor is sitting *on* a match, that match is
+/// the one selected; otherwise move to the next one (`forward`) or the previous
+/// one (`gN`). The wrap around the buffer works exactly like [`find`], so `gn`
+/// at the last match cycles to the first.
+///
+/// This exists separately from [`find`] because `gn` needs the match's *extent*
+/// (to paint / operate over the whole thing), whereas `n` only needs where to
+/// put the cursor. `case_insensitive`/`smartcase` thread through [`build_regex`]
+/// so a `gn` selection can never drift from what `n` would jump to.
+pub fn match_range(buf: &Buffer, from: Position, pattern: &str, forward: bool, ignorecase: bool, smartcase: bool) -> Option<(Position, Position)> {
+    let re = build_regex(pattern, ignorecase, smartcase)?;
+    let line_count = buf.line_count();
+    if forward {
+        match_range_forward(buf, &re, from, line_count)
+    } else {
+        match_range_backward(buf, &re, from, line_count)
+    }
+}
+
+fn match_range_forward(buf: &Buffer, re: &Regex, from: Position, line_count: usize) -> Option<(Position, Position)> {
+    for pass in 0..2 {
+        let (first, last) = if pass == 0 { (from.line, line_count) } else { (0, from.line + 1) };
+        for line in first..last.min(line_count) {
+            let Some(text) = buf.line(line) else { continue };
+            for (start, end) in line_match_cols(&text, re) {
+                // A match qualifies when it reaches past the cursor: on the
+                // cursor line that means `end > cursor.col`, which is true both
+                // when the cursor sits inside the match (select it) and when the
+                // match starts after the cursor (move to it). On any other line,
+                // or on the wrap, every match qualifies.
+                let qualifies = line != from.line || end > from.col;
+                let on_wrap = pass == 1 && (line < from.line || (line == from.line && start <= from.col));
+                if (pass == 0 && qualifies) || on_wrap {
+                    return Some((Position::new(line, start), Position::new(line, end)));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_range_backward(buf: &Buffer, re: &Regex, from: Position, line_count: usize) -> Option<(Position, Position)> {
+    let last_line = line_count.saturating_sub(1);
+    for pass in 0..2 {
+        let lines: Vec<usize> = if pass == 0 { (0..=from.line.min(last_line)).rev().collect() } else { (from.line..line_count).rev().collect() };
+        for line in lines {
+            let Some(text) = buf.line(line) else { continue };
+            let mut best: Option<(usize, usize)> = None;
+            for (start, end) in line_match_cols(&text, re) {
+                // Rightmost match starting at or before the cursor on the cursor
+                // line (covers both "cursor inside the match" and "match before
+                // the cursor"); every match on other lines / the wrap.
+                let qualifies = line != from.line || start <= from.col;
+                let on_wrap = pass == 1 && (line > from.line || (line == from.line && start >= from.col));
+                if (pass == 0 && qualifies) || on_wrap {
+                    best = Some((start, end));
+                }
+            }
+            if let Some((start, end)) = best {
+                return Some((Position::new(line, start), Position::new(line, end)));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +371,45 @@ mod tests {
         assert!(!build_regex("foo", false, false).unwrap().is_match("Foo"));
         // ignorecase on: it does.
         assert!(build_regex("foo", true, false).unwrap().is_match("Foo"));
+    }
+
+    #[test]
+    fn word_pattern_loose_drops_the_word_boundaries() {
+        assert_eq!(word_pattern("foo"), r"\bfoo\b");
+        assert_eq!(word_pattern_loose("foo"), "foo");
+        // The loose pattern matches inside a longer word; the anchored one does not.
+        assert!(build_regex(&word_pattern_loose("foo"), false, false).unwrap().is_match("foobar"));
+        assert!(!build_regex(&word_pattern("foo"), false, false).unwrap().is_match("foobar"));
+    }
+
+    #[test]
+    fn file_under_cursor_reads_a_path_like_token() {
+        let buf = Buffer::from_str("see src/main.rs here");
+        assert_eq!(file_under_cursor(&buf, Position::new(0, 4)).as_deref(), Some("src/main.rs"));
+        // Off a token, it scans forward to the next one on the line.
+        assert_eq!(file_under_cursor(&buf, Position::new(0, 3)).as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn match_range_selects_the_match_under_the_cursor_then_the_next() {
+        let buf = Buffer::from_str("foo foo foo");
+        // Cursor inside the middle match selects that whole match, not the next.
+        let (s, e) = match_range(&buf, Position::new(0, 5), "foo", true, false, false).unwrap();
+        assert_eq!((s, e), (Position::new(0, 4), Position::new(0, 7)));
+        // Cursor before a match (in the gap) moves forward to it.
+        let (s, e) = match_range(&buf, Position::new(0, 3), "foo", true, false, false).unwrap();
+        assert_eq!((s, e), (Position::new(0, 4), Position::new(0, 7)));
+    }
+
+    #[test]
+    fn match_range_backward_takes_the_previous_match() {
+        let buf = Buffer::from_str("foo foo foo");
+        let (s, e) = match_range(&buf, Position::new(0, 8), "foo", false, false, false).unwrap();
+        // From inside the last match, gN selects that same match.
+        assert_eq!((s, e), (Position::new(0, 8), Position::new(0, 11)));
+        // From the gap before it, gN steps back to the middle match.
+        let (s, e) = match_range(&buf, Position::new(0, 7), "foo", false, false, false).unwrap();
+        assert_eq!((s, e), (Position::new(0, 4), Position::new(0, 7)));
     }
 
     #[test]

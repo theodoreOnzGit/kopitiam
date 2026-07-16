@@ -64,12 +64,40 @@ pub enum GrammarCommand {
     ReplaceChar { count: Option<usize>, ch: char },
     /// `~`
     ToggleCaseUnderCursor { count: Option<usize> },
-    /// `J`
-    JoinLines { count: Option<usize> },
-    /// `p`/`P`
-    Put { register: Option<char>, count: Option<usize>, before: bool },
-    /// `i a I A o O`
+    /// `J` (`space == true`, insert a space between the joined lines) or `gJ`
+    /// (`space == false`, join with nothing between — no space inserted and no
+    /// leading whitespace stripped off the joined-in line). See
+    /// [`super::Editor::join_lines`] for the exact whitespace rule each takes.
+    JoinLines { count: Option<usize>, space: bool },
+    /// `p`/`P`, and their `gp`/`gP` cousins. `before` picks paste-before
+    /// (`P`/`gP`) over paste-after (`p`/`gp`); `cursor_after` is the `g`
+    /// variants' one difference — leave the cursor *after* the pasted text
+    /// rather than on its last (charwise) / first (linewise) grapheme.
+    Put { register: Option<char>, count: Option<usize>, before: bool, cursor_after: bool },
+    /// `i a I A o O`, plus `gi` ([`InsertPos::LastInsert`]) and `gI`
+    /// ([`InsertPos::FirstColumn`]).
     EnterInsert(InsertPos),
+    /// `gf`: open the file whose name is under the cursor. `Pending` cannot
+    /// read the buffer (see the module docs), so it only reports the intent;
+    /// [`super::Editor`] extracts the name and resolves the path.
+    GotoFile,
+    /// `g;`/`g,`: step backward (`forward == false`) / forward (`g,`) through
+    /// the changelist — the positions of recent edits. Resolved by `Editor`,
+    /// which owns the changelist (`Pending` has no buffer, see the module
+    /// docs).
+    ChangelistJump { count: Option<usize>, forward: bool },
+    /// `g*`/`g#`: search for the keyword under the cursor, forward/backward,
+    /// but **without** the `\<...\>` word boundaries that `*`/`#`
+    /// ([`GrammarCommand::SearchWord`]) wrap it in — so `g*` on `foo` also
+    /// matches `foobar`.
+    SearchWordLoose { forward: bool },
+    /// `gn`/`gN`, including the operator-composed forms (`cgn`, `dgn`). With no
+    /// operator, visually select the next (`forward`) / previous match of the
+    /// last search pattern; with one, run it over that match's range. The
+    /// operator-composed form is what makes `cgn` + `.` change match after
+    /// match. `Pending` has no search pattern of its own (only `Editor` does —
+    /// see [`GrammarCommand::RepeatSearch`]), so this resolves to a command.
+    SelectMatch { register: Option<char>, operator: Option<Operator>, forward: bool },
     Undo,
     Redo,
     /// `.`
@@ -114,6 +142,12 @@ pub enum GrammarCommand {
     /// last substitution was (only `Editor` does), so this resolves to a
     /// command for `Editor` to fill in.
     RepeatSubstitute,
+    /// `g&`: repeat the last `:s` over the **whole file** with its original
+    /// flags kept (vim's `:%s//~/&`), as opposed to `&`
+    /// ([`GrammarCommand::RepeatSubstitute`]), which redoes it on the current
+    /// line only and drops the flags. Like `&`, only `Editor` remembers the
+    /// last substitution, so this resolves to a command.
+    RepeatSubstituteGlobal,
     /// `['`/`` [` ``/`]'`/`` ]` ``: jump to the previous (`forward == false`)
     /// or next (`forward == true`) lowercase mark, by buffer position. `exact`
     /// is `true` for the back-tick forms (land on the mark's exact column) and
@@ -139,6 +173,13 @@ pub enum InsertPos {
     NewLineBelow,
     /// `O`: on a new line above.
     NewLineAbove,
+    /// `gI`: at column 1 — the *first* column, unlike `I`
+    /// ([`InsertPos::LineStart`]) which stops at the first non-blank.
+    FirstColumn,
+    /// `gi`: at the position where Insert mode was last left (vim's `` `^ ``
+    /// mark). [`super::Editor`] resolves the remembered position; see
+    /// `Editor::enter_insert_at`.
+    LastInsert,
 }
 
 /// What happened to a key fed into [`Pending::feed`].
@@ -375,9 +416,9 @@ impl Pending {
             KeyCode::Char('X') if self.operator.is_none() => self.finish(GrammarCommand::DeleteCharBackward { register: self.register, count: self.effective_count() }),
             KeyCode::Char('s') if self.operator.is_none() => self.finish(GrammarCommand::SubstituteChar { register: self.register, count: self.effective_count() }),
             KeyCode::Char('~') if self.operator.is_none() => self.finish(GrammarCommand::ToggleCaseUnderCursor { count: self.effective_count() }),
-            KeyCode::Char('J') if self.operator.is_none() => self.finish(GrammarCommand::JoinLines { count: self.effective_count() }),
-            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false }),
-            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true }),
+            KeyCode::Char('J') if self.operator.is_none() => self.finish(GrammarCommand::JoinLines { count: self.effective_count(), space: true }),
+            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: false }),
+            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: false }),
             KeyCode::Char('u') if self.operator.is_none() => self.finish(GrammarCommand::Undo),
             KeyCode::Char('.') if self.operator.is_none() => self.finish(GrammarCommand::RepeatLast),
             // `<C-v>` (visual-block) and plain `v` (visual) share
@@ -501,6 +542,18 @@ impl Pending {
         FeedResult::Continue
     }
 
+    /// The second key of a `g`-prefixed command. The motions here
+    /// (`gg`/`ge`/`gE`/`g_`/`gj`/`gk`) compose with a pending operator through
+    /// [`Self::complete_motion`] exactly like any bare motion — that is what
+    /// makes `dgg`, `dge`, `dgj` work — so they carry **no** `operator.is_none`
+    /// guard. Everything else here is a standalone command: `gu`/`gU`/`g~` are
+    /// themselves operators (guarded so they only start at the top level), and
+    /// the rest (`gf`, `gi`, `gp`, `g;`, `g&`, `g*`, ...) are whole commands
+    /// that make no sense after an operator, so they are guarded and reset to
+    /// Invalid if one is pending. `gn`/`gN` are the deliberate exception: they
+    /// are the *only* `g` commands that both stand alone *and* compose with an
+    /// operator (`cgn`), so they read `self.operator` and pass it along rather
+    /// than guarding on it.
     fn feed_g(&mut self, key: Key) -> FeedResult {
         match key.code {
             KeyCode::Char('g') => self.complete_motion(Motion::FileStart),
@@ -516,6 +569,45 @@ impl Pending {
             KeyCode::Char('u') if self.operator.is_none() => self.set_operator(Operator::LowerCase),
             KeyCode::Char('U') if self.operator.is_none() => self.set_operator(Operator::UpperCase),
             KeyCode::Char('~') if self.operator.is_none() => self.set_operator(Operator::ToggleCase),
+
+            // `gf`: open the file under the cursor.
+            KeyCode::Char('f') if self.operator.is_none() => self.finish(GrammarCommand::GotoFile),
+
+            // `gi` (resume the last insert) / `gI` (insert at column 1).
+            KeyCode::Char('i') if self.operator.is_none() => self.finish(GrammarCommand::EnterInsert(InsertPos::LastInsert)),
+            KeyCode::Char('I') if self.operator.is_none() => self.finish(GrammarCommand::EnterInsert(InsertPos::FirstColumn)),
+
+            // `gJ`: join lines with no space inserted (see `J`, which does).
+            KeyCode::Char('J') if self.operator.is_none() => self.finish(GrammarCommand::JoinLines { count: self.effective_count(), space: false }),
+
+            // `gp`/`gP`: put, then leave the cursor after the pasted text.
+            KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: true }),
+            KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: true }),
+
+            // `g;`/`g,`: walk the changelist backward/forward.
+            KeyCode::Char(';') if self.operator.is_none() => self.finish(GrammarCommand::ChangelistJump { count: self.effective_count(), forward: false }),
+            KeyCode::Char(',') if self.operator.is_none() => self.finish(GrammarCommand::ChangelistJump { count: self.effective_count(), forward: true }),
+
+            // `g*`/`g#`: keyword search without word boundaries.
+            KeyCode::Char('*') if self.operator.is_none() => self.finish(GrammarCommand::SearchWordLoose { forward: true }),
+            KeyCode::Char('#') if self.operator.is_none() => self.finish(GrammarCommand::SearchWordLoose { forward: false }),
+
+            // `g&`: repeat the last `:s` over the whole file, flags kept.
+            KeyCode::Char('&') if self.operator.is_none() => self.finish(GrammarCommand::RepeatSubstituteGlobal),
+
+            // `gn`/`gN`: select (or operate on) the next/previous search match.
+            // The one `g` command that carries a pending operator through.
+            KeyCode::Char('n') => {
+                let register = self.register;
+                let operator = self.operator;
+                self.finish(GrammarCommand::SelectMatch { register, operator, forward: true })
+            }
+            KeyCode::Char('N') => {
+                let register = self.register;
+                let operator = self.operator;
+                self.finish(GrammarCommand::SelectMatch { register, operator, forward: false })
+            }
+
             _ => self.invalid(),
         }
     }
