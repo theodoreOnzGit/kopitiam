@@ -57,6 +57,8 @@
 //!   is *not* a leaf in [`window`]'s tree.
 //! * [`filetree`] — the file-tree sidebar (`<leader>e`), presenting
 //!   [`crate::plugins::filetree`] with NERDTree's in-tree keymaps.
+//! * [`harpoon`] — the harpoon quick menu (`<leader><Esc>`), an editable
+//!   floating list over [`crate::plugins::harpoon`]'s marks.
 //! * [`app`] — the event loop that ties the above together.
 //! * [`bootstrap`] — [`run`], the entry point `main.rs` calls, plus the
 //!   permanent `impl BufferView for text::Buffer` and the temporary
@@ -82,6 +84,7 @@ pub mod completion_menu;
 pub mod event;
 pub mod filetree;
 pub mod gutter;
+pub mod harpoon;
 pub mod highlight;
 pub mod hop;
 pub mod lsp_ui;

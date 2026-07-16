@@ -64,10 +64,11 @@ use std::path::PathBuf;
 
 use ratatui::{layout::Rect, Frame};
 
-use crate::core::BufferId;
+use crate::core::{BufferId, Position};
 use crate::icons::IconSet;
 use crate::ui::event::KeyPress;
 use crate::ui::filetree::FileTreePanel;
+use crate::ui::harpoon::HarpoonMenuPanel;
 use crate::ui::picker::PickerPanel;
 use crate::ui::theme::Theme;
 
@@ -190,6 +191,16 @@ pub enum OverlayOutcome {
     /// A picker confirmed a help topic (`\fh`): run `:help <topic>` and close
     /// the picker.
     PickHelp(String),
+    /// The harpoon quick menu (`<leader><Esc>`) confirmed a mark: open `path`
+    /// **at `cursor`** and close the menu. Distinct from
+    /// [`OverlayOutcome::PickPath`], which lands at the top of the file — a
+    /// harpoon mark's whole value is jumping back to the *line* you were on, so
+    /// it carries the saved position the app then restores.
+    OpenAt { path: PathBuf, cursor: Position },
+    /// The harpoon quick menu deleted a line: drop the mark at this index from
+    /// the canonical list. The menu **stays open** (you keep editing the list),
+    /// so unlike the pick family this does not close the overlay.
+    HarpoonRemove(usize),
     /// Show an informational message on the command line.
     Message(String),
     /// Show an error on the command line.
@@ -205,6 +216,9 @@ pub enum Overlay {
     /// over the window tree rather than reserving a strip, which is why
     /// [`OverlayPlacement::Float`] finally has a user.
     Picker(PickerPanel),
+    /// The harpoon quick menu (`<leader><Esc>`) — a small floating, editable
+    /// list of the project's marks. See [`crate::ui::harpoon`].
+    HarpoonMenu(HarpoonMenuPanel),
 }
 
 impl Overlay {
@@ -215,6 +229,9 @@ impl Overlay {
             // A telescope-sized float: wide and tall enough to browse, but not
             // fullscreen — you can still see the buffer it sits over.
             Self::Picker(_) => OverlayPlacement::Float { width_pct: 80, height_pct: 80 },
+            // The harpoon menu holds at most a handful of marks, so it floats
+            // smaller than the pickers — enough to read the list, no more.
+            Self::HarpoonMenu(_) => OverlayPlacement::Float { width_pct: 60, height_pct: 50 },
         }
     }
 
@@ -224,6 +241,7 @@ impl Overlay {
         match self {
             Self::FileTree(panel) => panel.handle_key(key),
             Self::Picker(panel) => panel.handle_key(key),
+            Self::HarpoonMenu(panel) => panel.handle_key(key),
         }
     }
 
@@ -242,6 +260,7 @@ impl Overlay {
         match self {
             Self::FileTree(panel) => panel.render(frame, rect, theme, icons, focused),
             Self::Picker(panel) => panel.render(frame, rect, theme, icons, focused),
+            Self::HarpoonMenu(panel) => panel.render(frame, rect, theme, icons, focused),
         }
     }
 }

@@ -49,6 +49,7 @@ use crate::editor::ex::QuickfixCommand;
 use crate::editor::quickfix::{ListKind, NavError, QuickfixEntry, QuickfixList};
 use crate::icons::IconSet;
 use crate::plugins::grep;
+use crate::plugins::harpoon::Harpoon;
 use crate::plugins::picker::walk_files;
 use crate::lsp::completion::{self, CompletionItem as CItem, CompletionSource};
 use crate::lsp::{Location as LspLocation, LspClient};
@@ -59,6 +60,7 @@ use crate::ui::cmdline::{Cmdline, CmdlineState, PromptKind, StatusMessage, Wildm
 use crate::ui::event::{map_crossterm_key, BufferView, EditorHost, HostResponse, Key, KeyPress};
 use crate::ui::filetree::FileTreePanel;
 use crate::ui::gutter::LineNumberMode;
+use crate::ui::harpoon::HarpoonMenuPanel;
 use crate::ui::hop::{HopFeed, HopState};
 use crate::ui::overlay::{Focus, OpenTarget, Overlay, OverlayOutcome};
 use crate::ui::picker::{PickAction, PickRow, PickerPanel};
@@ -251,6 +253,13 @@ pub struct App<H: EditorHost> {
     /// [`crate::ui::run`] after the config has executed; a unit test that builds
     /// an `App` directly leaves it `None`.
     lua: Option<crate::luaconfig::LuaRuntime>,
+    /// This project's harpoon marks (`<leader>b` marks, `<leader><Esc>` menu,
+    /// `<leader>q` find). Session-scoped for now — [`Harpoon::empty`] reads and
+    /// writes no store file, so marks live only for the editor's lifetime. On-disk
+    /// per-project persistence (the engine already supports it via
+    /// [`Harpoon::load`]/[`Harpoon::save`]) is a deliberate follow-up. See
+    /// [`crate::plugins::harpoon`].
+    harpoon: Harpoon,
 }
 
 /// A navigable list of reference locations (`<leader>gr`).
@@ -359,6 +368,9 @@ impl<H: EditorHost> App<H> {
         // instead (or, once `render_windows` respects `window.buffer`, nothing
         // useful).
         let windows = WindowTree::single(host.active_buffer_id());
+        // Harpoon marks are scoped to the working directory, exactly as the file
+        // tree roots there — the same `cwd`, resolved once.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             host,
             windows,
@@ -370,7 +382,7 @@ impl<H: EditorHost> App<H> {
             // A process with no working directory (deleted out from under it) is
             // pathological but not a reason to refuse to start; `.` is what every
             // other tool falls back to.
-            tree_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            tree_root: cwd.clone(),
             overlay: None,
             focus: Focus::Buffer,
             hop: None,
@@ -400,6 +412,7 @@ impl<H: EditorHost> App<H> {
             #[cfg(test)]
             tmux_calls: Vec::new(),
             lua: None,
+            harpoon: Harpoon::empty(&cwd),
         }
     }
 
@@ -722,6 +735,9 @@ impl<H: EditorHost> App<H> {
             Action::FindFiles => self.open_file_picker(),
             Action::FindBuffers => self.open_buffer_picker(),
             Action::FindHelp => self.open_help_picker(),
+            Action::HarpoonAdd => self.harpoon_mark(),
+            Action::HarpoonMenu => self.harpoon_menu(),
+            Action::HarpoonFind => self.harpoon_find(),
             Action::HopWords => self.start_hop(),
             Action::LspDefinition => self.lsp_definition(),
             Action::LspReferences => self.lsp_references(),
@@ -2043,6 +2059,64 @@ impl<H: EditorHost> App<H> {
         self.open_picker(PickerPanel::new("Find Help", rows))
     }
 
+    /// `<leader>b`. Marks the current file at the cursor — harpoon's
+    /// `mark.add_file`. A scratch buffer with no path cannot be marked (there is
+    /// nothing to jump back *to*), so that is reported honestly rather than
+    /// marking a phantom. Re-marking an already-marked file is a no-op, matching
+    /// upstream. See [`crate::plugins::harpoon`].
+    fn harpoon_mark(&mut self) -> LoopAction {
+        let Some(path) = self.host.buffer().path().map(Path::to_path_buf) else {
+            return self.info("Harpoon: buffer got no file to mark lah".to_string());
+        };
+        let cursor = self.host.cursor();
+        let display = path.display().to_string();
+        if self.harpoon.add_file(path, cursor.line, cursor.col) {
+            self.info(format!("Harpoon: marked \"{display}\" liao — now got {}", self.harpoon.len()))
+        } else {
+            self.info(format!("Harpoon: \"{display}\" already marked liao"))
+        }
+    }
+
+    /// `<leader><Esc>`. Toggles the harpoon quick menu — a floating, editable
+    /// list of this project's marks. Pressing it again while the menu is open
+    /// closes it, the way `toggle_quick_menu` does upstream. See
+    /// [`crate::ui::harpoon`].
+    fn harpoon_menu(&mut self) -> LoopAction {
+        if matches!(self.overlay, Some(Overlay::HarpoonMenu(_))) {
+            self.close_overlay();
+            return LoopAction::Redraw;
+        }
+        let panel = HarpoonMenuPanel::new(self.harpoon.marks().to_vec());
+        self.overlay = Some(Overlay::HarpoonMenu(panel));
+        self.focus = Focus::Overlay;
+        LoopAction::Redraw
+    }
+
+    /// `<leader>q`. Opens a fuzzy picker scoped to the harpoon marks — the same
+    /// [`PickerPanel`] the `\ff`/`\fb`/`\fh` pickers use, as a fourth source
+    /// (see [`crate::ui::picker`]). `<CR>` opens the chosen mark's file.
+    ///
+    /// Unlike the quick menu, the picker lands at the top of the file rather
+    /// than the saved cursor: it reuses [`PickAction::OpenFile`] (the frozen
+    /// picker contract), and jump-to-saved-cursor is the quick menu's job. The
+    /// row still *shows* the saved line so you can tell two marks in the same
+    /// file apart.
+    fn harpoon_find(&mut self) -> LoopAction {
+        if self.harpoon.is_empty() {
+            return self.info("Harpoon: no marks yet lah — go mark one with <leader>b first".to_string());
+        }
+        let rows: Vec<PickRow> = self
+            .harpoon
+            .marks()
+            .iter()
+            .map(|mark| {
+                let label = format!("{}:{}", mark.path.display(), mark.line + 1);
+                PickRow::new(label, PickAction::OpenFile(mark.path.clone()))
+            })
+            .collect();
+        self.open_picker(PickerPanel::new("Harpoon Marks", rows))
+    }
+
     /// Shows `panel` as the active overlay and drops focus into it. Replaces any
     /// overlay already open (opening a picker over the file tree is fine — the
     /// picker takes focus, and closing it returns you underneath), matching how
@@ -2086,7 +2160,38 @@ impl<H: EditorHost> App<H> {
                 self.close_overlay();
                 self.open_help_topic(&topic)
             }
+            // The harpoon quick menu confirmed a mark: open it *at its saved
+            // cursor* and close the menu (like the pick family, harpoon's menu
+            // disappears the moment you jump).
+            OverlayOutcome::OpenAt { path, cursor } => {
+                self.close_overlay();
+                self.open_at(&path, cursor)
+            }
+            // The harpoon menu deleted a line: drop that mark from the canonical
+            // list. The menu stays open — its own snapshot already removed the
+            // same index (see [`crate::ui::harpoon`]), so the two stay in step.
+            OverlayOutcome::HarpoonRemove(index) => {
+                self.harpoon.remove(index);
+                LoopAction::Redraw
+            }
         }
+    }
+
+    /// Opens `path` in the current window and restores `cursor` — the harpoon
+    /// quick menu's jump. Distinct from [`Self::open_path`] in exactly one way:
+    /// after the open (which lands the editor at the origin), it drives the
+    /// cursor back to where the mark was set, which is the whole reason a
+    /// harpoon mark stores a position.
+    fn open_at(&mut self, path: &Path, cursor: Position) -> LoopAction {
+        if let Err(e) = self.host.open(path) {
+            return self.error(e);
+        }
+        self.host.move_cursor(cursor);
+        self.focus = Focus::Buffer;
+        self.sync_active_window();
+        self.windows.active_mut().scroll = Scroll::default();
+        self.message = StatusMessage::Info(format!("\"{}\"", path.display()));
+        LoopAction::Redraw
     }
 
     /// Switches the active window to buffer `id` (the `\fb` accept). Goes through
@@ -4382,10 +4487,11 @@ mod tests {
 
     #[test]
     fn an_action_with_no_ui_yet_still_says_so_rather_than_being_swallowed() {
-        // `HopWords` is now wired (see the hop tests below), so this uses a
-        // still-unwired action to keep pinning the honest-message path.
+        // The harpoon actions are now wired (see the harpoon tests below), so
+        // this uses `EasyAlign` — still unwired — to keep pinning the
+        // honest-message path.
         let mut app = app_with(vec!["a"]);
-        app.host.answer_next_with(HostResponse::Action(Action::HarpoonMenu));
+        app.host.answer_next_with(HostResponse::Action(Action::EasyAlign));
         assert_eq!(app.handle_event(key_event('x')), LoopAction::Redraw);
         match &app.message {
             StatusMessage::Info(m) => assert!(m.contains("not wired into the UI yet"), "{m}"),
@@ -5111,6 +5217,156 @@ mod tests {
         assert!(
             text.contains("go-to-definition") || text.contains("language servers"),
             "the LSP help section is on screen:\n{text}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Harpoon (<leader>b mark / <leader><Esc> menu / <leader>q find) — cj0.10.7.
+    // ------------------------------------------------------------------
+
+    /// Fires an editor [`Action`] the way the keymap engine would — through the
+    /// host, as a [`HostResponse::Action`]. Only valid while the *buffer* has
+    /// focus (an open float owns the keyboard and the host never sees the key).
+    fn fire(app: &mut App<FakeHost>, action: Action) {
+        app.host.answer_next_with(HostResponse::Action(action));
+        app.handle_event(key_event('x'));
+    }
+
+    /// Points the fake host at `path` with the cursor at `(line, col)` — the
+    /// state `<leader>b` reads when it marks. No file I/O: marking never touches
+    /// disk, only the picker/jump paths do.
+    fn at_file(app: &mut App<FakeHost>, path: &Path, line: usize, col: usize) {
+        app.host.buffer = FakeBuffer::new(vec![String::from("x")]).with_path(path);
+        app.host.cursor = Position::new(line, col);
+    }
+
+    #[test]
+    fn marking_two_files_lists_both_in_the_quick_menu() {
+        let mut app = app_with(vec!["x"]);
+        at_file(&mut app, Path::new("a.rs"), 0, 0);
+        fire(&mut app, Action::HarpoonAdd);
+        at_file(&mut app, Path::new("bob.rs"), 4, 2);
+        fire(&mut app, Action::HarpoonAdd);
+
+        fire(&mut app, Action::HarpoonMenu);
+        assert!(matches!(app.overlay, Some(Overlay::HarpoonMenu(_))), "<leader><Esc> opens the menu");
+
+        let text = screen(&mut app, 60, 14).join("\n");
+        assert!(text.contains("Harpoon (2)"), "the menu is titled with the count:\n{text}");
+        assert!(text.contains("a.rs"), "the first mark is listed:\n{text}");
+        // The second mark shows its file and its 1-based saved line.
+        assert!(text.contains("bob.rs:5"), "the second mark and its saved line show:\n{text}");
+    }
+
+    #[test]
+    fn marking_an_already_marked_file_does_not_duplicate_it() {
+        let mut app = app_with(vec!["x"]);
+        at_file(&mut app, Path::new("a.rs"), 1, 1);
+        fire(&mut app, Action::HarpoonAdd);
+        // Same path, different cursor — still a no-op (dedup is by path).
+        at_file(&mut app, Path::new("a.rs"), 9, 9);
+        fire(&mut app, Action::HarpoonAdd);
+        assert!(
+            matches!(&app.message, StatusMessage::Info(m) if m.contains("already marked")),
+            "a dup is reported: {:?}",
+            app.message
+        );
+
+        fire(&mut app, Action::HarpoonMenu);
+        let text = screen(&mut app, 50, 10).join("\n");
+        assert!(text.contains("Harpoon (1)"), "the list did not grow:\n{text}");
+    }
+
+    #[test]
+    fn selecting_a_mark_in_the_menu_jumps_to_it_at_its_saved_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, "a0\na1\na2\n").unwrap();
+        std::fs::write(&b, "b0\nb1\nb2\n").unwrap();
+
+        let mut app = app_with(vec!["x"]);
+        at_file(&mut app, &a, 3, 1);
+        fire(&mut app, Action::HarpoonAdd);
+        at_file(&mut app, &b, 2, 4);
+        fire(&mut app, Action::HarpoonAdd);
+
+        fire(&mut app, Action::HarpoonMenu);
+        // Jump straight to slot 2 (b.rs) by its number.
+        app.handle_event(key_event('2'));
+
+        assert!(app.overlay.is_none(), "the menu closes on jump");
+        assert_eq!(app.focus(), Focus::Buffer);
+        assert_eq!(app.host.opened.last(), Some(&b), "the second mark's file opened: {:?}", app.host.opened);
+        assert_eq!(app.host.cursor, Position::new(2, 4), "and the cursor landed on the saved position");
+    }
+
+    #[test]
+    fn deleting_a_line_in_the_menu_removes_that_mark() {
+        let mut app = app_with(vec!["x"]);
+        at_file(&mut app, Path::new("a.rs"), 0, 0);
+        fire(&mut app, Action::HarpoonAdd);
+        at_file(&mut app, Path::new("b.rs"), 0, 0);
+        fire(&mut app, Action::HarpoonAdd);
+
+        fire(&mut app, Action::HarpoonMenu);
+        // `d` deletes the selected (first) line.
+        app.handle_event(key_event('d'));
+        assert!(matches!(app.overlay, Some(Overlay::HarpoonMenu(_))), "the menu stays open after a delete");
+
+        let text = screen(&mut app, 50, 10).join("\n");
+        assert!(text.contains("Harpoon (1)"), "one mark left:\n{text}");
+        assert!(!text.contains("a.rs"), "the deleted mark is gone:\n{text}");
+        assert!(text.contains("b.rs"), "the surviving mark remains:\n{text}");
+    }
+
+    #[test]
+    fn harpoon_find_picker_filters_the_marks() {
+        let mut app = app_with(vec!["x"]);
+        at_file(&mut app, Path::new("alpha.rs"), 0, 0);
+        fire(&mut app, Action::HarpoonAdd);
+        at_file(&mut app, Path::new("beta.rs"), 0, 0);
+        fire(&mut app, Action::HarpoonAdd);
+
+        fire(&mut app, Action::HarpoonFind);
+        assert!(matches!(app.overlay, Some(Overlay::Picker(_))), "<leader>q opens a picker over the marks");
+        if let Some(Overlay::Picker(p)) = &app.overlay {
+            assert_eq!(p.match_count(), 2, "both marks show while unfiltered");
+        }
+
+        for c in "alpha".chars() {
+            app.handle_event(key_event(c));
+        }
+        match &app.overlay {
+            Some(Overlay::Picker(p)) => assert_eq!(p.match_count(), 1, "the query narrowed the marks"),
+            other => panic!("the picker vanished: {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn marking_a_bufferless_scratch_is_reported_not_faked() {
+        let mut app = app_with(vec!["x"]); // a scratch buffer with no path
+        fire(&mut app, Action::HarpoonAdd);
+        assert!(
+            matches!(&app.message, StatusMessage::Info(m) if m.contains("no file")),
+            "a pathless buffer cannot be marked, and says so: {:?}",
+            app.message
+        );
+        // And nothing landed in the list.
+        fire(&mut app, Action::HarpoonMenu);
+        let text = screen(&mut app, 50, 8).join("\n");
+        assert!(text.contains("no marks"), "the menu is empty:\n{text}");
+    }
+
+    #[test]
+    fn the_find_picker_with_no_marks_says_so_and_opens_no_overlay() {
+        let mut app = app_with(vec!["x"]);
+        fire(&mut app, Action::HarpoonFind);
+        assert!(app.overlay.is_none(), "nothing to pick, so no picker opens");
+        assert!(
+            matches!(&app.message, StatusMessage::Info(m) if m.contains("no marks")),
+            "{:?}",
+            app.message
         );
     }
 }
