@@ -170,6 +170,14 @@ pub struct App<H: EditorHost> {
     /// `<C-n>`/`<C-p>`, accepted with `<CR>`/`<Tab>` — see
     /// [`App::completion_intercept`].
     completion: Option<CompletionMenu>,
+    /// Set once the user press `<C-x>` in insert mode: kvim is now in vim's
+    /// "CTRL-X mode", waiting for the sub-key that pick a native completion
+    /// source (`<C-f>` filename, `<C-l>` whole line, `<C-o>` omni,
+    /// `<C-n>`/`<C-p>` this-buffer keyword). Cleared the moment that sub-key
+    /// arrive — a recognised one open the matching submenu, an unrecognised one
+    /// just cancel CTRL-X mode and take its own normal meaning. See
+    /// [`App::completion_intercept`].
+    ctrl_x_pending: bool,
     /// The active snippet expansion being navigated with `<Tab>`/`<S-Tab>`, if
     /// any. Set when a snippet completion is accepted; cleared on `<Tab>` past
     /// the final tabstop or when insert mode ends. See [`crate::ui::snippet`].
@@ -237,6 +245,39 @@ const MAX_HOVER_ROWS: usize = 16;
 /// a long type signature from stretching the popup across the whole terminal.
 const MAX_HOVER_WIDTH: u16 = 72;
 
+/// Which native completion source is feeding an open menu — vim's insert-mode
+/// completion "modes". It tells [`App::refresh_completion`] where to re-gather
+/// candidates from as the user keeps typing, so a `<C-x><C-f>` filename menu
+/// stays a filename menu instead of quietly turning back into the default
+/// identifier menu on the next keystroke.
+///
+/// The distinction matter because kvim reuse the one completion popup for every
+/// source: without remembering *which* source opened it, the as-you-type
+/// refresh would always fall back to the default identifier/path logic, and the
+/// `<C-x>` submodes would only survive exactly one keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionKind {
+    /// The default `<C-Space>` / as-you-type menu: LSP + snippets + buffer words
+    /// + path, chosen automatically from the cursor context.
+    Auto,
+    /// Vim keyword completion (`<C-n>`/`<C-p>`, and `<C-x><C-n>`/`<C-x><C-p>`):
+    /// identifier-like words already in the buffers. `this_buffer_only` is the
+    /// difference between the two — plain `<C-n>` scan the current *and* other
+    /// window buffers (vim's default `complete` sources), while `<C-x><C-n>`
+    /// scan only the current one.
+    Keyword { this_buffer_only: bool },
+    /// Filename completion (`<C-x><C-f>`): filesystem entries under the path
+    /// fragment before the cursor, relative to the buffer's own directory.
+    File,
+    /// Whole-line completion (`<C-x><C-l>`): buffer lines that begin with the
+    /// text already typed on the current line.
+    Line,
+    /// Omni completion (`<C-x><C-o>`): routed to the language server, i.e. the
+    /// same `textDocument/completion` the default menu folds in, but on its own
+    /// so LSP is the *only* source.
+    Omni,
+}
+
 /// The open insert-mode completion popup: the ranked candidates, which one is
 /// selected, and where the accepted text replaces from.
 ///
@@ -250,10 +291,14 @@ struct CompletionMenu {
     selected: usize,
     scroll: usize,
     anchor: Position,
-    /// Whether the menu was opened explicitly with `<C-Space>`. An explicit menu
-    /// survives the prefix emptying (so `<C-Space>` on nothing lists everything);
-    /// an auto-triggered one closes when there is no longer a prefix to filter.
+    /// Whether the menu was opened explicitly with `<C-Space>` (or a native
+    /// `<C-n>`/`<C-x>...` trigger). An explicit menu survives the prefix
+    /// emptying (so `<C-Space>` on nothing lists everything); an auto-triggered
+    /// one closes when there is no longer a prefix to filter.
     explicit: bool,
+    /// Which native source is feeding this menu, so the as-you-type refresh
+    /// re-gathers from the right place. See [`CompletionKind`].
+    kind: CompletionKind,
 }
 
 impl<H: EditorHost> App<H> {
@@ -296,6 +341,7 @@ impl<H: EditorHost> App<H> {
             lsp_no_server: std::collections::HashSet::new(),
             pending_bracket: None,
             completion: None,
+            ctrl_x_pending: false,
             snippet: None,
             last_cursor_screen: None,
             in_tmux: std::env::var_os("TMUX").is_some(),
@@ -802,15 +848,31 @@ impl<H: EditorHost> App<H> {
     }
 
     // ---------------------------------------------------------------
-    // Insert-mode completion: the `blink.cmp` replacement.
+    // Insert-mode completion: the `blink.cmp` replacement *plus* vim's native
+    // insert-mode completion.
     //
     // The headless engine (`lsp::completion`) already merges and ranks the four
     // sources; this layer decides *when* to (re)query, owns the popup state, and
     // turns an accepted item into a buffer edit (a plain insert, or a snippet
     // expansion driven by `kopitiam-snippet`). Frontend keys follow the
-    // maintainer's `blink.cmp`/`LuaSnip`: `<C-Space>` triggers, `<C-n>`/`<C-p>`
-    // (and Down/Up) move, `<CR>`/`<Tab>` accept, `<C-e>` cancels, `<Tab>`/
-    // `<S-Tab>` drive snippet tabstops while a snippet is active.
+    // maintainer's `blink.cmp`/`LuaSnip` *and* vim exactly:
+    //
+    //   * `<C-Space>`               — the IDE-style all-sources menu.
+    //   * `<C-n>` / `<C-p>`         — vim keyword completion from the current +
+    //                                 other buffers (opens the menu when none is
+    //                                 up, else move to the next / previous match).
+    //   * `<C-x>` then …            — vim's CTRL-X submodes:
+    //       `<C-x><C-n>`/`<C-x><C-p>`  keyword, *this* buffer only.
+    //       `<C-x><C-f>`               filename.
+    //       `<C-x><C-l>`               whole line.
+    //       `<C-x><C-o>`               omni (the language server).
+    //   * inside a cycle: `<C-n>`/`<C-p>` (and Down/Up) move, `<C-y>` / `<CR>` /
+    //     `<Tab>` accept, `<C-e>` cancel (revert to the typed text), `<Tab>` /
+    //     `<S-Tab>` drive snippet tabstops while a snippet is active.
+    //
+    // kvim reuse the *one* popup for every source (see `CompletionKind`); a
+    // native trigger differs only in which source seed the menu, never in the
+    // menu itself — this is input wiring, not a second engine.
     // ---------------------------------------------------------------
 
     /// Intercepts the completion popup's and snippet session's own keys, or
@@ -831,6 +893,36 @@ impl<H: EditorHost> App<H> {
             }
         }
 
+        // CTRL-X mode: the previous key was `<C-x>`, so *this* key picks the
+        // native source. Consume it and clear the pending flag either way. An
+        // unrecognised sub-key falls out of this block (CTRL-X cancelled) and
+        // then takes its own normal path — including a second `<C-x>`, which
+        // re-arms below and so keeps CTRL-X mode alive (`<C-x><C-x>…`).
+        if self.ctrl_x_pending {
+            self.ctrl_x_pending = false;
+            if kp.mods.ctrl {
+                match kp.key {
+                    Key::Char('f') => return Some(self.start_file_completion()),
+                    Key::Char('l') => return Some(self.start_line_completion()),
+                    Key::Char('o') => return Some(self.start_omni_completion()),
+                    // `<C-x><C-n>`/`<C-x><C-p>`: keyword, this buffer only. If a
+                    // menu is already up, just move within it (vim keeps cycling).
+                    Key::Char('n') if self.completion.is_some() => return Some(self.menu_move(1)),
+                    Key::Char('p') if self.completion.is_some() => return Some(self.menu_move(-1)),
+                    Key::Char('n') => return Some(self.start_keyword_completion(true, true)),
+                    Key::Char('p') => return Some(self.start_keyword_completion(true, false)),
+                    _ => {}
+                }
+            }
+        }
+
+        // `<C-x>`: enter CTRL-X mode (the next key picks the source). Only in
+        // insert mode — `<C-x>` has no completion meaning in normal mode.
+        if insert && kp.mods.ctrl && kp.key == Key::Char('x') {
+            self.ctrl_x_pending = true;
+            return Some(LoopAction::Continue);
+        }
+
         // `<C-Space>`: open/refresh the menu. Terminals disagree on the byte for
         // Ctrl-Space (a literal space, or NUL / Ctrl-@), so accept all three.
         if insert
@@ -839,6 +931,18 @@ impl<H: EditorHost> App<H> {
         {
             self.refresh_completion(true);
             return Some(LoopAction::Redraw);
+        }
+
+        // `<C-n>`/`<C-p>` with no menu open: vim keyword completion from the
+        // current + other buffers. `<C-n>` seeds selecting the first match,
+        // `<C-p>` the last.
+        if insert
+            && self.completion.is_none()
+            && kp.mods.ctrl
+            && matches!(kp.key, Key::Char('n') | Key::Char('p'))
+        {
+            let forward = kp.key == Key::Char('n');
+            return Some(self.start_keyword_completion(false, forward));
         }
 
         // Everything below needs an open menu.
@@ -851,11 +955,16 @@ impl<H: EditorHost> App<H> {
             // Page through a long list (Neovim's pmenu `<C-f>`/`<C-b>`).
             Key::Char('f') if kp.mods.ctrl => Some(self.menu_move(MAX_COMPLETION_ROWS as isize)),
             Key::Char('b') if kp.mods.ctrl => Some(self.menu_move(-(MAX_COMPLETION_ROWS as isize))),
-            // `<C-e>`: dismiss, staying in insert mode with nothing inserted.
+            // `<C-e>`: cancel, staying in insert mode with the *typed* text
+            // intact. kvim never inserts a preview as you cycle (the buffer is
+            // only touched on accept), so simply dropping the menu is already
+            // vim's "revert to what you typed".
             Key::Char('e') if kp.mods.ctrl => {
                 self.completion = None;
                 Some(LoopAction::Redraw)
             }
+            // `<C-y>` yanks (accepts) the selected match, same as `<CR>`/`<Tab>`.
+            Key::Char('y') if kp.mods.ctrl => Some(self.accept_completion()),
             Key::Enter | Key::Tab => Some(self.accept_completion()),
             _ => None,
         }
@@ -875,6 +984,7 @@ impl<H: EditorHost> App<H> {
                 return LoopAction::Redraw;
             }
         } else if self.completion.is_some() || self.snippet.is_some() {
+            self.ctrl_x_pending = false;
             self.completion = None;
             self.snippet = None;
             return LoopAction::Redraw;
@@ -984,6 +1094,21 @@ impl<H: EditorHost> App<H> {
         if self.host.mode() != Mode::Insert {
             return self.close_completion_if_open();
         }
+
+        // A native completion (a `<C-n>` keyword cycle, a `<C-x>` submode) keeps
+        // re-gathering from *its own* source as the user types, rather than
+        // falling back to the default identifier/path logic below — that is what
+        // stops `<C-x><C-f>` reverting to an identifier menu on the next key.
+        if let Some(kind) = self.completion.as_ref().map(|m| m.kind) {
+            match kind {
+                CompletionKind::Keyword { this_buffer_only } => return self.reseed_keyword(this_buffer_only),
+                CompletionKind::File => return self.reseed_file(),
+                CompletionKind::Line => return self.reseed_line(),
+                CompletionKind::Omni => return self.reseed_omni(),
+                CompletionKind::Auto => {}
+            }
+        }
+
         let cursor = self.host.cursor();
         let line = self.host.buffer().line(cursor.line).unwrap_or_default();
 
@@ -1008,6 +1133,21 @@ impl<H: EditorHost> App<H> {
     /// when it still fits, or clears the popup when the list is empty. Returns
     /// whether anything changed.
     fn set_completion(&mut self, items: Vec<CItem>, anchor: Position, explicit: bool) -> bool {
+        self.set_completion_kind(items, anchor, explicit, CompletionKind::Auto)
+    }
+
+    /// Installs a candidate list, tagging the menu with the native source that
+    /// produced it so [`Self::refresh_completion`] re-gathers from the same
+    /// place on the next keystroke. See [`CompletionKind`]. As with
+    /// [`Self::set_completion`], preserves the selection index when it still
+    /// fits, and clears the popup on an empty list.
+    fn set_completion_kind(
+        &mut self,
+        items: Vec<CItem>,
+        anchor: Position,
+        explicit: bool,
+        kind: CompletionKind,
+    ) -> bool {
         if items.is_empty() {
             return self.close_completion_if_open();
         }
@@ -1017,7 +1157,7 @@ impl<H: EditorHost> App<H> {
             .map(|m| m.selected.min(items.len() - 1))
             .unwrap_or(0);
         let scroll = selected.saturating_sub(MAX_COMPLETION_ROWS - 1);
-        self.completion = Some(CompletionMenu { items, selected, scroll, anchor, explicit });
+        self.completion = Some(CompletionMenu { items, selected, scroll, anchor, explicit, kind });
         true
     }
 
@@ -1045,6 +1185,188 @@ impl<H: EditorHost> App<H> {
             completion::buffer_words(&refs)
         };
         completion::merge_and_rank(prefix, lsp_items, snippet_items, buffer_items, vec![])
+    }
+
+    // ---- vim native insert-mode completion sources --------------------
+    //
+    // Each `start_*` open a submenu on a key chord and translate a "nothing
+    // found" into a status message (vim beeps "Pattern not found"; kvim say so).
+    // Each `reseed_*` rebuild that same submenu against the cursor's current
+    // state — called on the initial trigger *and* on every later keystroke while
+    // the submenu stay up, so the source that opened the menu is the source that
+    // keeps feeding it (see `CompletionKind` and `refresh_completion`).
+
+    /// Opens vim keyword completion (`<C-n>`/`<C-p>`, or `<C-x><C-n>`/
+    /// `<C-x><C-p>`). `this_buffer_only` scan only the current buffer (the
+    /// `<C-x>` variants); otherwise the current *and* other window buffers are
+    /// scanned, matching vim's default `complete` sources. `forward` (`<C-n>`)
+    /// seed the selection on the first match; `<C-p>` on the last.
+    fn start_keyword_completion(&mut self, this_buffer_only: bool, forward: bool) -> LoopAction {
+        if !self.reseed_keyword(this_buffer_only) {
+            return self.info("kopi cannot find any matching keyword leh".to_string());
+        }
+        if !forward {
+            // `<C-p>`: land on the last match, like vim's search-upwards.
+            if let Some(menu) = self.completion.as_mut() {
+                menu.selected = menu.items.len() - 1;
+                let visible = menu.items.len().min(MAX_COMPLETION_ROWS);
+                menu.scroll = menu.selected + 1 - visible;
+            }
+        }
+        LoopAction::Redraw
+    }
+
+    /// Rebuilds the keyword menu from the buffer words matching the identifier
+    /// prefix before the cursor. The exact word already typed is dropped —
+    /// completing a word to itself help nobody, and vim leaves it out too.
+    fn reseed_keyword(&mut self, this_buffer_only: bool) -> bool {
+        let cursor = self.host.cursor();
+        let line = self.host.buffer().line(cursor.line).unwrap_or_default();
+        let (anchor_col, prefix) = identifier_prefix(&line, cursor.col);
+        let words = self.keyword_items(this_buffer_only);
+        let mut ranked = completion::merge_and_rank(&prefix, vec![], vec![], words, vec![]);
+        if !prefix.is_empty() {
+            ranked.retain(|i| i.label != prefix);
+        }
+        let anchor = Position::new(cursor.line, anchor_col);
+        self.set_completion_kind(ranked, anchor, true, CompletionKind::Keyword { this_buffer_only })
+    }
+
+    /// The buffer-word candidates for keyword completion: always the active
+    /// buffer, plus — unless `this_buffer_only` — every other window's buffer,
+    /// deduplicated by id. This is kvim's stand-in for vim's `.`+`w` `complete`
+    /// sources (current buffer + buffers in other windows); [`buffer_words`]
+    /// dedupes the words, so overlapping buffers cost nothing.
+    ///
+    /// [`buffer_words`]: crate::lsp::completion::buffer_words
+    fn keyword_items(&self, this_buffer_only: bool) -> Vec<CItem> {
+        let mut ids: Vec<BufferId> = vec![self.host.active_buffer_id()];
+        if !this_buffer_only {
+            for w in self.windows.windows() {
+                if !ids.contains(&w.buffer) {
+                    ids.push(w.buffer);
+                }
+            }
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for id in ids {
+            if let Some(buf) = self.host.buffer_by_id(id) {
+                for i in 0..buf.line_count() {
+                    lines.push(buf.line(i).unwrap_or_default());
+                }
+            }
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        completion::buffer_words(&refs)
+    }
+
+    /// Opens filename completion (`<C-x><C-f>`).
+    fn start_file_completion(&mut self) -> LoopAction {
+        if !self.reseed_file() {
+            return self.info("kopi cannot find any matching file leh".to_string());
+        }
+        LoopAction::Redraw
+    }
+
+    /// Rebuilds the filename menu from the filesystem entries under the path
+    /// fragment before the cursor, relative to the buffer's own directory.
+    /// Unlike the auto path context, a bare filename (no `/`) still completes —
+    /// that is the whole point of `<C-x><C-f>` versus typing a `/`.
+    fn reseed_file(&mut self) -> bool {
+        let cursor = self.host.cursor();
+        let line = self.host.buffer().line(cursor.line).unwrap_or_default();
+        let (start, token) = path_fragment(&line, cursor.col);
+        let base = self.completion_base_dir();
+        let items = completion::path_candidates(&token, &base);
+        let fname = token.rsplit('/').next().unwrap_or("").to_string();
+        let ranked = completion::merge_and_rank(&fname, vec![], vec![], vec![], items);
+        self.set_completion_kind(ranked, Position::new(cursor.line, start), true, CompletionKind::File)
+    }
+
+    /// The directory filename completion resolves against: the active buffer's
+    /// parent directory, falling back to the tree root (kvim's working
+    /// directory) for an unnamed buffer *or* a buffer opened by a bare relative
+    /// name. The relative-name case matter: `Path::new("test.txt").parent()` is
+    /// `Some("")`, an empty path that [`read_dir`](std::fs::read_dir) cannot
+    /// open — so an empty parent has to be treated as "no parent" and routed to
+    /// the tree root, else `<C-x><C-f>` in a file opened as `kvim test.txt`
+    /// would silently find nothing.
+    fn completion_base_dir(&self) -> PathBuf {
+        self.host
+            .buffer()
+            .path()
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.tree_root.clone())
+    }
+
+    /// Opens whole-line completion (`<C-x><C-l>`).
+    fn start_line_completion(&mut self) -> LoopAction {
+        if !self.reseed_line() {
+            return self.info("kopi cannot find any matching line leh".to_string());
+        }
+        LoopAction::Redraw
+    }
+
+    /// Rebuilds the whole-line menu: distinct buffer lines whose non-blank
+    /// content begins with the text already typed on the current line (leading
+    /// whitespace ignored when matching, as vim does), the current line itself
+    /// excluded. Accepting replaces everything typed on the line so far with the
+    /// matched line — so the anchor is column zero.
+    fn reseed_line(&mut self) -> bool {
+        let cursor = self.host.cursor();
+        let line = self.host.buffer().line(cursor.line).unwrap_or_default();
+        let graphemes: Vec<&str> = line.graphemes(true).collect();
+        let end = cursor.col.min(graphemes.len());
+        let typed: String = graphemes[..end].concat();
+        let needle = typed.trim_start();
+
+        let mut ids: Vec<BufferId> = vec![self.host.active_buffer_id()];
+        for w in self.windows.windows() {
+            if !ids.contains(&w.buffer) {
+                ids.push(w.buffer);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for id in ids {
+            let Some(buf) = self.host.buffer_by_id(id) else { continue };
+            for i in 0..buf.line_count() {
+                let l = buf.line(i).unwrap_or_default();
+                let trimmed = l.trim_start();
+                if trimmed.is_empty() || !trimmed.starts_with(needle) || l == typed {
+                    continue;
+                }
+                if seen.insert(l.clone()) {
+                    let mut item = CItem::new(l.trim_end().to_string(), CompletionSource::Buffer);
+                    item.insert_text = l.clone();
+                    items.push(item);
+                }
+            }
+        }
+        self.set_completion_kind(items, Position::new(cursor.line, 0), true, CompletionKind::Line)
+    }
+
+    /// Opens omni completion (`<C-x><C-o>`) — routed to the language server.
+    fn start_omni_completion(&mut self) -> LoopAction {
+        if !self.reseed_omni() {
+            return self.info("kopi got no omni (LSP) completion for you now".to_string());
+        }
+        LoopAction::Redraw
+    }
+
+    /// Rebuilds the omni menu from `textDocument/completion` alone — the same
+    /// LSP source the default menu folds in, but here it is the *only* source,
+    /// which is what `<C-x><C-o>` means. Empty (so the menu closes) when no
+    /// server is running for the buffer, exactly like the default LSP source.
+    fn reseed_omni(&mut self) -> bool {
+        let cursor = self.host.cursor();
+        let line = self.host.buffer().line(cursor.line).unwrap_or_default();
+        let (anchor_col, prefix) = identifier_prefix(&line, cursor.col);
+        let lsp_items = self.lsp_completion_items();
+        let ranked = completion::merge_and_rank(&prefix, lsp_items, vec![], vec![], vec![]);
+        self.set_completion_kind(ranked, Position::new(cursor.line, anchor_col), true, CompletionKind::Omni)
     }
 
     /// Fetches `textDocument/completion` for the active buffer and converts each
@@ -1080,28 +1402,18 @@ impl<H: EditorHost> App<H> {
     /// Detects a path-completion context: a trailing run of path characters that
     /// contains a `/`. Returns `(token-start column, filename prefix, candidate
     /// list)`, or `None` when the cursor is not in one.
+    ///
+    /// The `/` requirement is what keeps the *auto* (as-you-type) menu from
+    /// treating every bare word as a filename — you opt in by typing a slash.
+    /// Explicit `<C-x><C-f>` completion drops that requirement (see
+    /// [`Self::reseed_file`]); both share the [`path_fragment`] scanner so their
+    /// idea of "where the path token starts" can never drift apart.
     fn path_context(&self, line: &str, col: usize) -> Option<(usize, String, Vec<CItem>)> {
-        let graphemes: Vec<&str> = line.graphemes(true).collect();
-        let is_path = |g: &str| {
-            let c = g.chars().next().unwrap_or(' ');
-            c.is_alphanumeric() || matches!(c, '_' | '/' | '.' | '-' | '~')
-        };
-        let end = col.min(graphemes.len());
-        let mut start = end;
-        while start > 0 && is_path(graphemes[start - 1]) {
-            start -= 1;
-        }
-        let token: String = graphemes[start..end].concat();
+        let (start, token) = path_fragment(line, col);
         if !token.contains('/') {
             return None;
         }
-        let base = self
-            .host
-            .buffer()
-            .path()
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.tree_root.clone());
+        let base = self.completion_base_dir();
         let items = completion::path_candidates(&token, &base);
         if items.is_empty() {
             return None;
@@ -2391,6 +2703,30 @@ fn identifier_prefix(line: &str, col: usize) -> (usize, String) {
     (start, graphemes[start..end].concat())
 }
 
+/// The trailing run of path-like graphemes ending at grapheme column `col` on
+/// `line`, and the column it starts at. "Path-like" is the word graphemes plus
+/// the handful a path fragment carries: `/`, `.`, `-`, `~`. An empty run yields
+/// `(col, "")`.
+///
+/// Shared by the auto path context ([`App::path_context`], which additionally
+/// require the token contain a `/` before it treats it as a path) and by
+/// `<C-x><C-f>` filename completion ([`App::reseed_file`], which complete even a
+/// bare filename). Keeping the scanner in one place means the two never disagree
+/// on where a path token begins.
+fn path_fragment(line: &str, col: usize) -> (usize, String) {
+    let graphemes: Vec<&str> = line.graphemes(true).collect();
+    let is_path = |g: &str| {
+        let c = g.chars().next().unwrap_or(' ');
+        c.is_alphanumeric() || matches!(c, '_' | '/' | '.' | '-' | '~')
+    };
+    let end = col.min(graphemes.len());
+    let mut start = end;
+    while start > 0 && is_path(graphemes[start - 1]) {
+        start -= 1;
+    }
+    (start, graphemes[start..end].concat())
+}
+
 /// Converts a semantic-layer [`CompletionItem`](kopitiam_semantic::CompletionItem)
 /// (an LSP result) into the headless engine's [`CItem`], tagging it
 /// [`CompletionSource::Lsp`], carrying its kind for the menu badge, and routing
@@ -2701,6 +3037,7 @@ mod tests {
             scroll: 0,
             anchor: Position::new(0, 0),
             explicit: true,
+            kind: CompletionKind::Auto,
         });
         app.accept_completion();
         let line = app.host.buffer.line(0).unwrap();
@@ -2760,6 +3097,179 @@ mod tests {
         });
         app.handle_event(esc);
         assert!(app.completion.is_none(), "leaving insert mode closes the completion menu");
+    }
+
+    // ---- vim native insert-mode completion (cj0.37) -------------------
+
+    #[test]
+    fn plain_ctrl_n_opens_keyword_completion_from_buffer_words() {
+        // No popup up yet: `<C-n>` must open vim keyword completion seeded from
+        // the buffer's own words (current + other buffers), not do nothing.
+        let mut app = insert_app(vec!["value valiant", "va"], Position::new(1, 2));
+        app.completion_intercept(ctrl('n'));
+        let menu = app.completion.as_ref().expect("<C-n> opens the keyword menu");
+        assert_eq!(menu.kind, CompletionKind::Keyword { this_buffer_only: false });
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"value"), "buffer word `value` must be offered: {labels:?}");
+        assert!(labels.contains(&"valiant"), "buffer word `valiant` must be offered: {labels:?}");
+        assert!(!labels.contains(&"va"), "the exact typed word `va` must not complete to itself: {labels:?}");
+    }
+
+    #[test]
+    fn plain_ctrl_n_menu_paints_the_buffer_word() {
+        // Painted-cell proof: the keyword menu really shows on screen.
+        let mut app = insert_app(vec!["value valiant", "va"], Position::new(1, 2));
+        app.completion_intercept(ctrl('n'));
+        let joined = screen(&mut app, 60, 12).join("\n");
+        assert!(joined.contains("value"), "the keyword candidate must be painted:\n{joined}");
+    }
+
+    #[test]
+    fn ctrl_p_seeds_the_last_match() {
+        // `<C-p>` (search upwards) lands on the last match, not the first.
+        let mut app = insert_app(vec!["value valiant", "va"], Position::new(1, 2));
+        app.completion_intercept(ctrl('p'));
+        let menu = app.completion.as_ref().expect("<C-p> opens the keyword menu");
+        assert_eq!(menu.selected, menu.items.len() - 1, "<C-p> starts on the last match");
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_n_scans_this_buffer_only() {
+        let mut app = insert_app(vec!["value valiant", "va"], Position::new(1, 2));
+        assert_eq!(app.completion_intercept(ctrl('x')), Some(LoopAction::Continue));
+        assert!(app.ctrl_x_pending, "<C-x> arms CTRL-X mode");
+        app.completion_intercept(ctrl('n'));
+        assert!(!app.ctrl_x_pending, "the sub-key clears CTRL-X mode");
+        let menu = app.completion.as_ref().expect("<C-x><C-n> opens keyword completion");
+        assert_eq!(menu.kind, CompletionKind::Keyword { this_buffer_only: true });
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_f_completes_filenames() {
+        // The submode state machine: `<C-x>` then `<C-f>` routes to the filename
+        // source, which lists entries under the buffer's own directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "").unwrap();
+        let file = dir.path().join("main.rs");
+        let buffer = FakeBuffer::new(vec!["READ".to_string()]).with_path(&file);
+        let mut host = FakeHost::new(buffer);
+        host.mode = Mode::Insert;
+        host.cursor = Position::new(0, 4);
+        let mut app = App::new(host, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('f'));
+        let menu = app.completion.as_ref().expect("<C-x><C-f> opens the filename menu");
+        assert_eq!(menu.kind, CompletionKind::File);
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"README.md"), "the matching filename must be offered: {labels:?}");
+        assert!(!labels.contains(&"lib.rs"), "`lib.rs` does not start with the typed `READ`: {labels:?}");
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_f_resolves_a_relative_buffer_name_against_the_tree_root() {
+        // A buffer opened as a bare `test.txt` has an empty parent dir; filename
+        // completion must fall back to the working directory (tree root) instead
+        // of trying to read the empty path and finding nothing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        let buffer = FakeBuffer::new(vec!["READ".to_string()]).with_path("test.txt");
+        let mut host = FakeHost::new(buffer);
+        host.mode = Mode::Insert;
+        host.cursor = Position::new(0, 4);
+        let mut app = App::new(host, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        app.tree_root = dir.path().to_path_buf();
+
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('f'));
+        let menu = app.completion.as_ref().expect("<C-x><C-f> opens the filename menu");
+        assert!(
+            menu.items.iter().any(|i| i.label == "README.md"),
+            "filename completion must resolve against the tree root for a relative buffer name"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_l_completes_a_whole_line_and_accepts_it() {
+        let mut app = insert_app(vec!["let answer = 42;", "let ans"], Position::new(1, 7));
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('l'));
+        let menu = app.completion.as_ref().expect("<C-x><C-l> opens the line menu");
+        assert_eq!(menu.kind, CompletionKind::Line);
+        assert!(
+            menu.items.iter().any(|i| i.insert_text == "let answer = 42;"),
+            "the whole matching line must be offered"
+        );
+        app.completion_intercept(ctrl('y'));
+        assert_eq!(
+            app.host.buffer.line(1).unwrap(),
+            "let answer = 42;",
+            "accepting a line completion replaces what was typed on the line"
+        );
+    }
+
+    #[test]
+    fn ctrl_y_accepts_the_selected_keyword() {
+        let mut app = insert_app(vec!["value", "val"], Position::new(1, 3));
+        app.completion_intercept(ctrl('n'));
+        let expected = {
+            let menu = app.completion.as_ref().unwrap();
+            menu.items[menu.selected].insert_text.clone()
+        };
+        app.completion_intercept(ctrl('y'));
+        assert!(app.completion.is_none(), "<C-y> accepts and closes the menu");
+        assert_eq!(app.host.buffer.line(1).unwrap(), expected, "<C-y> inserts the selected match");
+    }
+
+    #[test]
+    fn ctrl_e_reverts_native_completion_to_the_typed_text() {
+        let mut app = insert_app(vec!["value", "val"], Position::new(1, 3));
+        app.completion_intercept(ctrl('n'));
+        assert!(app.completion.is_some());
+        app.completion_intercept(ctrl('e'));
+        assert!(app.completion.is_none(), "<C-e> cancels the menu");
+        assert_eq!(app.host.buffer.line(1).unwrap(), "val", "<C-e> leaves the typed text untouched");
+        assert_eq!(app.host.mode(), Mode::Insert, "and stays in insert mode");
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_o_routes_to_the_language_server_and_reports_when_idle() {
+        // No server is running in a unit test, so omni completion has nothing to
+        // offer: no menu, and kvim says so rather than beeping silently.
+        let mut app = insert_app(vec!["gr"], Position::new(0, 2));
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('o'));
+        assert!(app.completion.is_none(), "no running server -> no omni menu");
+        assert!(
+            matches!(app.message, StatusMessage::Info(_)),
+            "kvim reports there is nothing to omni-complete"
+        );
+    }
+
+    #[test]
+    fn keeps_a_native_menu_on_its_own_source_as_you_type() {
+        // Regression guard for the whole design: after `<C-x><C-l>` a keystroke
+        // must re-seed from the *line* source, not silently revert to the
+        // identifier menu (which is what a naive refresh would do).
+        let mut app = insert_app(vec!["let answer = 42;", "let an"], Position::new(1, 6));
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('l'));
+        assert_eq!(app.completion.as_ref().unwrap().kind, CompletionKind::Line);
+        // Type the next char through the real event path; the menu must stay a
+        // line menu.
+        let typed = Event::Key(KeyEvent {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        app.handle_event(typed);
+        assert_eq!(
+            app.completion.as_ref().expect("the line menu survives typing").kind,
+            CompletionKind::Line,
+            "typing must re-seed from the line source, not fall back to the identifier menu"
+        );
     }
 
     #[test]
