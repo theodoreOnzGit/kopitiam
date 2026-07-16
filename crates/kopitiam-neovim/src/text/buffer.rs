@@ -57,6 +57,14 @@ pub struct Buffer {
     /// correctly reports "not modified" again, instead of staying stuck on
     /// "modified" the way a naive dirty flag would.
     saved_at: NodeId,
+    /// State for the `U` command (line-undo): the line most recently changed
+    /// and a snapshot of its content *before* the current run of changes
+    /// began. See [`Buffer::undo_line`] and [`Buffer::note_line_before_edit`].
+    ///
+    /// `None` when there is no line to `U` (a pristine buffer, or the most
+    /// recent change spanned more than one line — see the deviation note on
+    /// [`Buffer::note_line_before_edit`]).
+    u_line: Option<(usize, String)>,
 }
 
 impl Default for Buffer {
@@ -86,6 +94,7 @@ impl Buffer {
             marks: HashMap::new(),
             saved_at: undo.current_id(),
             undo,
+            u_line: None,
         }
     }
 
@@ -232,9 +241,82 @@ impl Buffer {
     /// input rather than from this buffer itself should run it through
     /// [`Buffer::clamp`] first if they'd rather clamp than error.
     pub fn apply(&mut self, edit: Edit) -> Result<Position> {
+        self.note_line_before_edit(&edit);
         let (pos, forward, inverse) = self.raw_apply(&edit)?;
         self.undo.record(forward, inverse);
         Ok(pos)
+    }
+
+    /// Captures the pre-edit content of the line an edit is about to touch, so
+    /// `U` ([`Buffer::undo_line`]) can restore it.
+    ///
+    /// vim's `U` restores the *last changed line* to its state before the most
+    /// recent run of changes on it. The "run" boundary is "since you moved onto
+    /// this line": the snapshot is taken the first time a change touches a line
+    /// different from the one currently held, and subsequent changes to that
+    /// same line keep the original snapshot (so `xxx` on one line still lets a
+    /// single `U` bring the whole word back).
+    ///
+    /// Only called from [`Buffer::apply`] — never from the undo/redo replay
+    /// path ([`Buffer::replay`]), so plain `u`/`<C-r>` leave the `U` snapshot
+    /// alone, matching vim.
+    ///
+    /// # Deviation: single-line changes only
+    ///
+    /// vim's `U` can also restore a multi-line change (it saves a span of
+    /// lines). This implementation deliberately tracks only single-line edits:
+    /// any edit that spans two lines or inserts/deletes a newline **clears** the
+    /// snapshot, disabling `U` until the next single-line change. Restoring a
+    /// span would mean snapshotting a variable number of lines whose numbering
+    /// then shifts under later edits — real bookkeeping for a rare case. The
+    /// common uses (`x`, `r`, `s`, `~`, a `cw` run, a same-line `:s`) are all
+    /// single-line and fully supported. Widening this to line spans is filed as
+    /// a follow-up; see the `U` bead.
+    fn note_line_before_edit(&mut self, edit: &Edit) {
+        let (start, end) = edit.range.normalized();
+        let single_line = start.line == end.line && !edit.text.contains('\n');
+        if !single_line {
+            // A change that crosses or creates a line boundary shifts line
+            // numbers; rather than track a moving span, forget the snapshot.
+            self.u_line = None;
+            return;
+        }
+        // Keep the existing snapshot while the run continues on the same line;
+        // otherwise start a new run and snapshot this line's current content.
+        if self.u_line.as_ref().map(|(l, _)| *l) != Some(start.line) {
+            let content = self.line_content(start.line).unwrap_or_default();
+            self.u_line = Some((start.line, content));
+        }
+    }
+
+    /// `U`: restore the last-changed line to its content before the most recent
+    /// run of changes on it, returning the position to move the cursor to
+    /// (column 0 of that line), or `None` if there is no line to restore.
+    ///
+    /// `U` is itself an ordinary, undoable edit (a plain `u` reverts it), and it
+    /// **toggles**: the line's pre-`U` content becomes the new snapshot, so a
+    /// second `U` redoes the change. This mirrors vim, where `U` after `U`
+    /// flip-flops the line. See [`Buffer::note_line_before_edit`] for how the
+    /// snapshot is captured and the single-line deviation.
+    pub fn undo_line(&mut self) -> Result<Option<Position>> {
+        let Some((line, saved)) = self.u_line.clone() else { return Ok(None) };
+        if line >= self.line_count() {
+            // The line no longer exists (a later multi-line edit removed it);
+            // there is nothing sensible to restore.
+            self.u_line = None;
+            return Ok(None);
+        }
+        let current = self.line_content(line).unwrap_or_default();
+        // Replace the whole line with the saved content. This goes through
+        // `apply`, so it records an undo node (plain `u` can revert the `U`)
+        // and re-enters `note_line_before_edit` — which, seeing the same line,
+        // preserves `saved` as the snapshot rather than overwriting it.
+        let range = Range::new(Position::new(line, 0), Position::new(line, grapheme::grapheme_len(&current)));
+        self.apply(Edit::replace(range, saved))?;
+        // Toggle: the content that was on the line just before this `U` becomes
+        // the snapshot, so pressing `U` again restores it.
+        self.u_line = Some((line, current));
+        Ok(Some(Position::new(line, 0)))
     }
 
     /// Mutates the rope and fixes up marks for one edit, without touching

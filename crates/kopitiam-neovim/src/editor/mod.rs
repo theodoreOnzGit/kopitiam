@@ -1215,6 +1215,18 @@ impl Editor {
                 self.mode = Mode::Normal;
                 Ok(EditorResponse::Continue)
             }
+            GrammarCommand::UndoLine => {
+                self.mode = Mode::Normal;
+                // `U` is a change (it edits the line) and is itself dot-neutral
+                // in vim — `.` does not repeat it — so discard the dot rather
+                // than committing one.
+                self.discard_dot();
+                if let Some(pos) = self.current_buffer_mut().undo_line()? {
+                    let col = operator::first_non_blank_col(self.current_buffer(), pos.line);
+                    self.cursor = self.current_buffer().clamp(Position::new(pos.line, col));
+                }
+                Ok(EditorResponse::Continue)
+            }
             GrammarCommand::RepeatLast => {
                 self.discard_dot();
                 self.mode = Mode::Normal;
@@ -4144,6 +4156,59 @@ mod tests {
         let mut ed = editor_with(initial);
         feed(&mut ed, keys);
         ed.buffer().text()
+    }
+
+    // -----------------------------------------------------------------
+    // `U` — line-undo (restore the last-changed line; self-toggling).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn big_u_restores_the_last_changed_line_then_toggles() {
+        let mut ed = editor_with("hello world\nsecond");
+        feed(&mut ed, "xxx"); // delete "hel" from line 0
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("lo world"));
+        feed(&mut ed, "U"); // restore the whole line
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("hello world"), "U brings back the pre-change line");
+        feed(&mut ed, "U"); // toggle: redo the deletions
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("lo world"), "a second U flips back");
+    }
+
+    #[test]
+    fn big_u_covers_a_whole_change_run_on_one_line() {
+        // `cw` + typing is a run of edits on line 0; a single U undoes all of it.
+        let mut ed = editor_with("alpha beta");
+        feed(&mut ed, "cwZZZ<Esc>"); // change "alpha" -> "ZZZ"
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("ZZZ beta"));
+        feed(&mut ed, "U");
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("alpha beta"), "the whole run undoes as one");
+    }
+
+    #[test]
+    fn plain_u_can_undo_a_big_u() {
+        // vim: U is itself an ordinary undoable edit.
+        let mut ed = editor_with("target");
+        feed(&mut ed, "x"); // "arget"
+        feed(&mut ed, "U"); // back to "target"
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("target"));
+        feed(&mut ed, "u"); // undo the U itself
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("arget"), "plain u reverts the line-undo");
+    }
+
+    #[test]
+    fn big_u_tracks_the_most_recently_changed_line() {
+        let mut ed = editor_with("one\ntwo\nthree");
+        feed(&mut ed, "x"); // line 0: "ne"
+        feed(&mut ed, "jx"); // move to line 1, delete: "wo"
+        feed(&mut ed, "U"); // U now works on line 1 only
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("two"), "U restores the line last changed");
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("ne"), "the earlier line is left as it was");
+    }
+
+    #[test]
+    fn big_u_is_a_noop_with_nothing_changed() {
+        let mut ed = editor_with("untouched");
+        feed(&mut ed, "U");
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("untouched"));
     }
 
     // -----------------------------------------------------------------

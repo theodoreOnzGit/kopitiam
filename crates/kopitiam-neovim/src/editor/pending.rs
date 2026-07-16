@@ -100,6 +100,10 @@ pub enum GrammarCommand {
     SelectMatch { register: Option<char>, operator: Option<Operator>, forward: bool },
     Undo,
     Redo,
+    /// `U`: line-undo — restore the last-changed line to its state before the
+    /// most recent run of changes on it. Itself undoable and self-toggling; see
+    /// [`crate::text::Buffer::undo_line`].
+    UndoLine,
     /// `.`
     RepeatLast,
     /// `v`, `V`, `<C-v>`
@@ -505,6 +509,9 @@ impl Pending {
             KeyCode::Char('p') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: false, cursor_after: false }),
             KeyCode::Char('P') if self.operator.is_none() => self.finish(GrammarCommand::Put { register: self.register, count: self.effective_count(), before: true, cursor_after: false }),
             KeyCode::Char('u') if self.operator.is_none() => self.finish(GrammarCommand::Undo),
+            // `U`: line-undo. A top-level command only (an uppercase letter
+            // after a pending operator is not one of these), like `u`.
+            KeyCode::Char('U') if self.operator.is_none() => self.finish(GrammarCommand::UndoLine),
             KeyCode::Char('.') if self.operator.is_none() => self.finish(GrammarCommand::RepeatLast),
             // `<C-v>` (visual-block) and plain `v` (visual) share
             // `KeyCode::Char('v')`; same ordering requirement as `r` above.
