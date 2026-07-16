@@ -77,6 +77,21 @@ pub enum CommandId {
     Substitute,
     /// `:g`/`:global`.
     Global,
+    /// `:v`/`:vglobal` — inverse `:g` (act on lines *not* matching). Same as
+    /// `:g!`; kept as its own group because `v` is a distinct name vim ships.
+    VGlobal,
+    /// `:sort`/`:sor` — sort the lines in the range (whole buffer if none).
+    Sort,
+    /// `:m`/`:move` — move the range to after a destination line.
+    Move,
+    /// `:t`/`:copy`/`:co` — copy the range to after a destination line.
+    Copy,
+    /// `:normal`/`:norm` — run normal-mode keys over each line in the range.
+    Normal,
+    /// `:earlier`/`:ea` — step back through undo states by a count.
+    Earlier,
+    /// `:later`/`:lat` — step forward through redo states by a count.
+    Later,
     /// `:d`/`:delete`.
     Delete,
     /// `:noh`/`:nohlsearch`.
@@ -136,6 +151,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::ListBuffers, names: &["ls", "buffers", "files"], arg: ArgKind::None, help: "list open buffers" },
     CommandSpec { id: CommandId::Substitute, names: &["s", "substitute"], arg: ArgKind::None, help: "substitute pattern in range" },
     CommandSpec { id: CommandId::Global, names: &["g", "global"], arg: ArgKind::None, help: "run a command on matching lines" },
+    CommandSpec { id: CommandId::VGlobal, names: &["v", "vg", "vglobal"], arg: ArgKind::None, help: "run a command on non-matching lines" },
+    CommandSpec { id: CommandId::Sort, names: &["sor", "sort"], arg: ArgKind::None, help: "sort lines in range (!/u/n flags)" },
+    CommandSpec { id: CommandId::Move, names: &["m", "mo", "mov", "move"], arg: ArgKind::None, help: "move range to after {address}" },
+    CommandSpec { id: CommandId::Copy, names: &["t", "co", "cop", "copy"], arg: ArgKind::None, help: "copy range to after {address}" },
+    CommandSpec { id: CommandId::Normal, names: &["norm", "norma", "normal"], arg: ArgKind::None, help: "run normal-mode keys over range" },
+    CommandSpec { id: CommandId::Earlier, names: &["ea", "earlier"], arg: ArgKind::None, help: "go back N undo states" },
+    CommandSpec { id: CommandId::Later, names: &["lat", "later"], arg: ArgKind::None, help: "go forward N redo states" },
     CommandSpec { id: CommandId::Delete, names: &["d", "delete"], arg: ArgKind::None, help: "delete lines in range" },
     CommandSpec { id: CommandId::NoHighlight, names: &["noh", "nohlsearch"], arg: ArgKind::None, help: "clear search highlight" },
     CommandSpec { id: CommandId::Set, names: &["set"], arg: ArgKind::None, help: "set an option" },
@@ -189,6 +211,17 @@ mod tests {
         assert_eq!(lookup("wq").unwrap().id, CommandId::WriteQuit);
         assert_eq!(lookup("bwipeout").unwrap().id, CommandId::WipeBuffer);
         assert_eq!(lookup("vsplit").unwrap().id, CommandId::VSplit);
+        // The line-manipulation family added in kopitiam-cj0.19.
+        assert_eq!(lookup("v").unwrap().id, CommandId::VGlobal);
+        assert_eq!(lookup("vglobal").unwrap().id, CommandId::VGlobal);
+        assert_eq!(lookup("sort").unwrap().id, CommandId::Sort);
+        assert_eq!(lookup("m").unwrap().id, CommandId::Move);
+        assert_eq!(lookup("move").unwrap().id, CommandId::Move);
+        assert_eq!(lookup("t").unwrap().id, CommandId::Copy);
+        assert_eq!(lookup("copy").unwrap().id, CommandId::Copy);
+        assert_eq!(lookup("norm").unwrap().id, CommandId::Normal);
+        assert_eq!(lookup("earlier").unwrap().id, CommandId::Earlier);
+        assert_eq!(lookup("lat").unwrap().id, CommandId::Later);
         assert!(lookup("definitely-not-a-command").is_none());
     }
 

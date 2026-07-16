@@ -1463,6 +1463,159 @@ impl Editor {
         result
     }
 
+    /// `:{range}normal {keys}` — feed `keys` through the editor's own key
+    /// handler. With a range the keys run once per line (cursor parked at
+    /// column 0 of each line first), the way vim's `:normal` does; with no
+    /// range they run once at the current cursor.
+    ///
+    /// Line arithmetic across a shrinking (or growing) buffer is the tricky
+    /// part: `:%normal dd` deletes every line, so as lines vanish the *n*-th
+    /// original line moves to a lower index. We track the net change in line
+    /// count and offset each successive target by it, which reproduces vim's
+    /// "process each originally-in-range line once" behaviour whether the keys
+    /// add or remove lines.
+    fn run_ex_normal(&mut self, range: ex::LineRange, keys: &str) -> crate::Result<EditorResponse> {
+        let parsed = key::parse(keys);
+        if parsed.is_empty() {
+            return Ok(EditorResponse::Continue);
+        }
+        // `replaying` suppresses dot/macro capture, exactly as `play_keys` does
+        // — the keys are being driven, not typed live.
+        self.discard_dot();
+        self.mode = Mode::Normal;
+        self.replaying += 1;
+        let result = self.drive_ex_normal(range, &parsed);
+        self.replaying -= 1;
+        self.mode = Mode::Normal;
+        self.cursor = self.current_buffer().clamp(self.cursor);
+        result
+    }
+
+    /// The line-walking core of [`Self::run_ex_normal`], split out so the
+    /// `replaying` counter is always balanced (the `+=`/`-=` pair lives in the
+    /// caller, around this whole call).
+    fn drive_ex_normal(&mut self, range: ex::LineRange, keys: &[Key]) -> crate::Result<EditorResponse> {
+        match range {
+            ex::LineRange::None => {
+                self.feed_normal_keys(keys)?;
+            }
+            _ => {
+                let content = ex::content_line_count(self.current_buffer());
+                let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
+                let last = last.min(content.saturating_sub(1));
+                let initial = self.current_buffer().line_count() as isize;
+                let span = last.saturating_sub(first) + 1;
+                for i in 0..span {
+                    let removed = initial - self.current_buffer().line_count() as isize;
+                    let target = first as isize + i as isize - removed;
+                    if target < 0 {
+                        continue;
+                    }
+                    let target = target as usize;
+                    if target >= self.current_buffer().line_count() {
+                        break;
+                    }
+                    self.cursor = Position::new(target, 0);
+                    self.feed_normal_keys(keys)?;
+                }
+            }
+        }
+        Ok(EditorResponse::Continue)
+    }
+
+    /// `:g/pat/normal {keys}` (and its inverse `:v/pat/normal`): run `keys`
+    /// over every matching line. The matching lines are collected up front (the
+    /// vim algorithm), then walked top-to-bottom while a running `delta` tracks
+    /// how many lines earlier iterations added or removed, so a sub-command like
+    /// `dd` that shrinks the buffer still lands on the right successor line.
+    /// Returns how many lines were visited.
+    fn global_normal(&mut self, pattern: &str, invert: bool, keys: &str) -> crate::Result<usize> {
+        let parsed = key::parse(keys);
+        let matching = ex::global_matches(self.current_buffer(), pattern, invert)?;
+        if parsed.is_empty() {
+            return Ok(matching.len());
+        }
+        self.discard_dot();
+        self.mode = Mode::Normal;
+        self.replaying += 1;
+        let mut visited = 0usize;
+        let mut delta: isize = 0;
+        for &orig in &matching {
+            let before = self.current_buffer().line_count() as isize;
+            let target = orig as isize + delta;
+            if target < 0 || target >= before {
+                continue;
+            }
+            self.cursor = Position::new(target as usize, 0);
+            if let Err(e) = self.feed_normal_keys(&parsed) {
+                self.replaying -= 1;
+                self.mode = Mode::Normal;
+                return Err(e);
+            }
+            delta += self.current_buffer().line_count() as isize - before;
+            visited += 1;
+        }
+        self.replaying -= 1;
+        self.mode = Mode::Normal;
+        Ok(visited)
+    }
+
+    /// Feeds one key sequence through [`Self::handle_key`], then makes sure the
+    /// editor lands back in Normal mode — vim terminates a `:normal` command's
+    /// pending insert/visual state when the command ends, so a stray
+    /// `:normal Ifoo` leaves you in Normal with "foo" inserted, not stuck in
+    /// Insert. A small guard bounds the number of synthetic `<Esc>`s.
+    fn feed_normal_keys(&mut self, keys: &[Key]) -> crate::Result<()> {
+        for &k in keys {
+            self.handle_key(k)?;
+        }
+        let mut guard = 0;
+        while self.mode != Mode::Normal && guard < 3 {
+            self.handle_key(Key::esc())?;
+            guard += 1;
+        }
+        Ok(())
+    }
+
+    /// `:earlier {n}` (`redo == false`) / `:later {n}` (`redo == true`): step
+    /// `n` states back through the undo tree, or forward through redo. Stops
+    /// early — without erroring — when it runs out of history, reporting how
+    /// far it actually got, the way vim's own `:earlier`/`:later` do.
+    ///
+    /// This is the *count*-based form only. vim also accepts a time (`:earlier
+    /// 5m`) and a file-write count (`:earlier 2f`); those need timestamps and a
+    /// save-sequence counter the undo tree does not keep yet, so a time-form
+    /// argument (`count == None`) is reported as unsupported rather than faked.
+    /// Tracked as bead kopitiam-cj0.47.
+    fn time_travel(&mut self, count: Option<usize>, redo: bool) -> crate::Result<EditorResponse> {
+        let Some(n) = count else {
+            return Ok(EditorResponse::Message(
+                "kvim :earlier/:later only take a count for now (e.g. :earlier 3), not a time like 5m -- see kopitiam-cj0.47".to_string(),
+            ));
+        };
+        self.discard_dot();
+        self.mode = Mode::Normal;
+        let mut moved = 0usize;
+        let mut pos = self.cursor;
+        for _ in 0..n.max(1) {
+            let step = if redo { self.current_buffer_mut().redo() } else { self.current_buffer_mut().undo() };
+            match step {
+                Ok(p) => {
+                    pos = p;
+                    moved += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        self.cursor = self.current_buffer().clamp(pos);
+        if moved == 0 {
+            let edge = if redo { "already at newest change" } else { "already at oldest change" };
+            Ok(EditorResponse::Message(edge.to_string()))
+        } else {
+            Ok(EditorResponse::Continue)
+        }
+    }
+
     /// `;`/`,` bookkeeping and standalone `f`/`F`/`t`/`T` both funnel
     /// through here so the "remember the last find" side effect lives in
     /// exactly one place.
@@ -2393,11 +2546,71 @@ impl Editor {
                 self.last_substitution = Some((pattern, replacement, global));
                 Ok(EditorResponse::Message(format!("{n} substitution(s)")))
             }
-            ex::ExCommand::Global { pattern, cmd } => {
-                let n = ex::global(self.current_buffer_mut(), &pattern, &cmd)?;
+            ex::ExCommand::Global { pattern, cmd, invert } => {
+                // `:g/pat/normal ...` is the powerful combo — run normal-mode
+                // keys on every matching line. It cannot go through the pure
+                // buffer-level `ex::global` (which only knows `d`/`s`), because
+                // feeding keys needs the whole editor; the executor drives it.
+                if let ex::ExCommand::Normal { keys, .. } = ex::parse(cmd.trim()) {
+                    let n = self.global_normal(&pattern, invert, &keys)?;
+                    self.cursor = self.current_buffer().clamp(self.cursor);
+                    return Ok(EditorResponse::Message(format!("{n} line(s) changed")));
+                }
+                let n = ex::global(self.current_buffer_mut(), &pattern, &cmd, invert)?;
                 self.cursor = self.current_buffer().clamp(self.cursor);
                 Ok(EditorResponse::Message(format!("{n} line(s) changed")))
             }
+            ex::ExCommand::Sort { range, reverse, unique, numeric } => {
+                // `:sort` with no range sorts the whole buffer (vim), unlike
+                // most range commands which default to the current line.
+                let content = ex::content_line_count(self.current_buffer());
+                let (first, last) = match range {
+                    ex::LineRange::None => (0, content.saturating_sub(1)),
+                    other => other.resolve(self.cursor.line, self.current_buffer().line_count()),
+                };
+                ex::sort_lines(self.current_buffer_mut(), first, last, reverse, unique, numeric)?;
+                self.cursor = self.current_buffer().clamp(self.cursor);
+                Ok(EditorResponse::Continue)
+            }
+            ex::ExCommand::MoveOrCopy { range, dest, copy } => {
+                let content = ex::content_line_count(self.current_buffer());
+                let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
+                let dest_after = ex::resolve_dest(dest, self.cursor.line, content);
+                let cursor_line = ex::move_or_copy_lines(self.current_buffer_mut(), first, last, dest_after, copy)?;
+                let col = operator::first_non_blank_col(self.current_buffer(), cursor_line);
+                self.cursor = self.current_buffer().clamp(Position::new(cursor_line, col));
+                Ok(EditorResponse::Continue)
+            }
+            ex::ExCommand::Shift { range, right, count } => {
+                let content = ex::content_line_count(self.current_buffer());
+                let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
+                let last = last.min(content.saturating_sub(1));
+                let first = first.min(last);
+                let op = if right { Operator::Indent } else { Operator::Dedent };
+                let sw = self.options.shiftwidth.resolve(self.options.tabstop);
+                let expandtab = self.options.expandtab;
+                // The whole multi-shiftwidth shift is one undo step, matching
+                // how a normal-mode `3>>` coalesces into one change.
+                self.current_buffer_mut().begin_undo_group();
+                let content_range = operator::linewise_content_range(self.current_buffer(), first, last);
+                let mut cursor = self.cursor;
+                let mut outcome = Ok(());
+                for _ in 0..count.max(1) {
+                    match op.apply(self.current_buffer_mut(), content_range, Granularity::Linewise, sw, expandtab) {
+                        Ok(o) => cursor = o.cursor,
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
+                }
+                self.current_buffer_mut().end_undo_group();
+                outcome?;
+                self.cursor = self.current_buffer().clamp(cursor);
+                Ok(EditorResponse::Continue)
+            }
+            ex::ExCommand::Normal { range, keys } => self.run_ex_normal(range, &keys),
+            ex::ExCommand::TimeTravel { count, redo } => self.time_travel(count, redo),
             ex::ExCommand::Delete { range } => {
                 let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
                 let pos = ex::delete_lines(self.current_buffer_mut(), first, last)?;
@@ -4320,5 +4533,128 @@ mod tests {
         assert_eq!(ed.buffer_id(), first);
         feed_last(&mut ed, "<C-6>"); // and forward again (same key, other byte)
         assert_eq!(ed.buffer_id(), second);
+    }
+
+    // -----------------------------------------------------------------
+    // The line-manipulation ex commands (kopitiam-cj0.19): :sort, :m/:t,
+    // :>/:<, :normal, :v, :earlier/:later — driven through execute_ex the
+    // way the command line does.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ex_sort_reorders_the_whole_buffer_by_default() {
+        let mut ed = editor_with("banana\napple\ncherry\n");
+        ed.execute_ex("sort").unwrap();
+        assert_eq!(ed.buffer().text(), "apple\nbanana\ncherry\n");
+    }
+
+    #[test]
+    fn ex_sort_bang_reverses() {
+        let mut ed = editor_with("apple\nbanana\ncherry\n");
+        ed.execute_ex("sort!").unwrap();
+        assert_eq!(ed.buffer().text(), "cherry\nbanana\napple\n");
+    }
+
+    #[test]
+    fn ex_move_relocates_a_range_to_the_top() {
+        let mut ed = editor_with("a\nb\nc\nd\ne\n");
+        ed.execute_ex("2,3m0").unwrap();
+        assert_eq!(ed.buffer().text(), "b\nc\na\nd\ne\n");
+    }
+
+    #[test]
+    fn ex_copy_duplicates_a_line_after_the_destination() {
+        let mut ed = editor_with("a\nb\nc\n");
+        ed.execute_ex("1t$").unwrap();
+        assert_eq!(ed.buffer().text(), "a\nb\nc\na\n");
+    }
+
+    #[test]
+    fn ex_shift_indents_the_range_one_shiftwidth() {
+        let mut ed = editor_with("foo\nbar\nbaz\n");
+        ed.execute_ex("1,2>").unwrap();
+        // Default shiftwidth is 4 spaces (expandtab defaults on in kvim's opts
+        // for this test path); assert the first two lines gained leading blanks
+        // and the third did not.
+        let text = ed.buffer().text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with(char::is_whitespace) && lines[0].trim() == "foo");
+        assert!(lines[1].starts_with(char::is_whitespace) && lines[1].trim() == "bar");
+        assert_eq!(lines[2], "baz", "line outside the range is untouched");
+    }
+
+    #[test]
+    fn ex_shift_bang_multiplier_indents_twice_as_far() {
+        let mut ed = editor_with("x\ny\n");
+        ed.execute_ex("1>").unwrap();
+        let once = ed.buffer().text().lines().next().unwrap().len();
+        let mut ed = editor_with("x\ny\n");
+        ed.execute_ex("1>>").unwrap();
+        let twice = ed.buffer().text().lines().next().unwrap().len();
+        assert_eq!(twice - 1, 2 * (once - 1), ">> shifts twice as far as >");
+    }
+
+    #[test]
+    fn ex_normal_runs_keys_on_each_line_in_range() {
+        // Append ';' to every line via :%normal A;
+        let mut ed = editor_with("a\nb\nc\n");
+        ed.execute_ex("%normal A;").unwrap();
+        assert_eq!(ed.buffer().text(), "a;\nb;\nc;\n");
+    }
+
+    #[test]
+    fn ex_normal_composes_with_global() {
+        // :g/keep/normal A! marks only the matching lines.
+        let mut ed = editor_with("keep\ndrop\nkeep\n");
+        ed.execute_ex("g/keep/normal A!").unwrap();
+        assert_eq!(ed.buffer().text(), "keep!\ndrop\nkeep!\n");
+    }
+
+    #[test]
+    fn ex_normal_dd_over_range_deletes_every_line_despite_shifting() {
+        let mut ed = editor_with("a\nb\nc\n");
+        ed.execute_ex("%normal dd").unwrap();
+        assert_eq!(ed.buffer().text(), "", "all content lines gone");
+    }
+
+    #[test]
+    fn ex_inverse_global_deletes_non_matching_lines() {
+        let mut ed = editor_with("keep me\ndrop me\nkeep this\ntoss\n");
+        ed.execute_ex("v/keep/d").unwrap();
+        assert_eq!(ed.buffer().text(), "keep me\nkeep this\n");
+    }
+
+    #[test]
+    fn ex_earlier_and_later_step_through_undo_history() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "ione<Esc>"); // change 1
+        feed(&mut ed, "otwo<Esc>"); // change 2
+        feed(&mut ed, "othree<Esc>"); // change 3
+        let full = ed.buffer().text();
+        assert!(full.contains("one") && full.contains("two") && full.contains("three"));
+
+        ed.execute_ex("earlier 2").unwrap(); // back two changes
+        let back = ed.buffer().text();
+        assert!(back.contains("one"), "the first change survives");
+        assert!(!back.contains("three"), "the last two changes are undone");
+
+        ed.execute_ex("later 2").unwrap(); // and forward again
+        assert_eq!(ed.buffer().text(), full, ":later restores what :earlier undid");
+    }
+
+    #[test]
+    fn ex_earlier_past_the_oldest_change_reports_the_edge() {
+        let mut ed = editor_with("");
+        feed(&mut ed, "ihi<Esc>");
+        ed.execute_ex("earlier 1").unwrap(); // back to empty
+        let resp = ed.execute_ex("earlier 1").unwrap(); // nothing left
+        assert!(matches!(resp, EditorResponse::Message(m) if m.contains("oldest")));
+    }
+
+    #[test]
+    fn ex_earlier_time_form_is_reported_unsupported() {
+        let mut ed = editor_with("hi");
+        let resp = ed.execute_ex("earlier 5m").unwrap();
+        assert!(matches!(resp, EditorResponse::Message(m) if m.contains("count")));
     }
 }

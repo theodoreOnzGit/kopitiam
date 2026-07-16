@@ -111,7 +111,40 @@ pub enum ExCommand {
     /// modified (`+`) flag, the way vim's `:ls` does.
     ListBuffers,
     Substitute { range: LineRange, pattern: String, replacement: String, global: bool },
-    Global { pattern: String, cmd: String },
+    /// `:g/pat/cmd` and its inverse `:v`/`:g!`. When `invert` is set the
+    /// sub-command runs on every line that does **not** match `pattern` — that
+    /// is the only difference between `:g` and `:v`, so they share one variant.
+    Global { pattern: String, cmd: String, invert: bool },
+    /// `:{range}sort[!] [u][n]` — reorder the lines of `range` (the whole
+    /// buffer when no range is given, matching vim). `reverse` is the `!`
+    /// suffix, `unique` the `u` flag (drop duplicate lines), `numeric` the `n`
+    /// flag (order by the first decimal number on each line instead of by
+    /// text). See [`sort_lines`] for the exact ordering rules.
+    Sort { range: LineRange, reverse: bool, unique: bool, numeric: bool },
+    /// `:{range}m {dest}` (`copy == false`) and `:{range}t`/`:copy` /`:co`
+    /// (`copy == true`): move or copy `range` to *after* the `dest` line. The
+    /// destination is a bare line address — a number, `.` (current), `$`
+    /// (last) or `0` (before the first line) — resolved in
+    /// `Editor::execute_ex`, where the buffer's line count is known.
+    MoveOrCopy { range: LineRange, dest: LineSpec, copy: bool },
+    /// `:{range}>` / `:{range}<` — shift `range` right/left by `count`
+    /// shiftwidths (`:>>` is `count == 2`, and so on). Reuses the exact same
+    /// indent machinery as the normal-mode `>>`/`<<` operators.
+    Shift { range: LineRange, right: bool, count: usize },
+    /// `:{range}normal[!] {keys}` — feed `keys` (vim key notation, so `<Esc>`
+    /// etc. work) through the editor's own key handler. With a range the keys
+    /// run once per line (cursor parked at column 0 of each), matching vim;
+    /// with no range they run once at the current cursor. `keys` is the raw
+    /// remainder of the command line with exactly one separating space
+    /// stripped, so leading whitespace in the keys is preserved the way vim
+    /// preserves it.
+    Normal { range: LineRange, keys: String },
+    /// `:earlier {count}` (`redo == false`) / `:later {count}` (`redo == true`):
+    /// step `count` states back through undo history, or forward through redo.
+    /// `count` is `None` when the argument was a *time* form (`5m`, `1h`) that
+    /// kvim does not support yet — the executor reports that rather than
+    /// silently doing the wrong thing. See bead kopitiam-cj0.47.
+    TimeTravel { count: Option<usize>, redo: bool },
     Delete { range: LineRange },
     NoHighlight,
     Set { key: String, value: Option<String> },
@@ -156,6 +189,14 @@ pub fn parse(input: &str) -> ExCommand {
             LineRange::All => ExCommand::GotoLine(LineSpec::Last),
             LineRange::Pair(_, b) => ExCommand::GotoLine(b),
         };
+    }
+
+    // `:>` and `:<` are the only ex commands whose *name* is not alphabetic,
+    // so they cannot go through the registry's name lookup below — handle them
+    // before the alphabetic name is even extracted. `:>>` (or `:<<<`) repeats
+    // the shift, one shiftwidth per `>`/`<`.
+    if let Some(shift) = parse_shift(range, rest) {
+        return shift;
     }
 
     let name_len = rest.chars().take_while(|c| c.is_ascii_alphabetic()).count();
@@ -208,7 +249,19 @@ pub fn parse(input: &str) -> ExCommand {
         Some(CommandId::WipeBuffer) => ExCommand::DeleteBuffer { force, wipe: true },
         Some(CommandId::ListBuffers) => ExCommand::ListBuffers,
         Some(CommandId::Substitute) => parse_substitute(range, after),
-        Some(CommandId::Global) => parse_global(after),
+        // `:g` (`invert == force`, so `:g!` inverts) and `:v`/`:vglobal`
+        // (always inverted) share `parse_global`; only the starting `invert`
+        // flag differs.
+        Some(CommandId::Global) => parse_global(after, force),
+        Some(CommandId::VGlobal) => parse_global(after, true),
+        Some(CommandId::Sort) => parse_sort(range, arg, force),
+        Some(CommandId::Move) => parse_move_or_copy(range, arg, false),
+        Some(CommandId::Copy) => parse_move_or_copy(range, arg, true),
+        // `:normal` takes its keys from `after` (post-`!`), not the trimmed
+        // `arg`, because a space is significant in a key sequence.
+        Some(CommandId::Normal) => parse_normal(range, after),
+        Some(CommandId::Earlier) => ExCommand::TimeTravel { count: parse_count_arg(arg), redo: false },
+        Some(CommandId::Later) => ExCommand::TimeTravel { count: parse_count_arg(arg), redo: true },
         Some(CommandId::Delete) => ExCommand::Delete { range },
         Some(CommandId::NoHighlight) => ExCommand::NoHighlight,
         Some(CommandId::Set) => parse_set(arg),
@@ -278,14 +331,68 @@ fn parse_substitute(range: LineRange, after: &str) -> ExCommand {
     ExCommand::Substitute { range, pattern, replacement, global: flags.contains('g') }
 }
 
-fn parse_global(after: &str) -> ExCommand {
+fn parse_global(after: &str, invert: bool) -> ExCommand {
     let Some(rest) = after.strip_prefix('/') else {
         return ExCommand::Unknown(format!("g{after}"));
     };
     match rest.find('/') {
-        Some(end) => ExCommand::Global { pattern: rest[..end].to_string(), cmd: rest[end + 1..].to_string() },
+        Some(end) => ExCommand::Global { pattern: rest[..end].to_string(), cmd: rest[end + 1..].to_string(), invert },
         None => ExCommand::Unknown(format!("g{after}")),
     }
+}
+
+/// `:sort` flags follow the command as a run of letters (`:sort un`, `:sort n`).
+/// Only the flags kvim implements are recognized — `u` (unique) and `n`
+/// (numeric); `!` is handled separately as `reverse`. Unknown flag letters are
+/// ignored rather than erroring, which keeps `:sort` forgiving the way vim is.
+fn parse_sort(range: LineRange, arg: &str, reverse: bool) -> ExCommand {
+    ExCommand::Sort { range, reverse, unique: arg.contains('u'), numeric: arg.contains('n') }
+}
+
+/// `:m`/`:t` take a single trailing line address (`0`, `.`, `$`, or a number).
+/// A missing or unparseable address is an error rather than a silent default,
+/// since moving lines to an unknown place is never what was meant.
+fn parse_move_or_copy(range: LineRange, arg: &str, copy: bool) -> ExCommand {
+    match parse_line_spec(arg.trim()) {
+        Some((dest, rest)) if rest.trim().is_empty() => ExCommand::MoveOrCopy { range, dest, copy },
+        _ => ExCommand::Unknown(format!("{}{arg}", if copy { "t" } else { "m" })),
+    }
+}
+
+/// `:{range}normal[!] {keys}`: everything after the command name (and its
+/// optional `!`) is the literal key sequence, with exactly one separating
+/// space removed. An empty sequence is kept as an empty [`ExCommand::Normal`]
+/// so the executor can no-op it cleanly.
+fn parse_normal(range: LineRange, after: &str) -> ExCommand {
+    let keys = after.strip_prefix(' ').unwrap_or(after);
+    ExCommand::Normal { range, keys: keys.to_string() }
+}
+
+/// `:earlier`/`:later` take an optional count. Empty means `1` (one step).
+/// A pure number is that many undo/redo steps. Anything else — a vim *time*
+/// form such as `5m` or `1h` — returns `None`, signalling the executor to
+/// report that kvim does not do time-based travel yet (bead kopitiam-cj0.47).
+fn parse_count_arg(arg: &str) -> Option<usize> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Some(1);
+    }
+    arg.parse::<usize>().ok()
+}
+
+/// Detects the `:>` / `:<` shift commands, which the alphabetic-name path
+/// cannot see. `rest` is the command line past its range prefix. Returns the
+/// parsed [`ExCommand::Shift`] when it starts with `>` or `<`, counting the
+/// run of that character as the shift multiplier (`>>` shifts twice).
+fn parse_shift(range: LineRange, rest: &str) -> Option<ExCommand> {
+    let first = rest.chars().next()?;
+    let right = match first {
+        '>' => true,
+        '<' => false,
+        _ => return None,
+    };
+    let count = rest.chars().take_while(|&c| c == first).count();
+    Some(ExCommand::Shift { range, right, count })
 }
 
 fn parse_set(arg: &str) -> ExCommand {
@@ -339,14 +446,14 @@ pub fn delete_lines(buf: &mut Buffer, first: usize, last: usize) -> crate::Resul
     buf.apply(Edit::delete(range))
 }
 
-/// `:g/pattern/cmd`: runs `cmd` (only `d` and `s/.../.../ [g]` are
-/// supported — see the module docs' scope note) on every line matching
-/// `pattern`, using vim's own algorithm of collecting the matching lines
+/// `:g/pattern/cmd` (and, with `invert`, `:v`/`:g!`): runs `cmd` (only `d` and
+/// `s/.../.../ [g]` are supported — see the module docs' scope note) on every
+/// line matching `pattern` — or, when `invert` is set, every line *not*
+/// matching — using vim's own algorithm of collecting the target lines
 /// *before* running anything, so that a `d` sub-command shrinking the buffer
 /// mid-pass cannot skip or double-hit a line.
-pub fn global(buf: &mut Buffer, pattern: &str, cmd: &str) -> crate::Result<usize> {
-    let re = Regex::new(pattern).map_err(|e| crate::Error::InvalidPattern { pattern: pattern.to_string(), reason: e.to_string() })?;
-    let matching: Vec<usize> = (0..buf.line_count()).filter(|&l| buf.line(l).map(|t| re.is_match(&t)).unwrap_or(false)).collect();
+pub fn global(buf: &mut Buffer, pattern: &str, cmd: &str, invert: bool) -> crate::Result<usize> {
+    let matching = global_matches(buf, pattern, invert)?;
 
     let cmd = cmd.trim();
     if cmd == "d" || cmd == "delete" {
@@ -364,6 +471,160 @@ pub fn global(buf: &mut Buffer, pattern: &str, cmd: &str) -> crate::Result<usize
         return Ok(total);
     }
     Err(crate::Error::UnknownCommand(format!("g/{pattern}/{cmd}")))
+}
+
+/// The 0-based indices of the lines a `:g`/`:v` acts on: those matching
+/// `pattern` (or, with `invert`, those *not* matching), collected up front the
+/// way vim does so a sub-command that resizes the buffer can't skip or
+/// double-hit a line. Scans content lines only (see [`content_line_count`]).
+///
+/// Split out so richer sub-commands than `:g` can run over the same set — in
+/// particular `:g/pat/normal ...`, which the editor drives itself because
+/// running normal-mode keys needs the whole `Editor`, not just a `Buffer`.
+pub fn global_matches(buf: &Buffer, pattern: &str, invert: bool) -> crate::Result<Vec<usize>> {
+    let re = Regex::new(pattern).map_err(|e| crate::Error::InvalidPattern { pattern: pattern.to_string(), reason: e.to_string() })?;
+    Ok((0..content_line_count(buf))
+        .filter(|&l| {
+            let hit = buf.line(l).map(|t| re.is_match(&t)).unwrap_or(false);
+            hit != invert
+        })
+        .collect())
+}
+
+/// The number of *content* lines in `buf`: its raw line count minus the one
+/// phantom empty line that a trailing newline produces (see
+/// [`Buffer::line_count`]'s docs). The line-reordering commands (`:sort`,
+/// `:m`, `:t`, `:>`) work in these terms so they never sweep that phantom
+/// trailing line into a sort or shove it around — which would corrupt the
+/// buffer's trailing-newline state. vim has no such phantom (it tracks
+/// end-of-line separately), so this is how kvim matches vim's line arithmetic.
+pub(crate) fn content_line_count(buf: &Buffer) -> usize {
+    let n = buf.line_count();
+    // A rope ending in `\n` reports one extra, always-empty line. `text()`
+    // ending in `\n` is the precise test; an empty buffer ("") does not, so
+    // it correctly keeps its single line.
+    if buf.text().ends_with('\n') { n - 1 } else { n }
+}
+
+/// The first decimal integer appearing in `s` (with an optional leading `-`),
+/// or `0` if the line has no number — the sort key for `:sort n`. Matching
+/// vim, a line without a number sorts as if it were `0`.
+fn first_number(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = if i > 0 && bytes[i - 1] == b'-' { i - 1 } else { i };
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            return s[start..j].parse().unwrap_or(0);
+        }
+        i += 1;
+    }
+    0
+}
+
+/// `:{range}sort[!] [u][n]`: reorders lines `first..=last` in place.
+///
+/// * `numeric` sorts by [`first_number`] (a *stable* sort, so lines sharing a
+///   number keep their relative order, as vim does);
+/// * otherwise the sort is plain lexical over the whole line;
+/// * `reverse` flips the final order (`:sort!`);
+/// * `unique` drops runs of identical lines *after* sorting (`:sort u`),
+///   comparing the whole line text.
+///
+/// The rewrite replaces exactly the content span of the range, so the buffer's
+/// trailing-newline state is untouched (see [`content_line_count`]).
+pub fn sort_lines(buf: &mut Buffer, first: usize, last: usize, reverse: bool, unique: bool, numeric: bool) -> crate::Result<()> {
+    let content = content_line_count(buf);
+    if content == 0 {
+        return Ok(());
+    }
+    let last = last.min(content - 1);
+    let first = first.min(last);
+    let mut lines: Vec<String> = (first..=last).filter_map(|l| buf.line(l)).collect();
+    if numeric {
+        lines.sort_by_key(|l| first_number(l));
+    } else {
+        lines.sort();
+    }
+    if reverse {
+        lines.reverse();
+    }
+    if unique {
+        lines.dedup();
+    }
+    let joined = lines.join("\n");
+    let range = operator::linewise_content_range(buf, first, last);
+    buf.apply(Edit::replace(range, joined))?;
+    Ok(())
+}
+
+/// `:{range}m {dest}` (`copy == false`) and `:{range}t {dest}` (`copy == true`).
+///
+/// `dest_after` is the 0-based index of the line the range should land *after*,
+/// with `-1` meaning "before the first line" (vim's address `0`). Returns the
+/// 0-based line the cursor should end on (the last line of the moved/copied
+/// text), the way vim leaves the cursor.
+///
+/// The whole thing is computed on a `Vec<String>` of the buffer's content
+/// lines and written back as one edit. Working on the vector sidesteps the
+/// index-shift bug that plagues the naive "delete here, insert there" approach
+/// when the destination sits below the range: after the delete the destination
+/// has moved, and getting that adjustment wrong is the classic `:m` off-by-one.
+pub fn move_or_copy_lines(buf: &mut Buffer, first: usize, last: usize, dest_after: isize, copy: bool) -> crate::Result<usize> {
+    let content = content_line_count(buf);
+    if content == 0 {
+        return Ok(0);
+    }
+    let last = last.min(content - 1);
+    let first = first.min(last);
+    let dest = dest_after.clamp(-1, content as isize - 1);
+
+    // Moving a range to just before it, or into itself, is a no-op (vim
+    // errors; a no-op is the safe, non-destructive equivalent).
+    if !copy && dest >= first as isize - 1 && dest <= last as isize {
+        return Ok(last);
+    }
+
+    let mut lines: Vec<String> = (0..content).filter_map(|l| buf.line(l)).collect();
+    let block: Vec<String> = lines[first..=last].to_vec();
+    let block_len = block.len();
+
+    let cursor_line = if copy {
+        let insert_at = (dest + 1) as usize;
+        for (k, line) in block.into_iter().enumerate() {
+            lines.insert(insert_at + k, line);
+        }
+        insert_at + block_len - 1
+    } else {
+        lines.drain(first..=last);
+        // Below the range the destination shifted up by the block's length
+        // once those lines were removed; above the range it did not.
+        let insert_at = if dest < first as isize { (dest + 1) as usize } else { (dest + 1) as usize - block_len };
+        for (k, line) in block.into_iter().enumerate() {
+            lines.insert(insert_at + k, line);
+        }
+        insert_at + block_len - 1
+    };
+
+    let joined = lines.join("\n");
+    let range = operator::linewise_content_range(buf, 0, content - 1);
+    buf.apply(Edit::replace(range, joined))?;
+    Ok(cursor_line)
+}
+
+/// Resolves a `:m`/`:t` destination address to the 0-based index of the line
+/// to insert *after*, with `-1` meaning "before the first line" (vim's `0`).
+pub(crate) fn resolve_dest(spec: LineSpec, current_line: usize, content: usize) -> isize {
+    match spec {
+        // `:m3` lands after 1-based line 3, i.e. 0-based index 2; `:m0` -> -1.
+        LineSpec::Number(n) => n as isize - 1,
+        LineSpec::Current => current_line as isize,
+        LineSpec::Last => content as isize - 1,
+    }
 }
 
 #[cfg(test)]
@@ -451,7 +712,126 @@ mod tests {
 
     #[test]
     fn parses_global() {
-        assert_eq!(parse("g/foo/d"), ExCommand::Global { pattern: "foo".into(), cmd: "d".into() });
+        assert_eq!(parse("g/foo/d"), ExCommand::Global { pattern: "foo".into(), cmd: "d".into(), invert: false });
+    }
+
+    #[test]
+    fn parses_inverse_global() {
+        // `:v` and `:g!` both invert; `:g` alone does not.
+        assert_eq!(parse("v/foo/d"), ExCommand::Global { pattern: "foo".into(), cmd: "d".into(), invert: true });
+        assert_eq!(parse("vglobal/foo/d"), ExCommand::Global { pattern: "foo".into(), cmd: "d".into(), invert: true });
+        assert_eq!(parse("g!/foo/d"), ExCommand::Global { pattern: "foo".into(), cmd: "d".into(), invert: true });
+    }
+
+    #[test]
+    fn parses_sort_variants() {
+        assert_eq!(parse("sort"), ExCommand::Sort { range: LineRange::None, reverse: false, unique: false, numeric: false });
+        assert_eq!(parse("sort!"), ExCommand::Sort { range: LineRange::None, reverse: true, unique: false, numeric: false });
+        assert_eq!(parse("sort u"), ExCommand::Sort { range: LineRange::None, reverse: false, unique: true, numeric: false });
+        assert_eq!(parse("sort n"), ExCommand::Sort { range: LineRange::None, reverse: false, unique: false, numeric: true });
+        assert_eq!(
+            parse("%sort! un"),
+            ExCommand::Sort { range: LineRange::All, reverse: true, unique: true, numeric: true }
+        );
+    }
+
+    #[test]
+    fn parses_move_and_copy() {
+        assert_eq!(parse("m0"), ExCommand::MoveOrCopy { range: LineRange::None, dest: LineSpec::Number(0), copy: false });
+        assert_eq!(
+            parse("2,3m0"),
+            ExCommand::MoveOrCopy { range: LineRange::Pair(LineSpec::Number(2), LineSpec::Number(3)), dest: LineSpec::Number(0), copy: false }
+        );
+        assert_eq!(parse("t$"), ExCommand::MoveOrCopy { range: LineRange::None, dest: LineSpec::Last, copy: true });
+        assert_eq!(parse("copy ."), ExCommand::MoveOrCopy { range: LineRange::None, dest: LineSpec::Current, copy: true });
+        // A missing destination is an error, not a silent default.
+        assert!(matches!(parse("m"), ExCommand::Unknown(_)));
+    }
+
+    #[test]
+    fn parses_shift() {
+        assert_eq!(parse(">"), ExCommand::Shift { range: LineRange::None, right: true, count: 1 });
+        assert_eq!(parse("<<"), ExCommand::Shift { range: LineRange::None, right: false, count: 2 });
+        assert_eq!(
+            parse("1,4>>"),
+            ExCommand::Shift { range: LineRange::Pair(LineSpec::Number(1), LineSpec::Number(4)), right: true, count: 2 }
+        );
+    }
+
+    #[test]
+    fn parses_normal_preserving_keys() {
+        assert_eq!(parse("normal dw"), ExCommand::Normal { range: LineRange::None, keys: "dw".into() });
+        assert_eq!(parse("norm! Ihi"), ExCommand::Normal { range: LineRange::None, keys: "Ihi".into() });
+        assert_eq!(
+            parse("2,4normal A;"),
+            ExCommand::Normal { range: LineRange::Pair(LineSpec::Number(2), LineSpec::Number(4)), keys: "A;".into() }
+        );
+    }
+
+    #[test]
+    fn parses_earlier_and_later() {
+        assert_eq!(parse("earlier"), ExCommand::TimeTravel { count: Some(1), redo: false });
+        assert_eq!(parse("earlier 3"), ExCommand::TimeTravel { count: Some(3), redo: false });
+        assert_eq!(parse("later 2"), ExCommand::TimeTravel { count: Some(2), redo: true });
+        // A time form (5m) is not supported yet — flagged as `None`.
+        assert_eq!(parse("earlier 5m"), ExCommand::TimeTravel { count: None, redo: false });
+    }
+
+    #[test]
+    fn sort_orders_lines_plain_reverse_unique_numeric() {
+        let mut buf = Buffer::from_str("banana\napple\ncherry\n");
+        sort_lines(&mut buf, 0, 2, false, false, false).unwrap();
+        assert_eq!(buf.text(), "apple\nbanana\ncherry\n");
+
+        let mut buf = Buffer::from_str("banana\napple\ncherry\n");
+        sort_lines(&mut buf, 0, 2, true, false, false).unwrap();
+        assert_eq!(buf.text(), "cherry\nbanana\napple\n");
+
+        let mut buf = Buffer::from_str("b\na\nb\na\n");
+        sort_lines(&mut buf, 0, 3, false, true, false).unwrap();
+        assert_eq!(buf.text(), "a\nb\n");
+
+        // Numeric: "10" must sort after "9", not before it (lexical would flip).
+        let mut buf = Buffer::from_str("item 10\nitem 9\nitem 100\n");
+        sort_lines(&mut buf, 0, 2, false, false, true).unwrap();
+        assert_eq!(buf.text(), "item 9\nitem 10\nitem 100\n");
+    }
+
+    #[test]
+    fn move_relocates_lines_to_after_destination() {
+        // :2,3m0 -> the two lines jump to the top.
+        let mut buf = Buffer::from_str("a\nb\nc\nd\ne\n");
+        let cursor = move_or_copy_lines(&mut buf, 1, 2, -1, false).unwrap();
+        assert_eq!(buf.text(), "b\nc\na\nd\ne\n");
+        assert_eq!(cursor, 1);
+
+        // :1,2m$ -> the two lines jump to the bottom.
+        let mut buf = Buffer::from_str("a\nb\nc\nd\ne\n");
+        move_or_copy_lines(&mut buf, 0, 1, 4, false).unwrap();
+        assert_eq!(buf.text(), "c\nd\ne\na\nb\n");
+    }
+
+    #[test]
+    fn copy_duplicates_lines_after_destination() {
+        // :1t$ -> a copy of line 1 lands at the bottom.
+        let mut buf = Buffer::from_str("a\nb\nc\n");
+        let cursor = move_or_copy_lines(&mut buf, 0, 0, 2, true).unwrap();
+        assert_eq!(buf.text(), "a\nb\nc\na\n");
+        assert_eq!(cursor, 3);
+
+        // :2t0 -> a copy of line 2 lands at the top; originals untouched.
+        let mut buf = Buffer::from_str("a\nb\nc\n");
+        move_or_copy_lines(&mut buf, 1, 1, -1, true).unwrap();
+        assert_eq!(buf.text(), "b\na\nb\nc\n");
+    }
+
+    #[test]
+    fn inverse_global_deletes_non_matching_lines() {
+        // :v/keep/d removes every line that does NOT contain "keep".
+        let mut buf = Buffer::from_str("keep me\ndrop me\nkeep this\ntoss\n");
+        let n = global(&mut buf, "keep", "d", true).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(buf.text(), "keep me\nkeep this\n");
     }
 
     #[test]
