@@ -358,4 +358,38 @@ mod tests {
         assert_eq!(branch, "feature/foo");
         assert!(!detached);
     }
+
+    /// Pure fixture, no `git` binary: a hand-written detached-HEAD `HEAD`
+    /// (a raw object id, no `ref:` prefix) reports the short 7-char sha and the
+    /// `detached` flag, without shelling out or panicking.
+    #[test]
+    fn read_head_handles_a_hand_written_detached_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "0189895abcdef0123456789abcdef0123456789a\n").unwrap();
+        let (branch, detached) = read_head(&dir.path().join(".git")).unwrap();
+        assert_eq!(branch, "0189895");
+        assert!(detached);
+    }
+
+    /// Pure fixture, no `git` binary: a linked worktree's `.git` is a *file*
+    /// (`gitdir: <path>`, here relative) pointing at the real git directory.
+    /// [`find_git_dir`]/[`status`] must follow it and resolve the branch there,
+    /// exactly as git resolves a worktree's HEAD. See the module docs.
+    #[test]
+    fn status_follows_a_worktree_dot_git_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // The actual git directory the worktree points at.
+        let real_git = dir.path().join("real-git");
+        std::fs::create_dir(&real_git).unwrap();
+        std::fs::write(real_git.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        // The worktree: a `.git` *file* with a relative `gitdir:` line.
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../real-git\n").unwrap();
+
+        let st = status(&worktree).expect("a `.git` file worktree is still a repo");
+        assert_eq!(st.branch, "wt-branch");
+        assert!(!st.detached);
+    }
 }

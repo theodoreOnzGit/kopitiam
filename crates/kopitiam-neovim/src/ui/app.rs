@@ -33,7 +33,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
 use unicode_segmentation::UnicodeSegmentation;
@@ -48,6 +48,7 @@ use crate::core::{BufferId, Direction, Mode, Position, Range, ViewportScroll, Wi
 use crate::editor::ex::QuickfixCommand;
 use crate::editor::quickfix::{ListKind, NavError, QuickfixEntry, QuickfixList};
 use crate::icons::IconSet;
+use crate::plugins::git::GitStatus;
 use crate::plugins::grep;
 use crate::plugins::harpoon::Harpoon;
 use crate::plugins::picker::walk_files;
@@ -267,6 +268,23 @@ pub struct App<H: EditorHost> {
     /// [`Harpoon::load`]/[`Harpoon::save`]) is a deliberate follow-up. See
     /// [`crate::plugins::harpoon`].
     harpoon: Harpoon,
+    /// The cached git branch/dirty state shown in the statusline (the
+    /// vim-fugitive/airline slice — see [`crate::plugins::git`]). `None` when
+    /// the active file is not inside a git repository, so the statusline simply
+    /// omits the segment. **Never recomputed per frame:** the branch read is
+    /// cheap, but the dirty check walks the worktree, so this is refreshed on
+    /// the event loop's idle tick (throttled by [`Self::GIT_STATUS_TTL`]) and
+    /// immediately when the active buffer's directory changes — never inside
+    /// [`Self::render_statusline`], which only reads it. See
+    /// [`Self::refresh_git_status`].
+    git_status: Option<GitStatus>,
+    /// The directory [`Self::git_status`] was last computed for. A change here
+    /// (switching to a buffer in a different repository) forces an immediate
+    /// recompute, bypassing the TTL throttle.
+    git_status_dir: Option<PathBuf>,
+    /// When [`Self::git_status`] was last recomputed, so an idle tick can skip
+    /// re-walking the worktree until [`Self::GIT_STATUS_TTL`] has elapsed.
+    git_status_checked: Instant,
 }
 
 /// A navigable list of reference locations (`<leader>gr`).
@@ -367,6 +385,16 @@ impl<H: EditorHost> App<H> {
     /// Not a redraw interval — see the module docs.
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+    /// How stale the cached git status ([`Self::git_status`]) may get before an
+    /// idle tick recomputes it. Reading `.git/HEAD` for the branch is cheap,
+    /// but the dirty check walks the whole worktree, so this bounds that walk to
+    /// at most once per interval on a large repository rather than running it on
+    /// every 250 ms idle tick. A buffer switch to a different directory bypasses
+    /// this and recomputes immediately, so switching repos never shows a stale
+    /// branch; only the dirty flag lags, by at most this long, after an
+    /// external change (a `:w`, a `git checkout` in another terminal).
+    const GIT_STATUS_TTL: Duration = Duration::from_millis(1000);
+
     pub fn new(host: H, options: Options, theme: Theme, icons: IconSet, leader: char) -> Self {
         // Seed the sole window from the editor's *current* buffer, not a
         // hard-coded `BufferId(0)`: `run()` opens the files before building the
@@ -421,6 +449,14 @@ impl<H: EditorHost> App<H> {
             tmux_calls: Vec::new(),
             lua: None,
             harpoon: Harpoon::empty(&cwd),
+            // Computed lazily — not here, so building an `App` in a unit test
+            // never touches the filesystem (same rule as `tmux_prompt`). The
+            // first refresh happens at the top of `run()`; `git_status_dir`
+            // being `None` also makes the first idle-tick refresh recompute
+            // regardless of the throttle.
+            git_status: None,
+            git_status_dir: None,
+            git_status_checked: Instant::now(),
         }
     }
 
@@ -545,13 +581,22 @@ impl<H: EditorHost> App<H> {
     /// hold that guard until after `run` returns), so this function only
     /// needs to know how to draw into whatever `Terminal` it's handed.
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> io::Result<()> {
+        // Read the git branch once before the first paint so the statusline
+        // shows it from frame one, rather than only after the first idle tick.
+        self.refresh_git_status(true);
         terminal.draw(|frame| self.render(frame))?;
         loop {
             if !event::poll(Self::EVENT_POLL_INTERVAL)? {
                 // Idle tick: diagnostics are pushed by the server asynchronously,
                 // so poll for fresh ones here (never on a fixed redraw clock —
-                // see the module docs) and repaint only if they changed.
-                if self.refresh_diagnostics() {
+                // see the module docs) and repaint only if they changed. The git
+                // status is refreshed on the same tick (throttled, and forced
+                // when the active buffer's directory changed) — the one place
+                // the worktree is re-read, never per frame. Both are called
+                // unconditionally so neither short-circuits the other's refresh.
+                let diagnostics_changed = self.refresh_diagnostics();
+                let git_changed = self.refresh_git_status(false);
+                if diagnostics_changed || git_changed {
                     terminal.draw(|frame| self.render(frame))?;
                 }
                 continue;
@@ -3096,6 +3141,65 @@ impl<H: EditorHost> App<H> {
         }
     }
 
+    /// Recomputes the cached git status ([`Self::git_status`]) for the active
+    /// buffer's repository, returning whether the displayed value changed (so
+    /// the caller knows whether a repaint is warranted).
+    ///
+    /// This is the only place the worktree is re-read. It is called from the
+    /// event loop's idle tick, never per frame; [`Self::render_statusline`]
+    /// only *reads* the cache. With `force` false it skips the work entirely
+    /// while the cache is fresh (younger than [`Self::GIT_STATUS_TTL`]) and the
+    /// target directory is unchanged — so an idle repo costs one small
+    /// `.git/HEAD` read plus a bounded worktree walk at most once per TTL. A
+    /// change of target directory (switching to a buffer in another repo)
+    /// always recomputes immediately, regardless of the throttle, so the branch
+    /// on screen is never for the wrong repository.
+    fn refresh_git_status(&mut self, force: bool) -> bool {
+        let dir = self.git_status_dir_target();
+        let dir_changed = self.git_status_dir.as_deref() != Some(dir.as_path());
+        if !force && !dir_changed && self.git_status_checked.elapsed() < Self::GIT_STATUS_TTL {
+            return false;
+        }
+        let new_status = crate::plugins::git::status(&dir);
+        self.git_status_checked = Instant::now();
+        self.git_status_dir = Some(dir);
+        if new_status != self.git_status {
+            self.git_status = new_status;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The directory the git status is resolved from: the active buffer's
+    /// containing directory when it has a real path on disk, else the editor's
+    /// launch directory ([`Self::tree_root`]). A scratch buffer (`[No Name]`)
+    /// has no path, so it inherits the repository kvim was started in — the
+    /// same one airline would show. A bare relative filename has an empty
+    /// parent, which would resolve `.git` against an ambiguous root, so it
+    /// falls back the same way.
+    fn git_status_dir_target(&self) -> PathBuf {
+        if let Some(parent) = self.host.buffer().path().and_then(Path::parent)
+            && !parent.as_os_str().is_empty()
+        {
+            return parent.to_path_buf();
+        }
+        self.tree_root.clone()
+    }
+
+    /// Formats the cached [`GitStatus`] into the statusline segment text, the
+    /// airline way: a branch glyph (Nerd Font `` U+E0A0) and the branch name,
+    /// plus a trailing `*` when the worktree is dirty. When no Nerd Font is
+    /// present the glyph would render as a tofu box, so a plain `git:` prefix is
+    /// used instead — the same graceful-degradation rule the Powerline
+    /// separators follow (see [`Statusline::glyphs`]).
+    fn git_branch_segment(&self) -> Option<String> {
+        let status = self.git_status.as_ref()?;
+        let prefix = if self.glyphs() { "\u{e0a0} " } else { "git:" };
+        let dirty = if status.dirty { "*" } else { "" };
+        Some(format!("{prefix}{}{dirty}", status.branch))
+    }
+
     fn render_statusline(&self, frame: &mut Frame, area: Rect) {
         let buffer = self.host.buffer();
         // Subtle hint while the async LSP client is connecting on its background
@@ -3111,9 +3215,10 @@ impl<H: EditorHost> App<H> {
             file_name: display_file_name(buffer.path()),
             modified: buffer.is_modified(),
             filetype: filetype_from_path(buffer.path()),
-            // Populated by the plugin layer's git integration once it
-            // exists; see `ui/statusline.rs`'s module docs.
-            git_branch: None,
+            // The vim-fugitive/airline branch slice, from the cache refreshed on
+            // the idle tick — this only reads it, never re-walks the repo. See
+            // `Self::refresh_git_status` and `Self::git_branch_segment`.
+            git_branch: self.git_branch_segment(),
             lsp_status,
             cursor: self.host.cursor(),
             line_count: buffer.line_count(),
@@ -3612,6 +3717,69 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// A temp directory carrying a hand-written `.git/HEAD` on `branch`, and an
+    /// app rooted there. The app's buffer is a scratch buffer (no path), so
+    /// [`App::git_status_dir_target`] falls back to `tree_root` — the fixture
+    /// repo. Pure fixture: no `git` binary is invoked (see [`crate::plugins::git`]).
+    fn app_in_fake_repo(branch: &str) -> (tempfile::TempDir, App<FakeHost>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+        let mut app = app_with(vec!["fn main() {}"]);
+        app.tree_root = dir.path().to_path_buf();
+        (dir, app)
+    }
+
+    /// The wired hook: after a refresh, the branch read from `.git/HEAD` shows
+    /// up as a painted statusline segment. ASCII icon tier (`app_with` uses
+    /// [`IconSet::Ascii`]) means the plain `git:` prefix, not the Nerd Font
+    /// glyph, so the exact text is assertable on any terminal.
+    #[test]
+    fn statusline_shows_the_git_branch_segment() {
+        let (_dir, mut app) = app_in_fake_repo("main");
+        app.refresh_git_status(true);
+        let rows = screen(&mut app, 80, 6);
+        assert!(
+            rows.iter().any(|r| r.contains("git:main")),
+            "expected a git:main segment; screen was:\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    /// Outside any repository the segment is `None` and nothing git-related is
+    /// painted — the statusline just omits it, exactly as for the LSP hint.
+    #[test]
+    fn git_branch_segment_is_none_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap(); // no `.git` inside
+        let mut app = app_with(vec!["x"]);
+        app.tree_root = dir.path().to_path_buf();
+        app.refresh_git_status(true);
+        assert!(app.git_branch_segment().is_none());
+        let rows = screen(&mut app, 80, 6);
+        assert!(rows.iter().all(|r| !r.contains("git:")), "no git segment expected:\n{}", rows.join("\n"));
+    }
+
+    /// A dirty worktree gets a trailing `*` (airline's dirty marker).
+    #[test]
+    fn git_branch_segment_shows_a_dirty_marker() {
+        let mut app = app_with(vec!["x"]); // ASCII tier -> `git:` prefix
+        app.git_status = Some(GitStatus { branch: "main".into(), detached: false, dirty: true });
+        assert_eq!(app.git_branch_segment().as_deref(), Some("git:main*"));
+        app.git_status = Some(GitStatus { branch: "main".into(), detached: false, dirty: false });
+        assert_eq!(app.git_branch_segment().as_deref(), Some("git:main"));
+    }
+
+    /// A second refresh within the TTL, with the directory unchanged, does no
+    /// work and reports "unchanged" — this is what keeps the worktree walk off
+    /// the per-frame path. A forced refresh always recomputes.
+    #[test]
+    fn refresh_git_status_is_throttled_within_the_ttl() {
+        let (_dir, mut app) = app_in_fake_repo("main");
+        assert!(app.refresh_git_status(true), "first read establishes the branch");
+        // Immediately after, the cache is fresh and the dir is unchanged.
+        assert!(!app.refresh_git_status(false), "a throttled refresh does no work");
     }
 
     /// A fixture project tree for the quickfix tests: three files under `src/`,
