@@ -94,7 +94,7 @@ mod error;
 mod fetch;
 mod store;
 
-pub use catalog::{Architecture, Artifact, Catalog, ModelSpec};
+pub use catalog::{Architecture, Artifact, Catalog, CatalogProblem, ModelSpec};
 pub use error::Error;
 pub use fetch::{ensure_available, AcquiredModel, Fetcher};
 pub use store::ModelStore;

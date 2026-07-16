@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use kopitiam_models::{
-    ensure_available, Architecture, Artifact, Catalog, Error, Fetcher, ModelSpec,
-    ModelStore,
+    ensure_available, Architecture, Artifact, Catalog, CatalogProblem, Error, Fetcher,
+    ModelSpec, ModelStore,
 };
 
 /// The bytes our fake "model" is made of. Small, known, and hashable.
@@ -264,4 +264,142 @@ fn builtin_checksums_are_placeholders() {
 fn find_returns_known_and_none_for_unknown() {
     assert!(Catalog::find("qwen2.5-0.5b-instruct-q4_0").is_some());
     assert!(Catalog::find("no-such-model").is_none());
+}
+
+// -------------------------------------------------------------------------
+// Catalog validation. Pure-data, fully offline -- no store, no fetcher.
+// -------------------------------------------------------------------------
+
+/// The shipped catalog must validate clean. The 64-zero placeholder sha256 is
+/// well-formed lowercase hex, so it passes the *format* check by design -- this
+/// test locks in that "placeholder is a valid shape" contract.
+#[test]
+fn builtin_catalog_validates_clean() {
+    let problems = Catalog::validate(&Catalog::builtin());
+    assert!(problems.is_empty(), "builtin should be clean, got: {problems:?}");
+}
+
+/// The dangerous one: a spec with no artifacts. Both `is_present` and `verify`
+/// pass vacuously on it, so validation is the only thing standing between a
+/// bytes-less spec and it counting as "acquired".
+#[test]
+fn no_artifacts_is_flagged_and_would_falsely_verify() {
+    let dir = tempdir().unwrap();
+    let store = ModelStore::with_root(dir.path());
+    let mut spec = one_artifact_spec(fake_sha256());
+    spec.artifacts.clear();
+
+    // Prove the latent bug that motivates the check: empty artifacts => both
+    // present() and verify() pass with nothing on disk.
+    assert!(store.is_present(&spec), "empty artifacts: is_present vacuously true");
+    store.verify(&spec).expect("empty artifacts: verify vacuously ok");
+
+    // ...and validation is what catches it.
+    let problems = spec.validate();
+    assert!(
+        problems.contains(&CatalogProblem::NoArtifacts {
+            id: "test-model".to_string()
+        }),
+        "want NoArtifacts, got: {problems:?}"
+    );
+}
+
+/// Duplicate ids across the catalog: `Catalog::find` returns only the first, so
+/// the later copy is silently shadowed. Reported once per extra copy.
+#[test]
+fn duplicate_model_id_is_flagged() {
+    let a = one_artifact_spec(fake_sha256());
+    let b = one_artifact_spec(fake_sha256()); // same id "test-model"
+    let problems = Catalog::validate(&[a, b]);
+    assert!(
+        problems.contains(&CatalogProblem::DuplicateModelId {
+            id: "test-model".to_string()
+        }),
+        "want DuplicateModelId, got: {problems:?}"
+    );
+}
+
+/// Two artifacts in one spec with the same filename collide on the same on-disk
+/// path `<root>/<id>/<filename>`.
+#[test]
+fn duplicate_artifact_filename_is_flagged() {
+    let mut spec = one_artifact_spec(fake_sha256());
+    spec.artifacts.push(Artifact {
+        filename: "model.gguf".to_string(), // same as the first
+        url: "https://example.invalid/other.gguf".to_string(),
+        sha256: fake_sha256(),
+        size_bytes: 1,
+    });
+    let problems = spec.validate();
+    assert!(
+        problems.contains(&CatalogProblem::DuplicateArtifactFilename {
+            id: "test-model".to_string(),
+            filename: "model.gguf".to_string(),
+        }),
+        "want DuplicateArtifactFilename, got: {problems:?}"
+    );
+}
+
+/// A malformed sha256 (wrong length, uppercase, non-hex) is caught. Uppercase
+/// is rejected on purpose -- the crate compares lowercase hex throughout.
+#[test]
+fn malformed_sha256_is_flagged() {
+    for bad in ["", "abc", &"A".repeat(64), &"g".repeat(64), &"0".repeat(63)] {
+        let spec = one_artifact_spec(bad.to_string());
+        let problems = spec.validate();
+        assert!(
+            problems.iter().any(|p| matches!(
+                p,
+                CatalogProblem::MalformedSha256 { sha256, .. } if sha256 == bad
+            )),
+            "want MalformedSha256 for {bad:?}, got: {problems:?}"
+        );
+    }
+    // And the 64-zero placeholder must NOT be flagged -- valid format.
+    let ok = one_artifact_spec("0".repeat(64));
+    assert!(
+        !ok.validate()
+            .iter()
+            .any(|p| matches!(p, CatalogProblem::MalformedSha256 { .. })),
+        "64-zero placeholder must pass the format check"
+    );
+}
+
+/// Empty id, empty filename and empty url are each flagged.
+#[test]
+fn empty_fields_are_flagged() {
+    // Empty id.
+    let mut spec = one_artifact_spec(fake_sha256());
+    spec.id = String::new();
+    assert!(spec
+        .validate()
+        .iter()
+        .any(|p| matches!(p, CatalogProblem::EmptyModelId { .. })));
+
+    // Empty filename and empty url on the artifact.
+    let spec = ModelSpec {
+        id: "x".to_string(),
+        display_name: "X".to_string(),
+        architecture: Architecture::Other("t".to_string()),
+        license: "Apache-2.0".to_string(),
+        artifacts: vec![Artifact {
+            filename: String::new(),
+            url: String::new(),
+            sha256: fake_sha256(),
+            size_bytes: 0,
+        }],
+    };
+    let problems = spec.validate();
+    assert!(
+        problems
+            .iter()
+            .any(|p| matches!(p, CatalogProblem::EmptyArtifactFilename { .. })),
+        "want EmptyArtifactFilename, got: {problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| matches!(p, CatalogProblem::EmptyArtifactUrl { .. })),
+        "want EmptyArtifactUrl, got: {problems:?}"
+    );
 }
