@@ -204,16 +204,35 @@ impl Widget for CompletionMenu<'_> {
     }
 }
 
-/// The rectangle a menu of `rows` rows and `width` columns occupies, anchored to
-/// the cursor cell `(cx, cy)` inside `area`.
+/// Which side of the cursor line a cursor-anchored popup want to sit on, *before*
+/// we flip at the edge. Two popup anchor at the cursor but lean opposite side one:
+/// the completion menu drop **below** the word you typing (so it never block the
+/// word), but the LSP hover box sit **above** the cursor line same like how
+/// `vim.lsp.buf.hover` do. Same flip-and-clamp maths, just the starting side
+/// different — so [`anchored_rect`] take this enum instead of keeping two almost-
+/// same copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// Try the line below the cursor first; only flip above if cannot fit.
+    Below,
+    /// Try the lines above the cursor first; only flip below if cannot fit.
+    Above,
+}
+
+/// The rectangle for a box of `rows` rows and `width` columns, anchored at the
+/// cursor cell `(cx, cy)` inside `area`.
 ///
-/// Drops the box on the line **below** the cursor by default (so it does not
-/// cover the text being typed), flipping to **above** when there is no room
-/// underneath — the standard IDE popup placement. Horizontally it starts at the
-/// cursor column, shifted left just enough to stay inside `area`. Height is
-/// `rows + 2` (borders), capped so it never exceeds the available space on the
-/// chosen side.
-pub fn menu_rect(area: Rect, cursor: (u16, u16), rows: usize, width: u16) -> Rect {
+/// Up-down wise it prefer whichever side `anchor` say (below for the completion
+/// menu, above for the hover box), and only flip to the other side when the
+/// preferred side cannot fit the box *and* the other side got strictly more room —
+/// standard IDE popup placement lah. Left-right wise the box start at the cursor
+/// column, then shift left just enough to stay inside `area`. Height is `rows + 2`
+/// (the borders), capped so it never overflow the space got on the chosen side.
+///
+/// This is the one and only anchoring maths in the whole crate: both the completion
+/// menu ([`menu_rect`]) and the LSP hover popup go through here, so their edge
+/// behaviour always the same, never drift apart.
+pub fn anchored_rect(area: Rect, cursor: (u16, u16), rows: usize, width: u16, anchor: Anchor) -> Rect {
     let (cx, cy) = cursor;
     let width = width.min(area.width).max(4);
 
@@ -222,20 +241,46 @@ pub fn menu_rect(area: Rect, cursor: (u16, u16), rows: usize, width: u16) -> Rec
     let above = cy.saturating_sub(area.y);
 
     let wanted = rows as u16 + 2; // borders
-    // Prefer below; flip above only if below cannot fit the box and above has
-    // strictly more room.
-    let (y, height) = if wanted <= below || below >= above {
-        let h = wanted.min(below).max(3);
-        (cy + 1, h)
-    } else {
-        let h = wanted.min(above).max(3);
+
+    // Place the box below the cursor line, starting at `cy + 1`.
+    let place_below = |room: u16| -> (u16, u16) { (cy + 1, wanted.min(room).max(3)) };
+    // Place the box above the cursor line, ending at `cy` (exclusive).
+    let place_above = |room: u16| -> (u16, u16) {
+        let h = wanted.min(room).max(3);
         (cy.saturating_sub(h), h)
+    };
+
+    let (y, height) = match anchor {
+        // Prefer below; flip above only if below cannot fit and above has more room.
+        Anchor::Below => {
+            if wanted <= below || below >= above {
+                place_below(below)
+            } else {
+                place_above(above)
+            }
+        }
+        // Prefer above; flip below only if above cannot fit and below has more room.
+        Anchor::Above => {
+            if wanted <= above || above >= below {
+                place_above(above)
+            } else {
+                place_below(below)
+            }
+        }
     };
 
     // Clamp x so the whole box stays inside `area`.
     let max_x = area.x + area.width.saturating_sub(width);
     let x = cx.min(max_x).max(area.x);
     Rect { x, y, width, height }
+}
+
+/// The rectangle for a completion menu of `rows` rows and `width` columns, anchored
+/// just below the cursor cell `(cx, cy)`. Just a thin wrapper over [`anchored_rect`]
+/// with [`Anchor::Below`] — the placement a blink.cmp-style popup want: drop under
+/// the word you typing, and flip above only when near the bottom edge.
+pub fn menu_rect(area: Rect, cursor: (u16, u16), rows: usize, width: u16) -> Rect {
+    anchored_rect(area, cursor, rows, width, Anchor::Below)
 }
 
 #[cfg(test)]
@@ -338,6 +383,32 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 40, height: 24 };
         // Cursor near the right edge with a wide box: it must not overflow.
         let rect = menu_rect(area, (38, 2), 2, 30);
+        assert!(rect.x + rect.width <= area.width, "the box must not overflow the right edge: {rect:?}");
+    }
+
+    #[test]
+    fn anchored_above_sits_above_the_cursor_and_col_aligns() {
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        // Plenty of room above row 10: the box (hover-style) must sit above it.
+        let rect = anchored_rect(area, (12, 10), 3, 30, Anchor::Above);
+        assert_eq!(rect.height, 5, "3 rows + 2 borders");
+        assert_eq!(rect.y + rect.height, 10, "the box's bottom border must touch the cursor row (10)");
+        assert_eq!(rect.x, 12, "and start at the cursor column");
+    }
+
+    #[test]
+    fn anchored_above_flips_below_near_the_top_edge() {
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        // Cursor on row 1: not enough room above, so an Above popup flips below.
+        let rect = anchored_rect(area, (5, 1), 6, 30, Anchor::Above);
+        assert!(rect.y > 1, "the box must flip to below the cursor row: {rect:?}");
+        assert_eq!(rect.y, 2, "starting on the line just below the cursor");
+    }
+
+    #[test]
+    fn anchored_above_clamps_the_right_edge() {
+        let area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let rect = anchored_rect(area, (38, 10), 2, 30, Anchor::Above);
         assert!(rect.x + rect.width <= area.width, "the box must not overflow the right edge: {rect:?}");
     }
 }

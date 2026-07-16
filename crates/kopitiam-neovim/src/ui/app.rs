@@ -48,7 +48,7 @@ use crate::core::{BufferId, Direction, Mode, Position, Range, ViewportScroll, Wi
 use crate::icons::IconSet;
 use crate::lsp::completion::{self, CompletionItem as CItem, CompletionSource};
 use crate::lsp::{Location as LspLocation, LspClient};
-use crate::ui::completion_menu::{menu_rect, CompletionMenu as CompletionMenuWidget};
+use crate::ui::completion_menu::{anchored_rect, menu_rect, Anchor, CompletionMenu as CompletionMenuWidget};
 use crate::ui::lsp_ui::{centered_rect, InfoBox};
 use crate::ui::snippet::SnippetSession;
 use crate::ui::cmdline::{Cmdline, CmdlineState, PromptKind, StatusMessage};
@@ -217,6 +217,16 @@ struct RenameState {
 /// The most rows the completion popup shows at once before it starts to scroll
 /// to keep the selection visible — a blink.cmp-ish height.
 const MAX_COMPLETION_ROWS: usize = 8;
+
+/// How many content rows the cursor-anchored hover box will paint before it stop
+/// growing — a long rust-analyzer doc string kena truncate instead of eating up the
+/// whole window. After this, [`anchored_rect`] still cap it again to whatever room
+/// got on the chosen side of the cursor.
+const MAX_HOVER_ROWS: usize = 16;
+
+/// How wide the hover box can go, in columns, before the lines kena clip. This stop
+/// a long type signature from stretching the popup across the whole terminal.
+const MAX_HOVER_WIDTH: u16 = 72;
 
 /// The open insert-mode completion popup: the ranked candidates, which one is
 /// selected, and where the accepted text replaces from.
@@ -1758,7 +1768,7 @@ impl<H: EditorHost> App<H> {
     /// mutually exclusively). See [`crate::ui::lsp_ui`].
     fn render_lsp_popups(&self, frame: &mut Frame, area: Rect) {
         if let Some(lines) = &self.lsp_hover {
-            let rect = popup_rect_for(area, lines, 60, "hover");
+            let rect = hover_rect(area, lines, self.last_cursor_screen);
             frame.render_widget(
                 InfoBox { title: "hover", lines, selected: None, theme: &self.theme, scroll: 0 },
                 rect,
@@ -2274,6 +2284,30 @@ fn popup_rect_for(area: Rect, lines: &[String], max_width: u16, title: &str) -> 
     let width = (longest.max(title.len()) as u16 + 4).min(max_width);
     let height = lines.len() as u16 + 2;
     centered_rect(area, width, height)
+}
+
+/// The rectangle for the LSP hover box, anchored **at the cursor** same like how
+/// Neovim's `vim.lsp.buf.hover` place it: size follow the hover content (widest line
+/// capped at [`MAX_HOVER_WIDTH`], up to [`MAX_HOVER_ROWS`] rows only), and drop it
+/// just *above* the cursor line, flip *below* only when the cursor too near the top
+/// edge. All the flip-and-clamp go through the shared [`anchored_rect`] the
+/// completion menu also use, so hover and completion behave the same at the screen
+/// edges, no need maintain two copies.
+///
+/// `cursor` is the last painted cursor cell ([`App::last_cursor_screen`]). If got
+/// nothing there — means no buffer had focus this frame, so no proper place to anchor
+/// — then the box just fall back to the old centred placement, better than anyhow
+/// guess a corner.
+fn hover_rect(area: Rect, lines: &[String], cursor: Option<(u16, u16)>) -> Rect {
+    let Some(cursor) = cursor else {
+        return popup_rect_for(area, lines, 60, "hover");
+    };
+    let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    // +4: the two border columns plus a leading/trailing pad; the title ("hover")
+    // sets a floor so it is never clipped by a shorter body.
+    let width = (longest.max("hover".len()) as u16 + 4).min(MAX_HOVER_WIDTH);
+    let rows = lines.len().min(MAX_HOVER_ROWS);
+    anchored_rect(area, cursor, rows, width, Anchor::Above)
 }
 
 /// A minimal, dependency-free filetype guess from a file extension, for the
@@ -3363,5 +3397,144 @@ mod tests {
         assert!(app.hop.is_none(), "operator-composed f must not start a hop");
         app.handle_event(key_event('('));
         assert_eq!(app.host.buffer().text(), "bar)baz\n", "df( deleted through the paren");
+    }
+
+    // --- LSP hover popup: cursor-anchored placement (kopitiam-cj0.29) ---
+    //
+    // These assert on the *painted border cells* of the hover box relative to a
+    // known cursor cell, not on a fixed screen corner — the whole point of the
+    // change. The first three drive the production `hover_rect` geometry directly;
+    // the last renders the whole editor and proves `render_lsp_popups` really does
+    // read `last_cursor_screen` (so the box tracks the live cursor, not the centre).
+
+    /// Renders the hover box for `lines` anchored at the screen cell `cursor` into a
+    /// fresh `w`×`h` backend, returning the computed rect and the painted buffer so a
+    /// test can assert on the actual border glyphs.
+    fn render_hover(
+        lines: &[String],
+        cursor: (u16, u16),
+        w: u16,
+        h: u16,
+    ) -> (Rect, ratatui::buffer::Buffer) {
+        let theme = Theme::gruvbox_dark();
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let captured = std::cell::Cell::new(Rect::default());
+        terminal
+            .draw(|frame| {
+                let rect = hover_rect(frame.area(), lines, Some(cursor));
+                captured.set(rect);
+                frame.render_widget(
+                    InfoBox { title: "hover", lines, selected: None, theme: &theme, scroll: 0 },
+                    rect,
+                );
+            })
+            .unwrap();
+        (captured.get(), terminal.backend().buffer().clone())
+    }
+
+    #[test]
+    fn hover_box_sits_just_above_and_column_aligned_with_the_cursor() {
+        let lines = vec!["fn greet() -> &str".to_string()];
+        let cursor = (12, 10);
+        let (rect, buf) = render_hover(&lines, cursor, 80, 24);
+        // Above the cursor: the box's bottom border row is the row just above it.
+        assert_eq!(
+            rect.y + rect.height,
+            cursor.1,
+            "hover bottom border must be the row directly above the cursor: {rect:?}"
+        );
+        // Column-aligned: the box starts at the cursor column.
+        assert_eq!(rect.x, cursor.0, "hover must start at the cursor column: {rect:?}");
+        // And the border is actually PAINTED there — the bottom-left corner glyph
+        // sits at the cursor column, one row above the cursor.
+        let corner = buf.cell((rect.x, rect.y + rect.height - 1)).unwrap();
+        assert_eq!(
+            corner.symbol(),
+            "└",
+            "the box's bottom-left corner must be painted just above the cursor, got {:?}",
+            corner.symbol()
+        );
+        // The cursor column, one row up, must carry a bottom-border cell — proof the
+        // box is adjacent to the cursor, not floating in a corner.
+        let above_cursor = buf.cell((cursor.0, cursor.1 - 1)).unwrap();
+        assert!(
+            matches!(above_cursor.symbol(), "─" | "└" | "┘"),
+            "a bottom-border cell must sit directly above the cursor column, got {:?}",
+            above_cursor.symbol()
+        );
+    }
+
+    #[test]
+    fn hover_box_flips_below_when_the_cursor_is_near_the_top_edge() {
+        // Eight content lines but the cursor on the second row: no room above, so
+        // the Above-preferring hover box must flip to below the cursor.
+        let lines: Vec<String> = (0..8).map(|i| format!("line {i}")).collect();
+        let cursor = (5, 1);
+        let (rect, buf) = render_hover(&lines, cursor, 80, 24);
+        assert!(
+            rect.y > cursor.1,
+            "near the top edge the box must flip to below the cursor: {rect:?}"
+        );
+        assert_eq!(rect.y, cursor.1 + 1, "flipped box starts on the line just below the cursor");
+        // Painted proof: a top-border cell sits directly below the cursor column.
+        let below_cursor = buf.cell((cursor.0, cursor.1 + 1)).unwrap();
+        assert!(
+            matches!(below_cursor.symbol(), "─" | "┌" | "┐"),
+            "a top-border cell must sit directly below the cursor column, got {:?}",
+            below_cursor.symbol()
+        );
+    }
+
+    #[test]
+    fn hover_box_clamps_to_the_right_edge() {
+        let lines =
+            vec!["a very long hover line that would happily overflow the terminal".to_string()];
+        // Cursor hard against the right edge of an 80-column screen.
+        let cursor = (78, 10);
+        let (rect, _buf) = render_hover(&lines, cursor, 80, 24);
+        assert!(
+            rect.x + rect.width <= 80,
+            "the hover box must not run off the right edge: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn full_render_anchors_hover_next_to_the_live_cursor_not_the_centre() {
+        // A tall-enough buffer so the cursor line has room above it and the window
+        // does not scroll; the cursor sits well left of screen centre so a still-
+        // centred (old) box would visibly fail the adjacency assertions below.
+        let lines: Vec<&str> = (0..15).map(|_| "let something_here = compute_value();").collect();
+        let mut app = app_with(lines);
+        app.host.cursor = Position::new(8, 3);
+        app.lsp_hover = Some(vec!["pub fn compute_value() -> i64".to_string(), "the docs".to_string()]);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let (cx, cy) = app.last_cursor_screen.expect("the buffer cursor must be captured this frame");
+        // Find the hover box by its top-left corner glyph. `┌` is painted nowhere
+        // else on a plain-text buffer, so this locates the box unambiguously.
+        let corner = (0..24)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .find(|&(x, y)| buf.cell((x, y)).unwrap().symbol() == "┌");
+        let (bx, by) = corner.expect("the hover box's top-left corner must be painted");
+
+        // Column-aligned to the cursor (there is room, no right clamp needed here).
+        assert_eq!(bx, cx, "the hover box must start at the cursor column, not the screen centre");
+        // Vertically adjacent above the cursor: the box's bottom border is at cy-1.
+        // Its bottom row is the last painted border row of this box in column bx.
+        let bottom = (by..24)
+            .take_while(|&y| {
+                let s = buf.cell((bx, y)).unwrap().symbol();
+                s == "┌" || s == "│" || s == "└"
+            })
+            .last()
+            .unwrap();
+        assert_eq!(
+            bottom + 1,
+            cy,
+            "the hover box's bottom border must be the row directly above the live cursor (cx={cx}, cy={cy}), box at ({bx},{by})..={bottom}"
+        );
     }
 }
