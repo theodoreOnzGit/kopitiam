@@ -42,9 +42,20 @@ tracing-subscriber = "0.3"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Scientific
+# Linear algebra / n-dimensional arrays
 nalgebra = "0.34"
 ndarray = "0.16"
+
+# GPU parallel-compute foundation (kopitiam-gpu). wgpu is NON-OPTIONAL at compile
+# on purpose -- no feature gate -- so the GPU path is always in the binary and the
+# absence of a GPU is handled at RUNTIME by a Result cascade (GPU -> CPU), never
+# by a build-time cfg. wgpu Cargo-builds with pure-Rust backends (no C toolchain
+# at build time); it only needs GPU drivers at RUNTIME. See AID-0037.
+# `pollster` blocks on wgpu's async adapter/device/buffer-map futures; `bytemuck`
+# reinterprets `&[f32]` as the `&[u8]` byte slices wgpu buffers speak.
+wgpu = "30"
+pollster = "0.4"
+bytemuck = "1"
 
 # Utilities
 itertools = "0.14"
