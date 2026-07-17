@@ -35,6 +35,7 @@ pub mod digraph;
 pub mod ex;
 pub mod fold;
 pub mod help;
+pub mod indent;
 pub mod key;
 pub mod motion;
 pub mod operator;
@@ -886,7 +887,36 @@ impl Editor {
             }
         }
 
+        self.follow_folds_after_edits();
         result
+    }
+
+    /// Shift the active buffer's manual folds to follow whatever text edits this
+    /// keystroke just made, so a fold keeps covering the same lines after an
+    /// insert or delete above/inside it.
+    ///
+    /// Folds are line-numbered and editor-owned, so — unlike the buffer's own
+    /// char-offset marks, which ride along inside `raw_apply` — they cannot fix
+    /// themselves up in place. Instead every rope mutation (ordinary edit *and*
+    /// undo/redo replay) leaves a `crate::text::LineEdit` in the buffer's
+    /// journal; here, once per keystroke, we drain that journal and replay each
+    /// entry onto the fold set with [`fold::FoldSet::shift_lines`]. Draining
+    /// unconditionally (even when the buffer has no folds) keeps the journal
+    /// from growing without bound.
+    ///
+    /// Runs at the tail of [`Self::handle_key`], which is the crate's single
+    /// input funnel, so by the time the next keystroke or a render reads the
+    /// folds they are already back in step with the text.
+    fn follow_folds_after_edits(&mut self) {
+        let line_edits = self.current_buffer_mut().take_line_edits();
+        if line_edits.is_empty() {
+            return;
+        }
+        if let Some(folds) = self.folds.get_mut(&self.current) {
+            for edit in &line_edits {
+                folds.shift_lines(edit);
+            }
+        }
     }
 
     fn commit_dot(&mut self) {
@@ -2530,18 +2560,46 @@ impl Editor {
         self.begin_insert_group();
         match pos {
             InsertPos::NewLineBelow => {
+                // `o`: the line we open from is the indent reference. Read it
+                // before the edit, split after it, then lay the auto-indent on
+                // the fresh line below.
+                let reference = self.current_buffer().line(line).unwrap_or_default();
                 let at = Position::new(line, self.current_buffer().line_len(line));
                 self.current_buffer_mut().apply(Edit::insert(at, "\n".to_string()))?;
-                self.cursor = Position::new(line + 1, 0);
+                self.cursor = self.autoindent_fresh_line(line + 1, &reference)?;
             }
             InsertPos::NewLineAbove => {
+                // `O`: the current line gets pushed down and is the reference.
+                // Read it first, open a blank line above, indent that.
+                let reference = self.current_buffer().line(line).unwrap_or_default();
                 self.current_buffer_mut().apply(Edit::insert(Position::new(line, 0), "\n".to_string()))?;
-                self.cursor = Position::new(line, 0);
+                self.cursor = self.autoindent_fresh_line(line, &reference)?;
             }
             _ => {}
         }
         self.mode = Mode::Insert;
         Ok(EditorResponse::Continue)
+    }
+
+    /// Lay the auto-indent onto a just-opened blank line `new_line`, using
+    /// `reference` (the line `o`/`O` opened from) to decide how deep — copy its
+    /// leading whitespace, plus one level if it opens a block. Returns where the
+    /// cursor should sit: just past the inserted indent (or column 0 of the line
+    /// when there is no indent to add). See [`indent`] for the full contract.
+    ///
+    /// The indent is inserted straight into the buffer, not routed through the
+    /// insert-mode `".` accumulator: it is structural, regenerated whenever the
+    /// keystroke is replayed (dot-repeat feeds the raw `o`/`O` back through
+    /// [`Self::handle_key`], which re-derives it), so it must not double up in
+    /// the "last inserted text" register.
+    fn autoindent_fresh_line(&mut self, new_line: usize, reference: &str) -> crate::Result<Position> {
+        let sw = self.options.shiftwidth.resolve(self.options.tabstop);
+        let indent = indent::new_line_indent(reference, sw, self.options.expandtab);
+        if indent.is_empty() {
+            return Ok(Position::new(new_line, 0));
+        }
+        let landed = self.current_buffer_mut().apply(Edit::insert(Position::new(new_line, 0), indent))?;
+        Ok(landed)
     }
 
     fn leave_insert(&mut self) {
@@ -2658,10 +2716,21 @@ impl Editor {
                 Ok(EditorResponse::Continue)
             }
             KeyCode::Enter => {
+                // Split the line, carrying indent onto the new lower half: copy
+                // the current line's leading whitespace (autoindent), plus one
+                // level if the text *before the cursor* ends with an opener
+                // (smartindent). The prefix — line start up to the cursor — is
+                // what we just finished typing, so it is the right reference for
+                // "did we just open a block". Anything after the cursor rides
+                // down after the indent.
                 let cur = self.cursor;
-                let pos = self.current_buffer_mut().apply(Edit::insert(cur, "\n".to_string()))?;
+                let prefix = self.current_buffer().slice(Range::new(Position::new(cur.line, 0), cur));
+                let sw = self.options.shiftwidth.resolve(self.options.tabstop);
+                let indent = indent::new_line_indent(&prefix, sw, self.options.expandtab);
+                let text = format!("\n{indent}");
+                let pos = self.current_buffer_mut().apply(Edit::insert(cur, text.clone()))?;
                 self.cursor = pos;
-                self.note_inserted("\n");
+                self.note_inserted(&text);
                 Ok(EditorResponse::Continue)
             }
             KeyCode::Backspace => {
@@ -2730,6 +2799,12 @@ impl Editor {
             }
             _ => {
                 if let Some(c) = key.as_char() {
+                    // Smartindent close: a lone `}`/`)`/`]` typed as the first
+                    // thing on an auto-indented line pulls the line back one
+                    // level so the closer lines up under its opener.
+                    if matches!(c, '}' | ')' | ']') {
+                        self.maybe_dedent_closer()?;
+                    }
                     let cur = self.cursor;
                     let pos = self.current_buffer_mut().apply(Edit::insert(cur, c.to_string()))?;
                     self.cursor = pos;
@@ -2738,6 +2813,30 @@ impl Editor {
                 Ok(EditorResponse::Continue)
             }
         }
+    }
+
+    /// Smartindent's closing half: if the cursor sits on a line that is nothing
+    /// but leading whitespace so far (the auto-indent from `o`/`O`/`<Enter>`,
+    /// untouched), dedent it one level before the closing bracket goes in, so a
+    /// lone `}`/`)`/`]` ends up aligned with its opener rather than one level in.
+    ///
+    /// The actual dedent reuses [`operator::indent_line`] — the same primitive
+    /// `<<` and `<C-d>` bottom out in — so mixed tabs/spaces and the "never past
+    /// column 0" rule are handled in one place. The cursor then rides to the new
+    /// end of the (shorter) leading whitespace, ready for the closer to be typed.
+    fn maybe_dedent_closer(&mut self) -> crate::Result<()> {
+        let line = self.cursor.line;
+        let cur = self.cursor;
+        let before = self.current_buffer().slice(Range::new(Position::new(line, 0), cur));
+        if !indent::wants_closer_dedent(&before) {
+            return Ok(());
+        }
+        let sw = self.options.shiftwidth.resolve(self.options.tabstop);
+        let expandtab = self.options.expandtab;
+        operator::indent_line(self.current_buffer_mut(), line, sw, expandtab, false)?;
+        let len = self.current_buffer().line_len(line);
+        self.cursor = Position::new(line, len);
+        Ok(())
     }
 
     /// `<C-w>` in Insert mode: delete the word before the cursor.
@@ -4281,6 +4380,126 @@ mod tests {
         feed(&mut ed, "U"); // U now works on line 1 only
         assert_eq!(ed.buffer().line(1).as_deref(), Some("two"), "U restores the line last changed");
         assert_eq!(ed.buffer().line(0).as_deref(), Some("ne"), "the earlier line is left as it was");
+    }
+
+    // -----------------------------------------------------------------
+    // Folds follow buffer edits (shift-on-edit wired through handle_key).
+    // -----------------------------------------------------------------
+
+    fn eight_lines() -> Editor {
+        editor_with("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7")
+    }
+
+    #[test]
+    fn fold_shifts_down_when_a_line_is_opened_above() {
+        let mut ed = eight_lines();
+        let id = ed.current;
+        ed.folds.entry(id).or_default().create(4, 6); // closed fold on lines 4..=6
+        feed(&mut ed, "O<Esc>"); // open a blank line above line 0
+        assert_eq!(ed.collapsed_folds_for(id), vec![(5, 7)], "one line in above -> fold slides down one");
+    }
+
+    #[test]
+    fn fold_shifts_up_when_a_line_above_is_deleted() {
+        let mut ed = eight_lines();
+        let id = ed.current;
+        ed.folds.entry(id).or_default().create(4, 6);
+        feed(&mut ed, "dd"); // delete line 0
+        assert_eq!(ed.collapsed_folds_for(id), vec![(3, 5)], "one line gone above -> fold slides up one");
+    }
+
+    #[test]
+    fn fold_rides_back_on_undo() {
+        let mut ed = eight_lines();
+        let id = ed.current;
+        ed.folds.entry(id).or_default().create(4, 6);
+        feed(&mut ed, "dd");
+        assert_eq!(ed.collapsed_folds_for(id), vec![(3, 5)]);
+        feed(&mut ed, "u"); // undo re-inserts line 0; the fold must ride back
+        assert_eq!(ed.collapsed_folds_for(id), vec![(4, 6)], "undo restores the fold's lines too");
+    }
+
+    #[test]
+    fn fold_is_dropped_when_its_whole_range_is_deleted() {
+        let mut ed = eight_lines();
+        let id = ed.current;
+        ed.folds.entry(id).or_default().create(4, 6);
+        // `5G` -> line index 4 (1-based line 5); `3dd` deletes indices 4,5,6 —
+        // exactly the folded lines.
+        feed(&mut ed, "5G3dd");
+        assert!(ed.collapsed_folds_for(id).is_empty(), "deleting every folded line drops the fold");
+    }
+
+    // -----------------------------------------------------------------
+    // Auto-indent on `o` / `O` / `<Enter>` (autoindent + smartindent).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn o_after_an_opener_indents_one_level_deeper() {
+        let mut ed = editor_spaces("fn foo() {");
+        feed(&mut ed, "oreturn;<Esc>");
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("    return;"));
+    }
+
+    #[test]
+    fn o_copies_the_reference_line_indent() {
+        let mut ed = editor_spaces("    let x = 1;");
+        feed(&mut ed, "oy = 2;<Esc>");
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("    y = 2;"));
+    }
+
+    #[test]
+    fn big_o_above_matches_the_indent_too() {
+        let mut ed = editor_spaces("        deep();");
+        feed(&mut ed, "Oz();<Esc>");
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("        z();"));
+    }
+
+    #[test]
+    fn typing_a_lone_closer_dedents_to_the_opener() {
+        let mut ed = editor_spaces("fn foo() {");
+        feed(&mut ed, "o}<Esc>"); // o indents to 4 spaces, `}` pulls back to col 0
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("}"));
+    }
+
+    #[test]
+    fn nested_closer_dedents_one_level_only() {
+        // Inside a doubly-nested block: opener at 4 spaces -> `o` gives 8, and a
+        // lone `)` pulls back to 4, lining up under its opener.
+        let mut ed = editor_spaces("    bar(");
+        feed(&mut ed, "o)<Esc>");
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("    )"));
+    }
+
+    #[test]
+    fn o_uses_a_hard_tab_when_expandtab_is_off() {
+        // Default options: expandtab off, so one level is a tab.
+        let mut ed = editor_with("fn foo() {");
+        feed(&mut ed, "obody<Esc>");
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("\tbody"));
+    }
+
+    #[test]
+    fn enter_mid_insert_carries_the_indent() {
+        let mut ed = editor_spaces("    hello world");
+        // Append at end, split after "hello ", newline should re-indent to 4.
+        feed(&mut ed, "A<Enter>again<Esc>");
+        assert_eq!(ed.buffer().line(0).as_deref(), Some("    hello world"));
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("    again"));
+    }
+
+    #[test]
+    fn enter_after_an_opener_indents_one_deeper() {
+        let mut ed = editor_spaces("fn foo() {");
+        feed(&mut ed, "A<Enter>body<Esc>");
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("    body"));
+    }
+
+    #[test]
+    fn o_on_a_plain_top_level_line_adds_no_indent() {
+        let mut ed = editor_spaces("plain");
+        feed(&mut ed, "onext<Esc>");
+        assert_eq!(ed.buffer().line(1).as_deref(), Some("next"));
     }
 
     #[test]

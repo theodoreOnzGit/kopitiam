@@ -28,6 +28,45 @@ use super::line_ending::LineEnding;
 use super::mark;
 use super::undo::{NodeId, UndoTree};
 
+/// The line-level footprint of one applied edit — how many lines it touched
+/// and how many it left behind — so line-anchored state that lives *outside*
+/// the buffer can shuffle along to follow the edit.
+///
+/// Marks ride inside the buffer as char offsets, so [`mark`] fixes them up in
+/// place. Manual folds cannot: they are numbered by *line* and kept on the
+/// editor (buffer-scoped, but not stored here). So instead of shifting them
+/// ourselves, every rope mutation drops one `LineEdit` into a journal the
+/// editor drains ([`Buffer::take_line_edits`]) and replays onto its folds.
+/// Same shift-on-edit idea as marks lah, just reported outward one layer.
+///
+/// One `LineEdit` is recorded per call to [`Buffer::raw_apply`], so ordinary
+/// edits *and* undo/redo replay both feed it — folds must follow an undo just
+/// as faithfully as the edit it reverses, otherwise `u` leaves them stale.
+///
+/// Coordinates are 0-based. `start_line`/`end_line` come straight from the
+/// edit's normalized [`Range`] (`end_line == start_line` for an insertion, since
+/// an insertion's range is empty). The exact line-shift rule folds derive from
+/// these fields is spelled out on `FoldSet::shift_lines`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineEdit {
+    /// First line the edit touched — the normalized range's start line.
+    pub start_line: usize,
+    /// Grapheme column on `start_line` where the edit began. Only load-bearing
+    /// for a pure insertion sitting at column 0 (which shoves the whole line
+    /// down instead of splitting it); every other case ignores it.
+    pub start_col: usize,
+    /// Last old line the edit spanned — the normalized range's end line,
+    /// inclusive. Equal to `start_line` for an insertion.
+    pub end_line: usize,
+    /// How many newlines the inserted text carried (0 for a plain deletion).
+    /// Net line-count change is `added_lines - (end_line - start_line)`.
+    pub added_lines: usize,
+    /// `true` when the edit removed nothing (old range was empty): a pure
+    /// insertion. This is what tells the col-0 push-down case apart from a
+    /// replacement that merely happens to start at column 0.
+    pub is_insertion: bool,
+}
+
 /// A rope-backed text buffer with branching undo and shift-on-edit marks.
 ///
 /// `Buffer` is the text engine's entire public surface; every other `kvim`
@@ -65,6 +104,12 @@ pub struct Buffer {
     /// recent change spanned more than one line — see the deviation note on
     /// [`Buffer::note_line_before_edit`]).
     u_line: Option<(usize, String)>,
+    /// Line-edit journal: one [`LineEdit`] per rope mutation since the editor
+    /// last drained it. The editor pulls this every keystroke to shift the
+    /// active buffer's manual folds so they keep covering the same text. See
+    /// [`LineEdit`] for why folds ride *here* instead of inside the buffer the
+    /// way marks do.
+    line_edits: Vec<LineEdit>,
 }
 
 impl Default for Buffer {
@@ -95,6 +140,7 @@ impl Buffer {
             saved_at: undo.current_id(),
             undo,
             u_line: None,
+            line_edits: Vec::new(),
         }
     }
 
@@ -348,6 +394,19 @@ impl Buffer {
 
         mark::shift_all(&mut self.marks, start, end, new_len);
 
+        // Journal this edit's line footprint for the editor to shift folds by.
+        // `start_pos`/`end_pos` are the *pre-edit* line/col coords (from the
+        // normalized range); `end == start` means nothing was removed, i.e. a
+        // pure insertion. Newlines are counted in the already-normalized
+        // `new_text` so CRLF buffers count correctly (CRLF still carries '\n').
+        self.line_edits.push(LineEdit {
+            start_line: start_pos.line,
+            start_col: start_pos.col,
+            end_line: end_pos.line,
+            added_lines: new_text.matches('\n').count(),
+            is_insertion: end == start,
+        });
+
         // Positions computed from here on read the rope in its POST-edit
         // state, which is exactly what both the returned cursor position
         // and the inverse edit's range need to be expressed in.
@@ -400,6 +459,18 @@ impl Buffer {
     /// Closes one level of undo group opened by [`Buffer::begin_undo_group`].
     pub fn end_undo_group(&mut self) {
         self.undo.end_group();
+    }
+
+    /// Drains and returns the line-edit journal built up since the last call.
+    ///
+    /// The editor calls this once per keystroke (in `handle_key`) to shift the
+    /// active buffer's manual folds so they keep tracking the same text after
+    /// inserts/deletes. Draining is what keeps the journal from growing without
+    /// bound: a buffer whose folds are never consulted simply throws these
+    /// away. See [`LineEdit`] for the whole reason folds ride out here rather
+    /// than inside the buffer the way marks do.
+    pub fn take_line_edits(&mut self) -> Vec<LineEdit> {
+        std::mem::take(&mut self.line_edits)
     }
 
     /// Sets mark `name` to `pos`, clamped into the buffer. Marks named `'`
