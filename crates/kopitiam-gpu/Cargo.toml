@@ -1,0 +1,28 @@
+[package]
+name = "kopitiam-gpu"
+# Seeded onto crates.io at 0.0.1 as an early name reservation while the GPU
+# parallel-compute foundation is still mid-build — deliberately BEHIND the
+# workspace version (0.1.x) so the real release supersedes it later, same pattern
+# as kopitiam-core/tensor/models. Overrides `version.workspace` on purpose; see
+# scripts/publish-gpu-seed.sh.
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPU parallel-compute foundation for KOPITIAM: wgpu compute pipelines with a runtime GPU->CPU fallback cascade. Domain-agnostic parallel compute infrastructure, not tied to any one field."
+
+[dependencies]
+# wgpu is NON-OPTIONAL — no feature gate. The GPU code path is always compiled
+# in; a missing GPU is a RUNTIME condition the cascade handles, not a build-time
+# one. See AID-0037 and the crate-level docs in src/lib.rs.
+wgpu.workspace = true
+# `pollster::block_on` drives wgpu's async futures (request_adapter,
+# request_device, buffer map_async) to completion on the calling thread. This
+# crate's public API is deliberately blocking/synchronous.
+pollster.workspace = true
+# `bytemuck::cast_slice` reinterprets `&[f32]` <-> `&[u8]` with zero copy, which
+# is how host data crosses into wgpu storage buffers (wgpu speaks bytes).
+bytemuck.workspace = true
+# Typed error for "no usable GPU on this machine" so callers can match on it.
+thiserror.workspace = true
