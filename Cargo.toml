@@ -80,6 +80,17 @@ tempfile = "3.27.0"
 # supply-chain surface.
 memmap2 = "0.9"
 
+# System info (RAM available/total, CPU core count + usage, per-process RSS).
+# Pure Rust, Android-capable (reads /proc under the hood on Linux/Android), and
+# it is the crate `bottom`/`btm` is built on -- so it keeps the Pure Rust Core
+# promise while being battle-tested. kvim uses it as a LIBRARY only; never shell
+# out to any external monitoring binary (won't exist on the Android tablet).
+# One dep, three consumers in kvim: the resource-aware LSP guard estimate, the
+# LSP startup progress-bar ETA (live CPU usage), and a future runtime
+# memory-cap-and-kill guard (per-process RSS). See
+# crates/kopitiam-neovim/src/lsp/resource_guard.rs.
+sysinfo = "0.37"
+
 # Internal crates. `version` is required alongside `path` so that
 # `cargo publish` can strip the (registry-meaningless) local path and embed
 # a real dependency version in the published manifest -- see

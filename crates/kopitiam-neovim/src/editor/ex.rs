@@ -194,6 +194,13 @@ pub enum ExCommand {
     /// returns it through `EditorResponse::Quickfix` the same way it hands back
     /// window commands. See [`QuickfixCommand`] and [`super::quickfix`].
     Quickfix(QuickfixCommand),
+    /// `:LspStart` — force-attach the language server for the current buffer,
+    /// bypassing the resource-aware guard for this session. Like the LSP keymaps
+    /// it routes back to the UI (which owns the [`crate::lsp::LspClient`]) via
+    /// [`super::EditorResponse::Action`].
+    LspStart,
+    /// `:LspInfo` — print the resource-guard probe/estimate/decision.
+    LspInfo,
     /// An empty command line (`:` followed immediately by Enter).
     Empty,
     /// Parsed but not recognized — surfaced to the user as
@@ -416,6 +423,8 @@ pub fn parse(input: &str) -> ExCommand {
         // character of `arg`. The plain `:r {file}` form is a filed follow-up.
         Some(CommandId::Read) => parse_read(range, force, after),
         Some(CommandId::Help) => ExCommand::Help { topic: opt_arg(arg) },
+        Some(CommandId::LspStart) => ExCommand::LspStart,
+        Some(CommandId::LspInfo) => ExCommand::LspInfo,
 
         // Quickfix (global) and location (`l`-prefixed) list commands. The two
         // families share `QuickfixCommand`; only the `ListKind` differs, so the

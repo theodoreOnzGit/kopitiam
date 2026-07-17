@@ -444,6 +444,9 @@ pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
     let theme = Theme::from_name(&config.theme);
     let options = config.options.clone();
     let leader = config.leader;
+    // The resource-aware LSP guard's tuning, cloned out before `config` moves
+    // into the editor. See `crate::lsp::resource_guard`.
+    let lsp_guard_cfg = config.lsp_guard.clone();
 
     // Detected once, here, and threaded down: the statusline needs to know
     // whether Powerline separators are safe (a bar full of tofu boxes is worse
@@ -458,6 +461,7 @@ pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
     }
 
     let mut app = App::new(editor, options, theme, icons, leader);
+    app.set_lsp_guard_config(lsp_guard_cfg);
     if let Some(runtime) = lua_runtime {
         app.set_lua_runtime(runtime);
     }

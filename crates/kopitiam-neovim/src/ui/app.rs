@@ -177,6 +177,23 @@ pub struct App<H: EditorHost> {
     /// [`App::refresh_diagnostics`] does not rescan `PATH` on every idle tick of
     /// an unserved buffer.
     lsp_no_server: std::collections::HashSet<PathBuf>,
+    /// The resource-aware LSP guard's config (constants + on/off switches). Set
+    /// from [`crate::config::Config::lsp_guard`] at start-up via
+    /// [`Self::set_lsp_guard_config`]; defaults to [`LspGuardConfig::default`] so
+    /// a test-built `App` behaves. See [`crate::lsp::resource_guard`].
+    lsp_guard_cfg: crate::config::LspGuardConfig,
+    /// Workspace roots the guard has **cleared to attach** — either because the
+    /// estimate passed, or because the user forced it with `:LspStart`. Keyed by
+    /// root (not file) so the guard runs at most once per project and forcing one
+    /// buffer attaches the server for the whole project (matching how a session
+    /// is `(server, root)`-keyed). Presence here means "don't re-probe, just
+    /// attach".
+    lsp_cleared_roots: std::collections::HashSet<PathBuf>,
+    /// Files the guard held back from auto-attach (project looks too big for this
+    /// device). Remembered so the idle tick does not re-probe (which walks the
+    /// source tree) or re-message every tick; cleared for a file when the user
+    /// forces it with `:LspStart`.
+    lsp_gated: std::collections::HashSet<PathBuf>,
     /// Set after `]`/`[` in Normal mode: the next key (`d`) completes a
     /// diagnostic-navigation motion (`]d`/`[d`). See [`App::handle_event`].
     pending_bracket: Option<char>,
@@ -431,6 +448,9 @@ impl<H: EditorHost> App<H> {
             diagnostics: std::collections::HashMap::new(),
             lsp_opened: std::collections::HashSet::new(),
             lsp_no_server: std::collections::HashSet::new(),
+            lsp_guard_cfg: crate::config::LspGuardConfig::default(),
+            lsp_cleared_roots: std::collections::HashSet::new(),
+            lsp_gated: std::collections::HashSet::new(),
             pending_bracket: None,
             quickfix: QuickfixList::default(),
             location: QuickfixList::default(),
@@ -466,6 +486,15 @@ impl<H: EditorHost> App<H> {
     /// field and [`Action::LuaKeymap`].
     pub fn set_lua_runtime(&mut self, runtime: crate::luaconfig::LuaRuntime) {
         self.lua = Some(runtime);
+    }
+
+    /// Hands the App the resolved LSP-guard config (constants + on/off), pulled
+    /// from [`crate::config::Config::lsp_guard`] at start-up. Kept out of
+    /// [`Self::new`] for the same reason as the Lua runtime: `new` stays pure
+    /// enough to build in a unit test without a full `Config`. See
+    /// [`crate::lsp::resource_guard`].
+    pub fn set_lsp_guard_config(&mut self, cfg: crate::config::LspGuardConfig) {
+        self.lsp_guard_cfg = cfg;
     }
 
     /// Shows a one-line informational message on the statusline at startup —
@@ -796,6 +825,8 @@ impl<H: EditorHost> App<H> {
             Action::LspReferences => self.lsp_references(),
             Action::LspRename => self.lsp_start_rename(),
             Action::LspHover => self.lsp_hover(),
+            Action::LspStart => self.lsp_force_start(),
+            Action::LspInfo => self.lsp_info(),
             Action::LuaKeymap(id) => self.fire_lua_keymap(id),
             other => self.info(format!("{other:?} is not wired into the UI yet")),
         }
@@ -901,6 +932,77 @@ impl<H: EditorHost> App<H> {
             Err(e) if e.is_not_ready() => self.info(format!("{ft} LSP is still starting — try again in a moment")),
             Err(e) => self.error(format!("LSP hover: {e}")),
         }
+    }
+
+    /// `:LspStart` — force-attach the language server for the current buffer,
+    /// bypassing the resource-aware guard for this session's workspace.
+    ///
+    /// This is the guard's escape hatch: even if the estimate said the project
+    /// is too big for the device, the user can insist. Forcing clears the gate
+    /// for this file and marks the whole workspace root as cleared, so the attach
+    /// path (and any sibling file) stops re-checking — the user has taken
+    /// responsibility for the memory cost. See [`crate::lsp::resource_guard`].
+    fn lsp_force_start(&mut self) -> LoopAction {
+        let Some((ft, file, _, _)) = self.lsp_context() else {
+            return self.info("no language server configured for this buffer lah".to_string());
+        };
+        if !LspClient::server_available(&ft) {
+            return self.info(format!("{ft} language server not installed — nothing to force"));
+        }
+        // Bypass the guard from here on for this whole workspace root.
+        let root = crate::lsp::resource_guard::project_root(&file);
+        self.lsp_gated.remove(&file);
+        self.lsp_no_server.remove(&file);
+        self.lsp_cleared_roots.insert(root);
+        if self.lsp_opened.contains(&file) {
+            return self.info(format!("{ft} LSP already attached"));
+        }
+        // Kick the attach off now (feels immediate) rather than waiting for the
+        // next idle tick. `did_open` lazily spawns the server; NotReady just
+        // means the async connect is in flight — the idle tick will finish it.
+        let text = self.active_buffer_text();
+        match self.lsp.did_open(&ft, &file, &text) {
+            Ok(()) => {
+                self.lsp_opened.insert(file);
+                self.info(format!("forcing {ft} LSP start — hold on ah, warming up..."))
+            }
+            Err(e) if e.is_not_ready() => self.info(format!("{ft} LSP warming up — hold on ah")),
+            Err(e) => self.error(format!("LSP start: {e}")),
+        }
+    }
+
+    /// `:LspInfo` — show the resource-guard's probe numbers, the rust-analyzer
+    /// memory estimate, and the gate decision, so the user can see the reasoning
+    /// and retune their `lsp_guard` config. Reads live, so it reflects RAM/CPU
+    /// right now.
+    fn lsp_info(&mut self) -> LoopAction {
+        let Some((_, file, _, _)) = self.lsp_context() else {
+            return self.info("no file / no language server for this buffer".to_string());
+        };
+        let d = crate::lsp::resource_guard::decide_for(&self.lsp_guard_cfg, &file);
+        let mut parts: Vec<String> = Vec::new();
+        match d.probe {
+            Some(p) => parts.push(format!(
+                "RAM {}/{}MB free, {} cores (cpu {:.0}%)",
+                p.avail_mb, p.total_mb, p.logical_cores, p.cpu_usage
+            )),
+            None => parts.push("device probe: n/a (fail-open)".to_string()),
+        }
+        if let Some(s) = d.size {
+            parts.push(format!("{} deps, {:.1}MB src", s.num_deps, s.src_bytes as f64 / (1024.0 * 1024.0)));
+        }
+        if let (Some(est), Some(budget), Some(cf)) = (d.est_ra_mb, d.budget_mb, d.core_factor) {
+            parts.push(format!(
+                "est ~{est:.0}MB vs budget ~{budget:.0}MB (headroom {:.2} x core {cf:.2})",
+                self.lsp_guard_cfg.headroom
+            ));
+        }
+        parts.push(format!(
+            "decision: {}",
+            if d.allow { "START ok".to_string() } else { "OFF (too big — :LspStart to force)".to_string() }
+        ));
+        parts.push(format!("guard: {}", if self.lsp_guard_cfg.enabled { "on" } else { "off" }));
+        self.info(format!("LspInfo — {}", parts.join(" | ")))
     }
 
     /// `<leader>rn`: begin renaming the symbol under the cursor. Captures the
@@ -1878,6 +1980,31 @@ impl<H: EditorHost> App<H> {
             if !LspClient::server_available(&ft) {
                 self.lsp_no_server.insert(file.clone());
                 return false;
+            }
+            // Resource-aware guard (kopitiam-cj0.61): before we spawn
+            // rust-analyzer, check the project is not too big for THIS device.
+            // On an Android tablet a heavy project can OOM-kill the whole app, so
+            // we hold off and tell the user (who can force it with `:LspStart`).
+            // The gate runs at most once per workspace root: a cleared root skips
+            // it, an already-gated file returns early WITHOUT re-probing (the
+            // probe walks the source tree — not something to redo every tick).
+            let root = crate::lsp::resource_guard::project_root(&file);
+            if !self.lsp_cleared_roots.contains(&root) {
+                if self.lsp_gated.contains(&file) {
+                    return false;
+                }
+                let decision = crate::lsp::resource_guard::decide_for(&self.lsp_guard_cfg, &file);
+                if decision.allow {
+                    // Passed (or the guard failed open / is off): remember the
+                    // root so we never re-probe it, then fall through to attach.
+                    self.lsp_cleared_roots.insert(root);
+                } else {
+                    // Held off. Never silently skip — surface WHY and how to
+                    // override, once, then stop touching this file until forced.
+                    self.lsp_gated.insert(file.clone());
+                    self.message = StatusMessage::Info(decision.reason);
+                    return true;
+                }
             }
             let text = self.active_buffer_text();
             match self.lsp.did_open(&ft, &file, &text) {
@@ -3210,16 +3337,34 @@ impl<H: EditorHost> App<H> {
         Some(format!("{prefix}{}{dirty}", status.branch))
     }
 
+    /// The statusline's LSP start-up hint: a Singlish "warming up" line with a
+    /// live progress bar (current step, %, rough ETA) while rust-analyzer is
+    /// connecting/indexing, or `None` once it is ready or not starting.
+    ///
+    /// Reads the `$/progress` snapshot the async session folds from the server
+    /// ([`crate::lsp::LspClient::progress`]); until the first notification lands
+    /// there is no snapshot yet, so it shows a plain "warming up" line rather
+    /// than a bogus 0% bar.
+    fn lsp_startup_hint(&self, path: Option<&Path>) -> Option<String> {
+        let path = path?;
+        let ft = lsp_filetype(path)?;
+        if !self.lsp.is_starting(&ft) {
+            return None;
+        }
+        match self.lsp.progress(&ft, path) {
+            Some(p) => Some(format_lsp_progress(&p)),
+            None => Some("rust-analyzer warming up ah, hold on...".to_string()),
+        }
+    }
+
     fn render_statusline(&self, frame: &mut Frame, area: Rect) {
         let buffer = self.host.buffer();
-        // Subtle hint while the async LSP client is connecting on its background
-        // thread (bead kopitiam-cj0.27): shown only for a buffer whose language
-        // server is still `Connecting`, and gone the moment it is ready.
-        let lsp_status = buffer
-            .path()
-            .and_then(lsp_filetype)
-            .filter(|ft| self.lsp.is_starting(ft))
-            .map(|_| "LSP: starting…".to_string());
+        // Hint while the async LSP client is connecting on its background thread
+        // (bead kopitiam-cj0.27): shown only for a buffer whose language server
+        // is still `Connecting`, and gone the moment it is ready. Now a Singlish
+        // "warming up" line with a live progress bar fed by rust-analyzer's
+        // `$/progress` stream (bead kopitiam-cj0.61.1).
+        let lsp_status = self.lsp_startup_hint(buffer.path());
         let data = StatuslineData {
             mode: self.host.mode(),
             file_name: display_file_name(buffer.path()),
@@ -3410,6 +3555,41 @@ fn lsp_filetype(path: &Path) -> Option<String> {
         _ => None,
     }
     .map(str::to_string)
+}
+
+/// Renders a [`ProgressSnapshot`](kopitiam_semantic::ProgressSnapshot) into the
+/// one-line Singlish statusline hint: the current step, its position in the
+/// sequence, a 10-cell bar + percentage when the server sent one, and a rough
+/// "how long more" derived from the current step's percentage.
+///
+/// Kept as a free fn (pure over the snapshot) so it is trivially unit-testable
+/// without an `App`. The ETA is deliberately labelled *rough* — it extrapolates
+/// only the current step (percentage resets each step), never the whole start-up.
+fn format_lsp_progress(p: &kopitiam_semantic::ProgressSnapshot) -> String {
+    let step = if p.current_step.is_empty() { "starting" } else { p.current_step.as_str() };
+    // "[3/5]" — where this step sits in the sequence RA walks through, so the
+    // user can see how much is left. Empty until we have the step list.
+    let seq = if p.steps.is_empty() {
+        String::new()
+    } else {
+        let idx = p.steps.iter().position(|s| *s == p.current_step).map(|i| i + 1).unwrap_or(p.steps.len());
+        format!(" [{}/{}]", idx, p.steps.len())
+    };
+    // A 10-cell bar, filled in tenths of the current step's percentage. Only
+    // drawn when the server actually sent a percentage.
+    let bar = match p.percentage {
+        Some(pct) => {
+            let filled = (pct as usize * 10 / 100).min(10);
+            let cells: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(10 - filled);
+            format!(" {cells} {pct}%")
+        }
+        None => String::new(),
+    };
+    let eta = match p.rough_eta {
+        Some(d) if d.as_secs() >= 1 => format!(", ~{}s more (rough)", d.as_secs()),
+        _ => String::new(),
+    };
+    format!("RA warming up: {step}{seq}{bar}{eta}")
 }
 
 /// The identifier grapheme-substring of `line` surrounding grapheme column
@@ -3685,6 +3865,104 @@ mod tests {
         // old `glyphs: false`, and every rendered icon is assertable on any
         // terminal.
         App::new(host, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ')
+    }
+
+    /// Builds a temp cargo workspace (Cargo.lock with `deps` packages + a
+    /// `src/lib.rs`) and an `App` whose active buffer is that lib.rs, for
+    /// exercising the resource-guard wiring end to end without a real server.
+    fn app_in_workspace(deps: usize) -> (tempfile::TempDir, PathBuf, App<FakeHost>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = String::from("# @generated\nversion = 4\n\n");
+        for i in 0..deps {
+            lock.push_str(&format!("[[package]]\nname = \"c{i}\"\nversion = \"0.1.0\"\n\n"));
+        }
+        std::fs::write(dir.path().join("Cargo.lock"), lock).unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let file = dir.path().join("src/lib.rs");
+        std::fs::write(&file, "pub fn hi() {}\n").unwrap();
+
+        let buffer = FakeBuffer::new(vec!["pub fn hi() {}".to_string()]).with_path(file.clone());
+        let host = FakeHost::new(buffer);
+        let app = App::new(host, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        (dir, file, app)
+    }
+
+    /// `:LspInfo` reports the probe, estimate and a START decision for a tiny
+    /// project — and never touches a server binary, so it runs anywhere.
+    #[test]
+    fn lsp_info_reports_a_start_decision_for_a_small_project() {
+        let (_dir, _file, mut app) = app_in_workspace(5);
+        app.lsp_info();
+        let msg = match &app.message {
+            StatusMessage::Info(m) => m.clone(),
+            other => panic!("expected Info, got {other:?}"),
+        };
+        assert!(msg.contains("LspInfo"), "{msg}");
+        assert!(msg.contains("deps"), "must report the dep count: {msg}");
+        // A 5-dep project must not be gated on any sane machine (fail-open if the
+        // probe is unavailable also yields START).
+        assert!(msg.contains("decision: START") || msg.contains("n/a"), "{msg}");
+    }
+
+    /// With the constants cranked so the estimate dwarfs any budget, `:LspInfo`
+    /// reports OFF and points the user at `:LspStart` — and `:LspStart` then
+    /// clears the gate for the whole workspace root. (Skips the actual attach if
+    /// no rust-analyzer is installed, but the gate bookkeeping is asserted.)
+    #[test]
+    fn guard_gates_then_lspstart_clears_it() {
+        let (_dir, file, mut app) = app_in_workspace(50);
+        // Force the gate to fire regardless of the host: a per-dep cost so large
+        // the estimate cannot fit any real budget, and the guard on.
+        app.lsp_guard_cfg = crate::config::LspGuardConfig { per_dep_mb: 100_000.0, ..Default::default() };
+
+        // If the probe is unavailable on this platform the guard fails open; in
+        // that case there is nothing to assert about gating, so only check the
+        // gated path when a probe exists.
+        let probed = crate::lsp::resource_guard::probe_device().is_some();
+
+        app.lsp_info();
+        if let StatusMessage::Info(m) = &app.message {
+            if probed {
+                assert!(m.contains("decision: OFF"), "huge estimate must gate: {m}");
+                assert!(m.contains(":LspStart"), "gated info must mention the override: {m}");
+            }
+        } else {
+            panic!("expected Info");
+        }
+
+        // Simulate the guard having gated this file, then force it.
+        app.lsp_gated.insert(file.clone());
+        let root = crate::lsp::resource_guard::project_root(&file);
+        app.lsp_force_start();
+        // Whether or not a server is installed, forcing must clear the gate for
+        // the file and mark the whole root cleared so the attach path stops
+        // re-checking.
+        assert!(!app.lsp_gated.contains(&file), "force must clear the file's gate");
+        assert!(app.lsp_cleared_roots.contains(&root), "force must clear the workspace root");
+    }
+
+    /// The Singlish progress line renders step/sequence/bar/ETA from a snapshot.
+    #[test]
+    fn progress_line_renders_step_bar_and_eta() {
+        use kopitiam_semantic::ProgressSnapshot;
+        let snap = ProgressSnapshot {
+            current_step: "Indexing".to_string(),
+            detail: Some("kopitiam-neovim".to_string()),
+            percentage: Some(40),
+            steps: vec!["Roots Scanned".to_string(), "Building CrateGraph".to_string(), "Indexing".to_string()],
+            elapsed: std::time::Duration::from_secs(6),
+            rough_eta: Some(std::time::Duration::from_secs(9)),
+        };
+        let line = format_lsp_progress(&snap);
+        assert!(line.contains("Indexing"), "{line}");
+        assert!(line.contains("[3/3]"), "step position in the sequence: {line}");
+        assert!(line.contains("40%"), "{line}");
+        assert!(line.contains("rough"), "ETA must be labelled rough: {line}");
+
+        // No percentage -> no bar, no bogus 0%.
+        let bare = ProgressSnapshot { percentage: None, rough_eta: None, ..snap };
+        let line = format_lsp_progress(&bare);
+        assert!(!line.contains('%'), "no percentage means no bar: {line}");
     }
 
     fn key_event(c: char) -> Event {

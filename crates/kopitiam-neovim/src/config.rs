@@ -212,6 +212,16 @@ pub enum Action {
     /// LSP: show hover documentation for the symbol under the cursor. Bound to
     /// `K`, matching Neovim's built-in default (`vim.lsp.buf.hover`).
     LspHover,
+    /// LSP: force-attach the server for the current buffer, bypassing the
+    /// resource-aware guard for this session (`:LspStart`). This is the escape
+    /// hatch so a user is never locked out of the LSP just because the guard's
+    /// estimate said the project was too big for the device. See
+    /// [`crate::lsp::resource_guard`].
+    LspStart,
+    /// LSP: print the resource-guard probe numbers, the RA-memory estimate, and
+    /// the gate decision (`:LspInfo`), so the user can see the reasoning and
+    /// tune [`LspGuardConfig`].
+    LspInfo,
     /// Toggle the file-tree sidebar (their `<leader>e` → `Neotree toggle`).
     FileTreeToggle,
     /// Label-jump to a word on screen (their `f` → `hop.hint_words`).
@@ -247,8 +257,85 @@ pub enum Action {
     LuaKeymap(usize),
 }
 
+/// Tuning knobs for the resource-aware LSP guard (see
+/// [`crate::lsp::resource_guard`]).
+///
+/// # What this is for
+///
+/// kvim runs on Android tablets. rust-analyzer indexes the whole dependency
+/// graph, so on a big project relative to the device it can chew through more
+/// RAM (and CPU during indexing) than the tablet has spare — and blowing past
+/// available memory does not just lag, it can OOM-kill the app and take the
+/// tablet down with it. So before kvim auto-attaches rust-analyzer on open, the
+/// guard *estimates* whether this project fits this device, and if not it holds
+/// off and tells the user (who can still force it with `:LspStart`).
+///
+/// The numbers below drive that estimate. They are deliberately **rough** — a
+/// per-dep memory model is a blunt instrument (see
+/// `docs/ai-decisions/AID-0037`) — which is exactly why they are configurable:
+/// a user who knows their device and project can retune the gate instead of
+/// being stuck with our guess.
+///
+/// Every field carries a conservative default via [`Default`]; on a big desktop
+/// the budget is so large the gate essentially never fires, matching "simple
+/// projects and capable machines are never blocked".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LspGuardConfig {
+    /// Master switch. `true` (default) = the guard runs before auto-attach.
+    /// `false` = kvim always auto-attaches, exactly like before the guard
+    /// existed (the guard's own escape hatch, for someone who never wants it).
+    pub enabled: bool,
+    /// Belt-and-braces "just always start" flag. When `true`, the guard
+    /// computes and reports its numbers (so `:LspInfo` still works) but never
+    /// actually blocks the attach. Distinct from `enabled = false`, which skips
+    /// the computation entirely.
+    pub always_start: bool,
+    /// Base rust-analyzer overhead in MB, independent of project size — the
+    /// server process, the empty VFS, its own machinery. The `150` in
+    /// `est_ra_mb = base + per_dep*deps + src_factor*src_mb`.
+    pub base_mb: f64,
+    /// Estimated MB of rust-analyzer RSS per dependency crate, since RA analyses
+    /// the full dependency graph and peak memory scales mostly with crate count.
+    /// The `4` in the estimate.
+    pub per_dep_mb: f64,
+    /// MB of RA RSS per MB of workspace `.rs` source — a secondary term, since a
+    /// big first-party codebase also costs memory to analyse. The `0.5`.
+    pub src_factor: f64,
+    /// Fraction of *available* RAM the estimate may occupy before the guard
+    /// fires. `0.5` keeps half of free RAM as headroom for the editor + OS; on
+    /// Android there is no swap to catch an overshoot, so headroom is safety,
+    /// not politeness.
+    pub headroom: f64,
+    /// CPU is a real input, not just message flavour: rust-analyzer is
+    /// CPU-heavy while indexing, so a few-core tablet janks on a mid-size
+    /// project even when RAM would fit. The effective budget is scaled by
+    /// `min(1.0, logical_cores / core_ref_count)`, so a machine with
+    /// `core_ref_count` cores or more is unpenalised and a 2-core tablet is
+    /// gated much sooner. `8.0` by default — treat "8+ logical cores" as
+    /// "plenty of indexing parallelism".
+    pub core_ref_count: f64,
+}
+
+impl Default for LspGuardConfig {
+    fn default() -> Self {
+        // Defaults match `docs/ai-decisions/AID-0037`. Conservative: on a
+        // capable machine the gate never fires; on a small tablet with a heavy
+        // project it does.
+        Self {
+            enabled: true,
+            always_start: false,
+            base_mb: 150.0,
+            per_dep_mb: 4.0,
+            src_factor: 0.5,
+            headroom: 0.5,
+            core_ref_count: 8.0,
+        }
+    }
+}
+
 /// The complete kvim configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub options: Options,
@@ -259,6 +346,8 @@ pub struct Config {
     /// `ensure_installed`.
     pub language_servers: BTreeMap<String, String>,
     pub theme: String,
+    /// Resource-aware LSP guard tuning. See [`LspGuardConfig`].
+    pub lsp_guard: LspGuardConfig,
 }
 
 impl Default for Config {
@@ -278,6 +367,7 @@ impl Default for Config {
             language_servers: default_language_servers(),
             // `vim.cmd.colorscheme("gruvbox")`, with `background = dark`.
             theme: "gruvbox".to_string(),
+            lsp_guard: LspGuardConfig::default(),
         }
     }
 }
