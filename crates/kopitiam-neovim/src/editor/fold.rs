@@ -36,15 +36,19 @@
 //! the thing that moves from `HashMap<BufferId, _>` on the editor to
 //! `HashMap<(WindowId, BufferId), _>`; nothing about the fold *math* changes.
 //!
-//! # A fold does not follow edits (yet)
+//! # Folds follow edits
 //!
-//! Folds hold absolute line numbers and are **not** shifted when text is
-//! inserted or deleted above them. After a structural edit a fold can therefore
-//! cover the wrong lines. This is a known limitation of the first manual-fold
-//! cut (tracked as a follow-up bead); vim keeps folds pinned to lines through
-//! every edit, which requires the same shift-on-edit machinery the mark table
-//! already has. Until that lands, `zE` (eliminate all folds) is the escape
-//! hatch.
+//! Folds hold absolute line numbers, but they are **kept in step** with buffer
+//! edits: insert or delete lines above or inside a fold and its `[start, end]`
+//! shifts so it still covers the same text — the same shift-on-edit idea the
+//! mark table runs, applied to both endpoints of every fold. The buffer records
+//! each edit's line footprint (`crate::text::LineEdit`); the editor drains that
+//! journal every keystroke and calls [`FoldSet::shift_lines`], which also feeds
+//! undo/redo (replay goes through the same buffer path, so a `u` moves folds
+//! back exactly as the edit it reverses moved them forward). The precise
+//! line-shift contract — 0- vs 1-indexed, what happens on a partial overlap,
+//! when a fold gets dropped — lives on [`FoldSet::shift_lines`]. `zE` still
+//! nukes every fold if you want a clean slate.
 
 /// One manual fold: an inclusive range of buffer lines that can be shown
 /// (`closed == false`) or collapsed to a single header row (`closed == true`).
@@ -161,6 +165,76 @@ impl FoldSet {
     /// Removes every fold in the buffer (`zE`).
     pub fn delete_all(&mut self) {
         self.folds.clear();
+    }
+
+    // ---- shift-on-edit -------------------------------------------------------
+
+    /// Shifts every fold's line range to follow one buffer edit, so a fold keeps
+    /// covering the same *text* after lines are inserted or deleted above or
+    /// inside it. This is folds' half of the shift-on-edit machinery
+    /// [`crate::text`] already runs for the buffer's own marks. Call it once per
+    /// applied edit — the editor drains [`crate::text::Buffer::take_line_edits`]
+    /// each keystroke and feeds every entry here, undo/redo replay included.
+    ///
+    /// # The line-shift contract (EXACT — read before touching)
+    ///
+    /// All line numbers are **0-based**; a fold is the **inclusive** range
+    /// `[start, end]`. An edit is described by [`crate::text::LineEdit`]: its
+    /// first touched line `a` (`start_line`), the column `ac` it began at
+    /// (`start_col`), its last old line `b` (`end_line`, `b >= a`), the number
+    /// of newlines its replacement text carried (`added`), and whether it
+    /// deleted nothing (`is_insertion`). Each fold endpoint line `L` moves like
+    /// so:
+    ///
+    /// **Pure insertion** (`is_insertion`, so `a == b`, `added` new lines
+    /// dropped in at `(a, ac)`):
+    /// * `L > a` → `L + added` (line sits below the split point, pushed down).
+    /// * `L == a` → `L + added` **only if** `ac == 0` (text inserted *before*
+    ///   the whole of line `a`, so line `a` itself gets shoved down — this is
+    ///   what makes `O` above a fold carry the fold down with it); otherwise
+    ///   `L` stays (the insertion split line `a` from the middle/end, so line
+    ///   `a`'s head keeps its number).
+    /// * `L < a` → unchanged.
+    ///
+    /// **Deletion / replacement** (`!is_insertion`; old lines `[a, b]` become
+    /// `added + 1` lines, net `delta = added - (b - a)`):
+    /// * `L < a` → unchanged.
+    /// * `L == a` → unchanged (line `a`'s head survives as the anchor).
+    /// * `a < L < b` → **`a`**: `L` sat strictly inside the replaced span and no
+    ///   longer exists, so it collapses to the edit's first line. Same
+    ///   clamp-to-start rule [`crate::text`]'s marks use for a mark caught
+    ///   inside a deleted range — a fold endpoint degrades gracefully instead of
+    ///   guessing.
+    /// * `L >= b` → `L + delta` (line at/after the edit's last old line, shifts
+    ///   by the net line-count change).
+    ///
+    /// Both endpoints go through the *same* rule (there is no start-vs-end
+    /// asymmetry). After shifting, a fold that no longer spans at least two
+    /// lines (`start >= end` — collapsed to a point or inverted, e.g. because
+    /// the whole folded range was deleted) is **dropped**; vim will not hold a
+    /// one-line fold either. `level`s are recomputed if anything was dropped.
+    ///
+    /// # Worked partial-overlap example (asserted in the tests)
+    ///
+    /// Fold `[10, 20]`, delete lines `8..=12` (a linewise `dd` is the edit
+    /// `delete (8,0)..(13,0)`, so `a = 8`, `b = 13`, `added = 0`,
+    /// `delta = -5`): the start `10` is interior (`8 < 10 < 13`) so it clamps to
+    /// `8`; the end `20 >= 13` so it shifts to `15`. The fold becomes
+    /// `[8, 15]` — it lost the three deleted lines off its top and slid up by
+    /// the two deleted lines that sat above it.
+    pub fn shift_lines(&mut self, edit: &crate::text::LineEdit) {
+        let mut dropped = false;
+        for f in &mut self.folds {
+            f.start = shift_line(f.start, edit);
+            f.end = shift_line(f.end, edit);
+            if f.start >= f.end {
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.folds.retain(|f| f.start < f.end);
+            self.recompute_levels();
+        }
     }
 
     // ---- open / close --------------------------------------------------------
@@ -378,6 +452,36 @@ impl FoldSet {
         let snapshot = self.folds.clone();
         for f in &mut self.folds {
             f.level = snapshot.iter().filter(|o| o.contains_fold(f)).count();
+        }
+    }
+}
+
+/// Moves one fold-endpoint line `L` to follow a single edit. The whole
+/// line-shift contract (and why start and end share this one rule) lives on
+/// [`FoldSet::shift_lines`]; this is just that contract in code.
+fn shift_line(line: usize, edit: &crate::text::LineEdit) -> usize {
+    let a = edit.start_line;
+    let b = edit.end_line;
+    if edit.is_insertion {
+        // Pure insertion at (a, start_col): a == b, `added` fresh lines.
+        if line > a || (line == a && edit.start_col == 0) {
+            line + edit.added_lines
+        } else {
+            line
+        }
+    } else {
+        // Deletion / replacement of old lines [a, b] -> `added + 1` lines.
+        let delta = edit.added_lines as i64 - (b - a) as i64;
+        if line >= b {
+            // Signed add is safe: the buffer is nowhere near isize::MAX and a
+            // line at/after `b` can never be pushed below 0 by this edit.
+            (line as i64 + delta) as usize
+        } else if line > a {
+            // Strictly inside the replaced span -> clamp to the edit's start,
+            // same as a mark caught inside a deleted range.
+            a
+        } else {
+            line
         }
     }
 }
@@ -644,6 +748,127 @@ mod tests {
         assert_eq!(rows.rows_between(0, 3), 1); // hidden line 3 maps to header row
         assert_eq!(rows.rows_between(0, 5), 2);
         assert_eq!(rows.rows_between(0, 6), 3);
+    }
+
+    // ---- shift-on-edit -------------------------------------------------------
+
+    use crate::text::LineEdit;
+
+    /// A pure insertion of `added` lines at `(line, col)`.
+    fn insert_at(line: usize, col: usize, added: usize) -> LineEdit {
+        LineEdit { start_line: line, start_col: col, end_line: line, added_lines: added, is_insertion: true }
+    }
+
+    /// A linewise deletion of the inclusive line span `[first, last]` — the
+    /// edit a `dd`/`{n}dd` makes: `delete (first,0)..(last+1,0)`, so its
+    /// `end_line` is `last + 1` (the join line) and it adds no text.
+    fn delete_lines(first: usize, last: usize) -> LineEdit {
+        LineEdit { start_line: first, start_col: 0, end_line: last + 1, added_lines: 0, is_insertion: false }
+    }
+
+    /// The one fold's range after shifting, or `None` if it was dropped.
+    fn shifted_range(fold: (usize, usize), edit: &LineEdit) -> Option<(usize, usize)> {
+        let mut s = FoldSet::new();
+        s.create(fold.0, fold.1);
+        s.shift_lines(edit);
+        s.folds().first().map(|f| (f.start, f.end))
+    }
+
+    #[test]
+    fn insert_above_shifts_fold_down() {
+        // Fold [10,20]; insert 3 lines at line 5 -> [13,23].
+        assert_eq!(shifted_range((10, 20), &insert_at(5, 0, 3)), Some((13, 23)));
+    }
+
+    #[test]
+    fn delete_partly_overlapping_top_clamps_and_shifts() {
+        // Fold [10,20]; delete lines 8..=12 -> start clamps to 8, end 20->15.
+        assert_eq!(shifted_range((10, 20), &delete_lines(8, 12)), Some((8, 15)));
+    }
+
+    #[test]
+    fn edit_entirely_below_leaves_fold_alone() {
+        // Insert at line 25, well below the fold: untouched.
+        assert_eq!(shifted_range((10, 20), &insert_at(25, 0, 4)), Some((10, 20)));
+        // Delete lines below the fold too: untouched.
+        assert_eq!(shifted_range((10, 20), &delete_lines(25, 30)), Some((10, 20)));
+    }
+
+    #[test]
+    fn deleting_the_whole_folded_range_drops_the_fold() {
+        // Delete exactly the fold's lines 10..=20: collapses to a point, dropped.
+        assert_eq!(shifted_range((10, 20), &delete_lines(10, 20)), None);
+        // Deleting more than the fold (a superset) drops it too.
+        assert_eq!(shifted_range((10, 20), &delete_lines(9, 21)), None);
+    }
+
+    #[test]
+    fn open_above_carries_the_fold_down_but_open_below_does_not() {
+        // `O` above the header inserts "\n" at (10,0) — col 0, so the header
+        // line itself is pushed down: [10,20] -> [11,21].
+        assert_eq!(shifted_range((10, 20), &insert_at(10, 0, 1)), Some((11, 21)));
+        // `o` on a non-empty header inserts at end of line (col > 0): the header
+        // keeps its line, the added line falls inside the fold -> [10,21].
+        assert_eq!(shifted_range((10, 20), &insert_at(10, 7, 1)), Some((10, 21)));
+    }
+
+    #[test]
+    fn insert_at_or_below_fold_end_does_not_grow_it() {
+        // Insert (col 0) exactly at the fold's last line: last line pushed down
+        // with everything from it on, so the fold rides down whole? No — only
+        // lines >= the insert line move. End 20 == insert line, col 0 -> 21;
+        // start 10 < 20 -> stays. Fold grows by the inserted line at its tail.
+        assert_eq!(shifted_range((10, 20), &insert_at(20, 0, 1)), Some((10, 21)));
+        // Insert just past the end never touches the fold.
+        assert_eq!(shifted_range((10, 20), &insert_at(21, 0, 1)), Some((10, 20)));
+    }
+
+    #[test]
+    fn deleting_the_fold_tail_shrinks_it() {
+        // Fold [5,11]; delete lines 8..=13 (edit (8,0)..(14,0)): start 5 < 8
+        // stays; end 11 is interior (8 < 11 < 14) -> clamps to 8. Fold [5,8].
+        assert_eq!(shifted_range((5, 11), &delete_lines(8, 13)), Some((5, 8)));
+    }
+
+    #[test]
+    fn join_line_above_a_fold_slides_it_up() {
+        // Backspace at start of line 10 joins it onto 9: edit (9,eol)..(10,0),
+        // a deletion with a=9, b=10, delta=-1. Fold [10,20] -> [9,19].
+        let join = LineEdit { start_line: 9, start_col: 4, end_line: 10, added_lines: 0, is_insertion: false };
+        assert_eq!(shifted_range((10, 20), &join), Some((9, 19)));
+    }
+
+    #[test]
+    fn nested_folds_survive_and_relevel_after_a_shift() {
+        // Outer [0,20], inner [5,10]. Insert 2 lines at line 2: that line sits
+        // inside the outer fold but above the inner, so the outer's start (0)
+        // stays put while its end and the whole inner slide down by 2.
+        let mut s = FoldSet::new();
+        s.create(0, 20);
+        s.create(5, 10);
+        s.shift_lines(&insert_at(2, 0, 2));
+        let outer = s.folds().iter().find(|f| f.start == 0).expect("outer keeps start 0");
+        let inner = s.folds().iter().find(|f| f.start == 7).expect("inner shifted to 7");
+        assert_eq!((outer.start, outer.end), (0, 22));
+        assert_eq!((inner.start, inner.end), (7, 12));
+        // Levels still correct after the shift dropped nothing.
+        assert_eq!(outer.level, 0);
+        assert_eq!(inner.level, 1);
+    }
+
+    #[test]
+    fn dropping_inner_fold_relevels_the_survivor() {
+        // Outer [0,20], inner [5,10]. Delete inner's lines 5..=10 entirely.
+        let mut s = FoldSet::new();
+        s.create(0, 20);
+        s.create(5, 10);
+        s.shift_lines(&delete_lines(5, 10));
+        // Inner collapsed and was dropped; outer survives, shrunk by 6 lines,
+        // and is back to level 0 with nothing nested in it.
+        assert_eq!(s.folds().len(), 1);
+        let outer = &s.folds()[0];
+        assert_eq!((outer.start, outer.end), (0, 14));
+        assert_eq!(outer.level, 0);
     }
 
     #[test]

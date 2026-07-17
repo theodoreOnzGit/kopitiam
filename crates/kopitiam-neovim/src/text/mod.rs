@@ -14,10 +14,12 @@
 //!   after, or on top of it.
 //! * [`line_ending`] — LF/CRLF detection and preservation.
 //!
-//! Only [`Buffer`] is exported. The rest are implementation details other
-//! `kvim` modules should never need to name directly — depending on
-//! `text::grapheme` or `text::undo` from outside this module would be a
-//! sign the abstraction boundary is in the wrong place.
+//! [`Buffer`] and [`LineEdit`] are the only exports. The rest are
+//! implementation details other `kvim` modules should never need to name
+//! directly — depending on `text::grapheme` or `text::undo` from outside this
+//! module would be a sign the abstraction boundary is in the wrong place.
+//! [`LineEdit`] is public because folds live one layer up (on the editor) and
+//! must be told how each edit moved the lines; see its docs.
 
 mod buffer;
 mod grapheme;
@@ -25,4 +27,4 @@ mod line_ending;
 mod mark;
 mod undo;
 
-pub use buffer::Buffer;
+pub use buffer::{Buffer, LineEdit};
