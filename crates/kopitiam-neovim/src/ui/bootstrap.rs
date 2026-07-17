@@ -472,6 +472,11 @@ pub fn run(config: Config, files: &[PathBuf]) -> anyhow::Result<()> {
     // in `App::new`, which must stay pure enough to build in a unit test. See
     // `crate::tmux`.
     app.apply_startup_advice(crate::tmux::startup_advice());
+    // Restore this project's harpoon marks from disk (per-project, keyed by the
+    // canonicalized cwd — see `crate::plugins::harpoon`). Reads the filesystem,
+    // so it lives here in `run` next to the other startup detection, not in
+    // `App::new` — a unit-test App keeps the session-scoped empty list.
+    app.load_persisted_harpoon();
 
     let mut guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(io::stdout());

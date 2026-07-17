@@ -262,10 +262,16 @@ pub struct App<H: EditorHost> {
     /// an `App` directly leaves it `None`.
     lua: Option<crate::luaconfig::LuaRuntime>,
     /// This project's harpoon marks (`<leader>b` marks, `<leader><Esc>` menu,
-    /// `<leader>q` find). Session-scoped for now — [`Harpoon::empty`] reads and
-    /// writes no store file, so marks live only for the editor's lifetime. On-disk
-    /// per-project persistence (the engine already supports it via
-    /// [`Harpoon::load`]/[`Harpoon::save`]) is a deliberate follow-up. See
+    /// `<leader>q` find).
+    ///
+    /// [`App::new`] seeds a **session-scoped** [`Harpoon::empty`] — no store
+    /// file, so building an `App` in a unit test never touches the real
+    /// `~/.kopitiam` (same purity rule as `git_status`/`tmux_prompt`). The
+    /// *real* editor launch swaps in the on-disk, per-project list via
+    /// [`Self::load_persisted_harpoon`], called from `crate::ui::bootstrap::run`
+    /// right next to the other startup filesystem work. Because a session-scoped
+    /// `Harpoon::save` is a no-op, the mark/delete handlers can call
+    /// `self.harpoon.save()` unconditionally and tests still stay in-memory. See
     /// [`crate::plugins::harpoon`].
     harpoon: Harpoon,
     /// The cached git branch/dirty state shown in the statusline (the
@@ -466,6 +472,19 @@ impl<H: EditorHost> App<H> {
     /// field and [`Action::LuaKeymap`].
     pub fn set_lua_runtime(&mut self, runtime: crate::luaconfig::LuaRuntime) {
         self.lua = Some(runtime);
+    }
+
+    /// Real-launch only: swap the session-scoped [`Harpoon::empty`] the
+    /// constructor installed for the on-disk, per-project mark list loaded from
+    /// `~/.kopitiam/kopitiam-neovim/harpoon.json`. Called by
+    /// [`crate::ui::bootstrap::run`], **never** in a unit test — same reasoning
+    /// as [`Self::apply_startup_advice`]: it reads the filesystem, so it lives
+    /// in `run`, next to the other startup detection, not in [`App::new`] which
+    /// must stay pure. A corrupt or absent store degrades to empty (see
+    /// [`crate::plugins::harpoon`]), so this can never stop kvim opening.
+    pub fn load_persisted_harpoon(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.harpoon = Harpoon::load(&cwd).unwrap_or_else(|_| Harpoon::empty(&cwd));
     }
 
     /// Shows a one-line informational message on the statusline at startup —
@@ -2124,6 +2143,11 @@ impl<H: EditorHost> App<H> {
         let cursor = self.host.cursor();
         let display = path.display().to_string();
         if self.harpoon.add_file(path, cursor.line, cursor.col) {
+            // Persist the new mark so it survive a restart (per-project, on
+            // disk). No-op for a session-scoped list, so tests stay in-memory;
+            // a write failure must not swallow the "marked" feedback, so we
+            // just drop the error here — losing persistence beats a broken UI.
+            let _ = self.harpoon.save();
             self.info(format!("Harpoon: marked \"{display}\" liao — now got {}", self.harpoon.len()))
         } else {
             self.info(format!("Harpoon: \"{display}\" already marked liao"))
@@ -2225,6 +2249,9 @@ impl<H: EditorHost> App<H> {
             // same index (see [`crate::ui::harpoon`]), so the two stay in step.
             OverlayOutcome::HarpoonRemove(index) => {
                 self.harpoon.remove(index);
+                // Persist the shrunk list too, same as marking. No-op when
+                // session-scoped; error dropped on purpose (see `harpoon_mark`).
+                let _ = self.harpoon.save();
                 LoopAction::Redraw
             }
         }
