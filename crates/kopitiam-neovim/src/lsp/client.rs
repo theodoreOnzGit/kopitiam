@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use kopitiam_semantic::edit::FileEdit;
-use kopitiam_semantic::{self as semantic, AsyncRustAnalyzerSession, LspState, RequestError};
+use kopitiam_semantic::{self as semantic, AsyncRustAnalyzerSession, LspState, ProgressSnapshot, RequestError};
 
 use crate::core::{Position, Range};
 
@@ -224,6 +224,17 @@ impl LspClient {
                     .any(|((exe, _), session)| *exe == s.executable && session.state() == LspState::Connecting)
             })
             .unwrap_or(false)
+    }
+
+    /// The start-up progress of the server for `filetype` rooted at `file`'s
+    /// workspace, or `None` when there is no progress to show (no session, not
+    /// started, already ready, or the server sent no `$/progress`). Feeds kvim's
+    /// LSP startup progress bar. See [`ProgressSnapshot`].
+    pub fn progress(&self, filetype: &str, file: &Path) -> Option<ProgressSnapshot> {
+        let server = registry::for_filetype(filetype)?;
+        let root = workspace_root(file);
+        let key = (server.executable.to_string(), root);
+        self.sessions.get(&key).and_then(AsyncRustAnalyzerSession::progress)
     }
 
     /// Whether the registry knows a server for `filetype` *and* its executable

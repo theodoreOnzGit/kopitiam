@@ -120,6 +120,14 @@ pub enum CommandId {
     /// `:h`/`:help`.
     Help,
 
+    // --- LSP control (kopitiam-cj0.61) ---
+    /// `:LspStart` — force-attach the language server for the current buffer,
+    /// bypassing the resource-aware guard for this session.
+    LspStart,
+    /// `:LspInfo` — print the guard's probe numbers, RA-memory estimate, and
+    /// gate decision.
+    LspInfo,
+
     // --- Quickfix & location lists (kopitiam-cj0.18) ---
     // Project-wide search into a navigable list. The `c`-prefixed commands act
     // on the global *quickfix* list; the `l`-prefixed twins act on the
@@ -225,6 +233,11 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::Terminal, names: &["term", "terminal"], arg: ArgKind::None, help: "open a terminal buffer" },
     CommandSpec { id: CommandId::Read, names: &["r", "read"], arg: ArgKind::None, help: "read shell command output into buffer" },
     CommandSpec { id: CommandId::Help, names: &["h", "help"], arg: ArgKind::File, help: "open the help manual" },
+    // LSP control. Capitalised like Neovim's own `:LspInfo`/`:LspStart` user
+    // commands (registry lookup is exact-match, and these are all-alphabetic so
+    // `ex::parse` captures the whole name).
+    CommandSpec { id: CommandId::LspStart, names: &["LspStart"], arg: ArgKind::None, help: "force-start the LSP, bypassing the resource guard" },
+    CommandSpec { id: CommandId::LspInfo, names: &["LspInfo"], arg: ArgKind::None, help: "show the LSP resource-guard estimate and decision" },
 
     // Quickfix list (global) — project search + navigate + iterate.
     CommandSpec { id: CommandId::Grep, names: &["gr", "grep"], arg: ArgKind::None, help: "search project into the quickfix list" },

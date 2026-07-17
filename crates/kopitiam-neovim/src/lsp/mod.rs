@@ -56,6 +56,7 @@ pub mod completion;
 pub mod install;
 pub mod position;
 pub mod registry;
+pub mod resource_guard;
 
 pub use client::{Diagnostic, Location, LspClient, LspError, Severity};
 pub use completion::{CompletionItem, CompletionSource};

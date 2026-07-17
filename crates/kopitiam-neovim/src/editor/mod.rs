@@ -3457,6 +3457,11 @@ impl Editor {
                 Ok(EditorResponse::Window(WindowCommand::BufferDeleted { deleted, replacement }))
             }
             ex::ExCommand::ListBuffers => Ok(EditorResponse::Message(self.buffer_list())),
+            // `:LspStart`/`:LspInfo` need the UI's `LspClient` (which the editor
+            // has no handle to), so — like the LSP keymaps — they route back
+            // through `EditorResponse::Action` for `App::handle_action` to run.
+            ex::ExCommand::LspStart => Ok(EditorResponse::Action(crate::config::Action::LspStart)),
+            ex::ExCommand::LspInfo => Ok(EditorResponse::Action(crate::config::Action::LspInfo)),
             ex::ExCommand::Substitute { range, pattern, replacement, global } => {
                 let (first, last) = range.resolve(self.cursor.line, self.current_buffer().line_count());
                 let n = ex::substitute(self.current_buffer_mut(), first, last, &pattern, &replacement, global)?;

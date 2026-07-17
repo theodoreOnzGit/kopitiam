@@ -58,16 +58,18 @@
 //!   that should collapse those into one live session lives on the kvim side;
 //!   this handle is per-call, so the dedup fix belongs with the wiring pass.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::edit::FileEdit;
+use crate::lsp_client::{ProgressKind, ProgressUpdate};
 use crate::lsp_types::{CompletionItem, Diagnostic, Hover, Location};
 use crate::session::{CodeAction, RustAnalyzerSession};
 
@@ -170,6 +172,149 @@ impl std::error::Error for RequestError {
 /// Aliased so the request plumbing does not trip clippy's `type_complexity`.
 type Job = Box<dyn FnOnce(&mut RustAnalyzerSession) + Send>;
 
+/// A read-only snapshot of how far along a server's start-up is, for kvim's
+/// LSP progress bar.
+///
+/// Folded from the stream of [`ProgressUpdate`]s by [`ProgressAggregator`] and
+/// handed out by [`AsyncRustAnalyzerSession::progress`]. Every field is a
+/// best-effort estimate — a server need not send percentages at all, and the
+/// ETA is arithmetic on the current step's percentage, so treat it as "roughly
+/// this much more", never a promise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgressSnapshot {
+    /// The step the server is on right now (the `title` of the active
+    /// `workDoneProgress` token), e.g. `"Indexing"`. Empty only if a report
+    /// arrived before any begin (should not happen, defended anyway).
+    pub current_step: String,
+    /// The server's free-text detail for the current step, if any (e.g. the
+    /// crate being indexed).
+    pub detail: Option<String>,
+    /// Current step completion `0..=100`, when the server sent one.
+    pub percentage: Option<u8>,
+    /// Every step title seen so far, in the order they began — the sequence the
+    /// user is watching rust-analyzer walk through (Roots Scanned → Building
+    /// CrateGraph → … → Indexing). De-duplicated, begin order preserved.
+    pub steps: Vec<String>,
+    /// Wall-clock since the first progress notification arrived.
+    pub elapsed: Duration,
+    /// A ROUGH estimate of time left, derived from the current step's elapsed
+    /// time and percentage (`elapsed / pct * (100 - pct)`). `None` when there is
+    /// no percentage to extrapolate from, or it is at 0/100. Label it approximate
+    /// in the UI — percentage resets each step, so this only models the current
+    /// step, not the whole start-up.
+    pub rough_eta: Option<Duration>,
+}
+
+/// Folds the stream of start-up [`ProgressUpdate`]s into a [`ProgressSnapshot`].
+///
+/// Lives behind the session's `Arc<Mutex<..>>`: the worker thread feeds it each
+/// update as it arrives during the connect, and the UI thread reads a snapshot
+/// on its idle tick.
+///
+/// # Why it keys on token
+///
+/// LSP puts the step `title` only on the `begin`; the following `report`s carry
+/// just `message`/`percentage`. So to know which step a bare `report` belongs
+/// to, we remember `token -> title` from the begin and look it back up. See
+/// [`ProgressUpdate`]'s protocol notes.
+#[derive(Default)]
+struct ProgressAggregator {
+    /// When the first progress notification landed — the anchor for `elapsed`
+    /// and the ETA. `None` until the first update.
+    started: Option<Instant>,
+    /// `token -> title`, learned from each `begin`, so a later `report` on the
+    /// same token can recover its step name.
+    token_titles: HashMap<String, String>,
+    /// The token whose progress is currently live (the most recent `begin` that
+    /// has not `end`ed, or the most recent update's token).
+    current_token: Option<String>,
+    /// Distinct step titles in the order they began — the [`ProgressSnapshot::steps`]
+    /// sequence.
+    steps: Vec<String>,
+    /// Current step's latest detail message.
+    detail: Option<String>,
+    /// Current step's latest percentage.
+    percentage: Option<u8>,
+    /// Instant the current step began, for that step's own ETA maths.
+    step_started: Option<Instant>,
+}
+
+impl ProgressAggregator {
+    /// Feeds one update in. Cheap; runs on the worker thread inside the connect.
+    fn apply(&mut self, update: ProgressUpdate) {
+        let now = Instant::now();
+        self.started.get_or_insert(now);
+        match update.kind {
+            ProgressKind::Begin => {
+                if let Some(title) = update.title.clone() {
+                    self.token_titles.insert(update.token.clone(), title.clone());
+                    if !self.steps.contains(&title) {
+                        self.steps.push(title);
+                    }
+                }
+                self.current_token = Some(update.token);
+                self.step_started = Some(now);
+                self.detail = update.message;
+                self.percentage = update.percentage;
+            }
+            ProgressKind::Report => {
+                self.current_token = Some(update.token);
+                // A report may omit either field; only overwrite when present so
+                // a message-only report does not wipe the last percentage.
+                if update.message.is_some() {
+                    self.detail = update.message;
+                }
+                if update.percentage.is_some() {
+                    self.percentage = update.percentage;
+                }
+            }
+            ProgressKind::End => {
+                // The step finished; keep the step list but clear the live
+                // detail/percentage so the snapshot does not show a stale bar
+                // between steps.
+                if self.current_token.as_deref() == Some(update.token.as_str()) {
+                    self.detail = update.message;
+                    self.percentage = None;
+                    self.step_started = None;
+                }
+            }
+        }
+    }
+
+    /// The current view, or `None` if no progress has been seen yet.
+    fn snapshot(&self) -> Option<ProgressSnapshot> {
+        let started = self.started?;
+        let current_step = self
+            .current_token
+            .as_ref()
+            .and_then(|t| self.token_titles.get(t).cloned())
+            .or_else(|| self.steps.last().cloned())
+            .unwrap_or_default();
+        let rough_eta = self.rough_eta();
+        Some(ProgressSnapshot {
+            current_step,
+            detail: self.detail.clone(),
+            percentage: self.percentage,
+            steps: self.steps.clone(),
+            elapsed: started.elapsed(),
+            rough_eta,
+        })
+    }
+
+    /// Rough remaining-time for the current step: `elapsed_step / pct * (100 -
+    /// pct)`. Only meaningful when a percentage strictly between 0 and 100 is
+    /// available and the step has a start instant.
+    fn rough_eta(&self) -> Option<Duration> {
+        let pct = self.percentage.filter(|p| *p > 0 && *p < 100)? as u32;
+        let step_elapsed = self.step_started?.elapsed();
+        // remaining = elapsed * (100 - pct) / pct. Use millis in u128 to avoid
+        // overflow and keep it exact-ish.
+        let elapsed_ms = step_elapsed.as_millis();
+        let remaining_ms = elapsed_ms.saturating_mul(u128::from(100 - pct)) / u128::from(pct);
+        Some(Duration::from_millis(remaining_ms.min(u128::from(u64::MAX)) as u64))
+    }
+}
+
 /// A handle to a rust-analyzer session that connects on a background thread, so
 /// the caller never blocks on the connect.
 ///
@@ -190,6 +335,11 @@ pub struct AsyncRustAnalyzerSession {
     state: Arc<AtomicU8>,
     /// The failure reason, populated by the worker when the connect fails.
     error: Arc<Mutex<Option<String>>>,
+    /// Start-up progress, folded from the server's `$/progress` stream by the
+    /// worker during the connect and read by the UI's idle tick via
+    /// [`Self::progress`]. Empty (no snapshot) before the first notification and
+    /// after the session is ready.
+    progress: Arc<Mutex<ProgressAggregator>>,
     /// The channel onto which caller requests are pushed as [`Job`]s. Dropping
     /// it (when the handle drops) is what signals the worker to stop.
     jobs: Sender<Job>,
@@ -219,6 +369,7 @@ impl AsyncRustAnalyzerSession {
     pub fn spawn_async_with_args(binary: &str, args: &[&str], root: &Path, index_timeout: Duration) -> Self {
         let state = Arc::new(AtomicU8::new(STATE_CONNECTING));
         let error = Arc::new(Mutex::new(None));
+        let progress = Arc::new(Mutex::new(ProgressAggregator::default()));
         let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
 
         // Own everything the worker needs so it outlives this call: the caller's
@@ -228,10 +379,22 @@ impl AsyncRustAnalyzerSession {
         let root = root.to_path_buf();
         let worker_state = Arc::clone(&state);
         let worker_error = Arc::clone(&error);
+        let worker_progress = Arc::clone(&progress);
 
         let worker = thread::spawn(move || {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let mut session = match RustAnalyzerSession::connect_with(&binary, &arg_refs, &root, index_timeout) {
+            // Fold each start-up `$/progress` into the shared aggregator so the
+            // UI's idle tick can read a snapshot. The closure only takes a short
+            // mutex and returns — it must not block, it runs inline in the
+            // connect (see `LspClient::spawn_with_args_observed`).
+            let observer = |update: ProgressUpdate| {
+                if let Ok(mut agg) = worker_progress.lock() {
+                    agg.apply(update);
+                }
+            };
+            let connect =
+                RustAnalyzerSession::connect_with_observed(&binary, &arg_refs, &root, index_timeout, observer);
+            let mut session = match connect {
                 Ok(session) => {
                     worker_state.store(STATE_READY, Ordering::SeqCst);
                     session
@@ -244,6 +407,11 @@ impl AsyncRustAnalyzerSession {
                     return;
                 }
             };
+            // Ready now: drop any start-up progress so `progress()` returns
+            // `None` and kvim clears the bar. Diagnostics take over from here.
+            if let Ok(mut agg) = worker_progress.lock() {
+                *agg = ProgressAggregator::default();
+            }
 
             // Serve jobs one at a time; on an idle tick, pump pushed
             // diagnostics into the store so they surface without a caller
@@ -263,13 +431,24 @@ impl AsyncRustAnalyzerSession {
             let _ = session.shutdown();
         });
 
-        Self { state, error, jobs: jobs_tx, _worker: worker }
+        Self { state, error, progress, jobs: jobs_tx, _worker: worker }
     }
 
     /// The current lifecycle [`LspState`]. A lock-free atomic load, cheap enough
     /// to call on every UI idle tick.
     pub fn state(&self) -> LspState {
         LspState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    /// A snapshot of the server's start-up progress, or `None` when there is no
+    /// progress to show (before the first `$/progress`, or once the session is
+    /// [`LspState::Ready`] — the worker clears it on ready). Cheap: a short mutex
+    /// take and a clone, safe to call every UI idle tick.
+    ///
+    /// This is the read side of kvim's LSP startup progress bar; the worker
+    /// thread is the write side. See [`ProgressSnapshot`].
+    pub fn progress(&self) -> Option<ProgressSnapshot> {
+        self.progress.lock().ok().and_then(|agg| agg.snapshot())
     }
 
     /// True once the server has connected and finished indexing, i.e. requests
@@ -383,6 +562,90 @@ impl AsyncRustAnalyzerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn begin(token: &str, title: &str, pct: Option<u8>) -> ProgressUpdate {
+        ProgressUpdate { token: token.into(), kind: ProgressKind::Begin, title: Some(title.into()), message: None, percentage: pct }
+    }
+    fn report(token: &str, pct: Option<u8>, msg: Option<&str>) -> ProgressUpdate {
+        ProgressUpdate { token: token.into(), kind: ProgressKind::Report, title: None, message: msg.map(str::to_string), percentage: pct }
+    }
+    fn end(token: &str) -> ProgressUpdate {
+        ProgressUpdate { token: token.into(), kind: ProgressKind::End, title: None, message: None, percentage: None }
+    }
+
+    /// The aggregator folds a realistic rust-analyzer start-up sequence into a
+    /// snapshot: it remembers each step's title (from the `begin`) so a bare
+    /// `report` on the same token knows which step it is, builds the ordered
+    /// step list, and tracks the live percentage.
+    #[test]
+    fn aggregator_folds_a_startup_sequence() {
+        let mut agg = ProgressAggregator::default();
+        assert!(agg.snapshot().is_none(), "no snapshot before any progress");
+
+        agg.apply(begin("roots", "Roots Scanned", None));
+        agg.apply(end("roots"));
+        agg.apply(begin("crategraph", "Building CrateGraph", Some(0)));
+        agg.apply(report("crategraph", Some(50), Some("half")));
+        let snap = agg.snapshot().expect("has progress");
+        assert_eq!(snap.current_step, "Building CrateGraph");
+        assert_eq!(snap.percentage, Some(50));
+        assert_eq!(snap.detail.as_deref(), Some("half"));
+        // Both steps seen, in begin order.
+        assert_eq!(snap.steps, vec!["Roots Scanned".to_string(), "Building CrateGraph".to_string()]);
+    }
+
+    /// A `report` carries no `title`; the step name must be recovered from the
+    /// matching `begin` by token, and a message-only report must not wipe the
+    /// last percentage (nor vice versa).
+    #[test]
+    fn report_recovers_title_and_does_not_clobber_fields() {
+        let mut agg = ProgressAggregator::default();
+        agg.apply(begin("idx", "Indexing", Some(10)));
+        agg.apply(report("idx", Some(40), None)); // percentage only
+        agg.apply(report("idx", None, Some("kopitiam-neovim"))); // message only
+        let snap = agg.snapshot().unwrap();
+        assert_eq!(snap.current_step, "Indexing", "title recovered from begin by token");
+        assert_eq!(snap.percentage, Some(40), "message-only report kept the last percentage");
+        assert_eq!(snap.detail.as_deref(), Some("kopitiam-neovim"));
+    }
+
+    /// `end` clears the live bar so a snapshot between steps does not show a
+    /// stale percentage.
+    #[test]
+    fn end_clears_the_live_percentage() {
+        let mut agg = ProgressAggregator::default();
+        agg.apply(begin("idx", "Indexing", Some(90)));
+        agg.apply(end("idx"));
+        let snap = agg.snapshot().unwrap();
+        assert_eq!(snap.percentage, None, "ended step must not leave a stale bar");
+        // The step is still remembered in the sequence.
+        assert_eq!(snap.steps, vec!["Indexing".to_string()]);
+    }
+
+    /// `parse_progress_update` reads the wire shape, clamps an out-of-range
+    /// percentage, and rejects non-progress / unknown-kind messages.
+    #[test]
+    fn parses_progress_json() {
+        use crate::lsp_client::parse_progress_update;
+        use serde_json::json;
+        let begin = json!({
+            "method": "$/progress",
+            "params": { "token": "rustAnalyzer/Indexing", "value": { "kind": "begin", "title": "Indexing", "percentage": 5 } }
+        });
+        let u = parse_progress_update(&begin).expect("a begin");
+        assert_eq!(u.kind, ProgressKind::Begin);
+        assert_eq!(u.token, "rustanalyzer/indexing", "token is lower-cased");
+        assert_eq!(u.title.as_deref(), Some("Indexing"));
+        assert_eq!(u.percentage, Some(5));
+
+        // Out-of-range percentage is clamped, not trusted.
+        let over = json!({ "method": "$/progress", "params": { "token": "t", "value": { "kind": "report", "percentage": 250 } } });
+        assert_eq!(parse_progress_update(&over).unwrap().percentage, Some(100));
+
+        // Not a $/progress -> None.
+        let diag = json!({ "method": "textDocument/publishDiagnostics", "params": {} });
+        assert!(parse_progress_update(&diag).is_none());
+    }
 
     /// The discriminant mapping is total and its unknown-value fallback is
     /// `Connecting` — a pure check of the state machine's decode with no

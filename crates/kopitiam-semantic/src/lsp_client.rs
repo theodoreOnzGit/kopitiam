@@ -83,6 +83,83 @@ fn read_one_message(stdout: &mut BufReader<ChildStdout>) -> Result<Option<Value>
     Ok(Some(serde_json::from_slice(&buf)?))
 }
 
+/// One `$/progress` (LSP `workDoneProgress`) notification, parsed into the
+/// bits kvim's startup progress bar cares about.
+///
+/// # `$/progress` / `workDoneProgress` protocol knowledge (LSP 3.15+)
+///
+/// A server that advertised `window.workDoneProgress` streams progress for a
+/// long task as a **sequence of `$/progress` notifications sharing one
+/// `token`**, in three phases (`params.value.kind`):
+///
+/// * `"begin"` — carries the human `title` (e.g. rust-analyzer's
+///   `"Roots Scanned"`, `"Building CrateGraph"`, `"Indexing"`), and *may*
+///   carry `message` and `percentage`.
+/// * `"report"` — zero or more updates. Carries `message` and/or `percentage`,
+///   but **no `title`** (you must remember it from the matching `begin` by
+///   token — that is why [`ProgressAggregator`](super::async_session) keys on
+///   token). `percentage` is an integer `0..=100`, and is **optional** — a
+///   server may report progress with only a message and no number.
+/// * `"end"` — the task is done; carries an optional final `message`.
+///
+/// rust-analyzer emits several such tokens back-to-back at start-up (scanning
+/// roots, building the crate graph, loading proc-macros, then cache-priming /
+/// indexing), which is exactly the "sequence of steps before it's ready" kvim
+/// shows the user. See `docs/ai-decisions/AID-0022` for the cachePriming token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgressUpdate {
+    /// The `workDoneProgress` token that ties `begin`/`report`/`end` together.
+    /// Lower-cased for stable comparison, same as [`progress_parts`].
+    pub token: String,
+    /// Which phase this notification is.
+    pub kind: ProgressKind,
+    /// The step name. Only ever `Some` on a `begin` (LSP puts `title` there and
+    /// nowhere else); consumers carry it forward to the token's `report`s.
+    pub title: Option<String>,
+    /// Free-text detail (`begin`/`report`/`end`), e.g. the crate being indexed.
+    pub message: Option<String>,
+    /// Completion `0..=100`, when the server chose to send one. Optional per
+    /// spec — never assume it is present.
+    pub percentage: Option<u8>,
+}
+
+/// Which of the three `workDoneProgress` phases a [`ProgressUpdate`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressKind {
+    Begin,
+    Report,
+    End,
+}
+
+/// Parses a raw `$/progress` message into a [`ProgressUpdate`], or `None` if
+/// `msg` is not a `$/progress` (or its `kind` is unrecognised).
+pub(crate) fn parse_progress_update(msg: &Value) -> Option<ProgressUpdate> {
+    if msg.get("method").and_then(Value::as_str) != Some("$/progress") {
+        return None;
+    }
+    let token = msg.pointer("/params/token").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+    let value = msg.pointer("/params/value")?;
+    let kind = match value.get("kind").and_then(Value::as_str)? {
+        "begin" => ProgressKind::Begin,
+        "report" => ProgressKind::Report,
+        "end" => ProgressKind::End,
+        _ => return None,
+    };
+    // `percentage` is optional and an integer 0..=100; clamp defensively in case
+    // a server sends something out of range rather than trusting it blindly.
+    let percentage = value
+        .get("percentage")
+        .and_then(Value::as_u64)
+        .map(|p| p.min(100) as u8);
+    Some(ProgressUpdate {
+        token,
+        kind,
+        title: value.get("title").and_then(Value::as_str).map(str::to_string),
+        message: value.get("message").and_then(Value::as_str).map(str::to_string),
+        percentage,
+    })
+}
+
 /// The `(token, kind, title)` of a `$/progress` notification, or `None` if
 /// `msg` is not one.
 fn progress_parts(msg: &Value) -> Option<(String, &str, String)> {
@@ -189,6 +266,31 @@ impl LspClient {
     /// of them independently discovered they could not spawn their server.**
     /// When four separate implementers hit the same wall, the wall is the bug.
     pub fn spawn_with_args(program: &str, args: &[&str], root: &Path, index_timeout: Duration) -> Result<Self> {
+        Self::spawn_with_args_observed(program, args, root, index_timeout, |_| {})
+    }
+
+    /// Like [`Self::spawn_with_args`], but calls `observer` for every
+    /// `$/progress` ([`ProgressUpdate`]) the server streams while it is starting
+    /// up and indexing.
+    ///
+    /// This is the seam kvim's LSP startup progress bar hangs off: the async
+    /// session (`crate::AsyncRustAnalyzerSession`) passes a closure that folds
+    /// each update into a shared snapshot the editor's idle tick reads. The
+    /// `observer` runs on **this** thread (the caller's, or the async worker's)
+    /// during the blocking connect, so it must not itself block for long — the
+    /// async session's closure only takes a short mutex and returns.
+    ///
+    /// Only start-up progress is observed: `observer` stops being called once
+    /// the connect returns (readiness reached or timed out). Post-ready progress
+    /// (rust-analyzer's `cargo check` flychecks, etc.) is not surfaced — kvim
+    /// clears the bar the moment the server is ready.
+    pub fn spawn_with_args_observed(
+        program: &str,
+        args: &[&str],
+        root: &Path,
+        index_timeout: Duration,
+        observer: impl FnMut(ProgressUpdate),
+    ) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
@@ -218,7 +320,7 @@ impl LspClient {
             doc_versions: HashMap::new(),
         };
         client.initialize(root)?;
-        client.wait_for_indexing(index_timeout, program);
+        client.wait_for_indexing(index_timeout, program, observer);
         Ok(client)
     }
 
@@ -420,7 +522,7 @@ impl LspClient {
     /// alive with its own progress `report`s, the short idle window only fires
     /// once the server is genuinely quiet, so this speeds up the common case
     /// without returning mid-index on a large project.
-    fn wait_for_indexing(&mut self, timeout: Duration, program: &str) {
+    fn wait_for_indexing(&mut self, timeout: Duration, program: &str, mut observer: impl FnMut(ProgressUpdate)) {
         /// How long a **non-rust-analyzer** server may stay silent before we
         /// treat it as ready. Servers like `lua-language-server` and `texlab`
         /// do not emit rust-analyzer's indexing token, so "gone quiet after
@@ -450,6 +552,13 @@ impl LspClient {
             let wait = if is_rust_analyzer { remaining } else { remaining.min(IDLE_GRACE) };
             match self.recv(wait) {
                 Ok(msg) => {
+                    // Surface every start-up `$/progress` to the observer (the
+                    // whole sequence of steps -- roots scanned, crate graph,
+                    // proc-macros, indexing -- not just cachePriming), so kvim
+                    // can show the user what rust-analyzer is chewing through.
+                    if let Some(update) = parse_progress_update(&msg) {
+                        observer(update);
+                    }
                     if is_indexing_progress_work(&msg) {
                         indexing_did_work = true;
                     }

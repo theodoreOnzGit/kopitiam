@@ -68,5 +68,11 @@ nucleo = "0.5"
 # Directory walking that honours .gitignore, for the file tree and file picker.
 ignore = "0.4"
 
+# Device probe for the resource-aware LSP guard: available/total RAM, CPU core
+# count + live usage, and (future) per-process RSS. Pure Rust, Android-capable,
+# library-only. See `src/lsp/resource_guard.rs` for why one dep serves three
+# features. Workspace-pinned so the version tracks the rest of the tree.
+sysinfo.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

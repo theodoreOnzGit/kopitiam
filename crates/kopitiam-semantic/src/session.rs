@@ -58,7 +58,23 @@ impl RustAnalyzerSession {
     /// tests want to bound the connect, rather than inheriting the 180 s default
     /// baked into [`Self::connect`].
     pub fn connect_with(binary: &str, args: &[&str], root: &Path, index_timeout: Duration) -> Result<Self> {
-        let client = LspClient::spawn_with_args(binary, args, root, index_timeout)?;
+        Self::connect_with_observed(binary, args, root, index_timeout, |_| {})
+    }
+
+    /// Like [`Self::connect_with`], but forwards every start-up `$/progress`
+    /// ([`ProgressUpdate`](crate::ProgressUpdate)) to `observer` while the
+    /// server connects and indexes. Used by the asynchronous
+    /// [`crate::AsyncRustAnalyzerSession`] to drive kvim's startup progress bar;
+    /// the synchronous constructors pass a no-op. See
+    /// [`LspClient::spawn_with_args_observed`].
+    pub fn connect_with_observed(
+        binary: &str,
+        args: &[&str],
+        root: &Path,
+        index_timeout: Duration,
+        observer: impl FnMut(crate::lsp_client::ProgressUpdate),
+    ) -> Result<Self> {
+        let client = LspClient::spawn_with_args_observed(binary, args, root, index_timeout, observer)?;
         Ok(Self { client })
     }
 
