@@ -56,8 +56,12 @@
 //! core doesn't know or care *how* bytes arrive -- only that they arrive and
 //! then verify.
 //!
-//! The one real fetcher, [`HttpFetcher`], lives behind the default-on `net`
-//! feature and is built on `ureq` + `rustls`.
+//! Two real fetchers live behind the default-on `net` feature, both built on
+//! `ureq` + `rustls`: the generic [`HttpFetcher`], and [`HfFetcher`] -- the
+//! first-class HuggingFace one, which adds an optional `HF_TOKEN` bearer header
+//! for gated / private repos and follows the `resolve`->CDN redirect. See the
+//! [`hf`] module for the HF URL scheme, revision-pinning, and how an
+//! [`HfModel`] folds down into a plain [`ModelSpec`] for the same acquire path.
 //!
 //! ### The ring/rustls caveat
 //!
@@ -92,12 +96,19 @@
 mod catalog;
 mod error;
 mod fetch;
+pub mod hf;
 mod store;
 
 pub use catalog::{Architecture, Artifact, Catalog, CatalogProblem, ModelSpec};
 pub use error::Error;
 pub use fetch::{ensure_available, AcquiredModel, Fetcher};
+pub use hf::{
+    hf_resolve_url, hf_token_from_env, normalize_token, HfFile, HfModel, Revision, RevisionError,
+};
 pub use store::ModelStore;
 
 #[cfg(feature = "net")]
 pub use fetch::HttpFetcher;
+
+#[cfg(feature = "net")]
+pub use hf::HfFetcher;

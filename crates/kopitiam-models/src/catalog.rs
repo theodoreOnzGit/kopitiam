@@ -115,6 +115,12 @@ impl Catalog {
     /// This ships **two different families** on purpose (Qwen2 and Llama), so
     /// the model-agnostic promise is not just talk.
     pub fn builtin() -> Vec<ModelSpec> {
+        // maintainer will populate: once specific HF-hosted models are named,
+        // declare them the clean way via [`crate::hf::HfModel`] (repo / revision
+        // / filename / sha256) and `.into_spec()`, ideally pinning a commit
+        // [`crate::hf::Revision`] for reproducibility. See bead
+        // `kopitiam-56q`. The two hand-written entries below predate that
+        // mechanism and stay until the real models + hashes are chosen.
         vec![
             // ---- Qwen2 family --------------------------------------------
             // Qwen2.5-0.5B-Instruct, Q4_0 GGUF. Small (~350MB), Apache-2.0,
