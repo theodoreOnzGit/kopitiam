@@ -644,11 +644,28 @@ instructed; if the maintainer later wants published-crate *public API* docs kept
 in plainer English for reach, that's a scope refinement they can make — until they
 say so, this rule is everywhere.
 
-## Never publish to crates.io
+## Publishing to crates.io — only on the maintainer's explicit prompt
 
-GitHub pushes only. `scripts/publish.sh` exists but is run **by the maintainer,
-deliberately**, never by an agent and never as part of any other workflow.
-Publishing is irreversible: a version, once live, cannot be recalled.
+Default stays: **don't publish.** Normal work is GitHub pushes only, and publishing
+is irreversible — a version, once live, cannot be recalled.
+
+The one exception (maintainer's standing amendment, 2026-07-18): **the main
+assistant MAY run `cargo publish` / the `scripts/publish*.sh` scripts when the
+maintainer explicitly instructs it in a prompt** — e.g. "publish kopitiam-gpu",
+"run publish-kvim.sh". That explicit, in-session instruction is the whole gate.
+
+Still forbidden, even now:
+
+* **Subagents never publish.** Only the main loop runs a publish, and only on an
+  explicit prompt. Agents prep to the edge — green build, publish script, a
+  `--dry-run` — and hand back the command; they never run it themselves.
+* **Never autonomously, never inferred, never as part of another workflow** — not
+  at session-close, not folded in as a silent step of a bigger task. If publishing
+  would be a side-effect the maintainer did not name as "publish now", confirm first.
+* Publish **exactly** the crate + version the maintainer named, then report what
+  went live. Because it cannot be undone, if the prompt is explicit but the target
+  is ambiguous (which crate? which version?), state what you are about to publish
+  before you do — don't publish the wrong thing.
 
 ## Record decisions the maintainer would have made
 

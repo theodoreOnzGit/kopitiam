@@ -121,6 +121,19 @@ the odd loanword), not caricature.
 may lose overseas readers. Default now: Singlish everywhere; the maintainer can
 later carve out published-crate public API docs if they want reach.
 
+## Publishing to crates.io — only on the maintainer's explicit prompt
+
+Default: **don't publish.** Normal work is GitHub pushes only; publishing is
+irreversible (a version, once live, cannot be recalled).
+
+Exception (maintainer's amendment, 2026-07-18): **the main assistant MAY run
+`cargo publish` / `scripts/publish*.sh` when the maintainer explicitly instructs
+it in a prompt** ("publish kopitiam-gpu", "run publish-kvim.sh"). That explicit
+in-session instruction is the whole gate. Still forbidden: **subagents never
+publish** (they prep to the edge + hand back the command); never autonomously,
+never inferred, never folded into another workflow or session-close. Publish
+**exactly** the crate + version named, then report what went live.
+
 ## Quick Reference
 
 ```bash

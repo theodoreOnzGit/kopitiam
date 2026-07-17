@@ -1,6 +1,10 @@
 [package]
-name = "kopitiam-scientific"
-version = "0.1.0"
-edition = "2024"
+name = "kopitiam-internet-research"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM internet research: gather knowledge from the open web across any domain (science, lifestyle, finance, ...) — the online-research arm of the general knowledge engine. Scaffold only for now."
 
 [dependencies]
