@@ -22,7 +22,7 @@ lopdf = { workspace = true }
 # provider.
 kopitiam-pdf = { workspace = true }
 # A digitised plot must end up as knowledge in the semantic graph, not as a
-# loose struct (CLAUDE.md, "Scientific Knowledge").
+# loose struct (CLAUDE.md, "Structured Knowledge").
 kopitiam-ontology = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

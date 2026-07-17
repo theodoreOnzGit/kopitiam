@@ -42,7 +42,7 @@ tracing-subscriber = "0.3"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Scientific
+# Linear algebra / n-dimensional arrays
 nalgebra = "0.34"
 ndarray = "0.16"
 
