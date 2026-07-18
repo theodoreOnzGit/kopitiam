@@ -1,0 +1,28 @@
+[package]
+name = "kopitiam-resource"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM's preemptive resource budgeter: estimate RAM/CPU cost BEFORE launching rust-analyzer or loading a gguf, so a small Android tablet degrades gracefully instead of getting OOM-killed."
+
+[dependencies]
+# Device probe: available/total RAM + CPU core count + usage. Pure Rust,
+# Android-capable (reads /proc under the hood), library-only. Same crate kvim
+# already ships (AID-0037) -- we generalise its LSP guard into this shared one.
+sysinfo.workspace = true
+
+# Accurate resolved dependency-graph crate count (the primary predictor of
+# rust-analyzer's RAM). Opt-in only -- it shells out to `cargo`, which is NOT
+# cheap on a cold tablet -- so the DEFAULT weight path stays on the cheap
+# Cargo.lock line-count. Already a workspace dep, so no new supply-chain surface.
+cargo_metadata.workspace = true
+
+# Stat-only source walk. `ignore` honours .gitignore and skips `target/`, so we
+# sum first-party `.rs` metadata bytes, never build artefacts, never opening a
+# file. Same crate + version kvim uses for its file tree.
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1942,6 +1942,16 @@ name = "kopitiam-rag"
 version = "0.1.0"
 
 [[package]]
+name = "kopitiam-resource"
+version = "0.1.2"
+dependencies = [
+ "cargo_metadata",
+ "ignore",
+ "sysinfo",
+ "tempfile",
+]
+
+[[package]]
 name = "kopitiam-runtime"
 version = "0.1.2"
 dependencies = [
