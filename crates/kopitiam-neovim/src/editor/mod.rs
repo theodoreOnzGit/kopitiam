@@ -149,6 +149,15 @@ pub enum EditorResponse {
     /// grammar where it belongs) and hands the parsed request back. See
     /// [`ex::QuickfixCommand`] and [`crate::ui::app::App`].
     Quickfix(ex::QuickfixCommand),
+    /// `:term [cmd]` — the editor made a terminal buffer and switched to
+    /// terminal-mode; the UI must now spawn the pty session for it. Like
+    /// [`EditorResponse::Window`], the editor recognises the command but cannot
+    /// perform it: the pty, its reader thread and the grid rendering are all the
+    /// UI's (it owns OS resources and the window geometry). `buffer` is the
+    /// freshly-created terminal buffer's id (the UI keys its session on it) and
+    /// `command` is the shell command line, `None` for the default shell. See
+    /// [`crate::termemu`], [`crate::ui::app::App`] and AID-0049.
+    Terminal { buffer: BufferId, command: Option<String> },
 }
 
 /// Which of the three command-line prompts is currently open — `:` for ex
@@ -478,6 +487,18 @@ impl Editor {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Leave terminal-mode back to Normal — the `<C-\><C-n>` escape. The UI
+    /// calls this when it sees that two-key sequence while in [`Mode::Terminal`]
+    /// (the UI owns the interception, since it is also the layer forwarding
+    /// every other terminal keystroke to the pty). A no-op if we are not
+    /// actually in terminal-mode, so a stray call cannot knock the editor out of
+    /// another mode. See AID-0049.
+    pub fn leave_terminal_mode(&mut self) {
+        if self.mode == Mode::Terminal {
+            self.mode = Mode::Normal;
+        }
     }
 
     /// The which-key rows to show for the key sequence buffered so far, or an
@@ -868,6 +889,22 @@ impl Editor {
             }
         }
 
+        // On a terminal buffer, Normal-mode `i`/`a`/`I`/`A` re-enter terminal-
+        // mode (they would otherwise enter Insert on a read-only buffer, which
+        // is a no-op) — this is how the user gets back to typing at the shell
+        // after leaving with `<C-\><C-n>` to scroll/copy. Matches neovim, where
+        // any insert-starting key on a terminal buffer resumes the job. The UI
+        // sees `mode() == Terminal` on the next paint and resumes forwarding
+        // keystrokes to the pty.
+        if self.mode == Mode::Normal
+            && !key.mods.ctrl
+            && matches!(key.code, KeyCode::Char('i' | 'a' | 'I' | 'A'))
+            && self.current_buffer().is_terminal()
+        {
+            self.mode = Mode::Terminal;
+            return Ok(EditorResponse::Continue);
+        }
+
         let mode_before = self.mode;
         let result = match self.mode {
             Mode::Insert => self.handle_insert_key(key),
@@ -875,6 +912,12 @@ impl Editor {
             Mode::Command => self.handle_command_key(key),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => self.handle_visual_key(key),
             Mode::Normal | Mode::OperatorPending => self.handle_normal_key(key),
+            // In terminal-mode the UI intercepts every keystroke and forwards it
+            // to the pty (see `App::handle_terminal_key`), so the editor is not
+            // normally handed keys here. If one arrives anyway (a macro replay,
+            // a test), it has no editor meaning — swallow it rather than letting
+            // it fall through to normal-mode handling.
+            Mode::Terminal => Ok(EditorResponse::Continue),
         };
 
         // Insert-mode `<C-o>` semantics: the keystroke that armed one-shot ran
@@ -3601,18 +3644,21 @@ impl Editor {
             // Tab pages are the UI's to change (see `TabCommand`), so the parsed
             // command just rides back out as `EditorResponse::Tab`. AID-0048.
             ex::ExCommand::Tab(cmd) => Ok(EditorResponse::Tab(cmd)),
-            // A real `:term` is a PTY-backed terminal emulator — a large
-            // feature (ANSI grid parsing, keystroke forwarding, colours) that
-            // is worse done badly than deferred. So this opens a scratch buffer
-            // that says so plainly, rather than a broken terminal or a silent
-            // no-op. Tracked as kopitiam-cj0.10.4; a future implementation may
-            // embed `kopitiam-mux`.
-            ex::ExCommand::Terminal => {
-                self.new_buffer();
-                let msg = "-- :term (terminal emulation) is not yet implemented in kvim (kopitiam-cj0.10.4) --";
-                self.current_buffer_mut().apply(Edit::insert(Position::ORIGIN, msg.to_string()))?;
+            // `:term [cmd]` — a real pty-backed terminal (kopitiam-cj0.10.4,
+            // AID-0049). The editor makes a fresh buffer, marks it a terminal
+            // (which also chopes it read-only, so the empty marker text is never
+            // edited and `:q` never nags), moves the cursor home, and switches
+            // straight into terminal-mode so the very next keystroke is
+            // forwarded to the shell. It cannot spawn the pty itself — the pty,
+            // its reader thread and the grid render are the UI's — so it hands
+            // the new buffer id and the command line back for the UI to spawn
+            // the `TermSession`. See `EditorResponse::Terminal`.
+            ex::ExCommand::Terminal { cmd } => {
+                let buffer = self.new_buffer();
+                self.current_buffer_mut().mark_terminal();
                 self.cursor = Position::ORIGIN;
-                Ok(EditorResponse::Continue)
+                self.mode = Mode::Terminal;
+                Ok(EditorResponse::Terminal { buffer, command: cmd })
             }
             // `:help [topic]` opens kvim's built-in Singlish manual in a fresh
             // scratch buffer — reusing the same "new_buffer + insert text"

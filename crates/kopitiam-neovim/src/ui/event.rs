@@ -404,6 +404,14 @@ pub trait EditorHost {
     fn which_key(&self) -> Vec<crate::ui::whichkey::WhichKeyRow> {
         Vec::new()
     }
+
+    /// Leave terminal-mode back to Normal — the editor side of the `<C-\><C-n>`
+    /// escape. The UI owns the interception (it forwards every other terminal
+    /// keystroke to the pty), and calls this when it sees the two-key sequence.
+    /// Default no-op, so a fake/placeholder host with no terminal support need
+    /// not implement it. See [`crate::editor::Editor::leave_terminal_mode`] and
+    /// AID-0049.
+    fn leave_terminal_mode(&mut self) {}
 }
 
 /// What the UI does after `handle_key` returns.
@@ -459,6 +467,15 @@ pub enum HostResponse {
     /// adapter to [`crate::ui::app::App`], the layer that owns both. See
     /// [`crate::editor::ex::QuickfixCommand`].
     Quickfix(crate::editor::ex::QuickfixCommand),
+    /// `:term [cmd]` — the editor made a terminal buffer and switched to
+    /// terminal-mode; the UI must spawn the pty session for it. `buffer` is the
+    /// terminal buffer's id (the UI keys its `TermSession` on it) and `command`
+    /// is the shell command line (`None` = default shell). The editor cannot
+    /// spawn the pty itself (it owns no OS resources or window geometry), same
+    /// reason [`HostResponse::Window`] exists. See
+    /// [`crate::editor::EditorResponse::Terminal`], [`crate::termemu`] and
+    /// AID-0049.
+    Terminal { buffer: BufferId, command: Option<String> },
 }
 
 /// Read-only view of a buffer's text, matching the frozen `text::Buffer`

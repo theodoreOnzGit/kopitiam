@@ -62,6 +62,7 @@ pub mod icons;
 pub mod lsp;
 pub mod luaconfig;
 pub mod plugins;
+pub mod termemu;
 pub mod text;
 pub mod tmux;
 pub mod ui;

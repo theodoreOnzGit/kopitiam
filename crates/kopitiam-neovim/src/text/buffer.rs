@@ -122,6 +122,17 @@ pub struct Buffer {
     /// scratch buffer stays fully editable, so the ordinary unsaved-changes
     /// guard is untouched.
     read_only: bool,
+    /// Whether this buffer is a `:term` terminal buffer (vim's `buftype=terminal`).
+    ///
+    /// A terminal buffer is a *marker*: its rope text is not where the terminal
+    /// content lives — that lives in the pty-backed [`crate::termemu::TermSession`]
+    /// the UI holds (keyed by this buffer's id), and the UI paints the vt100
+    /// grid instead of this buffer's text. The flag exists so the editor can (a)
+    /// route `i`/`a` in Normal mode into terminal-mode rather than insert-mode,
+    /// and (b) let the UI recognise which windows to render as a terminal. A
+    /// terminal buffer is also choped read-only, so no stray keystroke edits the
+    /// empty marker text and `:q` never nags. Default `false`. See AID-0049.
+    is_terminal: bool,
 }
 
 impl Default for Buffer {
@@ -154,6 +165,7 @@ impl Buffer {
             u_line: None,
             line_edits: Vec::new(),
             read_only: false,
+            is_terminal: false,
         }
     }
 
@@ -254,6 +266,22 @@ impl Buffer {
     pub fn chope_read_only(&mut self) {
         self.read_only = true;
         self.saved_at = self.undo.current_id();
+    }
+
+    /// Mark this buffer as a `:term` terminal buffer (and chope it read-only in
+    /// the same move, since the marker text must never be edited). See the
+    /// [`is_terminal`](Self::is_terminal) accessor and the field docs for what
+    /// the flag means. One-way, like [`chope_read_only`](Self::chope_read_only):
+    /// a buffer becomes a terminal once, at `:term` time, and the UI drops the
+    /// whole buffer + session together when the terminal closes.
+    pub fn mark_terminal(&mut self) {
+        self.is_terminal = true;
+        self.chope_read_only();
+    }
+
+    /// Whether this is a `:term` terminal buffer. See the field docs.
+    pub fn is_terminal(&self) -> bool {
+        self.is_terminal
     }
 
     /// Number of lines in the buffer. Always at least 1, even for an empty
