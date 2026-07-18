@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 authors = ["Theodore Kay Chen Ong"]
 license = "AGPL-3.0-only"
@@ -136,8 +136,8 @@ kopitiam-pdf = { path = "crates/kopitiam-pdf", version = "0.1.0" }
 kopitiam-plot = { path = "crates/kopitiam-plot", version = "0.1.0" }
 kopitiam-document = { path = "crates/kopitiam-document", version = "0.1.0" }
 kopitiam-markdown = { path = "crates/kopitiam-markdown", version = "0.1.0" }
-kopitiam-ontology = { path = "crates/kopitiam-ontology", version = "0.1.6" }
-kopitiam-semantic = { path = "crates/kopitiam-semantic", version = "0.1.6" }
+kopitiam-ontology = { path = "crates/kopitiam-ontology", version = "0.1.7" }
+kopitiam-semantic = { path = "crates/kopitiam-semantic", version = "0.1.7" }
 kopitiam-knowledge = { path = "crates/kopitiam-knowledge", version = "0.1.0" }
 kopitiam-index = { path = "crates/kopitiam-index", version = "0.1.0" }
 kopitiam-search = { path = "crates/kopitiam-search", version = "0.1.0" }
@@ -145,14 +145,14 @@ kopitiam-workspace = { path = "crates/kopitiam-workspace", version = "0.1.0" }
 kopitiam-workflow = { path = "crates/kopitiam-workflow", version = "0.1.0" }
 kopitiam-translation = { path = "crates/kopitiam-translation", version = "0.1.0" }
 kopitiam-ai = { path = "crates/kopitiam-ai", version = "0.1.0" }
-kopitiam-config = { path = "crates/kopitiam-config", version = "0.1.6" }
+kopitiam-config = { path = "crates/kopitiam-config", version = "0.1.7" }
 
 # A pure-Rust Lua 5.1 interpreter (no C, no mlua -- see AID-0003 and AID-0007).
 # kvim consumes it to execute the user's Lua config, which it can already
 # discover but not run.
-kopitiam-lua = { path = "crates/kopitiam-lua", version = "0.1.6" }
-kopitiam-syntax = { path = "crates/kopitiam-syntax", version = "0.1.6" }
-kopitiam-snippet = { path = "crates/kopitiam-snippet", version = "0.1.6" }
+kopitiam-lua = { path = "crates/kopitiam-lua", version = "0.1.7" }
+kopitiam-syntax = { path = "crates/kopitiam-syntax", version = "0.1.7" }
+kopitiam-snippet = { path = "crates/kopitiam-snippet", version = "0.1.7" }
 
 # The preemptive resource budgeter: estimate RAM/CPU cost BEFORE launching
 # rust-analyzer or loading a gguf, so a small Android tablet degrades gracefully
