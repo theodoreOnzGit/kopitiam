@@ -2019,6 +2019,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kopitiam-tools"
+version = "0.1.4"
+dependencies = [
+ "ignore",
+ "kopitiam-resource",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "kopitiam-translation"
 version = "0.1.4"
 dependencies = [
