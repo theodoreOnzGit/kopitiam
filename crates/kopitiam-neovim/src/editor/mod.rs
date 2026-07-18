@@ -3595,10 +3595,18 @@ impl Editor {
             // the cursor right on that section's heading. An unknown topic falls
             // back to the top of the manual rather than erroring: a typo should
             // still show *some* help, the way real vim does.
+            //
+            // The manual is read-only, same as neovim's `buftype=help`: we load
+            // the text first, THEN chope the buffer read-only (see
+            // `Buffer::chope_read_only`). Order matters — lock after the load, or
+            // the load itself no-ops and you get a blank help window. Once
+            // locked, typing does nothing and `:q`/`:qa` quit clean with no
+            // "save changes?" nag, because a read-only buffer is never modified.
             ex::ExCommand::Help { topic } => {
                 let rendered = help::render();
                 self.new_buffer();
                 self.current_buffer_mut().apply(Edit::insert(Position::ORIGIN, rendered.text))?;
+                self.current_buffer_mut().chope_read_only();
                 let line = topic
                     .as_deref()
                     .and_then(help::resolve)
@@ -5478,6 +5486,54 @@ mod tests {
         let mut ed = editor_with("hello");
         ed.execute_ex("help nonsense-topic-lah").unwrap();
         assert_eq!(ed.cursor, Position::new(0, 0), "an unknown topic still shows the manual, at the top");
+    }
+
+    #[test]
+    fn help_buffer_is_read_only_and_cannot_be_modified() {
+        // neovim opens `:help` as `buftype=help` + nomodifiable: the user can
+        // never edit it, and it never counts as dirty. kvim must match.
+        let mut ed = editor_with("hello");
+        ed.execute_ex("help").unwrap();
+        assert!(ed.current_buffer().is_read_only(), "the help buffer must be choped read-only");
+        assert!(!ed.current_buffer().is_modified(), "a read-only help buffer is never modified");
+
+        // Typing into it does nothing — insert mode + keystrokes leave the
+        // manual text byte-for-byte unchanged, and it stays not-modified.
+        let before = ed.current_buffer().text();
+        feed(&mut ed, "ohello sabo<Esc>"); // open a line and type — all no-ops
+        feed(&mut ed, "ggdG"); // try to delete the whole thing too
+        assert_eq!(ed.current_buffer().text(), before, "no edit may land in a read-only buffer");
+        assert!(!ed.current_buffer().is_modified(), "it stays not-modified after failed edits");
+    }
+
+    #[test]
+    fn quit_on_a_help_buffer_needs_no_save_prompt() {
+        // The actual bug: open `:help`, then `:q` must quit clean — NO
+        // UnsavedChanges guard, because a read-only buffer has nothing to save.
+        let mut ed = editor_with("hello");
+        ed.execute_ex("help").unwrap();
+        assert_eq!(ed.execute_ex("q").unwrap(), EditorResponse::Quit, "`:q` on help must quit, not prompt");
+
+        // Same for `:qa` — quit-all must not be blocked by a read-only help
+        // window sitting there.
+        let mut ed = editor_with("hello");
+        ed.execute_ex("help").unwrap();
+        assert_eq!(ed.execute_ex("qa").unwrap(), EditorResponse::QuitAll, "`:qa` with help open must quit-all clean");
+    }
+
+    #[test]
+    fn quit_still_guards_a_genuinely_modified_normal_buffer() {
+        // Regression guard: the read-only shortcut must NOT weaken the real
+        // unsaved-changes prompt for an ordinary, genuinely-edited file.
+        let mut ed = editor_with("hello");
+        feed(&mut ed, "ix<Esc>"); // a real edit into an editable buffer
+        assert!(ed.current_buffer().is_modified(), "a normal edited buffer is modified");
+        assert!(
+            matches!(ed.execute_ex("q"), Err(crate::Error::UnsavedChanges)),
+            "`:q` on a genuinely modified buffer must still prompt"
+        );
+        // And `:q!` still force-quits it.
+        assert_eq!(ed.execute_ex("q!").unwrap(), EditorResponse::Quit, "`:q!` still force-quits");
     }
 
     #[test]
