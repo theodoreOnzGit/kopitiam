@@ -94,6 +94,45 @@ pub fn paint_terminal(
     }
 }
 
+/// Paint a `[Process exited N]` banner across the last row of `area` — the
+/// signal that a `:term` child has exited and the buffer is now just its final
+/// output, kept open for scrollback. Matches neovim's own end-of-job line.
+///
+/// Drawn *over* the last grid row on purpose: the shell's parting output (a
+/// prompt, `logout`) already sits there and the banner replacing it is the
+/// clearest "this is done" cue. Styled reversed so it reads as a status strip,
+/// not as more shell output. A no-op if `area` has zero height. `code` is the
+/// child's exit code as reported by the pty layer (see
+/// [`crate::termemu::TermSession::exit_code`]).
+pub fn paint_exit_banner(buf: &mut Buffer, area: Rect, code: u32, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let y = area.y + area.height - 1;
+    let label = format!("[Process exited {code}]");
+    let style = Style::default().fg(theme.bg).bg(theme.fg).add_modifier(Modifier::BOLD);
+    // Repaint the whole banner row in the banner background first, then write
+    // the label — so it reads as one solid strip rather than a few words
+    // floating over the old shell output.
+    for col in 0..area.width {
+        if let Some(target) = buf.cell_mut((area.x + col, y)) {
+            target.set_symbol(" ");
+            target.set_style(style);
+        }
+    }
+    for (i, ch) in label.chars().enumerate() {
+        let x = area.x + i as u16;
+        if x >= area.x + area.width {
+            break;
+        }
+        if let Some(target) = buf.cell_mut((x, y)) {
+            let mut cell_buf = [0u8; 4];
+            target.set_symbol(ch.encode_utf8(&mut cell_buf));
+            target.set_style(style);
+        }
+    }
+}
+
 /// Map one `vt100` cell's colours + bold/italic/underline onto a ratatui
 /// [`Style`]. Inverse is applied by the caller (it is a modifier, not a
 /// colour). See [`vt_color`] for the colour mapping.
@@ -176,6 +215,30 @@ mod tests {
         // Must not panic.
         let _ = paint_terminal(parser.screen(), &mut buf, area, &theme);
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "x");
+    }
+
+    #[test]
+    fn exit_banner_paints_on_the_last_row() {
+        let theme = Theme::gruvbox_dark();
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        paint_exit_banner(&mut buf, area, 0, &theme);
+        // Bottom row (y = 4) starts with the banner text.
+        let row: String = (0..40).map(|x| buf.cell((x, 4)).unwrap().symbol().to_string()).collect();
+        assert!(row.starts_with("[Process exited 0]"), "banner row was {row:?}");
+        // A non-zero code is shown verbatim.
+        let mut buf2 = Buffer::empty(area);
+        paint_exit_banner(&mut buf2, area, 130, &theme);
+        let row2: String = (0..40).map(|x| buf2.cell((x, 4)).unwrap().symbol().to_string()).collect();
+        assert!(row2.starts_with("[Process exited 130]"), "banner row was {row2:?}");
+    }
+
+    #[test]
+    fn exit_banner_on_zero_height_is_a_noop() {
+        let theme = Theme::gruvbox_dark();
+        // Zero-height area must not panic / read out of bounds.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        paint_exit_banner(&mut buf, Rect::new(0, 0, 10, 0), 0, &theme);
     }
 
     #[test]

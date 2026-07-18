@@ -293,6 +293,25 @@ impl TermSession {
             self.exit_status = Some(status);
         }
     }
+
+    /// The child's exit code, but only once it has actually been *reaped* (via
+    /// [`reap_if_done`]) — `None` while it is still running, and also `None` in
+    /// the brief gap where the pty hit EOF but [`reap_if_done`] has not yet
+    /// harvested the status on the next idle tick.
+    ///
+    /// Why "reaped", not just "finished": the UI uses this to announce
+    /// `[Process exited N]` and to drop out of terminal-mode, and it wants the
+    /// real code, not a guess. [`is_finished`] flips on EOF (before reaping) so
+    /// the fast poll kicks in; `exit_code` flips one tick later, once the code
+    /// is known for sure. The gap is ~16ms (the child has already exited, so the
+    /// next `try_wait` succeeds straight away), so the transition still feels
+    /// instant to the user.
+    ///
+    /// [`reap_if_done`]: Self::reap_if_done
+    /// [`is_finished`]: Self::is_finished
+    pub fn exit_code(&self) -> Option<u32> {
+        self.exit_status.as_ref().map(|s| s.exit_code())
+    }
 }
 
 impl Drop for TermSession {
@@ -521,6 +540,45 @@ mod tests {
         session.write_input(b"hi\r\n").unwrap();
         let contents = wait_until(&session, Duration::from_secs(5), |c| c.contains("hi"));
         assert!(contents.contains("hi"), "screen was: {contents:?}");
+    }
+
+    /// Join `handle`, but never hang the test: a watcher thread does the
+    /// blocking join and pings a channel; we wait on that with a timeout.
+    /// Returns `true` if the thread finished within `dur`.
+    fn join_within(handle: JoinHandle<()>, dur: Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(dur).is_ok()
+    }
+
+    #[test]
+    fn reader_thread_exits_on_eof() {
+        // The freeze's first suspect: a reader thread that busy-loops or blocks
+        // forever once the pty hits EOF. `std::io::empty()` returns `Ok(0)` on
+        // the first read (EOF), so the thread must set the flag and *return*.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(5, 5, 0)));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let eof = Arc::new(AtomicBool::new(false));
+        let reader: Box<dyn Read + Send> = Box::new(std::io::empty());
+        let handle = spawn_reader(reader, Arc::clone(&parser), Arc::clone(&dirty), Arc::clone(&eof));
+        assert!(join_within(handle, Duration::from_secs(2)), "reader thread must terminate on EOF, not hang");
+        assert!(eof.load(Ordering::Acquire), "EOF flag must be set once the read returns 0");
+    }
+
+    #[test]
+    fn exit_code_is_none_until_reaped_then_matches() {
+        // `false` exits with code 1. Before reaping, `exit_code()` is None even
+        // once EOF landed; after `reap_if_done` it reports the real code.
+        let mut session = TermSession::spawn(Some("exit 3"), TermSize::new(24, 80)).unwrap();
+        let start = Instant::now();
+        while !session.is_finished() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.reap_if_done();
+        assert_eq!(session.exit_code(), Some(3), "exit_code must report the child's real code once reaped");
     }
 
     #[test]
