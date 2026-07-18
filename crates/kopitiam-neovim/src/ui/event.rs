@@ -42,7 +42,7 @@ use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::core::{BufferId, Mode, Position, Range, ViewportScroll, WindowCommand};
+use crate::core::{BufferId, Mode, Position, Range, TabCommand, ViewportScroll, WindowCommand};
 use crate::ui::cmdline::PromptKind;
 
 /// A single logical key, independent of crossterm.
@@ -434,6 +434,9 @@ pub enum HostResponse {
     /// A window-management command (`:sp`, `:vs`, `:only`, `:close`) for the
     /// UI to carry out — see [`WindowCommand`].
     Window(WindowCommand),
+    /// A tab-page command (`:tabnew`, `:tabclose`, `gt`, `gT`, ...) for the UI
+    /// to carry out — see [`TabCommand`]. Tab pages sit above the window tree.
+    Tab(TabCommand),
     /// A viewport reposition (`zz`, `zt`, `zb`, `<C-e>`, `<C-y>`) — see
     /// [`ViewportScroll`].
     Scroll(ViewportScroll),

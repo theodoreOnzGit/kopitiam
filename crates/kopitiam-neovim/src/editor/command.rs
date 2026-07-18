@@ -112,6 +112,25 @@ pub enum CommandId {
     Only,
     /// `:clo`/`:close`.
     Close,
+    // --- Tab pages (kopitiam-ygk, AID-0048). A tab is a whole window layout;
+    // these parse into `crate::core::TabCommand` for the UI to carry out, same
+    // like the split commands parse into `WindowCommand`. ---
+    /// `:tabnew`/`:tabe`/`:tabedit [file]` — open a new tab.
+    TabNew,
+    /// `:tabc`/`:tabclose` — close the current tab.
+    TabClose,
+    /// `:tabo`/`:tabonly` — close every other tab.
+    TabOnly,
+    /// `:tabn`/`:tabnext [count]` — next tab, or absolute tab {count}.
+    TabNext,
+    /// `:tabp`/`:tabprevious`/`:tabN`/`:tabNext [count]` — previous tab.
+    TabPrev,
+    /// `:tabfir`/`:tabfirst`/`:tabr`/`:tabrewind` — first tab.
+    TabFirst,
+    /// `:tabl`/`:tablast` — last tab.
+    TabLast,
+    /// `:tabs` — list the open tabs.
+    TabList,
     /// `:term`/`:terminal`.
     Terminal,
     /// `:r`/`:read` — read a shell command's output into the buffer
@@ -230,6 +249,18 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: CommandId::VNew, names: &["vnew", "vne"], arg: ArgKind::None, help: "new vertical split" },
     CommandSpec { id: CommandId::Only, names: &["on", "only"], arg: ArgKind::None, help: "close all other windows" },
     CommandSpec { id: CommandId::Close, names: &["clo", "close"], arg: ArgKind::None, help: "close this window" },
+    // Tab pages (kopitiam-ygk). Registry lookup is exact-match, so we spell out
+    // the abbreviations vim accepts. `:tabnext`/`:tabprevious` take an optional
+    // count in their arg — `ArgKind::None` because the arg is a number, not a
+    // path to complete; ex.rs parses the count off the raw arg.
+    CommandSpec { id: CommandId::TabNew, names: &["tabnew", "tabe", "tabedit", "tabne"], arg: ArgKind::File, help: "open a new tab page" },
+    CommandSpec { id: CommandId::TabClose, names: &["tabc", "tabclose"], arg: ArgKind::None, help: "close this tab page" },
+    CommandSpec { id: CommandId::TabOnly, names: &["tabo", "tabonly"], arg: ArgKind::None, help: "close all other tab pages" },
+    CommandSpec { id: CommandId::TabNext, names: &["tabn", "tabnext"], arg: ArgKind::None, help: "go to the next tab (or tab {count})" },
+    CommandSpec { id: CommandId::TabPrev, names: &["tabp", "tabprevious", "tabprev", "tabN", "tabNext"], arg: ArgKind::None, help: "go to the previous tab" },
+    CommandSpec { id: CommandId::TabFirst, names: &["tabfir", "tabfirst", "tabr", "tabrewind"], arg: ArgKind::None, help: "go to the first tab" },
+    CommandSpec { id: CommandId::TabLast, names: &["tabl", "tablast"], arg: ArgKind::None, help: "go to the last tab" },
+    CommandSpec { id: CommandId::TabList, names: &["tabs"], arg: ArgKind::None, help: "list the open tabs" },
     CommandSpec { id: CommandId::Terminal, names: &["term", "terminal"], arg: ArgKind::None, help: "open a terminal buffer" },
     CommandSpec { id: CommandId::Read, names: &["r", "read"], arg: ArgKind::None, help: "read shell command output into buffer" },
     CommandSpec { id: CommandId::Help, names: &["h", "help"], arg: ArgKind::File, help: "open the help manual" },

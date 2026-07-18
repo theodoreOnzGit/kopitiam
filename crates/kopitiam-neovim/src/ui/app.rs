@@ -44,7 +44,7 @@ use ratatui::{
 };
 
 use crate::config::{Action, Options};
-use crate::core::{BufferId, Direction, Mode, Position, Range, ViewportScroll, WindowCommand};
+use crate::core::{BufferId, Direction, Mode, Position, Range, TabCommand, ViewportScroll, WindowCommand};
 use crate::editor::ex::QuickfixCommand;
 use crate::editor::quickfix::{ListKind, NavError, QuickfixEntry, QuickfixList};
 use crate::icons::IconSet;
@@ -67,6 +67,8 @@ use crate::ui::overlay::{Focus, OpenTarget, Overlay, OverlayOutcome};
 use crate::ui::picker::{PickAction, PickRow, PickerPanel};
 use crate::ui::scrolling;
 use crate::ui::statusline::{Statusline, StatuslineData};
+use crate::ui::tab::TabPages;
+use crate::ui::tabline::{Tabline, TablineEntry};
 use crate::ui::textarea::{Scroll, Selection, TextArea};
 use crate::ui::theme::Theme;
 use crate::ui::window::{Separator, SplitKind, WindowTree};
@@ -92,7 +94,22 @@ pub enum LoopAction {
 /// needed here.
 pub struct App<H: EditorHost> {
     pub host: H,
+    /// The **active tab page's** live window tree. Not "the" window tree
+    /// anymore — kvim now has tab pages (see [`crate::ui::tab::TabPages`]), and
+    /// this field always holds the tree for whichever tab is currently active.
+    /// The other tabs' trees sit parked in [`App::tabs`]; switching tabs swaps
+    /// one out and this one in (an O(1) `mem::swap`, no clone). Every existing
+    /// `<C-w>`/split call site keeps working unchanged, because it only ever
+    /// wanted the *active* tab's layout — which is exactly what this is.
     pub windows: WindowTree,
+    /// The tab-page collection: every tab in tabline order, plus the active
+    /// index. A tab page is a whole window layout (a [`WindowTree`]), vim-style
+    /// — NOT a browser buffer-tab. The active tab's *live* tree lives in
+    /// [`App::windows`], not in here, so `tabs`'s own slot for the active tab is
+    /// a stale parked placeholder (see [`crate::ui::tab::TabPages`] for the
+    /// viewport-swap discipline and AID-0048). One editor cursor still: a tab
+    /// switch is a viewport swap, same as a window-focus change (AID-0020).
+    pub tabs: TabPages,
     pub theme: Theme,
     pub options: Options,
     /// The message shown on the bottom row when no prompt is active (`"written"`,
@@ -426,12 +443,20 @@ impl<H: EditorHost> App<H> {
         // instead (or, once `render_windows` respects `window.buffer`, nothing
         // useful).
         let windows = WindowTree::single(host.active_buffer_id());
+        // One tab page to start with, holding this same layout. The active tab's
+        // *live* tree is `windows` (above); the copy parked in `tabs`'s slot 0 is
+        // the stale placeholder the viewport-swap discipline expects (see
+        // `TabPages` docs) — it self-corrects the first time you switch away, when
+        // the live tree gets parked back into it. So a clone here is correct, not
+        // wasteful bookkeeping.
+        let tabs = TabPages::single(windows.clone());
         // Harpoon marks are scoped to the working directory, exactly as the file
         // tree roots there — the same `cwd`, resolved once.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             host,
             windows,
+            tabs,
             theme,
             options,
             message: StatusMessage::None,
@@ -817,6 +842,7 @@ impl<H: EditorHost> App<H> {
             HostResponse::Unchanged => LoopAction::Continue,
             HostResponse::Action(action) => self.handle_action(action),
             HostResponse::Window(cmd) => self.handle_window_command(cmd),
+            HostResponse::Tab(cmd) => self.handle_tab_command(cmd),
             HostResponse::Scroll(req) => self.handle_scroll(req),
             HostResponse::Quickfix(cmd) => self.handle_quickfix(cmd),
         }
@@ -2433,10 +2459,16 @@ impl<H: EditorHost> App<H> {
     /// file from it, and closing it here would make `i`/`s` (open in a split)
     /// useless for opening a second file.
     fn open_path(&mut self, path: &Path, target: OpenTarget) -> LoopAction {
+        // `t` in the tree opens the file in a **new tab page** now (it used to
+        // just say "no tab pages yet"). `open_tab` does the whole dance — park
+        // the current tab, open the file, swap the new tab live — so hand off to
+        // it and we're done.
+        if let OpenTarget::Tab = target {
+            return self.open_tab(Some(path.to_path_buf()));
+        }
         // Split *before* opening: `WindowTree::split` duplicates the active
         // window's view, and the new window is the one that should end up showing
         // the file.
-        let mut note = None;
         match target {
             OpenTarget::Current => {}
             OpenTarget::HorizontalSplit => {
@@ -2445,11 +2477,8 @@ impl<H: EditorHost> App<H> {
             OpenTarget::VerticalSplit => {
                 self.windows.split(SplitKind::Vertical);
             }
-            // kvim has no tab pages (see `ui::window`: one tree, one "tab"). Say
-            // so, and do the closest useful thing, rather than pretending.
-            OpenTarget::Tab => {
-                note = Some("kvim has no tab pages yet — opened in the current window");
-            }
+            // Handled above via early return.
+            OpenTarget::Tab => unreachable!("tab open handled above"),
         }
 
         if let Err(e) = self.host.open(path) {
@@ -2461,10 +2490,7 @@ impl<H: EditorHost> App<H> {
         // offset must not survive into it.
         self.windows.active_mut().scroll = Scroll::default();
 
-        self.message = match note {
-            Some(note) => StatusMessage::Info(note.to_string()),
-            None => StatusMessage::Info(format!("\"{}\"", path.display())),
-        };
+        self.message = StatusMessage::Info(format!("\"{}\"", path.display()));
         LoopAction::Redraw
     }
 
@@ -2581,16 +2607,38 @@ impl<H: EditorHost> App<H> {
             Key::Char('r') => self.rotate_windows(true),
             Key::Char('R') => self.rotate_windows(false),
             // Deferred: moving a window to an edge (H/J/K/L) restructures the
-            // tree, and `T` needs tab pages, which kvim does not have. Say so
-            // rather than silently doing the wrong thing.
+            // tree. Say so rather than silently doing the wrong thing.
             Key::Char('H') | Key::Char('J') | Key::Char('K') | Key::Char('L') => {
                 self.info("<C-w> move-to-edge is not implemented yet (kopitiam-cj0.10.5)".to_string())
             }
-            Key::Char('T') => {
-                self.info("kvim has no tab pages yet (kopitiam-cj0.10.6)".to_string())
-            }
+            // `<C-w>T`: move the current window to a brand-new tab page.
+            Key::Char('T') => self.window_to_new_tab(),
             _ => LoopAction::Continue,
         }
+    }
+
+    /// `<C-w>T`: move the current window to a new tab page. Same as vim — it
+    /// fails when the tab has only one window (there'd be nothing to move *out
+    /// of*; moving it would leave an empty tab behind). Otherwise the window is
+    /// removed from the current tab and re-opened as the sole window of a fresh
+    /// tab right after this one, carrying its buffer + cursor across.
+    fn window_to_new_tab(&mut self) -> LoopAction {
+        self.sync_active_window();
+        if self.windows.window_count() <= 1 {
+            return self.info("only window in this tab — nothing to move".to_string());
+        }
+        let buffer = self.windows.active().buffer;
+        let cursor = self.windows.active().cursor;
+        // Take the window out of the source tab first (still the live tree), then
+        // swap in the new tab that shows the same buffer.
+        self.windows.close_active();
+        let mut new_tree = WindowTree::single(buffer);
+        new_tree.active_mut().cursor = cursor;
+        self.tabs.open_after_active(&mut self.windows, new_tree);
+        self.host.set_active(buffer, cursor);
+        self.windows.active_mut().scroll = Scroll::default();
+        self.focus = Focus::Buffer;
+        LoopAction::Redraw
     }
 
     /// `<C-w>h/j/k/l`: focus the spatially adjacent window. Pure kvim — no tmux
@@ -2797,6 +2845,168 @@ impl<H: EditorHost> App<H> {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Tab-page commands (`:tabnew`/`:tabclose`/..., `gt`/`gT`)
+    // ---------------------------------------------------------------
+
+    /// Carries out a tab-page command the editor handed back (`:tabnew`, `gt`,
+    /// ...). Tab pages are the UI's — `App` owns the [`TabPages`] collection —
+    /// so the editor only *recognises* the command (see [`TabCommand`]); this is
+    /// where it actually happen.
+    ///
+    /// Every command that changes which tab is active follows the same
+    /// viewport-swap dance a window-focus change does (AID-0020): first
+    /// [`Self::sync_active_window`] writes the editor's live cursor into the
+    /// outgoing tab's active window, then the tab trees swap
+    /// ([`App::windows`] gets the incoming tab's tree), then
+    /// [`Self::load_active_window`] loads the newly-active window's saved cursor
+    /// back into the single editor. One editor cursor throughout — a tab is a
+    /// viewport, not a second edit context.
+    fn handle_tab_command(&mut self, cmd: TabCommand) -> LoopAction {
+        match cmd {
+            TabCommand::New { file } => self.open_tab(file),
+            TabCommand::Close => {
+                if self.tabs.is_last() {
+                    // vim won't close the final tab page — say so plainly.
+                    return self.info("cannot close last tab".to_string());
+                }
+                self.sync_active_window();
+                self.tabs.close_active(&mut self.windows);
+                self.load_active_window();
+                LoopAction::Redraw
+            }
+            TabCommand::Only => {
+                if self.tabs.is_last() {
+                    return self.info("already only one tab".to_string());
+                }
+                // `only` keeps the active tab's live tree (App.windows) untouched
+                // — nothing to sync/load, we don't move off the active tab.
+                self.tabs.only(&mut self.windows);
+                LoopAction::Redraw
+            }
+            TabCommand::Step { by, forward } => {
+                self.sync_active_window();
+                self.tabs.step(&mut self.windows, by, forward);
+                self.load_active_window();
+                LoopAction::Redraw
+            }
+            TabCommand::Goto { index } => {
+                self.sync_active_window();
+                self.tabs.goto_1based(&mut self.windows, index);
+                self.load_active_window();
+                LoopAction::Redraw
+            }
+            TabCommand::First => {
+                self.sync_active_window();
+                self.tabs.goto_1based(&mut self.windows, 1);
+                self.load_active_window();
+                LoopAction::Redraw
+            }
+            TabCommand::Last => {
+                let n = self.tabs.count();
+                self.sync_active_window();
+                self.tabs.goto_1based(&mut self.windows, n);
+                self.load_active_window();
+                LoopAction::Redraw
+            }
+            TabCommand::List => self.list_tabs(),
+        }
+    }
+
+    /// `:tabnew`/`:tabedit [file]`: open a fresh tab right after the current one
+    /// and switch to it. With a `file`, the new tab opens that file; with none,
+    /// a fresh empty (scratch) buffer, same like vim's bare `:tabnew`.
+    ///
+    /// Order matters hor: [`Self::sync_active_window`] MUST run before we touch
+    /// the editor's buffer (open/new_buffer both move the editor's active
+    /// buffer), otherwise the outgoing tab's window would record the *new*
+    /// buffer instead of the one it was showing.
+    fn open_tab(&mut self, file: Option<PathBuf>) -> LoopAction {
+        self.sync_active_window();
+        let (buffer_id, cursor) = match &file {
+            Some(path) => {
+                if let Err(e) = self.host.open(path) {
+                    return self.error(e);
+                }
+                (self.host.active_buffer_id(), self.host.cursor())
+            }
+            None => {
+                let id = self.host.new_buffer();
+                self.host.set_active(id, Position::ORIGIN);
+                (id, Position::ORIGIN)
+            }
+        };
+        let mut new_tree = WindowTree::single(buffer_id);
+        // `WindowTree::single` seeds the cursor at the origin; for an opened file
+        // put it where the editor actually landed.
+        new_tree.active_mut().cursor = cursor;
+        self.tabs.open_after_active(&mut self.windows, new_tree);
+        self.windows.active_mut().scroll = Scroll::default();
+        self.focus = Focus::Buffer;
+        self.message = match &file {
+            Some(path) => StatusMessage::Info(format!("\"{}\" (new tab)", path.display())),
+            None => StatusMessage::Info("new tab".to_string()),
+        };
+        LoopAction::Redraw
+    }
+
+    /// `:tabs`: list the open tabs on the message line — the tab number, its
+    /// active window's buffer name, a `+` when modified, and a `>` marking the
+    /// current tab. Same info the tabline paints, but reachable when the tabline
+    /// is hidden (only one tab) or you just want it echoed.
+    fn list_tabs(&mut self) -> LoopAction {
+        let summary = self
+            .tabline_entries()
+            .iter()
+            .map(|e| {
+                let mark = if e.active { ">" } else { " " };
+                let plus = if e.modified { " +" } else { "" };
+                format!("{mark}{} {}{plus}", e.number, e.name)
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        self.info(summary)
+    }
+
+    /// Builds the per-tab data the [`Tabline`] widget renders. For the ACTIVE
+    /// tab the live tree is [`App::windows`]; for the others it is the parked
+    /// tree in [`App::tabs`] (see the staleness note on
+    /// [`crate::ui::tab::TabPages::tree_at`]). The buffer *name* + modified flag
+    /// come from the editor's buffer table (`host.buffers()`), keyed by the
+    /// tab's active-window buffer id — a buffer shown in two tabs shows the same
+    /// name in both, exactly like vim.
+    /// Whether the tabline row should be drawn this frame. Implements the
+    /// `'showtabline'` default (1): show the tabline the moment there are two or
+    /// more tabs, hide it when there is only one (nothing to switch between).
+    /// The `0` (never) / `2` (always) overrides are a deferred `:set` knob.
+    fn should_show_tabline(&self) -> bool {
+        self.tabs.count() >= 2
+    }
+
+    fn tabline_entries(&self) -> Vec<TablineEntry> {
+        let buffers = self.host.buffers();
+        (0..self.tabs.count())
+            .map(|i| {
+                let active = i == self.tabs.active();
+                let tree = if active {
+                    &self.windows
+                } else {
+                    // `i` is in `0..count`, and only the active slot is stale —
+                    // which we don't take this branch for — so this is always
+                    // `Some`.
+                    self.tabs.tree_at(i).expect("non-active tab index in range")
+                };
+                let buffer_id = tree.active().buffer;
+                let (name, modified) = buffers
+                    .iter()
+                    .find(|b| b.id == buffer_id)
+                    .map(|b| (tab_display_name(&b.name), b.modified))
+                    .unwrap_or_else(|| ("[No Name]".to_string(), false));
+                TablineEntry { number: i + 1, name, modified, active }
+            })
+            .collect()
+    }
+
     fn handle_scroll(&mut self, req: ViewportScroll) -> LoopAction {
         // The scroll offset lives in the window; the cursor line lives in the
         // editor. `zz`/`zt`/`zb` reposition the *view* around the cursor;
@@ -2910,11 +3120,31 @@ impl<H: EditorHost> App<H> {
     /// pickers, when they land) draws over the text rather than under it.
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let chunks = Layout::default()
-            .direction(LayoutDirection::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
-        let (full_windows_area, statusline_area, cmdline_area) = (chunks[0], chunks[1], chunks[2]);
+        // The tabline gets a one-row strip at the very top, but only when it
+        // should show. `'showtabline'` default (1) is "show once there are ≥2
+        // tabs"; with a single tab there is nothing to switch between, so the
+        // row is not reserved and the windows get that row back. (`:set
+        // showtabline=0/2` to force-hide/always-show is a deferred knob —
+        // kopitiam-ygk follow-up.)
+        let show_tabline = self.should_show_tabline();
+        let (tabline_area, full_windows_area, statusline_area, cmdline_area) = if show_tabline {
+            let chunks = Layout::default()
+                .direction(LayoutDirection::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            (Some(chunks[0]), chunks[1], chunks[2], chunks[3])
+        } else {
+            let chunks = Layout::default()
+                .direction(LayoutDirection::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+                .split(area);
+            (None, chunks[0], chunks[1], chunks[2])
+        };
 
         let (overlay_area, windows_area) = match &self.overlay {
             Some(overlay) => {
@@ -2942,6 +3172,13 @@ impl<H: EditorHost> App<H> {
         };
 
         self.render_windows(frame, windows_area);
+        // The tabline paints its own top strip (carved out above). Built into a
+        // local Vec first so the immutable borrow of `self` ends before the
+        // `&mut self` `render_widget` call.
+        if let Some(rect) = tabline_area {
+            let entries = self.tabline_entries();
+            frame.render_widget(Tabline { entries: &entries, theme: &self.theme }, rect);
+        }
         self.render_statusline(frame, statusline_area);
         self.render_cmdline(frame, cmdline_area);
         // The `<Tab>` completion wildmenu, when open, sits in the status-line
@@ -3524,6 +3761,22 @@ fn display_file_name(path: Option<&Path>) -> String {
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| "[No Name]".to_string())
+}
+
+/// The tail (basename) of a buffer name for the tabline, or `[No Name]` for an
+/// unnamed/scratch buffer. `host.buffers()` hand back the *full* path
+/// (`src/ui/app.rs`); the tabline, same like vim's, shows only the file part
+/// (`app.rs`) so a row of tabs stays readable. An already-`[No Name]` (or empty)
+/// name passes straight through.
+fn tab_display_name(name: &str) -> String {
+    if name.is_empty() || name == "[No Name]" {
+        return "[No Name]".to_string();
+    }
+    Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// The gruvbox colour a diagnostic severity paints in — for its gutter sign and
@@ -4947,7 +5200,7 @@ mod tests {
     }
 
     #[test]
-    fn t_opens_the_file_and_says_plainly_that_tab_pages_do_not_exist() {
+    fn t_opens_the_file_in_a_new_tab() {
         let (dir, mut app) = app_with_tree();
         press_leader_e(&mut app);
         app.handle_event(key_event('j'));
@@ -4955,11 +5208,164 @@ mod tests {
         app.handle_event(key_event('t'));
 
         assert_eq!(app.host.opened, vec![dir.path().join("README.md")]);
-        assert_eq!(app.windows.windows().len(), 1, "no tab pages, so no new window either");
+        // A second tab now exists and we've switched onto it; its one window
+        // shows the opened file.
+        assert_eq!(app.tabs.count(), 2, "`t` should open a new tab page");
+        assert_eq!(app.tabs.active(), 1, "and switch to it");
+        assert_eq!(app.windows.windows().len(), 1, "the new tab has one window");
+        assert_eq!(app.focus(), Focus::Buffer);
         match &app.message {
-            StatusMessage::Info(m) => assert!(m.contains("tab pages"), "{m}"),
-            other => panic!("expected an honest note, got {other:?}"),
+            StatusMessage::Info(m) => assert!(m.contains("new tab"), "{m}"),
+            other => panic!("expected a new-tab note, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Tab pages (kopitiam-ygk)
+    // ---------------------------------------------------------------
+
+    use crate::core::TabCommand;
+
+    #[test]
+    fn tabnew_opens_a_second_tab_and_switches_to_it() {
+        let mut app = app_with(vec!["one"]);
+        assert_eq!(app.tabs.count(), 1);
+        app.handle_tab_command(TabCommand::New { file: None });
+        assert_eq!(app.tabs.count(), 2, "a new tab was opened");
+        assert_eq!(app.tabs.active(), 1, "and we switched onto it");
+    }
+
+    #[test]
+    fn host_tab_response_is_routed_to_the_tab_handler() {
+        // Proves the dispatch wiring: a `HostResponse::Tab` the editor hands back
+        // reaches `handle_tab_command`, not just a direct call.
+        let mut app = app_with(vec!["one"]);
+        app.host.answer_next_with(HostResponse::Tab(TabCommand::New { file: None }));
+        app.handle_event(key_event('x'));
+        assert_eq!(app.tabs.count(), 2);
+        assert_eq!(app.tabs.active(), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // `gT` is a vim key; the case carries meaning.
+    fn gt_and_gT_cycle_through_tabs_wrapping() {
+        let mut app = app_with(vec!["one"]);
+        app.handle_tab_command(TabCommand::New { file: None }); // tab 2 (active 1)
+        app.handle_tab_command(TabCommand::New { file: None }); // tab 3 (active 2)
+        assert_eq!(app.tabs.count(), 3);
+        assert_eq!(app.tabs.active(), 2);
+
+        // gt from the last tab wraps to the first.
+        app.handle_tab_command(TabCommand::Step { by: 1, forward: true });
+        assert_eq!(app.tabs.active(), 0);
+        // gt again -> tab 2 (index 1).
+        app.handle_tab_command(TabCommand::Step { by: 1, forward: true });
+        assert_eq!(app.tabs.active(), 1);
+        // gT (previous) -> back to tab 1 (index 0).
+        app.handle_tab_command(TabCommand::Step { by: 1, forward: false });
+        assert_eq!(app.tabs.active(), 0);
+        // gT from the first wraps to the last (index 2).
+        app.handle_tab_command(TabCommand::Step { by: 1, forward: false });
+        assert_eq!(app.tabs.active(), 2);
+    }
+
+    #[test]
+    fn count_gt_jumps_to_an_absolute_tab() {
+        let mut app = app_with(vec!["one"]);
+        app.handle_tab_command(TabCommand::New { file: None });
+        app.handle_tab_command(TabCommand::New { file: None }); // 3 tabs, active 2
+
+        // `1gt` -> first tab (1-based).
+        app.handle_tab_command(TabCommand::Goto { index: 1 });
+        assert_eq!(app.tabs.active(), 0);
+        // `3gt` -> third tab.
+        app.handle_tab_command(TabCommand::Goto { index: 3 });
+        assert_eq!(app.tabs.active(), 2);
+        // Out-of-range clamps to the last tab.
+        app.handle_tab_command(TabCommand::Goto { index: 99 });
+        assert_eq!(app.tabs.active(), 2);
+    }
+
+    #[test]
+    fn tabclose_removes_a_tab_and_guards_the_last_one() {
+        let mut app = app_with(vec!["one"]);
+        app.handle_tab_command(TabCommand::New { file: None }); // 2 tabs
+        assert_eq!(app.tabs.count(), 2);
+
+        app.handle_tab_command(TabCommand::Close);
+        assert_eq!(app.tabs.count(), 1, "closing removes the active tab");
+
+        // The last tab is guarded — closing it is a no-op with an honest note.
+        app.handle_tab_command(TabCommand::Close);
+        assert_eq!(app.tabs.count(), 1, "the final tab cannot be closed");
+        match &app.message {
+            StatusMessage::Info(m) => assert!(m.contains("last tab"), "{m}"),
+            other => panic!("expected a last-tab note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_split_lives_inside_its_own_tab() {
+        let mut app = app_with(vec!["one"]);
+        // Split the first tab into two windows.
+        app.handle_window_command(WindowCommand::Split { vertical: true, file: None, scratch: false });
+        assert_eq!(app.windows.window_count(), 2, "tab 1 now has two windows");
+
+        // Open a second tab: it starts with exactly one window — the split did
+        // not leak across the tab boundary.
+        app.handle_tab_command(TabCommand::New { file: None });
+        assert_eq!(app.tabs.active(), 1);
+        assert_eq!(app.windows.window_count(), 1, "the new tab is a single window");
+
+        // Go back to tab 1: its two-window split is still intact.
+        app.handle_tab_command(TabCommand::Step { by: 1, forward: false });
+        assert_eq!(app.tabs.active(), 0);
+        assert_eq!(app.windows.window_count(), 2, "tab 1 kept its split");
+    }
+
+    #[test]
+    fn the_tabline_shows_only_with_two_or_more_tabs() {
+        let mut app = app_with(vec!["hello"]);
+        // One tab: no tabline row, the buffer text starts at row 0.
+        assert!(!app.should_show_tabline());
+        let rows = screen(&mut app, 40, 6);
+        assert!(rows[0].contains("hello"), "single tab: text on row 0, got {:?}", rows[0]);
+
+        // Two tabs: a tabline row appears at the very top, carrying both tab
+        // numbers; the buffer text is pushed down a row.
+        app.handle_tab_command(TabCommand::New { file: None });
+        assert!(app.should_show_tabline());
+        let rows = screen(&mut app, 40, 6);
+        assert!(rows[0].contains('1') && rows[0].contains('2'), "tabline row: {:?}", rows[0]);
+    }
+
+    #[test]
+    fn the_tabline_highlights_the_active_tab() {
+        let mut app = app_with(vec!["x"]);
+        app.handle_tab_command(TabCommand::New { file: None }); // now on tab 2
+
+        // Render into a real buffer so we can read cell *styles*, not just text.
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Walk the top (tabline) row. The active tab's cells carry the active
+        // background (`bg2`); the inactive tab's carry the base tabline bg
+        // (`bg1`). Both must appear — that is what "the active one is marked"
+        // means concretely.
+        let mut saw_active_bg = false;
+        let mut saw_inactive_bg = false;
+        for x in 0..40u16 {
+            let bg = buf.cell((x, 0)).unwrap().style().bg;
+            if bg == Some(app.theme.bg2) {
+                saw_active_bg = true;
+            }
+            if bg == Some(app.theme.bg1) {
+                saw_inactive_bg = true;
+            }
+        }
+        assert!(saw_active_bg, "the active tab should paint the active background");
+        assert!(saw_inactive_bg, "the inactive tab should paint the base tabline background");
     }
 
     #[test]

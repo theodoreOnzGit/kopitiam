@@ -177,6 +177,9 @@ impl EditorHost for crate::editor::Editor {
                 // must carry out (it owns the window tree and the scroll
                 // offsets — see `EditorResponse::Window`/`Scroll`).
                 EditorResponse::Window(cmd) => HostResponse::Window(cmd),
+                // Tab-page commands (`:tabnew`, `gt`, ...): the editor parsed
+                // them but the tab collection is `App`'s, so forward one hop.
+                EditorResponse::Tab(cmd) => HostResponse::Tab(cmd),
                 EditorResponse::Scroll(req) => HostResponse::Scroll(req),
 
                 // A keymap resolved to one of the maintainer's configured
