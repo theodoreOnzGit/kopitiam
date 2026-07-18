@@ -128,6 +128,13 @@ kopitiam-lua = { path = "crates/kopitiam-lua", version = "0.1.3" }
 kopitiam-syntax = { path = "crates/kopitiam-syntax", version = "0.1.3" }
 kopitiam-snippet = { path = "crates/kopitiam-snippet", version = "0.1.3" }
 
+# The preemptive resource budgeter: estimate RAM/CPU cost BEFORE launching
+# rust-analyzer or loading a gguf, so a small Android tablet degrades gracefully
+# instead of getting OOM-killed (uncatchable SIGKILL/SIGABRT/SIGBUS). ONE
+# budgeter, two clients. Generalises kvim's shipped LSP guard (AID-0037); kvim's
+# lsp/resource_guard.rs will later delegate to this (see the follow-up bead).
+kopitiam-resource = { path = "crates/kopitiam-resource", version = "0.1.2" }
+
 # Domain engines: policy/scheme documents -> provenance-carrying knowledge.
 kopitiam-finance = { path = "crates/kopitiam-finance", version = "0.1.0" }
 kopitiam-health = { path = "crates/kopitiam-health", version = "0.1.0" }
