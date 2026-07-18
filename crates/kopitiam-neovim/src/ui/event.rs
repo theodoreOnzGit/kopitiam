@@ -412,6 +412,15 @@ pub trait EditorHost {
     /// not implement it. See [`crate::editor::Editor::leave_terminal_mode`] and
     /// AID-0049.
     fn leave_terminal_mode(&mut self) {}
+
+    /// Terminal buffer `buffer`'s child exited with `code` — record it and, if
+    /// the user is driving that terminal right now, drop back to Normal mode.
+    /// The UI calls this the tick it reaps the child (see
+    /// `App::drain_terminals`). This is what stops the `:term` freeze: without
+    /// it the editor stays in terminal-mode after the shell dies and every
+    /// keystroke is swallowed into a dead pty. Default no-op for a fake host.
+    /// See [`crate::editor::Editor::finish_terminal`] and AID-0049.
+    fn finish_terminal(&mut self, _buffer: BufferId, _code: u32) {}
 }
 
 /// What the UI does after `handle_key` returns.

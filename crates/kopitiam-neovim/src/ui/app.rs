@@ -336,6 +336,14 @@ pub struct App<H: EditorHost> {
     /// (here, or when the whole App drops) kills and reaps its child — see
     /// [`crate::termemu::TermSession`]. See AID-0049.
     terminals: std::collections::HashMap<BufferId, crate::termemu::TermSession>,
+    /// Which terminal buffers we have already *announced* as exited to the
+    /// editor. A finished [`crate::termemu::TermSession`] is kept in `terminals`
+    /// (the buffer stays open so the user can scroll its output), so on every
+    /// idle tick it still reports `exit_code() == Some`. This set is how
+    /// [`Self::drain_terminals`] fires the child-exit lifecycle — mark the buffer
+    /// finished, drop out of terminal-mode — *exactly once* per terminal rather
+    /// than every 16ms forever. Entries are pruned when the buffer is deleted.
+    terminals_reaped: std::collections::HashSet<BufferId>,
     /// Half-typed `<C-\>` in terminal-mode: `<C-\>` on its own is armed here,
     /// and the *next* key decides — `<C-n>` leaves terminal-mode, anything else
     /// sends the literal `0x1c` (FS) byte followed by that key to the pty. This
@@ -535,6 +543,7 @@ impl<H: EditorHost> App<H> {
             git_status_dir: None,
             git_status_checked: Instant::now(),
             terminals: std::collections::HashMap::new(),
+            terminals_reaped: std::collections::HashSet::new(),
             term_pending_ctrl_backslash: false,
         }
     }
@@ -997,17 +1006,48 @@ impl<H: EditorHost> App<H> {
     }
 
     /// Drain terminal bookkeeping on the idle tick: reap any child that has
-    /// exited (so it never lingers as a zombie) and report whether any session
+    /// exited (so it never lingers as a zombie), run the child-exit lifecycle
+    /// for any terminal that *newly* finished, and report whether any session
     /// produced fresh output since the last check (so the caller repaints only
     /// when the screen actually changed). Returns `true` if a repaint is worth
     /// it. See the event loop in [`Self::run`].
+    ///
+    /// The child-exit lifecycle is the fix for the `:term` freeze. When a shell
+    /// exits (e.g. the user pressed `<C-d>`), the reader thread flags EOF, we
+    /// reap the child here (non-blocking `try_wait`), and the *first* tick we see
+    /// a real exit code we tell the editor about it via
+    /// [`crate::ui::event::EditorHost::finish_terminal`]: it marks the buffer
+    /// finished and drops out of terminal-mode back to Normal. Without that step
+    /// the editor stays in terminal-mode over a dead pty and swallows every
+    /// keystroke — `:q!` included — which looks exactly like a hung editor.
+    /// [`Self::terminals_reaped`] makes sure we announce each terminal once, not
+    /// on every 16ms tick for the rest of the session. The session itself is
+    /// kept in the map (buffer stays open for scrollback); it is dropped only
+    /// when the buffer is deleted or the App shuts down.
     fn drain_terminals(&mut self) -> bool {
         let mut dirty = false;
-        for session in self.terminals.values_mut() {
+        // Collect the newly-exited terminals under the `&mut self.terminals`
+        // borrow, then run the editor-side lifecycle afterwards — `finish_terminal`
+        // touches `self.host`, a different field, so it can't share the loop's
+        // borrow.
+        let mut newly_exited: Vec<(BufferId, u32)> = Vec::new();
+        for (id, session) in self.terminals.iter_mut() {
             if session.take_dirty() {
                 dirty = true;
             }
             session.reap_if_done();
+            if let Some(code) = session.exit_code()
+                && self.terminals_reaped.insert(*id)
+            {
+                newly_exited.push((*id, code));
+            }
+        }
+        for (id, code) in newly_exited {
+            self.host.finish_terminal(id, code);
+            // The mode/buffer changed and a `[Process exited N]` banner now
+            // wants painting — force the repaint even if no fresh pty output
+            // landed this tick.
+            dirty = true;
         }
         dirty
     }
@@ -3008,6 +3048,14 @@ impl<H: EditorHost> App<H> {
             // then sync the active window's cursor/scroll to the editor, which
             // landed on the alternate buffer's saved position.
             WindowCommand::BufferDeleted { deleted, replacement } => {
+                // If the deleted buffer was a terminal, drop its session now:
+                // that runs `TermSession::Drop`, which kills-and-reaps any child
+                // still running (a `:bd` on a live shell), so we never leak a
+                // process or leave `has_live_terminal` stuck `true` (which would
+                // pin the fast 16ms poll on for no reason). Harmless no-op for a
+                // non-terminal buffer.
+                self.terminals.remove(&deleted);
+                self.terminals_reaped.remove(&deleted);
                 self.windows.remap_buffer(deleted, replacement);
                 self.sync_active_window();
                 self.windows.active_mut().scroll = Scroll::default();
@@ -3545,6 +3593,12 @@ impl<H: EditorHost> App<H> {
                         crate::ui::termgrid::paint_terminal(screen, frame.buffer_mut(), rect, theme)
                     })
                 });
+                // If the child has exited, stamp `[Process exited N]` over the
+                // last grid row so the buffer plainly reads as finished (and the
+                // mode has already dropped to Normal — see `drain_terminals`).
+                if let Some(code) = self.terminals.get(&buffer_id).and_then(|s| s.exit_code()) {
+                    crate::ui::termgrid::paint_exit_banner(frame.buffer_mut(), rect, code, theme);
+                }
                 // The terminal cursor belongs to the focused terminal window,
                 // and only while no `:` command line is open (that owns the
                 // cursor). Hidden otherwise — same rule as the text path.
@@ -5789,6 +5843,107 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(screen.contains("hi"), "the child's echo of the typed line must paint; screen was:\n{screen}");
+    }
+
+    /// THE freeze regression test (kopitiam-cty): a `:term` child that exits
+    /// immediately — the `<C-d>` / shell-`exit` case — must drop the editor out
+    /// of terminal-mode back to Normal, paint `[Process exited N]`, and leave the
+    /// App fully able to process the *next* keystroke. The old bug: the editor
+    /// stayed in terminal-mode over the dead pty and swallowed every key (`:q!`
+    /// included), so the whole editor looked frozen.
+    #[test]
+    fn a_terminal_child_that_exits_drops_to_normal_and_keeps_processing_keys() {
+        let editor = Editor::new();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        let _ = real_screen(&mut app, 80, 24);
+
+        // `true` exits 0 straight away — same lifecycle as a shell that got EOF.
+        feed_str(&mut app, ":term true");
+        app.handle_event(enter_event());
+        assert_eq!(app.host.mode(), crate::core::Mode::Terminal, "`:term` starts in terminal-mode");
+        assert_eq!(app.terminals.len(), 1);
+
+        // Idle-tick until the child is reaped and the exit lifecycle fires.
+        let mut screen = String::new();
+        let mut dropped = false;
+        for _ in 0..500 {
+            app.drain_terminals();
+            if app.host.mode() == crate::core::Mode::Normal {
+                dropped = true;
+                screen = real_screen(&mut app, 80, 24).join("\n");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dropped, "a child that exits must drop the editor out of terminal-mode back to Normal");
+        assert!(screen.contains("[Process exited 0]"), "the exit banner must paint; screen was:\n{screen}");
+
+        // The App must STILL process keys — this is the anti-freeze assertion.
+        // `:` opens the command line (in the old bug it was swallowed by the
+        // dead pty and nothing happened).
+        app.handle_event(key_event(':'));
+        assert!(
+            app.host.command_line().is_some(),
+            "a `:` after the child exits must open the command line, not be swallowed into a dead pty",
+        );
+    }
+
+    /// The re-enter guard: once a terminal's child has exited, Normal-mode `i`
+    /// must NOT jump back into terminal-mode (there is no live pty to type into —
+    /// doing so would re-freeze the editor). On a dead terminal `i` is an inert
+    /// no-op so the user can still scroll and `:q`/`:bd` the buffer.
+    #[test]
+    fn i_does_not_reenter_terminal_mode_after_the_child_exits() {
+        let editor = Editor::new();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        let _ = real_screen(&mut app, 80, 24);
+
+        feed_str(&mut app, ":term true");
+        app.handle_event(enter_event());
+
+        let mut dropped = false;
+        for _ in 0..500 {
+            app.drain_terminals();
+            if app.host.mode() == crate::core::Mode::Normal {
+                dropped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dropped, "the child should have exited and dropped us to Normal");
+
+        // `i` on the now-dead terminal buffer must stay in Normal.
+        app.handle_event(key_event('i'));
+        assert_eq!(
+            app.host.mode(),
+            crate::core::Mode::Normal,
+            "`i` on an exited terminal must stay in Normal (no live pty to re-enter)",
+        );
+    }
+
+    /// Deleting a terminal buffer drops its session out of the App's map (so its
+    /// `Drop` kills-and-reaps any child), and clears the fast-poll pin: a `:bd`
+    /// on the last terminal must return `has_live_terminal()` to `false`.
+    #[test]
+    fn deleting_a_terminal_buffer_drops_its_session() {
+        let editor = Editor::new();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        let _ = real_screen(&mut app, 80, 24);
+
+        // A long-lived child so the session is still running at `:bd` time —
+        // proving Drop reaps a *live* child, not only an already-exited one.
+        feed_str(&mut app, ":term cat");
+        app.handle_event(enter_event());
+        assert!(app.has_live_terminal(), "`:term` must make a live terminal");
+
+        // Leave terminal-mode first (so `:bd` reaches the editor), then delete.
+        app.handle_event(ctrl_event('4'));
+        app.handle_event(ctrl_event('n'));
+        feed_str(&mut app, ":bd!");
+        app.handle_event(enter_event());
+
+        assert!(!app.has_live_terminal(), "`:bd` on the last terminal must drop its session");
+        assert!(app.terminals.is_empty());
     }
 
     /// An app over a real editor with `file_a` already open, plus a second file

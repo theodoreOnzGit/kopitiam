@@ -501,6 +501,35 @@ impl Editor {
         }
     }
 
+    /// The child of terminal buffer `buffer` has exited with `code` — record it
+    /// and, if the user is *currently* driving that terminal, drop them back to
+    /// Normal mode. This is the editor half of the child-exit lifecycle; the UI
+    /// calls it from `App::drain_terminals` the tick it reaps the child.
+    ///
+    /// The contract, exact, because getting it wrong is the freeze:
+    /// * The buffer is marked finished ([`Buffer::mark_terminal_exited`]) so its
+    ///   `i`/`a` re-enter path stops firing and the UI can paint
+    ///   `[Process exited N]`.
+    /// * Mode drops to Normal **only if** this exact buffer is the current one
+    ///   *and* we are in terminal-mode. Two guards, both needed: a *background*
+    ///   terminal exiting must not yank you out of typing in the buffer you are
+    ///   actually in, and if you had already left terminal-mode by hand
+    ///   (`<C-\><C-n>`) to scroll, there is nothing to leave. Anything else would
+    ///   knock the editor out of an unrelated mode — see the same care in
+    ///   [`leave_terminal_mode`](Self::leave_terminal_mode).
+    ///
+    /// The buffer is deliberately kept open (not closed) so the user can scroll
+    /// the final output and close it themselves with `:q`/`:bd`, matching
+    /// neovim. See AID-0049.
+    pub fn finish_terminal(&mut self, buffer: BufferId, code: u32) {
+        if let Some(buf) = self.buffers.get_mut(&buffer) {
+            buf.mark_terminal_exited(code);
+        }
+        if self.current == buffer && self.mode == Mode::Terminal {
+            self.mode = Mode::Normal;
+        }
+    }
+
     /// The which-key rows to show for the key sequence buffered so far, or an
     /// empty vector when nothing is pending.
     ///
@@ -896,12 +925,25 @@ impl Editor {
         // any insert-starting key on a terminal buffer resumes the job. The UI
         // sees `mode() == Terminal` on the next paint and resumes forwarding
         // keystrokes to the pty.
+        //
+        // A dead terminal is different: once the child has exited there is no
+        // pty left to type into, so re-entering terminal-mode would strand every
+        // keystroke in a dead pty — the very freeze this whole path guards
+        // against. But `i`/`a` must not fall through to *Insert* either: a
+        // terminal buffer is choped read-only, and dropping into Insert on it
+        // would just show an INSERT statusline over a buffer that eats every
+        // edit. So on any terminal buffer we consume `i`/`a`/`I`/`A` here: a
+        // *live* one resumes the job (back to terminal-mode), a *dead* one is an
+        // inert no-op that stays in Normal, letting the user scroll the
+        // `[Process exited N]` output and `:q`/`:bd` it — matching neovim.
         if self.mode == Mode::Normal
             && !key.mods.ctrl
             && matches!(key.code, KeyCode::Char('i' | 'a' | 'I' | 'A'))
             && self.current_buffer().is_terminal()
         {
-            self.mode = Mode::Terminal;
+            if self.current_buffer().is_live_terminal() {
+                self.mode = Mode::Terminal;
+            }
             return Ok(EditorResponse::Continue);
         }
 

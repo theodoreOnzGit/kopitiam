@@ -133,6 +133,21 @@ pub struct Buffer {
     /// terminal buffer is also choped read-only, so no stray keystroke edits the
     /// empty marker text and `:q` never nags. Default `false`. See AID-0049.
     is_terminal: bool,
+    /// For a terminal buffer, the child's exit code once its process has
+    /// exited — `None` while the shell/job is still running (and always `None`
+    /// for a non-terminal buffer).
+    ///
+    /// Why the editor needs to know a *UI-owned* thing (the pty lives in the
+    /// App's [`crate::termemu::TermSession`], not here): two editor decisions
+    /// hinge on "is this terminal still alive?". First, the `i`/`a` re-enter
+    /// path (Normal-mode `i` on a terminal buffer jumps back into terminal-mode)
+    /// must NOT fire once the process is dead — otherwise the user lands back in
+    /// terminal-mode typing into a corpse pty, which is exactly the freeze this
+    /// field exists to kill. Second, dropping out of terminal-mode on exit needs
+    /// a place to record *that* the exit happened. The App pushes the code here
+    /// (via [`Buffer::mark_terminal_exited`]) the tick it reaps the child. See
+    /// `App::drain_terminals` and AID-0049.
+    terminal_exit: Option<u32>,
 }
 
 impl Default for Buffer {
@@ -166,6 +181,7 @@ impl Buffer {
             line_edits: Vec::new(),
             read_only: false,
             is_terminal: false,
+            terminal_exit: None,
         }
     }
 
@@ -282,6 +298,34 @@ impl Buffer {
     /// Whether this is a `:term` terminal buffer. See the field docs.
     pub fn is_terminal(&self) -> bool {
         self.is_terminal
+    }
+
+    /// Record that this terminal buffer's child process has exited with `code`.
+    /// The UI calls this once, the tick it reaps the child (see
+    /// `App::drain_terminals`). A no-op guard on non-terminal buffers keeps a
+    /// stray call from lying about a plain text buffer. Once set, the buffer
+    /// counts as a *finished* terminal: [`terminal_exit`](Self::terminal_exit)
+    /// returns `Some`, and the `i`/`a` re-enter-terminal-mode path stops firing.
+    pub fn mark_terminal_exited(&mut self, code: u32) {
+        if self.is_terminal {
+            self.terminal_exit = Some(code);
+        }
+    }
+
+    /// The exit code of this terminal buffer's child, or `None` if the terminal
+    /// is still running (or this is not a terminal at all). See the field docs
+    /// for why the editor tracks a fact the pty layer owns.
+    pub fn terminal_exit(&self) -> Option<u32> {
+        self.terminal_exit
+    }
+
+    /// Whether this is a terminal buffer whose child is *still running* — i.e. a
+    /// terminal you can still type into. `false` for a plain buffer and for a
+    /// terminal whose process already exited. This is the exact predicate the
+    /// `i`/`a` re-enter guard wants: only a live terminal should re-enter
+    /// terminal-mode.
+    pub fn is_live_terminal(&self) -> bool {
+        self.is_terminal && self.terminal_exit.is_none()
     }
 
     /// Number of lines in the buffer. Always at least 1, even for an empty

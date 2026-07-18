@@ -215,6 +215,10 @@ impl EditorHost for crate::editor::Editor {
         crate::editor::Editor::leave_terminal_mode(self)
     }
 
+    fn finish_terminal(&mut self, buffer: crate::core::BufferId, code: u32) {
+        crate::editor::Editor::finish_terminal(self, buffer, code)
+    }
+
     fn cursor(&self) -> Position {
         crate::editor::Editor::cursor(self)
     }
