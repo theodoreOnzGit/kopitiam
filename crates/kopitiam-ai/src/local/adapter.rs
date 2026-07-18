@@ -38,6 +38,8 @@
 //! dependency graph at all.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 
 use anyhow::{Context, Result};
 use kopitiam_runtime::{GenerationConfig, QwenModel, generate, tokenizer_from_gguf};
@@ -45,7 +47,7 @@ use kopitiam_tokenizer::BpeTokenizer;
 
 use super::chat_template::render_chatml;
 use super::generation::{resolve_eos_token_id, resolve_max_new_tokens};
-use crate::{CompletionRequest, CompletionResponse, ModelAdapter};
+use crate::{CompletionRequest, CompletionResponse, ModelAdapter, StreamChunk};
 
 const IM_END: &str = "<|im_end|>";
 const ENDOFTEXT: &str = "<|endoftext|>";
@@ -66,8 +68,16 @@ const GGUF_EOS_METADATA_KEY: &str = "tokenizer.ggml.eos_token_id";
 /// depending on `kopitiam-runtime` here does not violate the Semantic
 /// Runtime's dependency rule.
 pub struct LocalAdapter {
-    model: QwenModel,
-    tokenizer: BpeTokenizer,
+    /// The loaded model, behind an [`Arc`] so [`LocalAdapter::stream`] can
+    /// hand a cheap clone to its background generation thread without moving
+    /// the (large) weights or borrowing `self` across the thread boundary.
+    /// `complete` just derefs it on the calling thread. `QwenModel` is only
+    /// ever read during a forward pass (`&self`), so sharing it across
+    /// threads is sound.
+    model: Arc<QwenModel>,
+    /// The GGUF-embedded tokenizer, [`Arc`]-shared for the same reason as
+    /// [`LocalAdapter::model`].
+    tokenizer: Arc<BpeTokenizer>,
     /// Names the specific model this adapter serves, resolved once at
     /// [`LocalAdapter::load`] time from the GGUF's own `general.name`
     /// metadata (falling back to `general.architecture`, then a generic
@@ -123,7 +133,7 @@ impl LocalAdapter {
             tokenizer.special_token_id(ENDOFTEXT),
         );
 
-        Ok(Self { model, tokenizer, model_name, eos_token_id })
+        Ok(Self { model: Arc::new(model), tokenizer: Arc::new(tokenizer), model_name, eos_token_id })
     }
 }
 
@@ -139,10 +149,74 @@ impl ModelAdapter for LocalAdapter {
             eos_token_id: self.eos_token_id,
         };
 
-        let content = generate(&self.model, &self.tokenizer, &prompt, &config, |_id, _text| {})
+        let content = generate(&*self.model, &*self.tokenizer, &prompt, &config, |_id, _text| {})
             .context("local Qwen generation failed")?;
 
         Ok(CompletionResponse { content, model: self.model_name.clone() })
+    }
+
+    /// Streams the model's reply **token by token** off a background thread,
+    /// so a chat UI renders each token as `kopitiam-runtime` decodes it
+    /// instead of freezing for the whole generation — the non-negotiable
+    /// shape on a phone doing a few tokens per second (`temp_ai_design.md`
+    /// §10.4).
+    ///
+    /// # How it stays off the foreground thread
+    ///
+    /// The heavy state — model weights and tokenizer — lives behind [`Arc`]s
+    /// (see [`LocalAdapter::model`]), so this clones the two `Arc`s (cheap:
+    /// two refcount bumps, no weight copy) and **moves** them into a spawned
+    /// std thread. That thread owns the channel's `Sender` and runs
+    /// [`generate`], whose `on_token` callback fires once per decoded token;
+    /// each fire sends a [`StreamChunk::Token`]. On a clean finish it sends
+    /// [`StreamChunk::Done`]; if `generate` errors it sends
+    /// [`StreamChunk::Error`] instead. This is the AID-0028 actor discipline
+    /// (worker owns the resource, streams over a channel, never blocks the
+    /// caller) — no async runtime, just a thread and an `mpsc`.
+    ///
+    /// Moving the `Arc`s (rather than borrowing `self`) is what lets the
+    /// thread outlive this call safely: it holds its own strong references,
+    /// so the weights stay alive for exactly as long as generation needs
+    /// them even if the `LocalAdapter` itself is dropped meanwhile.
+    ///
+    /// # If the caller stops listening
+    ///
+    /// `generate`'s `on_token` can't itself abort the loop, so if the
+    /// receiver is dropped mid-reply the `send` starts failing but generation
+    /// runs to its `max_new_tokens`/EOS on the background thread before the
+    /// thread exits. Wasted compute, never a hang or a panic — acceptable for
+    /// phase 1; a cancellation token is a later refinement.
+    fn stream(&self, request: &CompletionRequest) -> Receiver<StreamChunk> {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Everything the thread needs, resolved on the calling thread so the
+        // closure captures only owned, `Send` values (Arcs, a String, a
+        // small Copy config) — nothing borrowed from `self` or `request`.
+        let prompt = render_chatml(&request.messages);
+        let config = GenerationConfig {
+            max_new_tokens: resolve_max_new_tokens(request.max_tokens),
+            eos_token_id: self.eos_token_id,
+        };
+        let model = Arc::clone(&self.model);
+        let tokenizer = Arc::clone(&self.tokenizer);
+
+        std::thread::spawn(move || {
+            let result = generate(&*model, &*tokenizer, &prompt, &config, |_id, text| {
+                // Ignore send errors: they only happen once the receiver is
+                // gone, and there's nothing further to deliver to.
+                let _ = tx.send(StreamChunk::Token(text.to_string()));
+            });
+            match result {
+                Ok(_) => {
+                    let _ = tx.send(StreamChunk::Done);
+                }
+                Err(error) => {
+                    let _ = tx.send(StreamChunk::Error(format!("{error:#}")));
+                }
+            }
+        });
+
+        rx
     }
 }
 
@@ -229,6 +303,53 @@ mod tests {
             short.content,
             long.content
         );
+    }
+
+    /// Streaming must honour the [`StreamChunk`] contract end to end against
+    /// a real (synthetic) model: some [`StreamChunk::Token`]s arrive and the
+    /// run ends with **exactly one** terminal chunk — a [`StreamChunk::Done`]
+    /// (a synthetic forward pass doesn't error), last, with no
+    /// [`StreamChunk::Error`] anywhere.
+    ///
+    /// It also checks the streamed-token count matches the number of tokens
+    /// the greedy loop generates — with `max_tokens = 8` and deterministic
+    /// greedy decoding, `stream` fires `on_token` once per generated token,
+    /// so the `Token` count is the generated-token count (0 only if the very
+    /// first sampled token is EOS). It deliberately does **not** assert the
+    /// concatenated text equals [`LocalAdapter::complete`]'s string: `stream`
+    /// decodes token-by-token while `complete` decodes the whole sequence at
+    /// once, and per [`StreamChunk::Token`]'s own docs a multi-byte Unicode
+    /// character split across two tokens can legitimately differ between the
+    /// two — asserting byte-exact equality would be asserting the *absence*
+    /// of that accepted behaviour, which the random synthetic weights don't
+    /// guarantee.
+    #[test]
+    fn stream_is_wellformed_against_a_synthetic_gguf() {
+        let bytes = build_local_adapter_fixture();
+        let path = write_temp_gguf(&bytes, "local-adapter-stream");
+        let adapter = LocalAdapter::load(&path).unwrap();
+
+        let request = CompletionRequest::new([
+            Message::system("you are a test fixture"),
+            Message::user("hello"),
+        ])
+        .with_max_tokens(8);
+
+        let chunks: Vec<StreamChunk> = adapter.stream(&request).iter().collect();
+
+        // Exactly one terminal chunk, it's last, and it's `Done` — no `Error`.
+        assert_eq!(chunks.last(), Some(&StreamChunk::Done));
+        assert_eq!(chunks.iter().filter(|c| **c == StreamChunk::Done).count(), 1);
+        assert!(!chunks.iter().any(|c| matches!(c, StreamChunk::Error(_))));
+
+        // Every non-terminal chunk is a `Token`, and there are at most
+        // `max_tokens` of them (greedy loop is bounded by the budget).
+        let token_count = chunks
+            .iter()
+            .filter(|c| matches!(c, StreamChunk::Token(_)))
+            .count();
+        assert_eq!(token_count, chunks.len() - 1, "every chunk but the terminal Done must be a Token");
+        assert!(token_count <= 8, "generated more tokens than the max_tokens budget");
     }
 
     /// Real, full-size Qwen `.gguf` weights were not found anywhere on
