@@ -110,6 +110,18 @@ pub struct Buffer {
     /// [`LineEdit`] for why folds ride *here* instead of inside the buffer the
     /// way marks do.
     line_edits: Vec<LineEdit>,
+    /// Whether this buffer is choped read-only — vim's `nomodifiable` +
+    /// `readonly` rolled into one. When `true`, [`Buffer::apply`] refuses every
+    /// edit (typing does nothing, no panic), and [`Buffer::is_modified`] is
+    /// forced to `false` — a buffer you cannot change has, by definition,
+    /// nothing unsaved to lose, so `:q`/`:qa` never nag about it.
+    ///
+    /// This backs `:help` (and any other generated view the user is only meant
+    /// to read): the manual is loaded, then the buffer is locked with
+    /// [`Buffer::chope_read_only`]. Default is `false` — every real file and
+    /// scratch buffer stays fully editable, so the ordinary unsaved-changes
+    /// guard is untouched.
+    read_only: bool,
 }
 
 impl Default for Buffer {
@@ -141,6 +153,7 @@ impl Buffer {
             undo,
             u_line: None,
             line_edits: Vec::new(),
+            read_only: false,
         }
     }
 
@@ -206,8 +219,41 @@ impl Buffer {
     /// Whether the buffer differs from its last-saved (or, if never saved,
     /// initial) state. See the doc comment on [`Buffer::saved_at`] for why
     /// this is exact even across undo.
+    ///
+    /// A choped-read-only buffer (see [`Buffer::chope_read_only`]) always
+    /// reports `false`: [`Buffer::apply`] refuses every edit on it, so it
+    /// *cannot* have drifted from its loaded state — there is nothing unsaved
+    /// to lose. This is exactly what lets `:q` on a `:help` window quit clean,
+    /// no "save changes?" nag, matching neovim's `buftype=help` behaviour.
     pub fn is_modified(&self) -> bool {
-        self.undo.current_id() != self.saved_at
+        !self.read_only && self.undo.current_id() != self.saved_at
+    }
+
+    /// Whether this buffer is choped read-only (vim's `nomodifiable`). See
+    /// [`Buffer::chope_read_only`].
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Chope this buffer read-only — lock it like vim's `nomodifiable` +
+    /// `readonly`, the way a `:help` window works: after this call every
+    /// [`Buffer::apply`] is a silent no-op (typing does nothing, no error, no
+    /// panic) and [`Buffer::is_modified`] is pinned to `false` so `:q`/`:qa`
+    /// quit without any save prompt.
+    ///
+    /// Call this **after** loading the buffer's content, not before: the load
+    /// is not an edit the *user* made, so the read-only baseline is "whatever
+    /// text is sitting here now". Locking first would make the content-load
+    /// itself a no-op and you'd get an empty buffer. The baseline is reset to
+    /// the current undo node here too, so the buffer is clean the instant it
+    /// locks — belt-and-braces on top of the `is_modified` short-circuit.
+    ///
+    /// One-way by design: nothing in kvim un-chopes a read-only buffer today
+    /// (`:help` views are opened fresh, never edited), so there is no
+    /// `set_modifiable(true)` counterpart to misuse.
+    pub fn chope_read_only(&mut self) {
+        self.read_only = true;
+        self.saved_at = self.undo.current_id();
     }
 
     /// Number of lines in the buffer. Always at least 1, even for an empty
@@ -287,6 +333,17 @@ impl Buffer {
     /// input rather than from this buffer itself should run it through
     /// [`Buffer::clamp`] first if they'd rather clamp than error.
     pub fn apply(&mut self, edit: Edit) -> Result<Position> {
+        // A choped-read-only buffer (`:help` etc.) rejects every edit: typing
+        // does nothing, exactly like vim's `nomodifiable`. We swallow it as a
+        // no-op instead of erroring so the dozens of edit call sites (insert,
+        // delete, operators, paste, ...) need no read-only special-casing —
+        // this single chokepoint makes the whole buffer immutable. The cursor
+        // stays put: nothing was inserted, so we hand back the clamped start of
+        // where the edit *would* have gone, not a phantom post-insert position.
+        if self.read_only {
+            let (start, _) = edit.range.normalized();
+            return Ok(self.clamp(start));
+        }
         self.note_line_before_edit(&edit);
         let (pos, forward, inverse) = self.raw_apply(&edit)?;
         self.undo.record(forward, inverse);
@@ -775,6 +832,36 @@ mod tests {
 
         buf.undo().unwrap();
         assert!(!buf.is_modified(), "undoing back to the saved state must clear modified");
+    }
+
+    #[test]
+    fn chope_read_only_rejects_edits_and_pins_not_modified() {
+        // Load content first, THEN lock — the vim `:help` order.
+        let mut buf = Buffer::from_str("read me lah\nno touching");
+        buf.chope_read_only();
+        assert!(buf.is_read_only());
+        assert!(!buf.is_modified(), "a freshly-locked buffer is clean");
+
+        // Every edit shape is a silent no-op: text unchanged, still not
+        // modified, cursor lands at the (clamped) edit start, no error.
+        let before = buf.text();
+        let pos = buf.apply(Edit::insert(Position::new(0, 4), "XXX")).unwrap();
+        assert_eq!(buf.text(), before, "insert into a read-only buffer must not land");
+        assert_eq!(pos, Position::new(0, 4), "cursor stays at the edit point, no phantom text");
+
+        buf.apply(Edit::delete(Range::new(Position::new(0, 0), Position::new(0, 4)))).unwrap();
+        assert_eq!(buf.text(), before, "delete must not land either");
+
+        buf.apply(Edit::replace(Range::new(Position::new(1, 0), Position::new(1, 2)), "zz")).unwrap();
+        assert_eq!(buf.text(), before, "replace must not land either");
+
+        assert!(!buf.is_modified(), "no failed edit may flip the modified flag");
+    }
+
+    #[test]
+    fn a_normal_buffer_is_not_read_only_by_default() {
+        let buf = Buffer::from_str("hello");
+        assert!(!buf.is_read_only());
     }
 
     #[test]
