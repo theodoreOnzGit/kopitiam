@@ -1,0 +1,42 @@
+[package]
+name = "kopitiam-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM's Rust-gated deterministic tool layer for the AI agent loop: the model PROPOSES a search/read/write/edit/run call, Rust DISPOSES — every call is schema-checked, confined inside the workspace, and budget-checked BEFORE it runs; a hallucinated, out-of-workspace, or oversized call is rejected deterministically, never executed."
+
+[dependencies]
+# Typed request/response per tool. The model emits JSON; serde parsing INTO the
+# typed request IS the schema gate -- if it does not deserialise, it is rejected
+# before anything runs. This is the deterministic partner of the grammar-
+# constrained decoding keystone (temp_ai_design.md §10.1 #2).
+serde.workspace = true
+serde_json.workspace = true
+
+# Typed, never-panic error surface for every rejection.
+thiserror.workspace = true
+
+# Recursive search + the stat-only cost walk both honour .gitignore and skip
+# target/ via `ignore`. Same crate + version kopitiam-resource uses for its
+# project walk, so no new supply-chain surface.
+ignore = "0.4"
+
+# Regex search mode for the search tool (plain-substring is the default).
+regex.workspace = true
+
+# THE budget gate. temp_ai_design.md §6's "one budgeter" -- a "search the whole
+# tree" on a tablet must be budget-checked before it runs (§10.2). We reuse its
+# will_fit / Verdict / Reason and its stat-only project weight estimator as the
+# cheap cost proxy -- we do NOT grow a second copy of the arithmetic.
+kopitiam-resource.workspace = true
+
+[dev-dependencies]
+# Sandbox workspace roots for the gate tests (path-escape, budget-refuse, ...).
+tempfile.workspace = true
+# The end-to-end gate-contract tests live in `tests/` (a separate crate), so they
+# need these as dev-deps to build a synthetic Capacity and craft JSON tool calls,
+# even though the library already depends on both.
+serde_json.workspace = true
+kopitiam-resource.workspace = true

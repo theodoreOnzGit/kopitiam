@@ -1943,7 +1943,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-resource"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cargo_metadata",
  "ignore",
@@ -2016,6 +2016,19 @@ dependencies = [
  "kopitiam-core",
  "regex",
  "serde_json",
+]
+
+[[package]]
+name = "kopitiam-tools"
+version = "0.1.3"
+dependencies = [
+ "ignore",
+ "kopitiam-resource",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
