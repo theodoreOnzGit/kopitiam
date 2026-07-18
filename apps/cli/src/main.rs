@@ -22,6 +22,7 @@
 //! symbols and apply refactorings (see [`rename`] and [`code_actions`]).
 
 mod adapter;
+mod ai;
 mod code_actions;
 mod models;
 mod plan;
@@ -111,6 +112,16 @@ enum Command {
     /// invoke model -> validate -> persist` pipeline end to end.
     Plan(plan::PlanArgs),
 
+    /// Talk to the AI layer. `ai chat` opens an interactive, streamed chat
+    /// with the local model (echo stub when no `.gguf` is present, so it
+    /// always runs).
+    ///
+    /// This is the maintainer's testable AI interface — `temp_ai_design.md`
+    /// §10.6 phase 1 (chat over `LocalAdapter`, streamed token-by-token, no
+    /// tools). See `apps/cli/src/ai.rs`, whose `chat_loop` is factored over
+    /// `Read`/`Write` so the streamed loop is testable headlessly.
+    Ai(ai::AiArgs),
+
     /// Go and get, then check, the local model weights the AI layer runs on.
     ///
     /// Group of four actions — `list`, `pull`, `path`, `verify` — over the
@@ -152,6 +163,10 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Plan(args) => {
             plan::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Ai(args) => {
+            ai::run(args)?;
             ExitCode::SUCCESS
         }
         Command::Models(args) => models::run(args)?,

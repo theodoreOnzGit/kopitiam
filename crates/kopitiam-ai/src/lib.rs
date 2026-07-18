@@ -17,16 +17,33 @@
 //! for the full local-vs-cloud architecture and why depending on
 //! `kopitiam-runtime` from here does not violate the Semantic Runtime's
 //! dependency rule.
+//!
+//! Two other pieces round out the boundary for a live chat UI:
+//!
+//! * **Streaming** — alongside the blocking [`ModelAdapter::complete`], every
+//!   adapter can [`ModelAdapter::stream`] its reply token-by-token over a
+//!   channel of [`StreamChunk`]s, so a UI renders tokens as they land instead
+//!   of freezing on a slow generation. [`EchoAdapter`] and [`LocalAdapter`]
+//!   do this on a real background thread (the AID-0028 actor discipline, std
+//!   threads + `mpsc`, no async runtime).
+//! * **Cloud scaffold** — [`CloudAdapter`] + [`CloudStub`] for
+//!   Claude/GPT/Gemini ([`CloudVendor`]), gated on an API key from the
+//!   environment. Key-detection and the "no key → [`CloudUnavailable`]" path
+//!   are real; the network layer itself is a deliberate follow-up.
 
 mod adapter;
+mod cloud;
 mod echo;
 mod message;
+mod stream;
 
 #[cfg(feature = "local")]
 mod local;
 
 pub use adapter::ModelAdapter;
+pub use cloud::{CloudAdapter, CloudStub, CloudUnavailable, CloudVendor};
 pub use echo::EchoAdapter;
 #[cfg(feature = "local")]
 pub use local::LocalAdapter;
 pub use message::{CompletionRequest, CompletionResponse, Message, Role};
+pub use stream::StreamChunk;
