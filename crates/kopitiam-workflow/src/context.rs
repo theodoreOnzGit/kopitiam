@@ -2,6 +2,8 @@ use kopitiam_knowledge::SemanticGraph;
 use kopitiam_ontology::{Entity, EntityKind};
 use kopitiam_workspace::ProjectState;
 
+use crate::budget::ResourceBudget;
+
 /// Default cap on [`Context::facts`], so a large project's semantic graph
 /// cannot silently balloon a model request. See [`ContextBuilder::with_max_facts`]
 /// to override it.
@@ -57,32 +59,71 @@ impl<'a> ContextBuilder<'a> {
         self
     }
 
-    pub fn build(&self) -> Context {
+    /// The full priority-ordered candidate list, **before** any cap.
+    ///
+    /// This is the single source of truth for fact ordering, and it is what
+    /// makes context **deterministic-given-budget** (temp_ai_design.md §4
+    /// Refinement 2): the order is a pure function of `(graph, state)` — no
+    /// wall-clock, no thread race — so taking the first *N* always yields the
+    /// same prefix. `context = f(task, budget)`, never `f(wall-clock)`.
+    ///
+    /// Priority order (highest first), matching the runtime's "what the model
+    /// most needs to see":
+    /// 1. entities the current working set names (what we are touching now),
+    /// 2. standing [`EntityKind::Decision`] entities (the rules in force),
+    /// 3. standing [`EntityKind::Fact`] entities (tool-derived observations).
+    ///
+    /// Deduplicated by [`Entity::id`], stable within each tier by the graph's
+    /// own iteration order.
+    fn prioritized_candidates(&self) -> Vec<Entity> {
         let mut facts: Vec<Entity> = Vec::new();
+        let push_unique = |facts: &mut Vec<Entity>, entity: &Entity| {
+            if !facts.iter().any(|f| f.id == entity.id) {
+                facts.push(entity.clone());
+            }
+        };
 
         for name in &self.state.working_set {
             for entity in self.graph.entities().filter(|e| &e.name == name) {
-                if !facts.iter().any(|f| f.id == entity.id) {
-                    facts.push(entity.clone());
-                }
+                push_unique(&mut facts, entity);
             }
         }
-
         for entity in self
             .graph
             .entities_of_kind(EntityKind::Decision)
             .chain(self.graph.entities_of_kind(EntityKind::Fact))
         {
-            if facts.len() >= self.max_facts {
-                break;
-            }
-            if !facts.iter().any(|f| f.id == entity.id) {
-                facts.push(entity.clone());
-            }
+            push_unique(&mut facts, entity);
         }
+        facts
+    }
 
-        facts.truncate(self.max_facts);
+    /// Builds context capped at the builder's `max_facts` (the eager,
+    /// synchronous path — the "small essential core, fetched synchronously"
+    /// of §4).
+    pub fn build(&self) -> Context {
+        self.assemble(self.max_facts)
+    }
 
+    /// Builds context capped at whatever `budget` allows, but never more than
+    /// the builder's own `max_facts`.
+    ///
+    /// This is the progressive/anytime seam of §4: the same priority order as
+    /// [`Self::build`], but the *prefix length* is a function of the budget. A
+    /// tight budget (a tablet, per the §6 probe) yields a short but honest
+    /// prefix of exactly the highest-priority facts; a generous budget yields
+    /// more of the same list. Because the order never depends on timing, a
+    /// smaller budget's facts are always a strict prefix of a larger budget's —
+    /// see the `smaller_budget_is_a_prefix_of_larger` test. That prefix
+    /// property is the whole point: reproducible, testable context.
+    pub fn build_within(&self, budget: &dyn ResourceBudget) -> Context {
+        self.assemble(self.max_facts.min(budget.fact_allowance()))
+    }
+
+    /// Shared assembly: prioritized candidates, truncated to `cap`.
+    fn assemble(&self, cap: usize) -> Context {
+        let mut facts = self.prioritized_candidates();
+        facts.truncate(cap);
         Context {
             current_task: self.state.current_task.clone(),
             working_set: self.state.working_set.clone(),
@@ -162,6 +203,42 @@ mod tests {
 
         let context = ContextBuilder::new(&graph, ProjectState::default()).with_max_facts(3).build();
         assert_eq!(context.facts.len(), 3);
+    }
+
+    #[test]
+    fn build_within_caps_at_the_budgets_fact_allowance() {
+        use crate::budget::FactBudget;
+        let mut graph = SemanticGraph::new();
+        for i in 0..10 {
+            graph.insert_entity(entity(EntityKind::Fact, &format!("fact-{i}")));
+        }
+        let builder = ContextBuilder::new(&graph, ProjectState::default());
+        assert_eq!(builder.build_within(&FactBudget(2)).facts.len(), 2);
+        assert_eq!(builder.build_within(&FactBudget(4)).facts.len(), 4);
+    }
+
+    #[test]
+    fn context_is_deterministic_given_budget_a_smaller_budget_is_a_prefix_of_larger() {
+        // The §4 Refinement-2 property: context = f(task, budget), never
+        // f(wall-clock). A tighter budget must yield EXACTLY the highest-
+        // priority prefix of a looser budget's facts — same order, fewer of
+        // them — so "how far it got" depends only on the budget, not timing.
+        use crate::budget::FactBudget;
+        let mut graph = SemanticGraph::new();
+        for i in 0..8 {
+            graph.insert_entity(entity(EntityKind::Fact, &format!("fact-{i}")));
+        }
+        let builder = ContextBuilder::new(&graph, ProjectState::default()).with_max_facts(usize::MAX);
+
+        let small = builder.build_within(&FactBudget(3)).facts;
+        let large = builder.build_within(&FactBudget(6)).facts;
+        assert_eq!(small.len(), 3);
+        assert_eq!(large.len(), 6);
+        assert_eq!(small, large[..3], "small budget must be a strict prefix of large");
+
+        // And repeated assembly at the same budget is byte-for-byte identical.
+        let again = builder.build_within(&FactBudget(3)).facts;
+        assert_eq!(small, again, "same budget -> same prefix, every time");
     }
 
     #[test]
