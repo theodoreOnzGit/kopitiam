@@ -32,6 +32,7 @@
 use kopitiam_core::Result;
 use kopitiam_tokenizer::Tokenizer;
 
+use crate::constraint::{ConstrainedSampler, ConstraintError, TokenConstraint};
 use crate::sampling::{GreedySampler, Sampler};
 use crate::traits::Model;
 
@@ -145,6 +146,127 @@ pub fn generate_with_sampler<M: Model>(
     }
 
     tokenizer.decode(&generated_ids)
+}
+
+/// Either a normal runtime error, or the constraint leaving no valid token —
+/// the two failure modes [`generate_constrained`] can hit.
+///
+/// Kept crate-local (hand-rolled `Display`/`Error`, no `thiserror`) rather than
+/// bolted onto [`kopitiam_core::Error`]: this crate does not own that enum, and
+/// "the grammar constraint masked every token" is a decoding-policy fact that
+/// belongs next to the decoding code, not in the shared tensor-error vocabulary.
+/// A `?` on any inner runtime call folds into [`Runtime`](Self::Runtime); a
+/// `?` on [`ConstrainedSampler::try_sample`] folds into
+/// [`Constraint`](Self::Constraint).
+#[derive(Debug)]
+pub enum ConstrainedGenerateError {
+    /// A normal runtime failure (tokenize / forward pass / decode).
+    Runtime(kopitiam_core::Error),
+    /// The constraint masked every in-range token at some step — see
+    /// [`ConstraintError`]. Almost always means the constraint is missing an
+    /// escape hatch (e.g. it never allows EOS), not a broken model.
+    Constraint(ConstraintError),
+}
+
+impl std::fmt::Display for ConstrainedGenerateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConstrainedGenerateError::Runtime(e) => write!(f, "{e}"),
+            ConstrainedGenerateError::Constraint(e) => write!(f, "constrained decoding failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConstrainedGenerateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConstrainedGenerateError::Runtime(e) => Some(e),
+            ConstrainedGenerateError::Constraint(e) => Some(e),
+        }
+    }
+}
+
+impl From<kopitiam_core::Error> for ConstrainedGenerateError {
+    fn from(e: kopitiam_core::Error) -> Self {
+        ConstrainedGenerateError::Runtime(e)
+    }
+}
+
+impl From<ConstraintError> for ConstrainedGenerateError {
+    fn from(e: ConstraintError) -> Self {
+        ConstrainedGenerateError::Constraint(e)
+    }
+}
+
+/// Like [`generate_with_sampler`], but every step is **grammar-constrained**:
+/// the [`ConstrainedSampler`]'s [`TokenConstraint`] masks disallowed tokens to
+/// `-inf` *before* its inner sampler runs, so the model physically cannot emit
+/// a token the constraint forbids. This is the keystone that makes a small
+/// model reliably produce valid JSON / valid tool names / valid structure —
+/// see [`crate::constraint`] for the full rationale and provenance (AID-0045).
+///
+/// The decode loop is otherwise identical to [`generate_with_sampler`] —
+/// prefill, one-token-at-a-time KV-cache decoding, EOS handling, streaming via
+/// `on_token`, the returned completion text. The *only* differences are that
+/// token selection goes through [`ConstrainedSampler::try_sample`] (which
+/// applies the mask at the front of the sampling path) and that the extra
+/// failure mode — the constraint masking every token — is surfaced as
+/// [`ConstrainedGenerateError::Constraint`] rather than silently emitting
+/// rubbish.
+///
+/// `constrained` carries its own generated-token history for the constraint's
+/// [`crate::constraint::DecodeState`]; it should be freshly constructed (or
+/// [`ConstrainedSampler::reset`]) per decode so the constraint starts from an
+/// empty prefix. The constraint's vocabulary (if it is a
+/// [`crate::constraint::JsonStructure`]) must be sized to the same vocab as the
+/// model's logits row, or its mask can never allow the higher token ids.
+///
+/// # Errors
+///
+/// [`ConstrainedGenerateError::Runtime`] for any tokenize/forward/decode
+/// failure (exactly [`generate`]'s error set), or
+/// [`ConstrainedGenerateError::Constraint`] if the constraint leaves no valid
+/// token at some step. On a constraint error the partial completion is
+/// discarded — the loop stops and returns the error rather than a truncated
+/// string, so a caller cannot mistake a masked-out dead end for a finished
+/// completion.
+pub fn generate_constrained<M, C, S>(
+    model: &M,
+    tokenizer: &dyn Tokenizer,
+    prompt: &str,
+    config: &GenerationConfig,
+    constrained: &mut ConstrainedSampler<C, S>,
+    mut on_token: impl FnMut(u32, &str),
+) -> std::result::Result<String, ConstrainedGenerateError>
+where
+    M: Model,
+    C: TokenConstraint,
+    S: Sampler,
+{
+    let prompt_ids = tokenizer.encode(prompt)?;
+    let mut cache = model.new_cache();
+    let mut generated_ids: Vec<u32> = Vec::new();
+
+    if prompt_ids.is_empty() {
+        return Ok(String::new());
+    }
+
+    let logits = model.forward(&prompt_ids, &mut cache)?;
+    let mut next = constrained.try_sample(&last_row(&logits, model.vocab_size())?)?;
+
+    for _ in 0..config.max_new_tokens {
+        if config.eos_token_id == Some(next) {
+            break;
+        }
+        generated_ids.push(next);
+        let token_text = tokenizer.decode(&[next])?;
+        on_token(next, &token_text);
+
+        let logits = model.forward(&[next], &mut cache)?;
+        next = constrained.try_sample(&last_row(&logits, model.vocab_size())?)?;
+    }
+
+    Ok(tokenizer.decode(&generated_ids)?)
 }
 
 /// Extracts the last row (the newest token's logits) out of a
@@ -295,6 +417,56 @@ mod tests {
         };
 
         assert_eq!(run(), run(), "the same seed must reproduce the exact same completion end to end");
+    }
+
+    // -- generate_constrained: the keystone, end to end --
+
+    #[test]
+    fn constrained_generation_only_ever_emits_allowed_tokens_end_to_end() {
+        // The full loop must mask BEFORE sampling: the greedy inner sampler,
+        // run over a real synthetic model, must never stream a token outside
+        // the allowed set, no matter what the model's raw argmax wanted.
+        use crate::constraint::{AllowedTokens, ConstrainedSampler};
+        use crate::sampling::GreedySampler;
+
+        let model = model_matching_tokenizer();
+        let tokenizer = tiny_tokenizer();
+        let config = GenerationConfig { max_new_tokens: 12, eos_token_id: None };
+
+        let allowed: Vec<u32> = vec![10, 20, 30, 40];
+        let constraint = AllowedTokens::new(allowed.clone()).unwrap();
+        let mut sampler = ConstrainedSampler::new(constraint, GreedySampler);
+
+        let mut streamed: Vec<u32> = Vec::new();
+        let text =
+            generate_constrained(&model, &tokenizer, "abc", &config, &mut sampler, |id, _| streamed.push(id)).unwrap();
+
+        assert_eq!(streamed.len(), 12, "no EOS configured, so the full budget must run");
+        for id in &streamed {
+            assert!(allowed.contains(id), "constrained decode streamed disallowed token {id}");
+        }
+        // The returned text is exactly the decode of the (all-allowed) ids.
+        assert_eq!(text, tokenizer.decode(&streamed).unwrap());
+    }
+
+    #[test]
+    fn constrained_generation_surfaces_a_dead_constraint_as_an_error() {
+        // A constraint whose only allowed id is out of the model's vocab range
+        // masks everything -> an honest Constraint error, not a panic and not a
+        // truncated string.
+        use crate::constraint::{AllowedTokens, ConstrainedSampler, ConstraintError};
+        use crate::sampling::GreedySampler;
+
+        let model = model_matching_tokenizer();
+        let tokenizer = tiny_tokenizer();
+        let config = GenerationConfig { max_new_tokens: 4, eos_token_id: None };
+
+        // vocab_size is 258; id 9999 can never be in range.
+        let constraint = AllowedTokens::new([9999]).unwrap();
+        let mut sampler = ConstrainedSampler::new(constraint, GreedySampler);
+
+        let err = generate_constrained(&model, &tokenizer, "abc", &config, &mut sampler, |_, _| {}).unwrap_err();
+        assert!(matches!(err, ConstrainedGenerateError::Constraint(ConstraintError::NoTokenAllowed)));
     }
 
     #[test]

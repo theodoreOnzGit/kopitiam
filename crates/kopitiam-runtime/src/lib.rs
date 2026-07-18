@@ -30,6 +30,7 @@
 //!              KV cache read/append           (crate::kv_cache)
 //!            RMSNorm -> swiglu_mlp            (crate::mlp)
 //!          final RMSNorm -> output projection
+//!          [optional] constraint mask -> -inf  (crate::constraint)
 //!          greedy sampling                    (crate::sampling)
 //! ```
 //!
@@ -70,6 +71,16 @@
 //!   repetition penalty, composed as a pipeline and driven by a seeded
 //!   PRNG — see that module's docs for the pipeline shape and why
 //!   seedability is mandatory, not optional).
+//! * [`constraint`] — grammar-constrained decoding (the keystone): mask the
+//!   tokens a [`constraint::TokenConstraint`] forbids to `-inf` at the *front*
+//!   of the sampling path, *before* temperature/top-k/top-p, so the model
+//!   physically cannot emit invalid structure. Ships a fixed allowed-token-set
+//!   ([`constraint::AllowedTokens`], e.g. a tool-name enum) and a structural
+//!   JSON constraint ([`constraint::JsonStructure`]); [`constraint::mask_logits`]
+//!   is the masking step and [`constraint::ConstrainedSampler`] the drop-in
+//!   sampler wrapper, driven end to end by [`generate::generate_constrained`].
+//!   See that module's docs for why mask-before-sample and `-inf`-not-`0.0`
+//!   (AID-0045).
 //! * [`gguf_tokenizer`] — builds a [`kopitiam_tokenizer::BpeTokenizer`]
 //!   directly from a GGUF file's embedded `tokenizer.ggml.*` vocabulary
 //!   (no companion `tokenizer.json` needed).
@@ -101,6 +112,7 @@ mod attention;
 mod block;
 mod bridge;
 mod config;
+mod constraint;
 mod gguf_tokenizer;
 mod generate;
 mod kv_cache;
@@ -118,7 +130,11 @@ pub mod traits;
 
 pub use bridge::{load_matmul_weight, load_matmul_weight_opt, load_tensor_f32, load_tensor_f32_opt, tensor_from_entry};
 pub use config::QwenConfig;
-pub use generate::{GenerationConfig, generate, generate_with_sampler};
+pub use constraint::{
+    AllowedSet, AllowedTokens, ConstrainedSampler, ConstraintError, DecodeState, JsonStructure, SliceVocab,
+    TokenConstraint, TokenVocab, mask_logits,
+};
+pub use generate::{ConstrainedGenerateError, GenerationConfig, generate, generate_constrained, generate_with_sampler};
 pub use gguf_tokenizer::tokenizer_from_gguf;
 pub use kv_cache::KvCache;
 pub use model::QwenModel;
