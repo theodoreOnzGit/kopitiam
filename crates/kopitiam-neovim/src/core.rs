@@ -251,6 +251,54 @@ pub enum WindowCommand {
     BufferDeleted { deleted: BufferId, replacement: BufferId },
 }
 
+/// A tab-page command the editor parsed (from `:tabnew`, `gt`, ...) but cannot
+/// itself carry out, because tab pages live in the UI (`ui::tab::TabPages`),
+/// one layer *above* the window tree.
+///
+/// # Why this rides the same "editor recognises, UI performs" seam as [`WindowCommand`]
+///
+/// A tab page in vim/neovim is a whole window layout — an ordered set of window
+/// trees with one active. kvim keeps that collection in the UI (the headless
+/// [`crate::editor::Editor`] got no window, let alone a tab of windows). So same
+/// like `:sp` cannot split from inside the editor, `:tabnew` cannot open a tab
+/// from inside the editor: the editor *recognises* the command (keeping the ex/
+/// normal-mode grammar where it belongs) and passes back this description for the
+/// UI to act on. Same split [`WindowCommand`] and [`ViewportScroll`] draw, one
+/// level up. See AID-0020 (windows) and AID-0048 (tabs) for the reasoning.
+///
+/// The one-editor-cursor invariant still holds hor: a tab switch is a *viewport
+/// swap*, not a second cursor — the UI parks the outgoing tab's window tree and
+/// swaps the incoming one live, then reloads the single editor cursor from the
+/// newly-active window (same sync/load dance AID-0020 uses for `<C-w>` focus).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabCommand {
+    /// `:tabnew`/`:tabedit [file]`: open a fresh tab right after the current
+    /// one and switch to it. With a file, the new tab opens that file; with
+    /// none, it opens a fresh empty (scratch) buffer — vim's `:tabnew` with no
+    /// argument lands you on an empty `[No Name]`.
+    New { file: Option<PathBuf> },
+    /// `:tabclose`: close the current tab (a no-op message on the last one —
+    /// vim won't let you close the final tab page).
+    Close,
+    /// `:tabonly`: close every tab except the current one.
+    Only,
+    /// `gt`/`:tabnext` (no count) and `:tabnext`/`:tabprevious` with a *relative*
+    /// count: move `by` tabs, wrapping round the ends like vim. `forward` picks
+    /// next (`gt`) vs previous (`gT`).
+    Step { by: usize, forward: bool },
+    /// `{count}gt` / `:tabnext {count}`: jump straight to the 1-based tab
+    /// `index` (the user sees tabs numbered from one). Vim's absolute form —
+    /// different from [`TabCommand::Step`], which is relative.
+    Goto { index: usize },
+    /// `:tabfirst`/`:tabrewind`: go to the first tab.
+    First,
+    /// `:tablast`: go to the last tab.
+    Last,
+    /// `:tabs`: list the open tabs (and the windows in each) on the message
+    /// line, so you can see what sits where without squinting at the tabline.
+    List,
+}
+
 /// A single edit to a buffer: replace the text in `range` with `text`.
 ///
 /// Both insertion (empty `range`) and deletion (empty `text`) are expressed as

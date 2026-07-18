@@ -133,6 +133,11 @@ pub enum EditorResponse {
     /// `:only`, `:close`). See [`WindowCommand`] for why the editor cannot do
     /// this itself.
     Window(WindowCommand),
+    /// A tab-page command the UI must carry out (`:tabnew`, `:tabclose`, `gt`,
+    /// ...). Tab pages sit one layer above the window tree and live in the UI,
+    /// so — same as [`EditorResponse::Window`] — the editor only recognises the
+    /// command and hands it back. See [`crate::core::TabCommand`] and AID-0048.
+    Tab(crate::core::TabCommand),
     /// A viewport reposition request (`zz`, `zt`, `zb`, `<C-e>`, `<C-y>`).
     /// See [`ViewportScroll`] for why this is a request, not an edit.
     Scroll(ViewportScroll),
@@ -1397,6 +1402,24 @@ impl Editor {
                 self.discard_dot();
                 self.mode = Mode::Normal;
                 Ok(self.changelist_jump(count.unwrap_or(1).max(1), forward))
+            }
+            // `gt`/`gT`/`{count}gt`: a tab switch is the UI's job (tab pages live
+            // in `ui::tab`), so we just translate the keystroke into a
+            // `TabCommand` and hand it back. `gt` with a count is the *absolute*
+            // jump (`2gt` = tab 2); `gt` without is the relative next. `gT`
+            // always steps back, by `count` tabs (default one). See AID-0048.
+            GrammarCommand::GotoTab { count, forward } => {
+                self.discard_dot();
+                self.mode = Mode::Normal;
+                let cmd = if forward {
+                    match count {
+                        Some(n) => crate::core::TabCommand::Goto { index: n },
+                        None => crate::core::TabCommand::Step { by: 1, forward: true },
+                    }
+                } else {
+                    crate::core::TabCommand::Step { by: count.unwrap_or(1).max(1), forward: false }
+                };
+                Ok(EditorResponse::Tab(cmd))
             }
             GrammarCommand::SearchWordLoose { forward } => {
                 self.discard_dot();
@@ -3575,6 +3598,9 @@ impl Editor {
             })),
             ex::ExCommand::Only => Ok(EditorResponse::Window(WindowCommand::Only)),
             ex::ExCommand::Close => Ok(EditorResponse::Window(WindowCommand::Close)),
+            // Tab pages are the UI's to change (see `TabCommand`), so the parsed
+            // command just rides back out as `EditorResponse::Tab`. AID-0048.
+            ex::ExCommand::Tab(cmd) => Ok(EditorResponse::Tab(cmd)),
             // A real `:term` is a PTY-backed terminal emulator — a large
             // feature (ANSI grid parsing, keystroke forwarding, colours) that
             // is worse done badly than deferred. So this opens a scratch buffer
@@ -5350,6 +5376,16 @@ mod tests {
     }
 
     #[test]
+    fn tab_ex_commands_bridge_to_editor_response_tab() {
+        use crate::core::TabCommand;
+        let mut ed = editor_with("hello");
+        assert_eq!(ed.execute_ex("tabnew").unwrap(), EditorResponse::Tab(TabCommand::New { file: None }));
+        assert_eq!(ed.execute_ex("tabclose").unwrap(), EditorResponse::Tab(TabCommand::Close));
+        assert_eq!(ed.execute_ex("tabnext").unwrap(), EditorResponse::Tab(TabCommand::Step { by: 1, forward: true }));
+        assert_eq!(ed.execute_ex("tabs").unwrap(), EditorResponse::Tab(TabCommand::List));
+    }
+
+    #[test]
     fn quit_all_quits_when_clean_refuses_when_dirty_and_bang_forces() {
         let mut ed = editor_with("hello");
         // A clean buffer: `:qa` exits the whole editor.
@@ -6429,6 +6465,36 @@ mod tests {
         let mut ed = editor_with("no_such_file_kvim.xyz");
         let resp = feed_last(&mut ed, "gf");
         assert!(matches!(resp, EditorResponse::Message(m) if m.contains("cannot find file")));
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // `gT` is a vim key; the case carries meaning.
+    fn gt_and_gT_hand_back_relative_tab_steps() {
+        use crate::core::TabCommand;
+        // Bare `gt` = next, `gT` = previous — both relative, by one.
+        let mut ed = editor_with("hello");
+        assert_eq!(feed_last(&mut ed, "gt"), EditorResponse::Tab(TabCommand::Step { by: 1, forward: true }));
+        assert_eq!(feed_last(&mut ed, "gT"), EditorResponse::Tab(TabCommand::Step { by: 1, forward: false }));
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // `gT` is a vim key; the case carries meaning.
+    fn count_gt_hands_back_an_absolute_jump_and_count_gT_steps_back() {
+        use crate::core::TabCommand;
+        // `2gt` = jump to tab 2 (absolute); `3gT` = three tabs back (relative).
+        let mut ed = editor_with("hello");
+        assert_eq!(feed_last(&mut ed, "2gt"), EditorResponse::Tab(TabCommand::Goto { index: 2 }));
+        assert_eq!(feed_last(&mut ed, "3gT"), EditorResponse::Tab(TabCommand::Step { by: 3, forward: false }));
+    }
+
+    #[test]
+    fn dgt_is_not_a_tab_switch() {
+        // With an operator pending, `gt` must not fire the tab command — it is
+        // not a motion, so the operator finds nothing and the buffer is left be.
+        let mut ed = editor_with("hello world");
+        let resp = feed_last(&mut ed, "dgt");
+        assert!(!matches!(resp, EditorResponse::Tab(_)), "dgt must not switch tabs");
+        assert_eq!(ed.buffer().text(), "hello world", "and it must not delete anything");
     }
 
     #[test]

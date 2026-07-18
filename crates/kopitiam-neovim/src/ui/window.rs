@@ -119,8 +119,10 @@ enum Node {
     },
 }
 
-/// The full window tree for one editor "tab" (vim's terminology; kvim does
-/// not yet have multiple tab pages, so there is exactly one tree today).
+/// The full window tree for one editor **tab page** — vim's terminology, and
+/// now literal: one `WindowTree` per tab, owned by [`crate::ui::tab::TabPages`]
+/// (see AID-0048). The active tab's live tree is `App.windows`; the rest sit
+/// parked. This type stays tab-unaware — it is just "a layout of windows".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowTree {
     root: Node,

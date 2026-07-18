@@ -151,10 +151,9 @@ fn sidebar_width(requested: u16, total: u16) -> u16 {
 
 /// Which window an overlay wants a file opened in.
 ///
-/// Mirrors NERDTree's `o` / `i` / `s` / `t`. `Tab` is carried faithfully even
-/// though kvim has no tab pages yet (see [`crate::ui::window`]) — the app
-/// reports that honestly rather than silently doing something else, and the day
-/// tab pages land, the key already means the right thing.
+/// Mirrors NERDTree's `o` / `i` / `s` / `t`. `Tab` opens the file in a new tab
+/// page now (see [`crate::ui::tab`]); the app routes it through
+/// `App::open_tab`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenTarget {
     Current,

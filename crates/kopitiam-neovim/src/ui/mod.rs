@@ -51,6 +51,10 @@
 //! * [`statusline`] — the vim-airline-style powerline statusline.
 //! * [`cmdline`] — the `:`/`/`/`?` command line and message area.
 //! * [`window`] — the window/split tree (`:sp`, `:vs`).
+//! * [`tab`] — the tab-page collection ([`tab::TabPages`]): an ordered set of
+//!   [`window::WindowTree`]s with one active, the layer above `window`. A tab
+//!   is a whole window layout, vim-style, not a browser buffer-tab.
+//! * [`tabline`] — the top-row tabline widget that paints those tab pages.
 //! * [`overlay`] — the focus/placement layer shared by every panel that takes
 //!   over the keyboard: the file tree today, the fuzzy pickers, hop and the
 //!   harpoon menu next. Its module docs carry the reasoning for why a sidebar
@@ -93,6 +97,8 @@ pub mod picker;
 pub mod scrolling;
 pub mod snippet;
 pub mod statusline;
+pub mod tab;
+pub mod tabline;
 pub mod terminal;
 pub mod textarea;
 pub mod theme;
@@ -107,6 +113,7 @@ pub use bootstrap::run;
 pub use event::{BufferView, EditorHost, HostResponse, KeyPress};
 pub use filetree::FileTreePanel;
 pub use overlay::{Focus, OpenTarget, Overlay, OverlayOutcome, OverlayPlacement};
+pub use tab::TabPages;
 pub use terminal::TerminalGuard;
 pub use theme::Theme;
 pub use window::{SplitKind, WindowTree};

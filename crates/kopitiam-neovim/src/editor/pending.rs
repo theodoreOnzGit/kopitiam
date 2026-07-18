@@ -91,6 +91,14 @@ pub enum GrammarCommand {
     /// which owns the changelist (`Pending` has no buffer, see the module
     /// docs).
     ChangelistJump { count: Option<usize>, forward: bool },
+    /// `gt`/`gT`/`{count}gt`: switch tab page. `forward` picks `gt` (next) vs
+    /// `gT` (previous). `count` is the raw prefix count: for `gt` a count means
+    /// the *absolute* 1-based tab to jump to (`2gt` → tab 2), no count means the
+    /// relative next; for `gT` a count means "that many tabs back", no count
+    /// means one back. Tab pages live in the UI, so `Editor` only recognises
+    /// this and hands back a `crate::core::TabCommand` — same seam as `:sp`.
+    /// See AID-0048.
+    GotoTab { count: Option<usize>, forward: bool },
     /// `g*`/`g#`: search for the keyword under the cursor, forward/backward,
     /// but **without** the `\<...\>` word boundaries that `*`/`#`
     /// ([`GrammarCommand::SearchWord`]) wrap it in — so `g*` on `foo` also
@@ -697,6 +705,18 @@ impl Pending {
 
             // `g&`: repeat the last `:s` over the whole file, flags kept.
             KeyCode::Char('&') if self.operator.is_none() => self.finish(GrammarCommand::RepeatSubstituteGlobal),
+
+            // `gt`/`gT`: next/previous tab page (`{count}gt` = jump to tab N).
+            // Only when idle — `dgt` is not a thing. The count rides along so
+            // `Editor` can tell absolute (`2gt`) from relative (`gt`).
+            KeyCode::Char('t') if self.operator.is_none() => {
+                let count = self.effective_count();
+                self.finish(GrammarCommand::GotoTab { count, forward: true })
+            }
+            KeyCode::Char('T') if self.operator.is_none() => {
+                let count = self.effective_count();
+                self.finish(GrammarCommand::GotoTab { count, forward: false })
+            }
 
             // `gn`/`gN`: select (or operate on) the next/previous search match.
             // The one `g` command that carries a pending operator through.

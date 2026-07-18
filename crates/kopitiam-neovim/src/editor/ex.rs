@@ -163,6 +163,11 @@ pub enum ExCommand {
     Only,
     /// `:close` — close the active window.
     Close,
+    /// `:tabnew`/`:tabclose`/`:tabnext`/... — a tab-page command. Tab pages are
+    /// the UI's to change (one layer above the window tree), so this forwards as
+    /// `EditorResponse::Tab`, same like [`ExCommand::Split`] forwards windows.
+    /// See [`crate::core::TabCommand`] and AID-0048.
+    Tab(crate::core::TabCommand),
     /// `:term`/`:terminal` — kvim has no terminal emulator yet, so this opens
     /// an honest placeholder buffer rather than a broken or silent one. See
     /// `Editor::execute_ex` and bead `kopitiam-cj0.10.4`.
@@ -415,6 +420,25 @@ pub fn parse(input: &str) -> ExCommand {
         Some(CommandId::VNew) => ExCommand::Split { vertical: true, file: None, scratch: true },
         Some(CommandId::Only) => ExCommand::Only,
         Some(CommandId::Close) => ExCommand::Close,
+        // Tab pages (kopitiam-ygk). `parse_tab_count` returns None for an empty
+        // arg so a bare `:tabnext` is relative (next) while `:tabnext 3` is the
+        // absolute jump — the same split vim draws.
+        Some(CommandId::TabNew) => {
+            ExCommand::Tab(crate::core::TabCommand::New { file: opt_arg(arg).map(std::path::PathBuf::from) })
+        }
+        Some(CommandId::TabClose) => ExCommand::Tab(crate::core::TabCommand::Close),
+        Some(CommandId::TabOnly) => ExCommand::Tab(crate::core::TabCommand::Only),
+        Some(CommandId::TabNext) => ExCommand::Tab(match parse_tab_count(arg) {
+            Some(n) => crate::core::TabCommand::Goto { index: n },
+            None => crate::core::TabCommand::Step { by: 1, forward: true },
+        }),
+        Some(CommandId::TabPrev) => ExCommand::Tab(crate::core::TabCommand::Step {
+            by: parse_tab_count(arg).unwrap_or(1),
+            forward: false,
+        }),
+        Some(CommandId::TabFirst) => ExCommand::Tab(crate::core::TabCommand::First),
+        Some(CommandId::TabLast) => ExCommand::Tab(crate::core::TabCommand::Last),
+        Some(CommandId::TabList) => ExCommand::Tab(crate::core::TabCommand::List),
         Some(CommandId::Terminal) => ExCommand::Terminal,
         // `:r`/`:read` currently supports only the shell form `:r !{cmd}` (and
         // its no-space `:r!{cmd}`). `force` is `true` when the `!` sat directly
@@ -558,6 +582,20 @@ fn parse_count_arg(arg: &str) -> Option<usize> {
     let arg = arg.trim();
     if arg.is_empty() {
         return Some(1);
+    }
+    arg.parse::<usize>().ok()
+}
+
+/// The count for `:tabnext {count}` / `:tabprevious {count}`. Unlike
+/// [`parse_count_arg`], an EMPTY arg here means "no count given" (`None`), not
+/// `Some(1)` — because a bare `:tabnext` is the *relative* next tab, while
+/// `:tabnext 3` is the *absolute* jump to tab 3. Squashing empty to `Some(1)`
+/// would lose that distinction and make `:tabnext` jump to tab 1 always. A
+/// non-numeric arg is also `None` (we just treat it as no count, not an error).
+fn parse_tab_count(arg: &str) -> Option<usize> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return None;
     }
     arg.parse::<usize>().ok()
 }
@@ -837,6 +875,31 @@ pub(crate) fn resolve_dest(spec: LineSpec, current_line: usize, content: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_tab_page_commands() {
+        use crate::core::TabCommand;
+        assert_eq!(parse("tabnew"), ExCommand::Tab(TabCommand::New { file: None }));
+        assert_eq!(
+            parse("tabnew foo.rs"),
+            ExCommand::Tab(TabCommand::New { file: Some(std::path::PathBuf::from("foo.rs")) })
+        );
+        assert_eq!(parse("tabedit bar.rs"), ExCommand::Tab(TabCommand::New { file: Some("bar.rs".into()) }));
+        assert_eq!(parse("tabclose"), ExCommand::Tab(TabCommand::Close));
+        assert_eq!(parse("tabc"), ExCommand::Tab(TabCommand::Close));
+        assert_eq!(parse("tabonly"), ExCommand::Tab(TabCommand::Only));
+        // Bare `:tabnext` is the relative next; `:tabnext 3` is the absolute jump.
+        assert_eq!(parse("tabnext"), ExCommand::Tab(TabCommand::Step { by: 1, forward: true }));
+        assert_eq!(parse("tabn"), ExCommand::Tab(TabCommand::Step { by: 1, forward: true }));
+        assert_eq!(parse("tabnext 3"), ExCommand::Tab(TabCommand::Goto { index: 3 }));
+        // `:tabprevious` steps back; with a count, that many back.
+        assert_eq!(parse("tabprevious"), ExCommand::Tab(TabCommand::Step { by: 1, forward: false }));
+        assert_eq!(parse("tabp"), ExCommand::Tab(TabCommand::Step { by: 1, forward: false }));
+        assert_eq!(parse("tabprevious 2"), ExCommand::Tab(TabCommand::Step { by: 2, forward: false }));
+        assert_eq!(parse("tabfirst"), ExCommand::Tab(TabCommand::First));
+        assert_eq!(parse("tablast"), ExCommand::Tab(TabCommand::Last));
+        assert_eq!(parse("tabs"), ExCommand::Tab(TabCommand::List));
+    }
 
     #[test]
     fn parses_write_and_quit_variants() {
