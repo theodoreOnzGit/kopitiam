@@ -91,6 +91,32 @@ tempfile = "3.27.0"
 # supply-chain surface.
 memmap2 = "0.9"
 
+# kvim's `:term` terminal emulator. Both pure Rust and both build for
+# aarch64-linux-android (Termux has ptys), which is what makes an on-tablet
+# terminal possible.
+#
+# `portable-pty` (wezterm's) opens the pseudo-terminal and spawns the shell.
+# It calls libc's `openpty`/`ioctl` via FFI -- that is the OS's own pty
+# interface, NOT a bundled C library that Cargo has to compile. Same Pure Rust
+# Core standard we already accept for `sysinfo` (reads /proc) and `memmap2`
+# (wraps mmap): a thin safe wrapper over a syscall is pure Rust; a `cc`-built
+# C dependency is not. No `cc`, no CMake, no vendored C in the build.
+#
+# `vt100` (built on alacritty's `vte`) is the ANSI/VT parser: it eats the raw
+# pty byte stream and maintains a `Screen` grid of cells (glyph + fg/bg +
+# attrs + cursor) that kvim paints straight into a ratatui window. Pure Rust,
+# maintained, no C. See crates/kopitiam-neovim/src/termemu.rs and AID-0049.
+#
+# WHY 0.15 AND NOT 0.16, HOR: `vt100` 0.16 bumped to `unicode-width ^0.2.1`,
+# but `ratatui` 0.29.0 HARD-PINS `unicode-width =0.2.0` (exact `=`, because
+# unicode-width 0.2.1 changed some East-Asian widths and ratatui froze it).
+# One version per semver-compat range, so 0.16 cannot coexist with our pinned
+# ratatui -- Cargo refuses to resolve. `vt100` 0.15.2 depends on the 0.1 line
+# (`unicode-width 0.1.14`, a different major that unifies fine), so it slots in
+# clean. When ratatui unpins unicode-width (or we bump ratatui), revisit 0.16.
+portable-pty = "0.9"
+vt100 = "0.15"
+
 # System info (RAM available/total, CPU core count + usage, per-process RSS).
 # Pure Rust, Android-capable (reads /proc under the hood on Linux/Android), and
 # it is the crate `bottom`/`btm` is built on -- so it keeps the Pure Rust Core

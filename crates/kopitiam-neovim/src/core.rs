@@ -104,6 +104,14 @@ pub enum Mode {
     /// An operator has been given and kvim is waiting for the motion that
     /// tells it what to operate on — the `d` in `d2w`, before the `2w`.
     OperatorPending,
+    /// Terminal-mode: the active window is a `:term` terminal, and keystrokes
+    /// are forwarded raw to the child process in the pty rather than handled as
+    /// editor commands. `<C-\><C-n>` leaves back to Normal so the user can
+    /// scroll/copy; `i`/`a` from Normal on a terminal buffer re-enters here.
+    /// The keystroke forwarding itself lives in the UI (it owns the pty
+    /// sessions — see [`crate::ui::app`] and [`crate::termemu`]); this variant
+    /// is just the modal state everyone agrees on. See AID-0049.
+    Terminal,
 }
 
 impl Mode {
@@ -118,6 +126,7 @@ impl Mode {
             Self::Replace => "REPLACE",
             Self::Command => "COMMAND",
             Self::OperatorPending => "O-PENDING",
+            Self::Terminal => "TERMINAL",
         }
     }
 

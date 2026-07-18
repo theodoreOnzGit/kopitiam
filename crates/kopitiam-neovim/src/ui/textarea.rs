@@ -164,6 +164,11 @@ pub fn cursor_style_for_mode(mode: Mode) -> crossterm::cursor::SetCursorStyle {
         | Mode::VisualBlock
         | Mode::Command
         | Mode::OperatorPending => SetCursorStyle::SteadyBlock,
+        // Terminal-mode uses a steady bar like Insert: you are typing at a
+        // shell prompt, text goes *between* characters. (In practice the child
+        // program's own cursor shows through the painted grid; this is the
+        // fallback shape kvim asks the outer terminal for.)
+        Mode::Terminal => SetCursorStyle::SteadyBar,
     }
 }
 

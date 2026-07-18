@@ -195,6 +195,13 @@ impl EditorHost for crate::editor::Editor {
                 // The quickfix / location-list family, parsed by the editor and
                 // performed by `App` (see `EditorResponse::Quickfix`).
                 EditorResponse::Quickfix(cmd) => HostResponse::Quickfix(cmd),
+
+                // `:term` made the terminal buffer + switched to terminal-mode;
+                // `App` now spawns the pty session for it (it owns the OS
+                // resources and window geometry). One hop out, same as Window.
+                EditorResponse::Terminal { buffer, command } => {
+                    HostResponse::Terminal { buffer, command }
+                }
             },
             Err(e) => HostResponse::Error(e.to_string()),
         }
@@ -202,6 +209,10 @@ impl EditorHost for crate::editor::Editor {
 
     fn mode(&self) -> Mode {
         crate::editor::Editor::mode(self)
+    }
+
+    fn leave_terminal_mode(&mut self) {
+        crate::editor::Editor::leave_terminal_mode(self)
     }
 
     fn cursor(&self) -> Position {

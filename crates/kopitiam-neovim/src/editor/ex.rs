@@ -168,10 +168,12 @@ pub enum ExCommand {
     /// `EditorResponse::Tab`, same like [`ExCommand::Split`] forwards windows.
     /// See [`crate::core::TabCommand`] and AID-0048.
     Tab(crate::core::TabCommand),
-    /// `:term`/`:terminal` — kvim has no terminal emulator yet, so this opens
-    /// an honest placeholder buffer rather than a broken or silent one. See
-    /// `Editor::execute_ex` and bead `kopitiam-cj0.10.4`.
-    Terminal,
+    /// `:term`/`:terminal [cmd]` — open a real pty-backed terminal buffer
+    /// running `$SHELL` (`cmd == None`) or the given command line (`cmd ==
+    /// Some(line)`, run through `$SHELL -c line`). The editor spawns the buffer
+    /// and switches to terminal-mode; the UI owns the pty session and rendering
+    /// (see [`crate::termemu`], `Editor::execute_ex` and AID-0049).
+    Terminal { cmd: Option<String> },
     /// `:help`/`:h [topic]` — open kvim's built-in Singlish help manual in a
     /// scratch buffer. `topic` is the optional `:help <topic>` argument that
     /// jumps to a section (see [`super::help`]); `None` opens at the top.
@@ -439,7 +441,11 @@ pub fn parse(input: &str) -> ExCommand {
         Some(CommandId::TabFirst) => ExCommand::Tab(crate::core::TabCommand::First),
         Some(CommandId::TabLast) => ExCommand::Tab(crate::core::TabCommand::Last),
         Some(CommandId::TabList) => ExCommand::Tab(crate::core::TabCommand::List),
-        Some(CommandId::Terminal) => ExCommand::Terminal,
+        // `:term`/`:terminal [cmd]` — `arg` is the raw rest of the line, the
+        // command to run (empty means the default shell). `opt_arg` maps "" to
+        // `None`; a non-empty command line is kept whole (spaces significant —
+        // it goes to `$SHELL -c`), so `:term ls -la` runs `ls -la`.
+        Some(CommandId::Terminal) => ExCommand::Terminal { cmd: opt_arg(arg) },
         // `:r`/`:read` currently supports only the shell form `:r !{cmd}` (and
         // its no-space `:r!{cmd}`). `force` is `true` when the `!` sat directly
         // against the name (`:r!cmd`), in which case `after` is already the

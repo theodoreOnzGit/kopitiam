@@ -101,6 +101,9 @@ pub fn mode_color(mode: Mode, theme: &Theme) -> Color {
         Mode::Replace => theme.red_bright,
         Mode::Command => theme.yellow_bright,
         Mode::OperatorPending => theme.orange_bright,
+        // Terminal-mode gets aqua — distinct from Insert's green so you can tell
+        // at a glance whether a keystroke goes to the shell or edits text.
+        Mode::Terminal => theme.aqua_bright,
     }
 }
 

@@ -99,6 +99,7 @@ pub mod snippet;
 pub mod statusline;
 pub mod tab;
 pub mod tabline;
+pub mod termgrid;
 pub mod terminal;
 pub mod textarea;
 pub mod theme;

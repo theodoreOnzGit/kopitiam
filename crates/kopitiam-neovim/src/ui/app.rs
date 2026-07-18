@@ -325,6 +325,23 @@ pub struct App<H: EditorHost> {
     /// When [`Self::git_status`] was last recomputed, so an idle tick can skip
     /// re-walking the worktree until [`Self::GIT_STATUS_TTL`] has elapsed.
     git_status_checked: Instant,
+    /// The live `:term` terminal sessions, keyed by the terminal buffer's id.
+    ///
+    /// A buffer is a terminal iff it has an entry here — the App owns the pty,
+    /// its reader thread and the child process (all OS resources, which is why
+    /// they live in the UI and not in the pure editor). A window whose buffer is
+    /// in this map is painted as a terminal grid ([`crate::ui::termgrid`])
+    /// instead of as editable text, and while [`Mode::Terminal`] is active its
+    /// keystrokes are forwarded raw to the session's pty. Dropping a session
+    /// (here, or when the whole App drops) kills and reaps its child — see
+    /// [`crate::termemu::TermSession`]. See AID-0049.
+    terminals: std::collections::HashMap<BufferId, crate::termemu::TermSession>,
+    /// Half-typed `<C-\>` in terminal-mode: `<C-\>` on its own is armed here,
+    /// and the *next* key decides — `<C-n>` leaves terminal-mode, anything else
+    /// sends the literal `0x1c` (FS) byte followed by that key to the pty. This
+    /// is the only two-key sequence terminal-mode recognises. See
+    /// [`Self::handle_terminal_key`].
+    term_pending_ctrl_backslash: bool,
 }
 
 /// A navigable list of reference locations (`<leader>gr`).
@@ -425,6 +442,15 @@ impl<H: EditorHost> App<H> {
     /// Not a redraw interval — see the module docs.
     const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+    /// The idle poll interval used while a `:term` terminal is live. A pty's
+    /// output arrives asynchronously (the reader thread writes it into the vt100
+    /// parser off the UI thread), and crossterm's `event::poll` only wakes on
+    /// *terminal input* — not on pty output. So while a terminal is open the
+    /// loop polls on this much shorter tick and repaints when a session reports
+    /// fresh output, giving smooth ~60fps-ish terminal rendering; the slow
+    /// [`Self::EVENT_POLL_INTERVAL`] resumes once every terminal is closed.
+    const EVENT_POLL_INTERVAL_TERM: Duration = Duration::from_millis(16);
+
     /// How stale the cached git status ([`Self::git_status`]) may get before an
     /// idle tick recomputes it. Reading `.git/HEAD` for the branch is cheap,
     /// but the dirty check walks the whole worktree, so this bounds that walk to
@@ -508,6 +534,8 @@ impl<H: EditorHost> App<H> {
             git_status: None,
             git_status_dir: None,
             git_status_checked: Instant::now(),
+            terminals: std::collections::HashMap::new(),
+            term_pending_ctrl_backslash: false,
         }
     }
 
@@ -659,17 +687,28 @@ impl<H: EditorHost> App<H> {
         self.refresh_git_status(true);
         terminal.draw(|frame| self.render(frame))?;
         loop {
-            if !event::poll(Self::EVENT_POLL_INTERVAL)? {
+            // A live terminal needs the fast tick so its async pty output paints
+            // promptly; otherwise the slow tick is plenty (only diagnostics/git
+            // refresh on it).
+            let poll_interval = if self.has_live_terminal() {
+                Self::EVENT_POLL_INTERVAL_TERM
+            } else {
+                Self::EVENT_POLL_INTERVAL
+            };
+            if !event::poll(poll_interval)? {
                 // Idle tick: diagnostics are pushed by the server asynchronously,
                 // so poll for fresh ones here (never on a fixed redraw clock —
                 // see the module docs) and repaint only if they changed. The git
                 // status is refreshed on the same tick (throttled, and forced
                 // when the active buffer's directory changed) — the one place
-                // the worktree is re-read, never per frame. Both are called
-                // unconditionally so neither short-circuits the other's refresh.
+                // the worktree is re-read, never per frame. A live terminal's
+                // fresh pty output is drained on the same tick (and any exited
+                // child reaped). All called unconditionally so none
+                // short-circuits another's refresh.
                 let diagnostics_changed = self.refresh_diagnostics();
                 let git_changed = self.refresh_git_status(false);
-                if diagnostics_changed || git_changed {
+                let terminal_changed = self.drain_terminals();
+                if diagnostics_changed || git_changed || terminal_changed {
                     terminal.draw(|frame| self.render(frame))?;
                 }
                 continue;
@@ -732,6 +771,16 @@ impl<H: EditorHost> App<H> {
                         self.handle_overlay_key(kp)
                     }
                     Focus::Buffer => {
+                        // Terminal-mode owns the keyboard outright: every key is
+                        // forwarded raw to the pty (only `<C-\><C-n>` is special —
+                        // it leaves terminal-mode). Checked FIRST, before the
+                        // quickfix / LSP / completion / hop interceptors, because
+                        // in terminal-mode those editor niceties do not apply —
+                        // the keystrokes belong to the shell. See
+                        // `handle_terminal_key`.
+                        if self.host.mode() == Mode::Terminal {
+                            return self.handle_terminal_key(kp);
+                        }
                         // The bottom quickfix/location window, when focused, owns
                         // the keyboard like an overlay: `j`/`k`/`<CR>`/`q` move,
                         // jump and close the list. Suspended while a `:` prompt is
@@ -845,7 +894,129 @@ impl<H: EditorHost> App<H> {
             HostResponse::Tab(cmd) => self.handle_tab_command(cmd),
             HostResponse::Scroll(req) => self.handle_scroll(req),
             HostResponse::Quickfix(cmd) => self.handle_quickfix(cmd),
+            HostResponse::Terminal { buffer, command } => self.spawn_terminal(buffer, command),
         }
+    }
+
+    /// Spawn the pty session for a `:term` buffer the editor just created, and
+    /// bind it to the active window.
+    ///
+    /// The editor already switched to [`Mode::Terminal`] and made `buffer` the
+    /// active buffer; here we (1) size a pty to the active window, (2) spawn the
+    /// [`crate::termemu::TermSession`] and stash it keyed on `buffer`, and (3)
+    /// point the active window at the new buffer. From the next frame,
+    /// [`Self::render_windows`] paints it as a terminal grid and
+    /// [`Self::handle_terminal_key`] forwards keystrokes to it. A spawn failure
+    /// (no pty available — extremely unlikely on Linux/Android, possible in a
+    /// locked-down sandbox) is reported on the command line and leaves the
+    /// buffer as an empty read-only marker rather than crashing kvim.
+    fn spawn_terminal(&mut self, buffer: BufferId, command: Option<String>) -> LoopAction {
+        let size = self.terminal_size_for_active_window();
+        match crate::termemu::TermSession::spawn(command.as_deref(), size) {
+            Ok(session) => {
+                self.terminals.insert(buffer, session);
+                self.sync_active_window();
+                LoopAction::Redraw
+            }
+            Err(e) => {
+                // The editor is already in terminal-mode for a buffer that now
+                // has no pty; drop back to Normal so the user is not stuck.
+                self.host.leave_terminal_mode();
+                self.error(format!("E: could not open terminal: {e}"))
+            }
+        }
+    }
+
+    /// The pty size to give a freshly-spawned terminal: the active window's
+    /// current on-screen rectangle (rows × cols), falling back to the whole
+    /// windows area before the first paint. [`crate::termemu::TermSize::new`]
+    /// clamps to at least 1×1, so a never-yet-rendered App still gets a valid
+    /// size. The next frame's [`Self::render_windows`] resizes it to the exact
+    /// text area anyway, so this only has to be in the right ballpark.
+    fn terminal_size_for_active_window(&self) -> crate::termemu::TermSize {
+        let active = self.windows.active_id();
+        let rect = self
+            .windows
+            .layout(self.last_windows_area)
+            .into_iter()
+            .find(|(id, _)| *id == active)
+            .map(|(_, r)| r)
+            .unwrap_or(self.last_windows_area);
+        crate::termemu::TermSize::new(rect.height, rect.width)
+    }
+
+    /// Handle one keystroke while in [`Mode::Terminal`]: forward it raw to the
+    /// active terminal's pty, except the `<C-\><C-n>` escape.
+    ///
+    /// `<C-\>` on its own arms [`Self::term_pending_ctrl_backslash`]; the next
+    /// key decides. `<C-n>` after it leaves terminal-mode (back to Normal, so
+    /// the user can scroll/copy the buffer). Any other key after `<C-\>` sends
+    /// the literal `0x1c` (FS) byte followed by that key — so a program that
+    /// genuinely wants `<C-\>` still receives it. Every other key is encoded to
+    /// its terminal byte sequence by [`crate::termemu::encode_key`] and written
+    /// to the pty.
+    fn handle_terminal_key(&mut self, kp: KeyPress) -> LoopAction {
+        // First half of the `<C-\>` escape: arm and wait for the next key.
+        if !self.term_pending_ctrl_backslash && is_ctrl_backslash(kp) {
+            self.term_pending_ctrl_backslash = true;
+            return LoopAction::Continue;
+        }
+
+        if self.term_pending_ctrl_backslash {
+            self.term_pending_ctrl_backslash = false;
+            // `<C-\><C-n>`: leave terminal-mode.
+            if kp.mods.ctrl && kp.key == Key::Char('n') {
+                self.host.leave_terminal_mode();
+                return LoopAction::Redraw;
+            }
+            // `<C-\>` followed by anything else: the shell still wanted the
+            // `<C-\>` (0x1c FS), so send it, then fall through to send this key.
+            self.term_write(&[0x1c]);
+        }
+
+        match crate::termemu::encode_key(&kp) {
+            Some(bytes) => {
+                self.term_write(&bytes);
+                // The pty echoes asynchronously; this repaint shows the current
+                // grid and the short terminal poll interval catches the echo a
+                // few ms later (see `EVENT_POLL_INTERVAL_TERM`).
+                LoopAction::Redraw
+            }
+            None => LoopAction::Continue,
+        }
+    }
+
+    /// Write raw bytes to the active window's terminal session, if it has one.
+    /// A dropped write (the child already exited, the pipe is gone) is
+    /// swallowed — a dead terminal simply stops accepting input.
+    fn term_write(&mut self, bytes: &[u8]) {
+        let id = self.host.active_buffer_id();
+        if let Some(session) = self.terminals.get_mut(&id) {
+            let _ = session.write_input(bytes);
+        }
+    }
+
+    /// Drain terminal bookkeeping on the idle tick: reap any child that has
+    /// exited (so it never lingers as a zombie) and report whether any session
+    /// produced fresh output since the last check (so the caller repaints only
+    /// when the screen actually changed). Returns `true` if a repaint is worth
+    /// it. See the event loop in [`Self::run`].
+    fn drain_terminals(&mut self) -> bool {
+        let mut dirty = false;
+        for session in self.terminals.values_mut() {
+            if session.take_dirty() {
+                dirty = true;
+            }
+            session.reap_if_done();
+        }
+        dirty
+    }
+
+    /// Whether any live terminal session exists — used to pick the fast idle
+    /// poll interval so a shell's output paints smoothly, instead of the slow
+    /// default tick that is fine when only diagnostics/git refresh matter.
+    fn has_live_terminal(&self) -> bool {
+        !self.terminals.is_empty()
     }
 
     /// Performs a configured [`Action`] — the last hop of a keymap like
@@ -3357,6 +3528,37 @@ impl<H: EditorHost> App<H> {
             let is_active = id == active_id;
             let Some(win) = windows.iter().find(|w| w.id == id).copied() else { continue };
             let buffer_id = win.buffer;
+
+            // A terminal window is painted from its pty-backed vt100 grid, not
+            // from editable buffer text. Resize the pty to this window (whole
+            // rect, no gutter — a terminal has no line numbers), paint the grid,
+            // place the terminal cursor if this window is focused, and skip the
+            // whole text/syntax/fold/diagnostics path below (none of it applies).
+            if self.terminals.contains_key(&buffer_id) {
+                let size = crate::termemu::TermSize::new(rect.height, rect.width);
+                if let Some(session) = self.terminals.get_mut(&buffer_id) {
+                    session.resize(size);
+                }
+                let theme = &self.theme;
+                let cursor = self.terminals.get(&buffer_id).and_then(|session| {
+                    session.with_screen(|screen| {
+                        crate::ui::termgrid::paint_terminal(screen, frame.buffer_mut(), rect, theme)
+                    })
+                });
+                // The terminal cursor belongs to the focused terminal window,
+                // and only while no `:` command line is open (that owns the
+                // cursor). Hidden otherwise — same rule as the text path.
+                if is_active
+                    && self.focus() == Focus::Buffer
+                    && self.host.command_line().is_none()
+                    && let Some((x, y)) = cursor
+                {
+                    frame.set_cursor_position((x, y));
+                    cursor_screen = Some((x, y));
+                }
+                continue;
+            }
+
             // Each window shows ITS buffer with ITS cursor — the fix for
             // `kopitiam-cj0.10.3`. The active window's cursor is the editor's
             // live one; an inactive split's is whatever it last left behind.
@@ -3738,6 +3940,21 @@ fn ctrl_hjkl_direction(kp: KeyPress) -> Option<Direction> {
         Key::Char('l') => Some(Direction::Right),
         _ => None,
     }
+}
+
+/// Whether `kp` is the `<C-\>` that begins the `<C-\><C-n>` terminal-mode escape.
+///
+/// FORMAT KNOWLEDGE (crossterm 0.29 unix legacy decode): a real terminal sends a
+/// single byte `0x1C` for `<C-\>`, and crossterm decodes `0x1C..0x1F` to the
+/// DIGITS `'4'..'7'` + CONTROL — it genuinely cannot tell `<C-\>` from `<C-4>`,
+/// they are the same byte on a legacy tty. So `<C-4>`/`Char('4')` is the form
+/// that actually arrives when a user presses Ctrl+backslash. Under the newer
+/// kitty/modifyOtherKeys protocols the symbolic `Char('\\')` form can arrive
+/// instead, so accept both — otherwise `<C-\><C-n>` would be un-typable on the
+/// exact legacy terminals (and Termux) kvim targets. See
+/// [`crate::termemu::encode_key`], which mirrors this mapping for forwarding.
+fn is_ctrl_backslash(kp: KeyPress) -> bool {
+    kp.mods.ctrl && !kp.mods.alt && matches!(kp.key, Key::Char('\\') | Key::Char('4'))
 }
 
 /// The `tmux select-pane` flag for a directional focus move — `-L`/`-D`/`-U`/`-R`
@@ -5481,6 +5698,97 @@ mod tests {
         (0..height)
             .map(|y| (0..width).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect::<String>())
             .collect()
+    }
+
+    /// `:term {cmd}` end-to-end through the real editor + App: typing the ex
+    /// command spawns a pty session, switches to terminal-mode, and the child's
+    /// output is drained by the idle-tick path and painted into the window.
+    /// The painted-cell proof (not just a state field) — same discipline as the
+    /// `:help` test. Covers kopitiam-cj0.10.4 / AID-0049.
+    #[test]
+    fn term_command_spawns_a_pty_and_paints_its_output() {
+        let editor = Editor::new();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        // One paint so `last_windows_area` is set (the pty is sized to it).
+        let _ = real_screen(&mut app, 80, 24);
+
+        // Type `:term printf hello` and run it.
+        feed_str(&mut app, ":term printf hello");
+        app.handle_event(enter_event());
+
+        assert_eq!(app.host.mode(), crate::core::Mode::Terminal, "`:term` must switch to terminal-mode");
+        assert_eq!(app.terminals.len(), 1, "`:term` must spawn exactly one pty session");
+
+        // The pty output arrives asynchronously; drain + repaint until it lands.
+        let mut screen = String::new();
+        for _ in 0..300 {
+            app.drain_terminals();
+            screen = real_screen(&mut app, 80, 24).join("\n");
+            if screen.contains("hello") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(screen.contains("hello"), "the terminal's output must paint on screen; screen was:\n{screen}");
+    }
+
+    /// The terminal-mode escape and re-entry: `<C-\><C-n>` drops back to Normal
+    /// (so the user can scroll/copy), and `i` on the terminal buffer re-enters
+    /// terminal-mode. Covers the mode wiring for kopitiam-cj0.10.4 / AID-0049.
+    #[test]
+    fn ctrl_backslash_ctrl_n_leaves_terminal_mode_and_i_reenters() {
+        let editor = Editor::new();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        let _ = real_screen(&mut app, 80, 24);
+
+        // `cat` is a long-lived child, so the session stays alive across the
+        // mode dance (unlike a command that exits immediately).
+        feed_str(&mut app, ":term cat");
+        app.handle_event(enter_event());
+        assert_eq!(app.host.mode(), crate::core::Mode::Terminal);
+
+        // `<C-\>` then `<C-n>` leaves terminal-mode back to Normal. On a legacy
+        // tty crossterm delivers `<C-\>` as `Char('4')+CONTROL` (the 0x1C byte),
+        // so drive it through that realistic form — the exact case the first PTY
+        // run missed. See `is_ctrl_backslash`.
+        app.handle_event(ctrl_event('4'));
+        app.handle_event(ctrl_event('n'));
+        assert_eq!(app.host.mode(), crate::core::Mode::Normal, "<C-\\><C-n> must leave terminal-mode");
+
+        // `i` on the (still-current) terminal buffer re-enters terminal-mode.
+        app.handle_event(key_event('i'));
+        assert_eq!(app.host.mode(), crate::core::Mode::Terminal, "`i` on a terminal buffer must re-enter terminal-mode");
+    }
+
+    /// A keystroke typed in terminal-mode reaches the child: feed an interactive
+    /// `cat` the line `hi`, and `cat`'s echo of it must paint. This proves the
+    /// whole keystroke path — App terminal-mode routing → `encode_key` → pty →
+    /// reader → vt100 → render — not just the model-level unit test.
+    #[test]
+    fn a_keystroke_in_terminal_mode_reaches_the_child_and_echoes() {
+        let editor = Editor::new();
+        let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        let _ = real_screen(&mut app, 80, 24);
+        feed_str(&mut app, ":term cat");
+        app.handle_event(enter_event());
+        assert_eq!(app.host.mode(), crate::core::Mode::Terminal);
+
+        // Type `hi` then Enter — `cat` echoes each line back.
+        app.handle_event(key_event('h'));
+        app.handle_event(key_event('i'));
+        app.handle_event(enter_event());
+
+        let mut screen = String::new();
+        for _ in 0..300 {
+            app.drain_terminals();
+            screen = real_screen(&mut app, 80, 24).join("\n");
+            // `cat` echoes "hi" back, so it appears twice; one is enough proof.
+            if screen.contains("hi") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(screen.contains("hi"), "the child's echo of the typed line must paint; screen was:\n{screen}");
     }
 
     /// An app over a real editor with `file_a` already open, plus a second file

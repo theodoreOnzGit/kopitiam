@@ -74,5 +74,14 @@ ignore = "0.4"
 # features. Workspace-pinned so the version tracks the rest of the tree.
 sysinfo.workspace = true
 
+# The `:term` terminal emulator. `portable-pty` spawns `$SHELL` (or the given
+# command) inside a real pseudo-terminal; `vt100` parses the pty's raw output
+# into a `Screen` grid kvim paints into a window. Both pure Rust, both build for
+# aarch64-linux-android so `:term` works in Termux. A background reader thread
+# drains the pty into the vt100 parser behind a mutex (the AID-0028 actor
+# discipline). See `src/termemu.rs` and AID-0049.
+portable-pty.workspace = true
+vt100.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
