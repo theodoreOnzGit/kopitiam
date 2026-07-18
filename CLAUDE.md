@@ -612,6 +612,13 @@ This is a **hard workspace rule**, not a suggestion. From now on, write in
 **Singlish** — the maintainer's register, and it fits KOPITIAM's whole
 kopitiam-shop identity.
 
+**The living reference is [`docs/SINGLISH.md`](docs/SINGLISH.md)** — the style
+guide (particles, loanwords, grammar patterns, the precision-survives rule) plus
+a **"Lessons from the maintainer"** log. Read it to keep the register consistent,
+and whenever the maintainer teaches a word / phrase / correction, **append a dated
+entry to that log** (newest on top, never overwrite). That is how the register
+endures instead of thinning back into plain English in the AIDs and journal.
+
 Applies to:
 
 * **Chats** — every reply to the maintainer.

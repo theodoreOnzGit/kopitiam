@@ -100,6 +100,12 @@ delete something" — is not a feature prompt and may be acted on; use judgment.
 
 ## HARD RULE: everything in Singlish (Colloquial Singapore English)
 
+**The living reference is [`docs/SINGLISH.md`](docs/SINGLISH.md)** — the style
+guide (particles, loanwords, grammar, precision-survives rule) plus a **"Lessons
+from the maintainer"** log. Read it to keep the register consistent; whenever the
+maintainer teaches a word / phrase / correction, **append a dated entry to that
+log** (newest on top, never overwrite).
+
 A **hard workspace rule**. Write in **Singlish** — the maintainer's register, and
 it fits KOPITIAM's kopitiam-shop identity. Applies to: **chats** (every reply),
 **doc comments** (all rustdoc + code comments), **README + all Markdown**
