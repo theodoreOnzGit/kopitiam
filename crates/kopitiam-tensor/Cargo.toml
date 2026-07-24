@@ -3,7 +3,20 @@ name = "kopitiam-tensor"
 # Seeded at 0.0.1 as an early name reservation (mid-build), behind the workspace
 # version on purpose. Depends on kopitiam-core, which is seeded the same way, so
 # core must go up first. See scripts/publish-runtime-seed.sh.
-version = "0.0.1"
+#
+# 0.0.1 -> 0.0.2, in lockstep with kopitiam-core's own bump. The live 0.0.1 seed
+# was cut BEFORE the K-quant work: quant.rs, storage.rs and tensor/{concat,
+# matmul}.rs all name `DType::Q2_K`..`Q8_K` today, and those variants do not
+# exist in the published kopitiam-core 0.0.1 this seed was built against. Since
+# `cargo publish` strips the local `path` and resolves kopitiam-core from the
+# REGISTRY, republishing had to wait for core 0.0.2 -- and everything above
+# (loader, runtime, ai) needs THIS at 0.0.2 for the same reason.
+#
+# BUMP THE REQ IN THE SAME COMMIT. Every 0.0.x is its own incompatible major
+# under cargo semver, so `^0.0.1` matches ONLY 0.0.1. The matching req lives in
+# the root Cargo.toml's [workspace.dependencies]; miss it and the local build
+# dies straight away with "candidate versions found which didn't match".
+version = "0.0.2"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

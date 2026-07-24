@@ -72,7 +72,7 @@ mod tensor;
 
 pub use half::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 pub use storage::Storage;
-pub use tensor::Tensor;
+pub use tensor::{has_fused_matmul_kernel, Tensor};
 
 // Re-export the runtime's shared vocabulary so downstream crates can depend
 // on `kopitiam-tensor` alone for the common inference-time types, the same

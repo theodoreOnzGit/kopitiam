@@ -3,9 +3,10 @@
 //!
 //! The seven weight matrices that feed a matmul (`wq`/`wk`/`wv`/`wo`,
 //! `ffn_gate`/`ffn_up`/`ffn_down`) load through
-//! [`crate::bridge::load_matmul_weight`], which preserves a block-quantized
-//! on-disk dtype rather than eagerly dequantizing it — see that function's
-//! docs. Everything else (token embeddings, norm weights, attention
+//! [`crate::bridge::load_matmul_weight`], which keeps a block-quantized
+//! on-disk dtype only when it has a fused matmul kernel (Q4_0/Q8_0) and
+//! otherwise dequantizes it to `f32` at load — see that function's docs.
+//! Everything else (token embeddings, norm weights, attention
 //! biases) is not a matmul operand and always loads as plain `f32` via
 //! [`crate::bridge::load_tensor_f32`]/[`crate::bridge::load_tensor_f32_opt`],
 //! because [`kopitiam_tensor::Tensor::gather_rows`] and elementwise

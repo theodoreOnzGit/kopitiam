@@ -17,6 +17,12 @@ const ALIGNMENT: usize = 32;
 
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_Q8_0: u32 = 8;
+/// ggml `enum ggml_type` discriminants for the two formats the raw-bytes
+/// tensor writer below embeds in focused single-tensor fixtures (see
+/// [`single_quantized_weight_gguf`]). They match `kopitiam_loader::gguf`'s
+/// `dtype_from_ggml_type` (Q4_0 = 2, Q4_K = 12).
+pub(crate) const GGML_TYPE_Q4_0: u32 = 2;
+pub(crate) const GGML_TYPE_Q4_K: u32 = 12;
 const GGUF_TYPE_STRING: u32 = 8;
 const GGUF_TYPE_U32: u32 = 4;
 const GGUF_TYPE_F32: u32 = 6;
@@ -135,6 +141,16 @@ impl Xorshift64 {
         let unit = (self.0 >> 40) as u32 as f32 / (1u32 << 24) as f32; // in [0, 1)
         (unit - 0.5) * 0.2
     }
+
+    /// A pseudo-random byte, for filling opaque quantized block fields whose
+    /// numeric meaning the test does not need to control (see
+    /// [`arbitrary_q4_k_blocks`]).
+    fn next_byte(&mut self) -> u8 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 33) as u8
+    }
 }
 
 fn push_u32(buf: &mut Vec<u8>, v: u32) {
@@ -178,6 +194,54 @@ fn quantize_q8_0_blocks(data: &[f32]) -> Vec<u8> {
         for &v in chunk {
             let q = (v * id).round().clamp(-127.0, 127.0) as i8;
             out.push(q as u8);
+        }
+    }
+    out
+}
+
+/// Encodes `data` (length a multiple of 32) as raw Q4_0 block bytes (18
+/// bytes/block: an `f16` scale then 32 packed 4-bit nibbles), matching
+/// `kopitiam_tensor::quant`'s Q4_0 decode (`(nibble - 8) * d`, `d =
+/// max(|block|) / 7`, byte `j` holding elements `j` and `j + 16`) exactly.
+///
+/// A small, from-scratch, test-only encoder — same rationale as
+/// [`quantize_q8_0_blocks`]. Used to give [`single_quantized_weight_gguf`] a
+/// real on-disk Q4_0 tensor so a test can confirm the loader keeps Q4_0
+/// quantized for the fused kernel (no dequantize-at-load regression).
+pub(crate) fn quantize_q4_0_blocks(data: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 32 * 18);
+    for chunk in data.chunks_exact(32) {
+        let amax = chunk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 7.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&kopitiam_tensor::f32_to_f16(d).to_le_bytes());
+        let nibble = |v: f32| -> u8 { ((v * id).round().clamp(-8.0, 7.0) as i32 + 8) as u8 & 0x0F };
+        for j in 0..16 {
+            out.push(nibble(chunk[j]) | (nibble(chunk[j + 16]) << 4));
+        }
+    }
+    out
+}
+
+/// Produces `n_superblocks` of *valid* Q4_K block bytes (144 bytes each: an
+/// `f16` super-scale, an `f16` super-min, a 12-byte packed sub-scale/min
+/// field, then 128 quant nibbles).
+///
+/// The super-scale/super-min are pinned to small fixed values so decoded
+/// magnitudes stay modest and finite; the packed sub-scale field and the 128
+/// nibbles are filled from a fixed PRNG. Every 144-byte pattern is a
+/// well-formed Q4_K block, so no `f32 -> Q4_K` encoder is needed: the block's
+/// "true" `f32` values are *defined* as whatever `kopitiam_tensor`'s decoder
+/// makes of these bytes, and the test compares the loaded/forward-passed
+/// result against that same decode.
+pub(crate) fn arbitrary_q4_k_blocks(n_superblocks: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Xorshift64::new(seed);
+    let mut out = Vec::with_capacity(n_superblocks * 144);
+    for _ in 0..n_superblocks {
+        out.extend_from_slice(&kopitiam_tensor::f32_to_f16(0.05).to_le_bytes()); // super-scale d
+        out.extend_from_slice(&kopitiam_tensor::f32_to_f16(0.02).to_le_bytes()); // super-min dmin
+        for _ in 0..(12 + 128) {
+            out.push(rng.next_byte());
         }
     }
     out
@@ -285,6 +349,28 @@ impl GgufBuilder {
         self.tensor_data.extend(quantize_q8_0_blocks(data));
     }
 
+    /// Adds a quantized tensor whose raw block bytes are supplied directly
+    /// (already in the on-disk layout for `ggml_type`), doing no encoding of
+    /// its own. This lets a fixture embed a format this module has no
+    /// `f32 -> quant` encoder for — Q4_K especially — by handing over
+    /// pre-built block bytes (see [`arbitrary_q4_k_blocks`]).
+    fn tensor_raw_quantized(&mut self, name: &str, shape: &[usize], ggml_type: u32, bytes: &[u8]) {
+        pad_to_alignment(&mut self.tensor_data, ALIGNMENT);
+        let relative_offset = self.tensor_data.len() as u64;
+        let ne: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
+
+        push_string(&mut self.tensor_infos, name);
+        push_u32(&mut self.tensor_infos, ne.len() as u32);
+        for &d in &ne {
+            push_u64(&mut self.tensor_infos, d);
+        }
+        push_u32(&mut self.tensor_infos, ggml_type);
+        push_u64(&mut self.tensor_infos, relative_offset);
+        self.tensor_count += 1;
+
+        self.tensor_data.extend_from_slice(bytes);
+    }
+
     /// Writes `name` as `Q8_0` if `quantize` is set, `f32` otherwise — the
     /// single call site every matmul-operand weight in [`build`] goes
     /// through, so the quantized/unquantized choice lives in one place
@@ -373,6 +459,21 @@ pub(crate) fn build(spec: &SyntheticModelSpec) -> Vec<u8> {
 /// A ready-to-use tiny model: [`SyntheticModelSpec::default`].
 pub(crate) fn tiny_model_bytes() -> Vec<u8> {
     build(&SyntheticModelSpec::default())
+}
+
+/// Builds a minimal, metadata-free GGUF file containing exactly one quantized
+/// weight tensor: `name`, with [`kopitiam_core::Shape`]-convention `shape`,
+/// on-disk `ggml_type`, and raw block `bytes`.
+///
+/// `kopitiam_loader::load_model` needs no model metadata to expose a tensor by
+/// name (the architecture-namespaced hyperparameter KVs are all optional — see
+/// `kopitiam_loader::gguf`), so this is the smallest fixture that exercises
+/// [`crate::bridge::load_matmul_weight`] against a chosen on-disk quant format
+/// without standing up a whole synthetic model.
+pub(crate) fn single_quantized_weight_gguf(name: &str, shape: &[usize], ggml_type: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut g = GgufBuilder::new();
+    g.tensor_raw_quantized(name, shape, ggml_type, bytes);
+    g.build()
 }
 
 /// Writes `bytes` to a fresh, uniquely-named temp file and returns its

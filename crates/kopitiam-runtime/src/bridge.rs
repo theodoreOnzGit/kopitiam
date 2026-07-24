@@ -92,8 +92,9 @@ pub fn load_tensor_f32_opt(model: &LoadedModel, name: &str) -> Result<Option<Ten
 /// Loads `name` the way every *matmul-operand* weight
 /// (`wq`/`wk`/`wv`/`wo`, the SwiGLU MLP's three matrices, and
 /// `output.weight` — see [`crate::weights::LayerWeights`] /
-/// [`crate::weights::ModelWeights`]) should: preserving a block-quantized
-/// on-disk dtype instead of eagerly dequantizing it to `f32`.
+/// [`crate::weights::ModelWeights`]) should: keeping a block-quantized
+/// on-disk dtype *only when there is a fused kernel to compute on it*, and
+/// otherwise dequantizing it to `f32` at load.
 ///
 /// # Why this is a separate function from [`load_tensor_f32`], not a flag
 ///
@@ -104,16 +105,28 @@ pub fn load_tensor_f32_opt(model: &LoadedModel, name: &str) -> Result<Option<Ten
 /// be false (see that crate's docs on why a quantized tensor cannot be
 /// indexed elementwise at all), so those call sites must keep using
 /// [`load_tensor_f32`]. Only the seven weight matrices that feed
-/// [`crate::linear::linear`] (a matmul, which
-/// [`kopitiam_tensor::Tensor::quantized_matmul`] has a fused
-/// quantized-native path for) benefit from staying quantized, so this is a
-/// distinct, narrowly-named function rather than a boolean parameter that
-/// would let a caller accidentally quantize an embedding or a norm.
+/// [`crate::linear::linear`] (a matmul) benefit from staying quantized, so
+/// this is a distinct, narrowly-named function rather than a boolean
+/// parameter that would let a caller accidentally quantize an embedding or a
+/// norm.
 ///
-/// `f16`/`bf16` still get upcast to `f32` here (no direct-compute
-/// half-precision matmul kernel exists yet — this crate's `f32` tensors
-/// are always the fallback for a dtype without a fused kernel); only
-/// [`kopitiam_tensor::DType::is_quantized`] dtypes are left as-is.
+/// # Why only *some* quantized dtypes stay quantized
+///
+/// [`kopitiam_tensor::Tensor::quantized_matmul`] has a fused,
+/// dequantize-free kernel for only [`DType::Q4_0`] and [`DType::Q8_0`]
+/// today (see [`kopitiam_tensor::has_fused_matmul_kernel`], the shared
+/// predicate this function keys off so the load-time and compute-time
+/// decisions cannot drift). A weight in any *other* quantized format —
+/// `Q4_1`/`Q5_0`/`Q5_1` or a K-quant (`Q4_K`/`Q5_K`/`Q6_K`/...) — has no
+/// fused kernel, so leaving it quantized would dead-end
+/// [`crate::linear::linear`] in an [`Error::UnsupportedDType`]. Those are
+/// dequantized to `f32` here so the forward pass takes the ordinary
+/// [`kopitiam_tensor::Tensor::matmul`] path. This mirrors what happens to
+/// `f16`/`bf16` weights (also upcast to `f32`, no half-precision matmul
+/// kernel exists yet): `f32` is this crate's fallback for any dtype without
+/// a fused kernel. When a GPU backend later fuses more formats, only
+/// `has_fused_matmul_kernel` changes and those formats begin staying
+/// quantized here automatically.
 ///
 /// # Errors
 ///
@@ -123,7 +136,7 @@ pub fn load_matmul_weight(model: &LoadedModel, name: &str) -> Result<Tensor> {
         .tensor(name)
         .ok_or_else(|| Error::MissingTensor { name: name.to_string() })?;
     let tensor = tensor_from_entry(model, entry)?;
-    if tensor.dtype().is_quantized() { Ok(tensor) } else { tensor.to_dtype(DType::F32) }
+    keep_quantized_or_dequantize(tensor)
 }
 
 /// Like [`load_matmul_weight`], but returns `Ok(None)` instead of
@@ -135,9 +148,22 @@ pub fn load_matmul_weight_opt(model: &LoadedModel, name: &str) -> Result<Option<
     match model.tensor(name) {
         Some(entry) => {
             let tensor = tensor_from_entry(model, entry)?;
-            Ok(Some(if tensor.dtype().is_quantized() { tensor } else { tensor.to_dtype(DType::F32)? }))
+            Ok(Some(keep_quantized_or_dequantize(tensor)?))
         }
         None => Ok(None),
+    }
+}
+
+/// Keeps `tensor` as-is when its dtype has a fused
+/// [`kopitiam_tensor::Tensor::quantized_matmul`] kernel, and otherwise
+/// dequantizes/upcasts it to `f32`. The one place [`load_matmul_weight`] and
+/// [`load_matmul_weight_opt`] encode the load-time half of the invariant
+/// [`kopitiam_tensor::has_fused_matmul_kernel`] anchors.
+fn keep_quantized_or_dequantize(tensor: Tensor) -> Result<Tensor> {
+    if kopitiam_tensor::has_fused_matmul_kernel(tensor.dtype()) {
+        Ok(tensor)
+    } else {
+        tensor.to_dtype(DType::F32)
     }
 }
 
@@ -186,5 +212,82 @@ mod tests {
             load_tensor_f32(&model, "does.not.exist"),
             Err(Error::MissingTensor { .. })
         ));
+    }
+
+    /// A K-quant matmul weight (Q4_K) has no fused
+    /// [`kopitiam_tensor::Tensor::quantized_matmul`] kernel, so before this
+    /// fix `load_matmul_weight` left it quantized and the first
+    /// [`crate::linear::linear`] call dead-ended in an `UnsupportedDType`.
+    /// It must now be dequantized to `f32` at load and complete a forward
+    /// pass whose output equals dequantize-then-`f32`-matmul.
+    #[test]
+    fn a_q4_k_matmul_weight_is_dequantized_at_load_and_completes_a_forward_pass() {
+        use crate::test_support::synthetic_gguf::{
+            arbitrary_q4_k_blocks, single_quantized_weight_gguf, GGML_TYPE_Q4_K,
+        };
+
+        // Q4_K super-block = 256 elements, so `in_features` is one super-block
+        // per row and each of the 4 rows is exactly one super-block.
+        let (out_features, in_features) = (4, 256);
+        let bytes = arbitrary_q4_k_blocks(out_features, 0xBEEF);
+        let gguf = single_quantized_weight_gguf("test.weight", &[out_features, in_features], GGML_TYPE_Q4_K, &bytes);
+        let path = write_temp_gguf(&gguf, "q4k-load");
+        let model = kopitiam_loader::load_model(&path).unwrap();
+
+        // The whole point of the fix: a format without a fused kernel is
+        // dequantized at load, not kept quantized.
+        let w = load_matmul_weight(&model, "test.weight").unwrap();
+        assert_eq!(w.dtype(), DType::F32);
+        assert!(!w.dtype().is_quantized());
+        assert!(!kopitiam_tensor::has_fused_matmul_kernel(DType::Q4_K));
+
+        // The loaded weight is exactly the decode of the same on-disk bytes.
+        let entry = model.tensor("test.weight").unwrap().clone();
+        let reference_w = tensor_from_entry(&model, &entry).unwrap().to_dtype(DType::F32).unwrap();
+        assert_eq!(w.to_vec_f32().unwrap(), reference_w.to_vec_f32().unwrap());
+
+        // A forward pass through `linear` now completes with finite output
+        // equal to dequantize-then-f32-matmul (`x @ W^T`).
+        let x_vals: Vec<f32> = (0..in_features).map(|i| (i as f32 % 7.0 - 3.0) * 0.1).collect();
+        let x = Tensor::from_f32(x_vals, [1, in_features]).unwrap();
+        let y = crate::linear::linear(&x, &w, None).unwrap();
+        assert_eq!(y.dtype(), DType::F32);
+        let y_vals = y.to_vec_f32().unwrap();
+        assert_eq!(y_vals.len(), out_features);
+        assert!(y_vals.iter().all(|v| v.is_finite()), "forward-pass output must be finite: {y_vals:?}");
+
+        let reference = x.matmul(&reference_w.transpose(0, 1).unwrap()).unwrap().to_vec_f32().unwrap();
+        assert_eq!(y_vals, reference);
+    }
+
+    /// The no-regression counterpart: a Q4_0 matmul weight — the format the
+    /// shipped `qwen2.5-0.5b-instruct-q4_0` model uses — must still be kept
+    /// quantized at load and run through the fused kernel, never dequantized.
+    #[test]
+    fn a_q4_0_matmul_weight_stays_quantized_at_load_and_uses_the_fused_kernel() {
+        use crate::test_support::synthetic_gguf::{
+            quantize_q4_0_blocks, single_quantized_weight_gguf, GGML_TYPE_Q4_0,
+        };
+
+        let (out_features, in_features) = (3, 64); // 2 blocks of 32 per row.
+        let data: Vec<f32> = (0..out_features * in_features).map(|i| (i as f32 * 0.037).sin() * 0.5).collect();
+        let bytes = quantize_q4_0_blocks(&data);
+        let gguf = single_quantized_weight_gguf("test.weight", &[out_features, in_features], GGML_TYPE_Q4_0, &bytes);
+        let path = write_temp_gguf(&gguf, "q40-load");
+        let model = kopitiam_loader::load_model(&path).unwrap();
+
+        let w = load_matmul_weight(&model, "test.weight").unwrap();
+        assert_eq!(w.dtype(), DType::Q4_0, "Q4_0 must stay quantized for the fused kernel");
+        assert!(w.dtype().is_quantized());
+        assert!(kopitiam_tensor::has_fused_matmul_kernel(w.dtype()));
+
+        // `linear` routes it through the fused `quantized_matmul`, matching a
+        // direct fused call bit-for-bit (i.e. no dequantize slipped in).
+        let x_vals: Vec<f32> = (0..in_features).map(|i| (i as f32 % 5.0 - 2.0) * 0.1).collect();
+        let x = Tensor::from_f32(x_vals, [1, in_features]).unwrap();
+        let y = crate::linear::linear(&x, &w, None).unwrap();
+        let fused = x.quantized_matmul(&w).unwrap();
+        assert_eq!(y.to_vec_f32().unwrap(), fused.to_vec_f32().unwrap());
+        assert!(y.to_vec_f32().unwrap().iter().all(|v| v.is_finite()));
     }
 }

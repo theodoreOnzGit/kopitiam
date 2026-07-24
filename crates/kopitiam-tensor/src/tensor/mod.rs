@@ -14,6 +14,7 @@
 //! crate, not just the tensor family of modules).
 
 mod matmul;
+pub use matmul::has_fused_matmul_kernel;
 mod elementwise;
 mod softmax;
 mod reduce;

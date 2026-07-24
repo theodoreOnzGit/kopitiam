@@ -13,6 +13,41 @@ use crate::storage::Storage;
 
 use super::Tensor;
 
+/// Whether [`Tensor::quantized_matmul`] has a *fused*, dequantize-free kernel
+/// for `dtype` in this build — the single source of truth every layer that
+/// must choose "compute on the quantized bytes directly" vs. "dequantize to
+/// `f32` first" shares, so the two decisions can never drift apart.
+///
+/// Today only [`DType::Q4_0`] and [`DType::Q8_0`] have such a kernel (the
+/// integer per-block dot products in [`crate::quant`]). Every other quantized
+/// format — `Q4_1`/`Q5_0`/`Q5_1` and every K-quant (`Q2_K`..`Q6_K`, `Q8_K`) —
+/// dequantizes correctly via [`Tensor::to_dtype`] but has no fused path here,
+/// so a caller wanting to matmul against one must dequantize it to `f32` and
+/// take the ordinary [`Tensor::matmul`] route.
+///
+/// # Why this is a predicate, not a hard-coded match in each caller
+///
+/// Three places must agree on this set: [`Tensor::quantized_matmul`] (which
+/// rejects a weight it cannot fuse), `kopitiam-runtime`'s `load_matmul_weight`
+/// (which keeps a weight quantized only when it can be fused, and otherwise
+/// dequantizes it at load so the forward pass never dead-ends in an
+/// `UnsupportedDType`), and that crate's `linear` dispatch. If any of them
+/// spelled the set out independently, adding a format to one and forgetting
+/// another would silently reintroduce the load-time/compute-time mismatch this
+/// function exists to prevent.
+///
+/// # Why it lives here and not on [`DType`]
+///
+/// "Which formats have a fused kernel" is a fact about *this crate's* kernels,
+/// not about what the bytes mean — [`DType`] in `kopitiam-core` deliberately
+/// says nothing about how a format is computed (see its docs). A future
+/// wgpu/GPU backend may fuse more formats (or a CPU kernel here may be replaced
+/// by one), and when it does, only this crate changes; `kopitiam-core` stays a
+/// pure description of the byte layout.
+pub const fn has_fused_matmul_kernel(dtype: DType) -> bool {
+    matches!(dtype, DType::Q4_0 | DType::Q8_0)
+}
+
 impl Tensor {
     /// Batched matrix multiplication: `self` is `[..batch, m, k]`, `other`
     /// is `[..batch, k, n]`, and the result is `[..batch, m, n]`.
@@ -175,7 +210,7 @@ impl Tensor {
     /// `in_features` is not a multiple of 32.
     pub fn quantized_matmul(&self, weight: &Tensor) -> Result<Tensor> {
         self.require_dtype(DType::F32)?;
-        if !matches!(weight.dtype(), DType::Q4_0 | DType::Q8_0) {
+        if !has_fused_matmul_kernel(weight.dtype()) {
             return Err(Error::UnsupportedDType { op: "quantized_matmul", dtype: weight.dtype() });
         }
         if weight.rank() != 2 {
@@ -198,7 +233,7 @@ impl Tensor {
         let x_data = self.to_vec_f32()?;
 
         let Storage::Quantized { dtype, bytes } = weight.storage.as_ref() else {
-            unreachable!("the DType::Q4_0 | DType::Q8_0 match above guarantees Storage::Quantized")
+            unreachable!("has_fused_matmul_kernel is true only for quantized dtypes, so the guard above guarantees Storage::Quantized")
         };
         let dtype = *dtype;
         let block_bytes = dtype.block_bytes();
@@ -218,7 +253,7 @@ impl Tensor {
                     acc += match dtype {
                         DType::Q4_0 => quant::q4_0_dot_q8_0(w_block, xq_block, x_scales[b]),
                         DType::Q8_0 => quant::q8_0_dot_q8_0(w_block, xq_block, x_scales[b]),
-                        _ => unreachable!("the DType::Q4_0 | DType::Q8_0 match above excludes every other dtype"),
+                        _ => unreachable!("has_fused_matmul_kernel admits only Q4_0 and Q8_0"),
                     };
                 }
                 out[r * out_features + o] = acc;
@@ -596,5 +631,44 @@ mod tests {
         let x = Tensor::from_f32(vec![1.0; 32], [1, 32]).unwrap();
         let weight = Tensor::from_quantized(DType::Q8_0, vec![0u8; 34], [32]).unwrap();
         assert!(matches!(x.quantized_matmul(&weight), Err(Error::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_a_k_quant_weight_with_no_fused_kernel() {
+        // Q4_K dequantizes fine (see quant::dequant_q4_k) but, like every
+        // K-quant, has no fused integer dot product here — it must be
+        // dequantized to f32 and go through `matmul` instead. One Q4_K
+        // super-block is 256 elements / 144 bytes.
+        let x = Tensor::from_f32(vec![1.0; 256], [1, 256]).unwrap();
+        let weight = Tensor::from_quantized(DType::Q4_K, vec![0u8; 144], [1, 256]).unwrap();
+        assert!(matches!(x.quantized_matmul(&weight), Err(Error::UnsupportedDType { .. })));
+    }
+
+    #[test]
+    fn has_fused_matmul_kernel_is_true_for_exactly_q4_0_and_q8_0() {
+        // The single source of truth every layer keys off. Q4_0 and Q8_0 are
+        // the only formats with a fused kernel; everything else (float, int,
+        // the other classic quants, and every K-quant) dequantizes to f32.
+        for dtype in [DType::Q4_0, DType::Q8_0] {
+            assert!(has_fused_matmul_kernel(dtype), "{dtype} should have a fused kernel");
+        }
+        for dtype in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::I8,
+            DType::I32,
+            DType::Q4_1,
+            DType::Q5_0,
+            DType::Q5_1,
+            DType::Q2_K,
+            DType::Q3_K,
+            DType::Q4_K,
+            DType::Q5_K,
+            DType::Q6_K,
+            DType::Q8_K,
+        ] {
+            assert!(!has_fused_matmul_kernel(dtype), "{dtype} should not have a fused kernel");
+        }
     }
 }

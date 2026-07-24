@@ -17,16 +17,21 @@
 //! # Dtype dispatch: the one place a quantized weight takes a different path
 //!
 //! [`crate::weights::ModelWeights`] keeps a matmul-operand weight
-//! block-quantized whenever the GGUF file shipped it that way (see
+//! block-quantized whenever the GGUF file shipped it in a format that has a
+//! fused kernel, and otherwise dequantizes it to `f32` at load (see
 //! [`crate::bridge::load_matmul_weight`]'s docs). A quantized tensor
 //! cannot be [`kopitiam_tensor::Tensor::transpose`]d at all (block data
 //! addresses no finer than a whole block — see that crate's docs), so this
 //! function, not each individual caller, is where the two cases split:
-//! `weight.dtype().is_quantized()` routes through
+//! [`kopitiam_tensor::has_fused_matmul_kernel`] (the *same* predicate the
+//! loader uses to decide what to keep quantized, so the two can never
+//! disagree) routes a fusable weight through
 //! [`kopitiam_tensor::Tensor::quantized_matmul`] (no transpose needed —
 //! that method already takes `weight` in its on-disk `[out, in]` layout
 //! directly, computing the equivalent of `x @ weight^T` without ever
-//! forming `weight^T`); anything else takes the original transpose-then-
+//! forming `weight^T`); anything else — a plain `f32` weight, or a
+//! quantized format the loader already dequantized to `f32` because it has
+//! no fused kernel — takes the original transpose-then-
 //! [`kopitiam_tensor::Tensor::matmul`] path. Every call site keeps writing
 //! `linear(x, w, b)` either way and never needs to know or care which
 //! dtype `w` turned out to be.
@@ -42,7 +47,7 @@ use kopitiam_tensor::Tensor;
 /// quantized, see [`crate::weights::LayerWeights`]). Returns
 /// `[.., out_features]`.
 pub(crate) fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    let y = if weight.dtype().is_quantized() {
+    let y = if kopitiam_tensor::has_fused_matmul_kernel(weight.dtype()) {
         x.quantized_matmul(weight)?
     } else {
         let weight_t = weight.transpose(0, 1)?;
