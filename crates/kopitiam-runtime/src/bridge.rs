@@ -40,9 +40,17 @@ pub fn tensor_from_entry(model: &LoadedModel, entry: &TensorEntry) -> Result<Ten
         DType::BF16 => Tensor::from_bf16(read_u16_le(bytes), entry.shape.clone()),
         DType::I8 => Tensor::from_i8(bytes.iter().map(|&b| b as i8).collect(), entry.shape.clone()),
         DType::I32 => Tensor::from_i32(read_i32_le(bytes), entry.shape.clone()),
-        DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Q8_0 => {
-            Tensor::from_quantized(entry.dtype, bytes.to_vec(), entry.shape.clone())
-        }
+        DType::Q4_0
+        | DType::Q4_1
+        | DType::Q5_0
+        | DType::Q5_1
+        | DType::Q8_0
+        | DType::Q2_K
+        | DType::Q3_K
+        | DType::Q4_K
+        | DType::Q5_K
+        | DType::Q6_K
+        | DType::Q8_K => Tensor::from_quantized(entry.dtype, bytes.to_vec(), entry.shape.clone()),
     }
 }
 

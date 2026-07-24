@@ -29,11 +29,12 @@ pub enum Storage {
     BF16(Vec<u16>),
     I8(Vec<i8>),
     I32(Vec<i32>),
-    /// Any block-quantized format ([`DType::Q4_0`], [`DType::Q4_1`],
-    /// [`DType::Q5_0`], [`DType::Q5_1`], [`DType::Q8_0`]): raw on-disk block
-    /// bytes plus the tag saying how to decode them. Never indexed
-    /// elementwise directly — see [`DType::is_quantized`] and
-    /// [`crate::quant`].
+    /// Any block-quantized format — the classic 32-element blocks
+    /// ([`DType::Q4_0`], [`DType::Q4_1`], [`DType::Q5_0`], [`DType::Q5_1`],
+    /// [`DType::Q8_0`]) and the 256-element K-quant super-blocks
+    /// ([`DType::Q4_K`], [`DType::Q6_K`], ...): raw on-disk block bytes plus
+    /// the tag saying how to decode them. Never indexed elementwise directly
+    /// — see [`DType::is_quantized`] and [`crate::quant`].
     Quantized { dtype: DType, bytes: Vec<u8> },
 }
 

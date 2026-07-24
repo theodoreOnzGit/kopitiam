@@ -18,6 +18,12 @@ use std::fmt;
 /// making quantization a property of the element type, every consumer is
 /// forced to ask "can I index this?" (see [`DType::is_quantized`]) instead
 /// of finding out at runtime.
+// The variant names deliberately mirror ggml's own type names (`Q4_0`,
+// `Q4_K`, ...) so a reader cross-referencing a GGUF file or ggml source sees
+// the identical spelling. That means embracing the underscores ggml uses,
+// which `non_camel_case_types` would otherwise flag (`Q4_K` -> `Q4K`);
+// renaming for the lint would make these harder, not easier, to match up.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     /// IEEE 754 single precision.
@@ -45,6 +51,33 @@ pub enum DType {
     /// 8-bit block quantization, symmetric, 32 elements per block plus one
     /// `f16` scale.
     Q8_0,
+    /// ggml "K-quant" 2-bit format. Superblock of 256 elements: 16 sub-block
+    /// scales+mins packed 4 bits each, 2-bit quants, an `f16` super-scale and
+    /// an `f16` super-min. 84 bytes per superblock.
+    Q2_K,
+    /// ggml "K-quant" 3-bit format. Superblock of 256: a high-bit mask, 2-bit
+    /// low quants, 16 six-bit sub-block scales packed into 12 bytes, and one
+    /// `f16` super-scale. 110 bytes per superblock.
+    Q3_K,
+    /// ggml "K-quant" 4-bit format (the `Q4_K_M` workhorse). Superblock of
+    /// 256: `f16` super-scale, `f16` super-min, 8 six-bit sub-block scales and
+    /// 8 six-bit sub-block mins packed into 12 bytes, then 4-bit quants. 144
+    /// bytes per superblock.
+    Q4_K,
+    /// ggml "K-quant" 5-bit format. Like [`Self::Q4_K`] plus a 32-byte
+    /// high-bit field promoting each 4-bit quant to 5 bits. 176 bytes per
+    /// superblock.
+    Q5_K,
+    /// ggml "K-quant" 6-bit format. Superblock of 256: 4-bit low quants, 2-bit
+    /// high quants, 16 signed `i8` sub-block scales and one `f16` super-scale.
+    /// 210 bytes per superblock.
+    Q6_K,
+    /// ggml "K-quant" 8-bit format. Superblock of 256: an `f32` scale, 256
+    /// signed `i8` quants and 16 `i16` group sums. 292 bytes per superblock.
+    /// Used by ggml only as an intermediate activation type for K-quant dot
+    /// products, never as an on-disk weight format; supported here for
+    /// completeness. `f32` (not `f16`) scale, unlike every other quant.
+    Q8_K,
 }
 
 impl DType {
@@ -58,6 +91,8 @@ impl DType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 | Self::I8 | Self::I32 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
+            // ggml K-quants are "super-blocks" of QK_K = 256 elements.
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K => 256,
         }
     }
 
@@ -68,6 +103,16 @@ impl DType {
     /// Q4_1 adds a 2-byte minimum = 20; Q5_0 adds a 4-byte high-bit field to
     /// Q4_0 = 22; Q5_1 likewise on Q4_1 = 24; Q8_0 is a 2-byte scale plus 32
     /// bytes = 34.
+    ///
+    /// The K-quant super-block sizes below are the `sizeof(block_qX_K)`
+    /// static-asserted in ggml's `ggml-common.h` (MIT), with `QK_K = 256`
+    /// and `K_SCALE_SIZE = 12`:
+    /// * Q2_K = `2*f16 + QK_K/16 + QK_K/4` = 4 + 16 + 64 = **84**
+    /// * Q3_K = `f16 + QK_K/8 + QK_K/4 + 12` = 2 + 32 + 64 + 12 = **110**
+    /// * Q4_K = `2*f16 + 12 + QK_K/2` = 4 + 12 + 128 = **144**
+    /// * Q5_K = `2*f16 + 12 + QK_K/2 + QK_K/8` = 4 + 12 + 128 + 32 = **176**
+    /// * Q6_K = `f16 + QK_K/16 + 3*QK_K/4` = 2 + 16 + 192 = **210**
+    /// * Q8_K = `f32 + QK_K + QK_K/16*i16` = 4 + 256 + 32 = **292**
     pub const fn block_bytes(self) -> usize {
         match self {
             Self::F32 | Self::I32 => 4,
@@ -78,6 +123,12 @@ impl DType {
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
             Self::Q8_0 => 34,
+            Self::Q2_K => 84,
+            Self::Q3_K => 110,
+            Self::Q4_K => 144,
+            Self::Q5_K => 176,
+            Self::Q6_K => 210,
+            Self::Q8_K => 292,
         }
     }
 
@@ -121,6 +172,12 @@ impl fmt::Display for DType {
             Self::Q5_0 => "q5_0",
             Self::Q5_1 => "q5_1",
             Self::Q8_0 => "q8_0",
+            Self::Q2_K => "q2_K",
+            Self::Q3_K => "q3_K",
+            Self::Q4_K => "q4_K",
+            Self::Q5_K => "q5_K",
+            Self::Q6_K => "q6_K",
+            Self::Q8_K => "q8_K",
         };
         f.write_str(name)
     }
@@ -165,5 +222,31 @@ mod tests {
             assert!(!dtype.is_float());
             assert_eq!(dtype.block_size(), 32);
         }
+    }
+
+    #[test]
+    fn k_quant_types_are_256_element_superblocks_and_not_float() {
+        for dtype in [DType::Q2_K, DType::Q3_K, DType::Q4_K, DType::Q5_K, DType::Q6_K, DType::Q8_K] {
+            assert!(dtype.is_quantized());
+            assert!(!dtype.is_float());
+            assert_eq!(dtype.block_size(), 256);
+        }
+    }
+
+    #[test]
+    fn k_quant_superblock_byte_sizes_match_ggml_static_asserts() {
+        // These are the sizeof(block_qX_K) values static-asserted in ggml's
+        // ggml-common.h with QK_K = 256, K_SCALE_SIZE = 12.
+        assert_eq!(DType::Q2_K.block_bytes(), 84);
+        assert_eq!(DType::Q3_K.block_bytes(), 110);
+        assert_eq!(DType::Q4_K.block_bytes(), 144);
+        assert_eq!(DType::Q5_K.block_bytes(), 176);
+        assert_eq!(DType::Q6_K.block_bytes(), 210);
+        assert_eq!(DType::Q8_K.block_bytes(), 292);
+        // One superblock of Q4_K holds 256 elements in 144 bytes.
+        assert_eq!(DType::Q4_K.storage_bytes(256), Some(144));
+        assert_eq!(DType::Q4_K.storage_bytes(512), Some(288));
+        // Not a whole superblock -> not representable.
+        assert_eq!(DType::Q4_K.storage_bytes(128), None);
     }
 }

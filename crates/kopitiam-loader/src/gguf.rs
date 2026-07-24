@@ -231,10 +231,13 @@ fn read_value(cursor: &mut Cursor, value_type: u32, depth: u32) -> Result<GgufVa
 
 /// Maps a `ggml_type` id to [`DType`].
 ///
-/// Only the types [`kopitiam_core::DType`] can represent are accepted.
-/// GGUF/ggml defines many more (the various K-quants, IQ-quants, MXFP4,
-/// I16/I64/F64, ...); until `kopitiam-core` grows variants for them, a
-/// tensor using one of those ids returns
+/// The ids are ggml's `enum ggml_type` discriminants (see `ggml.h`); only
+/// the types [`kopitiam_core::DType`] can represent are accepted. This
+/// covers the classic quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the modern
+/// K-quant super-block formats (Q2_K..Q8_K, ids 10-15) that files like
+/// `Q4_K_M`/`Q5_K_M`/`Q6_K` are built from. GGUF/ggml defines still more
+/// (the IQ-quants, MXFP4, I16/I64/F64, ...); until `kopitiam-core` grows
+/// variants for those, a tensor using one of them returns
 /// [`Error::UnsupportedModelFeature`] rather than being misread as one of
 /// the supported types (a wrong-but-plausible-looking dequantization is far
 /// worse than a load failure).
@@ -247,6 +250,12 @@ fn dtype_from_ggml_type(ggml_type: u32) -> Result<DType> {
         6 => Ok(DType::Q5_0),
         7 => Ok(DType::Q5_1),
         8 => Ok(DType::Q8_0),
+        10 => Ok(DType::Q2_K),
+        11 => Ok(DType::Q3_K),
+        12 => Ok(DType::Q4_K),
+        13 => Ok(DType::Q5_K),
+        14 => Ok(DType::Q6_K),
+        15 => Ok(DType::Q8_K),
         30 => Ok(DType::BF16),
         other => Err(unsupported(format!("ggml tensor type id {other}"))),
     }

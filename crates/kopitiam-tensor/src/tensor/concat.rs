@@ -76,7 +76,17 @@ impl Tensor {
             DType::BF16 => concat_variant!(BF16, u16),
             DType::I8 => concat_variant!(I8, i8),
             DType::I32 => concat_variant!(I32, i32),
-            DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Q8_0 => {
+            DType::Q4_0
+            | DType::Q4_1
+            | DType::Q5_0
+            | DType::Q5_1
+            | DType::Q8_0
+            | DType::Q2_K
+            | DType::Q3_K
+            | DType::Q4_K
+            | DType::Q5_K
+            | DType::Q6_K
+            | DType::Q8_K => {
                 unreachable!("quantized dtypes are rejected above")
             }
         };

@@ -1,13 +1,17 @@
 //! Decoders for the GGUF/GGML block-quantized formats.
 //!
-//! Every format here packs a fixed run of elements ([`DType::block_size`],
-//! 32 for all five formats we support) into a fixed number of bytes
-//! ([`DType::block_bytes`]) sharing one `f16` scale (and, for the `_1`
-//! variants, one `f16` minimum). The block layouts below were read from the
-//! reference C structs and dequantize loops in
-//! `crates/kopitiam-ai/vendor/ggml/src/ggml-common.h` and `ggml-quants.c`
-//! (MIT licensed) to get the byte offsets and nibble ordering right, then
-//! reimplemented from scratch here — no C was transliterated.
+//! Two families live here. The **classic** formats (Q4_0/Q4_1/Q5_0/Q5_1/
+//! Q8_0) pack 32 elements ([`DType::block_size`]) into a small block sharing
+//! one `f16` scale (and, for the `_1` variants, one `f16` minimum). The
+//! **K-quant** formats (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, plus the intermediate
+//! Q8_K) pack 256 elements into a "super-block" with a two-level scale: a
+//! floating-point super-scale over the whole block times small integer
+//! sub-block scales — see the K-quant section further down. The block
+//! layouts below were read from the reference C structs and dequantize loops
+//! in `crates/kopitiam-ai/vendor/llama.cpp/ggml/src/ggml-common.h` and
+//! `ggml-quants.c` (MIT licensed) to get the byte offsets, packing and
+//! nibble ordering right, then reimplemented from scratch here — no C was
+//! transliterated.
 //!
 //! # Block layouts
 //!
@@ -69,6 +73,12 @@ pub(crate) fn dequantize(dtype: DType, bytes: &[u8]) -> Result<Vec<f32>> {
         DType::Q5_0 => dequant_q5_0,
         DType::Q5_1 => dequant_q5_1,
         DType::Q8_0 => dequant_q8_0,
+        DType::Q2_K => dequant_q2_k,
+        DType::Q3_K => dequant_q3_k,
+        DType::Q4_K => dequant_q4_k,
+        DType::Q5_K => dequant_q5_k,
+        DType::Q6_K => dequant_q6_k,
+        DType::Q8_K => dequant_q8_k,
         _ => return Err(Error::UnsupportedDType { op: "dequantize", dtype }),
     };
 
@@ -138,6 +148,253 @@ fn dequant_q8_0(block: &[u8], out: &mut Vec<f32>) {
     let d = read_f16(block, 0);
     let qs = &block[2..34];
     out.extend(qs.iter().map(|&b| f32::from(b as i8) * d));
+}
+
+fn read_f32(bytes: &[u8], offset: usize) -> f32 {
+    f32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+}
+
+// ---- ggml "K-quant" super-block formats (QK_K = 256) ----
+//
+// The five weight formats below (Q2_K..Q6_K) and the intermediate Q8_K each
+// pack 256 elements into one super-block. The block layouts and decode
+// arithmetic follow ggml's `block_qX_K` structs (`ggml-common.h`) and
+// `dequantize_row_qX_K` routines (`ggml-quants.c`), both MIT — read for the
+// byte layout and the exact integer arithmetic, then reimplemented here from
+// scratch. Bit-exactness to ggml is a hard requirement (a K-quant weight
+// misread by even one ULP corrupts every downstream activation), so each
+// function mirrors ggml's field offsets and per-element formula precisely;
+// see the per-function docs for the layout of each.
+//
+// A K-quant super-block carries two levels of scale: a floating-point
+// *super-scale* (`d`, and for the asymmetric formats a super-min `dmin`)
+// shared by the whole 256-element block, and a set of small integer
+// *sub-block* scales (one per 16- or 32-element sub-block) that the
+// super-scale multiplies. `get_scale_min_k4` is the fiddly part: it unpacks
+// the 6-bit sub-block scales/mins that Q4_K and Q5_K pack into 12 bytes.
+
+/// Unpacks the `j`-th 6-bit sub-block scale (`d`) and min (`m`) from a Q4_K /
+/// Q5_K 12-byte `scales` field. This is ggml's `get_scale_min_k4` (MIT): the
+/// first four scales and mins live in the low 6 bits of bytes 0..8, while
+/// scales/mins 4..8 are split — their low 4 bits in bytes 8..12 and their
+/// high 2 bits stolen from the top 2 bits of bytes 0..8.
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let d = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+/// Q2_K (84 bytes): `scales[16]` (4-bit scale + 4-bit min per sub-block),
+/// `qs[64]` (2-bit quants), `f16 d`, `f16 dmin`. 16 sub-blocks of 16
+/// elements; each element is `d*scale*q - dmin*min`. Follows ggml's Q2_K
+/// (MIT).
+fn dequant_q2_k(block: &[u8], out: &mut Vec<f32>) {
+    let scales = &block[0..16];
+    let qs = &block[16..80];
+    let d = read_f16(block, 80);
+    let min = read_f16(block, 82);
+
+    let mut is = 0usize;
+    // Two 128-element halves; `qs` advances 32 bytes per half.
+    for half in 0..2 {
+        let q = &qs[half * 32..half * 32 + 32];
+        let mut shift = 0u32;
+        for _j in 0..4 {
+            let sc = scales[is];
+            is += 1;
+            let dl = d * f32::from(sc & 0x0F);
+            let ml = min * f32::from(sc >> 4);
+            for &b in &q[0..16] {
+                out.push(dl * f32::from((b >> shift) & 3) - ml);
+            }
+            let sc = scales[is];
+            is += 1;
+            let dl = d * f32::from(sc & 0x0F);
+            let ml = min * f32::from(sc >> 4);
+            for &b in &q[16..32] {
+                out.push(dl * f32::from((b >> shift) & 3) - ml);
+            }
+            shift += 2;
+        }
+    }
+}
+
+/// Q3_K (110 bytes): `hmask[32]` (the 3rd, high bit of each quant), `qs[64]`
+/// (low 2 bits), `scales[12]` (16 six-bit signed sub-block scales, packed),
+/// `f16 d`. Each element is `d * scale * (low2bits - (highbit ? 0 : 4))` —
+/// note the *inverted* high-bit convention. Follows ggml's Q3_K (MIT).
+fn dequant_q3_k(block: &[u8], out: &mut Vec<f32>) {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+
+    let hmask = &block[0..32];
+    let qs = &block[32..96];
+    let scale_bytes = &block[96..108];
+    let d_all = read_f16(block, 108);
+
+    // Unpack the 12 packed bytes into 16 six-bit scales, exactly as ggml
+    // does via a u32 aux array reinterpreted as i8. `aux0..2` are the 12
+    // bytes read as three little-endian u32; the shuffle below spreads the
+    // stolen high 2 bits of each scale back into place.
+    let aux0 = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
+    let aux1 = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
+    let aux2 = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+    let tmp = aux2;
+    let out_aux = [
+        (aux0 & KMASK2) | ((tmp & KMASK1) << 4),
+        (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4),
+        ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4),
+        ((aux1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4),
+    ];
+    let mut scales = [0i8; 16];
+    for (w, chunk) in out_aux.iter().enumerate() {
+        for (b, byte) in chunk.to_le_bytes().iter().enumerate() {
+            scales[w * 4 + b] = *byte as i8;
+        }
+    }
+
+    let mut m = 1u8;
+    let mut is = 0usize;
+    for half in 0..2 {
+        let q = &qs[half * 32..half * 32 + 32];
+        let mut shift = 0u32;
+        for _j in 0..4 {
+            let dl = d_all * (i32::from(scales[is]) - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let high = if hmask[l] & m != 0 { 0 } else { 4 };
+                let v = i32::from((q[l] >> shift) & 3) - high;
+                out.push(dl * v as f32);
+            }
+            let dl = d_all * (i32::from(scales[is]) - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let high = if hmask[l + 16] & m != 0 { 0 } else { 4 };
+                let v = i32::from((q[l + 16] >> shift) & 3) - high;
+                out.push(dl * v as f32);
+            }
+            shift += 2;
+            // Mirrors ggml's `uint8_t m <<= 1`: after the 8th sub-block m
+            // wraps to 0, but that value is never read again.
+            m <<= 1;
+        }
+    }
+}
+
+/// Q4_K (144 bytes): `f16 d`, `f16 dmin`, `scales[12]` (8 six-bit scales +
+/// 8 six-bit mins, packed via [`get_scale_min_k4`]), `qs[128]` (4-bit
+/// quants). 8 sub-blocks of 32; each element is `d*scale*nibble -
+/// dmin*min`. The `Q4_K_M` workhorse format. Follows ggml's Q4_K (MIT).
+fn dequant_q4_k(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let min = read_f16(block, 2);
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+
+    let mut is = 0usize;
+    // Four 64-element groups; each consumes 32 `qs` bytes (low nibbles then
+    // high nibbles) and two sub-block scale/min pairs.
+    for g in 0..4 {
+        let q = &qs[g * 32..g * 32 + 32];
+        let (sc, m) = get_scale_min_k4(is, scales);
+        let d1 = d * f32::from(sc);
+        let m1 = min * f32::from(m);
+        let (sc, m) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * f32::from(sc);
+        let m2 = min * f32::from(m);
+        for &byte in q {
+            out.push(d1 * f32::from(byte & 0x0F) - m1);
+        }
+        // Ordering matters: ggml emits all 32 low nibbles, then all 32 high
+        // nibbles — not interleaved — so these are two separate passes.
+        for &byte in q {
+            out.push(d2 * f32::from(byte >> 4) - m2);
+        }
+        is += 2;
+    }
+}
+
+/// Q5_K (176 bytes): like [`dequant_q4_k`] plus `qh[32]`, a high-bit field
+/// promoting each 4-bit quant to 5 bits. Layout: `f16 d`, `f16 dmin`,
+/// `scales[12]`, `qh[32]`, `qs[128]`. Each element is
+/// `d*scale*(nibble + 16*highbit) - dmin*min`. Follows ggml's Q5_K (MIT).
+fn dequant_q5_k(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let min = read_f16(block, 2);
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let ql = &block[48..176];
+
+    let mut is = 0usize;
+    for g in 0..4 {
+        let q = &ql[g * 32..g * 32 + 32];
+        // The high-bit field is shared across the whole super-block, read via
+        // a different bit pair per group: (bit0,bit1),(bit2,bit3),... .
+        let u1 = 1u8 << (2 * g);
+        let u2 = 2u8 << (2 * g);
+        let (sc, m) = get_scale_min_k4(is, scales);
+        let d1 = d * f32::from(sc);
+        let m1 = min * f32::from(m);
+        let (sc, m) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * f32::from(sc);
+        let m2 = min * f32::from(m);
+        for l in 0..32 {
+            let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+            out.push(d1 * (i32::from(q[l] & 0x0F) + hi) as f32 - m1);
+        }
+        for l in 0..32 {
+            let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+            out.push(d2 * (i32::from(q[l] >> 4) + hi) as f32 - m2);
+        }
+        is += 2;
+    }
+}
+
+/// Q6_K (210 bytes): `ql[128]` (low 4 bits), `qh[64]` (high 2 bits),
+/// `scales[16]` (signed `i8` sub-block scales), `f16 d`. 16 sub-blocks of
+/// 16; each 6-bit quant is `(low4 | high2<<4) - 32` (a signed value in
+/// `[-32, 31]`), scaled by `d * scale`. Follows ggml's Q6_K (MIT).
+fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208]; // interpreted as i8 below
+    let d = read_f16(block, 208);
+
+    // Two 128-element halves. Within a half ggml writes the four quadrants to
+    // y[l], y[l+32], y[l+64], y[l+96] as it walks l=0..32, so we stage a
+    // 128-slot buffer and emit it in natural order.
+    for half in 0..2 {
+        let ql = &ql[half * 64..half * 64 + 64];
+        let qh = &qh[half * 32..half * 32 + 32];
+        let sc = &scales[half * 8..half * 8 + 8];
+        let mut vals = [0f32; 128];
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = (i32::from(ql[l] & 0x0F) | (i32::from(qh[l] & 3) << 4)) - 32;
+            let q2 = (i32::from(ql[l + 32] & 0x0F) | (i32::from((qh[l] >> 2) & 3) << 4)) - 32;
+            let q3 = (i32::from(ql[l] >> 4) | (i32::from((qh[l] >> 4) & 3) << 4)) - 32;
+            let q4 = (i32::from(ql[l + 32] >> 4) | (i32::from((qh[l] >> 6) & 3) << 4)) - 32;
+            vals[l] = d * f32::from(sc[is] as i8) * q1 as f32;
+            vals[l + 32] = d * f32::from(sc[is + 2] as i8) * q2 as f32;
+            vals[l + 64] = d * f32::from(sc[is + 4] as i8) * q3 as f32;
+            vals[l + 96] = d * f32::from(sc[is + 6] as i8) * q4 as f32;
+        }
+        out.extend_from_slice(&vals);
+    }
+}
+
+/// Q8_K (292 bytes): `f32 d` (note: a full `f32` super-scale, unlike every
+/// other quant's `f16`), `qs[256]` signed `i8` quants, then `i16 bsums[16]`
+/// (group sums used only by ggml's fused dot products, ignored on decode).
+/// Each element is simply `d * q`. Follows ggml's Q8_K (MIT).
+fn dequant_q8_k(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f32(block, 0);
+    let qs = &block[4..260];
+    out.extend(qs.iter().map(|&b| d * f32::from(b as i8)));
 }
 
 /// Quantizes one row of `f32` activations to Q8_0 blocks: for every
@@ -577,5 +834,353 @@ mod tests {
 
         let dot = q4_0_dot_q8_0(&w_block, &x_q, x_scales[0]);
         assert!((dot - -1280.0).abs() < 1e-2, "expected 32 * -8 * 5 = -1280, got {dot}");
+    }
+
+    // ---- K-quant super-block tests ----
+    //
+    // Each test hand-encodes a super-block using the exact ggml packing
+    // (the encoders below are the literal inverse of ggml's `block_qX_K`
+    // layout / `get_scale_min_k4` / the Q3_K scale shuffle), then asserts the
+    // decoder produces bit-exact `f32`. All chosen super-scales are exact f16
+    // (1.0 = 0x3C00, 0.5 = 0x3800) and every quant/scale is a small integer,
+    // so each expected value is an exact integer-or-half product with no
+    // rounding: `assert_eq!` on `f32` is legitimate, not fragile. The
+    // expected values are recomputed by an independent per-element formula
+    // (different code path from the decoder's group-walking loops), so a bug
+    // in either the packing or the decode arithmetic surfaces here.
+
+    const F16_ONE: u16 = 0x3C00; // 1.0
+    const F16_HALF: u16 = 0x3800; // 0.5
+
+    /// Inverse of ggml's `get_scale_min_k4`: packs 8 six-bit sub-block scales
+    /// and 8 six-bit mins into the 12-byte Q4_K/Q5_K `scales` field.
+    fn pack_k4_scales(scales: &[u8; 8], mins: &[u8; 8]) -> [u8; 12] {
+        let mut q = [0u8; 12];
+        for j in 0..4 {
+            q[j] = (scales[j] & 63) | ((scales[j + 4] >> 4) << 6);
+            q[j + 4] = (mins[j] & 63) | ((mins[j + 4] >> 4) << 6);
+            q[j + 8] = (scales[j + 4] & 0x0F) | ((mins[j + 4] & 0x0F) << 4);
+        }
+        // Round-trip guard: what we pack must unpack to what we asked for.
+        for j in 0..8 {
+            assert_eq!(get_scale_min_k4(j, &q), (scales[j], mins[j]), "pack/unpack disagree at {j}");
+        }
+        q
+    }
+
+    // -- Q4_K --
+
+    fn build_q4_k(d: u16, dmin: u16, scales: &[u8; 8], mins: &[u8; 8], nib: &[u8; 256]) -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&d.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin.to_le_bytes());
+        block[4..16].copy_from_slice(&pack_k4_scales(scales, mins));
+        // qs: group g byte l holds sub-block 2g element l (low nibble) and
+        // sub-block 2g+1 element l (high nibble).
+        for g in 0..4 {
+            for l in 0..32 {
+                let low = nib[2 * g * 32 + l] & 0x0F;
+                let high = nib[(2 * g + 1) * 32 + l] & 0x0F;
+                block[16 + g * 32 + l] = low | (high << 4);
+            }
+        }
+        block
+    }
+
+    #[test]
+    fn q4_k_is_bit_exact_across_both_get_scale_min_k4_branches() {
+        // Sub-block scales 4..8 and mins 4..8 exercise the *else* branch of
+        // get_scale_min_k4 (the 6-bit split-packing); 63 hits the field max.
+        let scales = [1u8, 2, 3, 4, 5, 6, 7, 63];
+        let mins = [0u8, 1, 2, 3, 63, 10, 20, 30];
+        let mut nib = [0u8; 256];
+        for (e, n) in nib.iter_mut().enumerate() {
+            *n = (e % 16) as u8; // sweep every nibble value 0..15
+        }
+        let block = build_q4_k(F16_ONE, F16_HALF, &scales, &mins, &nib);
+        let mut out = Vec::new();
+        dequant_q4_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        for e in 0..256 {
+            let s = e / 32; // sub-block index
+            let expected = 1.0 * f32::from(scales[s]) * f32::from(nib[e]) - 0.5 * f32::from(mins[s]);
+            assert_eq!(out[e], expected, "Q4_K mismatch at element {e} (sub-block {s})");
+        }
+    }
+
+    #[test]
+    fn q4_k_all_zero_superblock_decodes_to_all_zero() {
+        let block = build_q4_k(F16_ONE, F16_HALF, &[0; 8], &[0; 8], &[0; 256]);
+        let mut out = Vec::new();
+        dequant_q4_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    // -- Q5_K (Q4_K plus a shared high-bit field) --
+
+    fn build_q5_k(
+        d: u16,
+        dmin: u16,
+        scales: &[u8; 8],
+        mins: &[u8; 8],
+        nib: &[u8; 256],
+        hi: &[u8; 256],
+    ) -> Vec<u8> {
+        let mut block = vec![0u8; 176];
+        block[0..2].copy_from_slice(&d.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin.to_le_bytes());
+        block[4..16].copy_from_slice(&pack_k4_scales(scales, mins));
+        // qh[l] bit s carries the high bit of sub-block s at position l.
+        for l in 0..32 {
+            let mut byte = 0u8;
+            for s in 0..8 {
+                byte |= (hi[s * 32 + l] & 1) << s;
+            }
+            block[16 + l] = byte;
+        }
+        for g in 0..4 {
+            for l in 0..32 {
+                let low = nib[2 * g * 32 + l] & 0x0F;
+                let high = nib[(2 * g + 1) * 32 + l] & 0x0F;
+                block[48 + g * 32 + l] = low | (high << 4);
+            }
+        }
+        block
+    }
+
+    #[test]
+    fn q5_k_is_bit_exact_including_the_fifth_bit() {
+        let scales = [2u8, 4, 6, 8, 10, 12, 63, 1];
+        let mins = [0u8, 2, 4, 6, 8, 63, 1, 3];
+        let mut nib = [0u8; 256];
+        let mut hi = [0u8; 256];
+        for e in 0..256 {
+            nib[e] = (e % 16) as u8;
+            hi[e] = ((e / 16) % 2) as u8; // alternate the 5th bit in stripes
+        }
+        let block = build_q5_k(F16_ONE, F16_HALF, &scales, &mins, &nib, &hi);
+        let mut out = Vec::new();
+        dequant_q5_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        for e in 0..256 {
+            let s = e / 32;
+            let val = i32::from(nib[e]) + if hi[e] != 0 { 16 } else { 0 };
+            let expected = 1.0 * f32::from(scales[s]) * val as f32 - 0.5 * f32::from(mins[s]);
+            assert_eq!(out[e], expected, "Q5_K mismatch at element {e} (sub-block {s})");
+        }
+    }
+
+    // -- Q6_K --
+
+    fn build_q6_k(d: u16, scales: &[i8; 16], v: &[u8; 256]) -> Vec<u8> {
+        // v[e] is the raw 6-bit quant (0..63); the decoder subtracts 32.
+        let mut block = vec![0u8; 210];
+        for h in 0..2 {
+            for l in 0..32 {
+                let vq1 = v[h * 128 + l];
+                let vq2 = v[h * 128 + l + 32];
+                let vq3 = v[h * 128 + l + 64];
+                let vq4 = v[h * 128 + l + 96];
+                block[h * 64 + l] = (vq1 & 0x0F) | ((vq3 & 0x0F) << 4);
+                block[h * 64 + l + 32] = (vq2 & 0x0F) | ((vq4 & 0x0F) << 4);
+                block[128 + h * 32 + l] =
+                    (vq1 >> 4) | ((vq2 >> 4) << 2) | ((vq3 >> 4) << 4) | ((vq4 >> 4) << 6);
+            }
+        }
+        for (i, &s) in scales.iter().enumerate() {
+            block[192 + i] = s as u8;
+        }
+        block[208..210].copy_from_slice(&d.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn q6_k_is_bit_exact_with_signed_scales_and_the_minus_32_offset() {
+        // Signed sub-block scales, both signs; raw quants sweep 0..63 so the
+        // decoded (q - 32) sweeps the full signed [-32, 31].
+        let scales: [i8; 16] = [1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8];
+        let mut v = [0u8; 256];
+        for (e, x) in v.iter_mut().enumerate() {
+            *x = (e % 64) as u8;
+        }
+        let block = build_q6_k(F16_ONE, &scales, &v);
+        let mut out = Vec::new();
+        dequant_q6_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        for e in 0..256 {
+            let h = e / 128;
+            let within = e % 128;
+            let l = within % 32;
+            let quadrant = within / 32;
+            let scale_index = h * 8 + l / 16 + 2 * quadrant;
+            let expected = 1.0 * f32::from(scales[scale_index]) * (i32::from(v[e]) - 32) as f32;
+            assert_eq!(out[e], expected, "Q6_K mismatch at element {e}");
+        }
+    }
+
+    // -- Q2_K --
+
+    fn build_q2_k(d: u16, dmin: u16, scales: &[u8; 16], mins: &[u8; 16], q2: &[u8; 256]) -> Vec<u8> {
+        let mut block = vec![0u8; 84];
+        for i in 0..16 {
+            block[i] = (scales[i] & 0x0F) | ((mins[i] & 0x0F) << 4);
+        }
+        // qs[h*32 + p] packs the four shift-planes (j = 0..4) at position p.
+        for h in 0..2 {
+            for p in 0..32 {
+                let mut byte = 0u8;
+                for j in 0..4 {
+                    byte |= (q2[h * 128 + j * 32 + p] & 3) << (2 * j);
+                }
+                block[16 + h * 32 + p] = byte;
+            }
+        }
+        block[80..82].copy_from_slice(&d.to_le_bytes());
+        block[82..84].copy_from_slice(&dmin.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn q2_k_is_bit_exact() {
+        let mut scales = [0u8; 16];
+        let mut mins = [0u8; 16];
+        for i in 0..16 {
+            scales[i] = (i as u8 % 15) + 1; // 1..15
+            mins[i] = (i as u8) % 16; // 0..15
+        }
+        let mut q2 = [0u8; 256];
+        for (e, x) in q2.iter_mut().enumerate() {
+            *x = (e % 4) as u8; // sweep 0..3
+        }
+        let block = build_q2_k(F16_ONE, F16_HALF, &scales, &mins, &q2);
+        let mut out = Vec::new();
+        dequant_q2_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        for e in 0..256 {
+            let h = e / 128;
+            let within = e % 128;
+            let r = within % 32;
+            let j = within / 32;
+            let s = h * 8 + 2 * j + usize::from(r >= 16);
+            let expected = 1.0 * f32::from(scales[s]) * f32::from(q2[e]) - 0.5 * f32::from(mins[s]);
+            assert_eq!(out[e], expected, "Q2_K mismatch at element {e} (sub-block {s})");
+        }
+    }
+
+    // -- Q3_K --
+
+    /// Inverse of ggml's Q3_K 6-bit scale shuffle: packs 16 six-bit scales
+    /// into the 12-byte `scales` field.
+    fn pack_q3_scales(sc: &[u8; 16]) -> [u8; 12] {
+        let mut q = [0u8; 12];
+        for b in 0..4 {
+            q[b] = (sc[b] & 0x0F) | ((sc[8 + b] & 0x0F) << 4);
+            q[4 + b] = (sc[4 + b] & 0x0F) | ((sc[12 + b] & 0x0F) << 4);
+            q[8 + b] = (sc[b] >> 4)
+                | ((sc[4 + b] >> 4) << 2)
+                | ((sc[8 + b] >> 4) << 4)
+                | ((sc[12 + b] >> 4) << 6);
+        }
+        q
+    }
+
+    fn build_q3_k(d: u16, sc: &[u8; 16], q2: &[u8; 256], hbit: &[u8; 256]) -> Vec<u8> {
+        let mut block = vec![0u8; 110];
+        // hmask[r] bit (h*4 + j) carries the high bit at position r.
+        for r in 0..32 {
+            let mut byte = 0u8;
+            for h in 0..2 {
+                for j in 0..4 {
+                    byte |= (hbit[h * 128 + j * 32 + r] & 1) << (h * 4 + j);
+                }
+            }
+            block[r] = byte;
+        }
+        for h in 0..2 {
+            for p in 0..32 {
+                let mut byte = 0u8;
+                for j in 0..4 {
+                    byte |= (q2[h * 128 + j * 32 + p] & 3) << (2 * j);
+                }
+                block[32 + h * 32 + p] = byte;
+            }
+        }
+        block[96..108].copy_from_slice(&pack_q3_scales(sc));
+        block[108..110].copy_from_slice(&d.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn q3_k_is_bit_exact_including_the_aux_scale_unpack_and_inverted_high_bit() {
+        // 6-bit scales spanning the whole range, so the 12->16 scale shuffle
+        // (the trickiest part of Q3_K) is fully exercised, including scales
+        // whose high 2 bits are set.
+        let mut sc = [0u8; 16];
+        for (i, s) in sc.iter_mut().enumerate() {
+            *s = (i as u8 * 4) & 63; // 0,4,8,...,60
+        }
+        let mut q2 = [0u8; 256];
+        let mut hbit = [0u8; 256];
+        for e in 0..256 {
+            q2[e] = (e % 4) as u8;
+            hbit[e] = ((e / 32) % 2) as u8; // toggle the high bit per sub-block plane
+        }
+        let block = build_q3_k(F16_ONE, &sc, &q2, &hbit);
+        let mut out = Vec::new();
+        dequant_q3_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        for e in 0..256 {
+            let h = e / 128;
+            let within = e % 128;
+            let r = within % 32;
+            let j = within / 32;
+            let s = h * 8 + 2 * j + usize::from(r >= 16);
+            // Inverted high-bit convention: subtract 0 if the bit is set, 4 if not.
+            let val = i32::from(q2[e]) - if hbit[e] != 0 { 0 } else { 4 };
+            let expected = 1.0 * (i32::from(sc[s]) - 32) as f32 * val as f32;
+            assert_eq!(out[e], expected, "Q3_K mismatch at element {e} (sub-block {s})");
+        }
+    }
+
+    // -- Q8_K --
+
+    #[test]
+    fn q8_k_is_bit_exact_with_an_f32_scale() {
+        // Q8_K's scale is a full f32 (not f16) — 0.25 is exact.
+        let d: f32 = 0.25;
+        let mut block = vec![0u8; 292];
+        block[0..4].copy_from_slice(&d.to_le_bytes());
+        let mut qs = [0i8; 256];
+        for (j, q) in qs.iter_mut().enumerate() {
+            *q = (j as i32 - 128) as i8; // sweep the full i8 range
+            block[4 + j] = *q as u8;
+        }
+        // bsums are ignored on decode; fill with garbage to prove it.
+        block[260..292].fill(0xAB);
+        let mut out = Vec::new();
+        dequant_q8_k(&block, &mut out);
+        assert_eq!(out.len(), 256);
+        for j in 0..256 {
+            assert_eq!(out[j], 0.25 * f32::from(qs[j]), "Q8_K mismatch at {j}");
+        }
+    }
+
+    // -- dispatch --
+
+    #[test]
+    fn dequantize_dispatches_k_quants_and_handles_multiple_superblocks() {
+        let scales = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mins = [0u8; 8];
+        let nib_a = [1u8; 256];
+        let nib_b = [2u8; 256];
+        let mut bytes = build_q4_k(F16_ONE, F16_HALF, &scales, &mins, &nib_a);
+        bytes.extend(build_q4_k(F16_ONE, F16_HALF, &scales, &mins, &nib_b));
+        let out = dequantize(DType::Q4_K, &bytes).unwrap();
+        assert_eq!(out.len(), 512);
+        // First superblock, sub-block 0 (scale 1, min 0), nibble 1 -> 1.0.
+        assert_eq!(out[0], 1.0);
+        // Second superblock, element 0 -> scale 1 * nibble 2 = 2.0.
+        assert_eq!(out[256], 2.0);
     }
 }

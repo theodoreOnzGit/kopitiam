@@ -29,7 +29,9 @@ pub const GGML_TYPE_F16: u32 = 1;
 pub const GGML_TYPE_Q4_0: u32 = 2;
 pub const GGML_TYPE_Q5_0: u32 = 6;
 pub const GGML_TYPE_Q8_0: u32 = 8;
-pub const GGML_TYPE_Q2_K: u32 = 10; // deliberately unsupported by kopitiam-loader
+// ggml id 16 = IQ2_XXS, a format kopitiam-loader deliberately does not map
+// (the K-quants at ids 10-15 *are* supported now; the IQ-quants are not yet).
+pub const GGML_TYPE_IQ2_XXS: u32 = 16;
 
 pub fn push_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());

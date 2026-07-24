@@ -227,7 +227,7 @@ fn a_misaligned_tensor_offset_is_rejected() {
 fn an_unsupported_ggml_tensor_type_is_reported_not_misdecoded() {
     let mut buf = Vec::new();
     push_header(&mut buf, 3, 1, 0);
-    push_tensor_info(&mut buf, "w", &[1], GGML_TYPE_Q2_K, 0);
+    push_tensor_info(&mut buf, "w", &[1], GGML_TYPE_IQ2_XXS, 0);
     pad_to_alignment(&mut buf, 32);
     let dir = tempfile::tempdir().unwrap();
     let path = write_temp_file(&dir, "unsupported_type.gguf", &buf);

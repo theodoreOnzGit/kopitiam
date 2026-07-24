@@ -163,11 +163,13 @@ impl Tensor {
     ///
     /// [`Error::DTypeMismatch`] if `self` is not `f32`.
     /// [`Error::UnsupportedDType`] if `weight`'s dtype is not one of the
-    /// two formats this method has a fused kernel for (`Q4_1`/`Q5_0`/`Q5_1`
-    /// dequantize fine via [`Tensor::to_dtype`], they simply have no fused
-    /// path here yet — see the parent crate's Phase 2 scope), or if
-    /// `weight` is not quantized at all (use [`Tensor::matmul`] directly
-    /// for a plain `f32` weight).
+    /// two formats this method has a fused kernel for. The other quantized
+    /// formats — `Q4_1`/`Q5_0`/`Q5_1` and every K-quant
+    /// (`Q4_K`/`Q5_K`/`Q6_K`/...) — dequantize fine via [`Tensor::to_dtype`]
+    /// but have no fused path here yet, so a caller wanting to matmul against
+    /// one must dequantize it to `f32` first; see the parent crate's Phase 2
+    /// scope. Also errors if `weight` is not quantized at all (use
+    /// [`Tensor::matmul`] directly for a plain `f32` weight).
     /// [`Error::ShapeMismatch`] if `weight` is not rank 2, if `self`'s last
     /// dimension does not equal `weight`'s `in_features`, or if
     /// `in_features` is not a multiple of 32.
