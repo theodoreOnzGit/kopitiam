@@ -24,6 +24,11 @@ kopitiam-ai = { workspace = true }
 kopitiam-models = { path = "../../crates/kopitiam-models" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# The `kopitiam tui` chat surface. Pinned to the same ratatui the `kvim`
+# editor uses (crates/kopitiam-neovim) so the workspace resolves one ratatui +
+# crossterm. crossterm is used via `ratatui::crossterm` (ratatui's default
+# feature re-exports it), so versions never skew.
+ratatui = "0.29"
 
 [dev-dependencies]
 # Used by adapter-selection tests to build throwaway model stores in a

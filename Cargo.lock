@@ -1670,6 +1670,7 @@ dependencies = [
  "kopitiam-semantic",
  "kopitiam-workflow",
  "kopitiam-workspace",
+ "ratatui",
  "tempfile",
 ]
 

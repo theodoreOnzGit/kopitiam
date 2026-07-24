@@ -29,6 +29,7 @@ mod plan;
 mod rename;
 mod scan;
 mod status;
+mod tui;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -122,6 +123,17 @@ enum Command {
     /// `Read`/`Write` so the streamed loop is testable headlessly.
     Ai(ai::AiArgs),
 
+    /// Open the KOPITIAM chat TUI: a full-screen, kopitiam-themed terminal
+    /// interface over the same streamed local model `ai chat` uses.
+    ///
+    /// A ratatui front-end onto `crate::adapter::select_adapter` — a real
+    /// on-CPU `kopitiam_ai::LocalAdapter` when a `.gguf` is present, otherwise
+    /// the deterministic `EchoAdapter`, so it always runs offline. Tokens
+    /// stream live into the transcript by polling the adapter's
+    /// `Receiver<StreamChunk>`; no business logic lives in the UI. This is the
+    /// runnable slice of `temp_ai_design.md`'s "full ratatui" phase.
+    Tui(tui::TuiArgs),
+
     /// Go and get, then check, the local model weights the AI layer runs on.
     ///
     /// Group of four actions — `list`, `pull`, `path`, `verify` — over the
@@ -167,6 +179,10 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Ai(args) => {
             ai::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Tui(args) => {
+            tui::run(args)?;
             ExitCode::SUCCESS
         }
         Command::Models(args) => models::run(args)?,
