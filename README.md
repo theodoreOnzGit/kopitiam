@@ -47,7 +47,7 @@ crates.io shows once the `kopitiam` package is published.
 
 > **K**nowledge-**O**riented **O**pen-source **P**latform for **I**ntelligent **T**ranslation, **I**ntegrated **A**nalysis and **M**odelling
 
-*An AGPLv3 knowledge, translation, and documentation workbench built in Rust.*
+*A GPLv3 knowledge, translation, and documentation workbench built in Rust.*
 
 ---
 
@@ -245,30 +245,27 @@ The engines own the functionality.
 
 Copyright (C) 2026 Theodore Kay Chen Ong.
 
-KOPITIAM is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
+KOPITIAM is licensed under the **GNU General Public License v3.0 (GPLv3)**.
 
 The intention is to keep the core platform free, open, and community-owned.
 
-### Why AGPLv3, specifically?
+### Why GPLv3, specifically?
 
-This is a deliberate choice, not a default. AGPLv3 is chosen because:
+This is a deliberate choice, not a default. GPLv3 is chosen because:
 
-* **It is copyleft.** Anyone who builds on KOPITIAM must share their
-  modifications under the same license. Improvements flow back to
-  everyone, not just whoever made them.
-* **It closes the network loophole plain GPL leaves open.** Ordinary GPL
-  only requires sharing source when you *distribute* the software. AGPL
-  also requires it when you run a modified version as a network service
-  others interact with — so KOPITIAM (or a derivative of it) can't be
-  quietly turned into a closed, hosted product without releasing the
-  source of what's actually running.
+* **It is copyleft.** Anyone who distributes KOPITIAM, or a work built on
+  it, must share their modifications under the same license. Improvements
+  flow back to everyone, not just whoever made them.
+* **It has a no-further-restrictions rule.** Nothing combined into
+  KOPITIAM may add terms that restrict the rights GPLv3 grants, so the
+  freedoms attached to the platform cannot be stripped away downstream.
 * **Nobody gets to take it away.** The goal is that KOPITIAM, and
-  everything built on it, stays open source, permanently. AGPLv3 is the
-  strongest widely-used copyleft license available for that purpose.
+  everything built on it, stays open source, permanently. GPLv3 is a
+  strong, widely-used copyleft license well suited to that purpose.
 
-GPLv3 and AGPLv3 also each carry an explicit mutual-compatibility clause
-(Section 13 in both), letting a GPLv3-or-later work be combined into an
-AGPLv3 project should the need ever arise.
+GPLv3 also composes cleanly with the wider free-software ecosystem:
+permissive code (MIT, Apache-2.0, BSD) can be incorporated, and other
+GPLv3-or-later works combine directly.
 
 KOPITIAM is a personal project of Theodore Kay Chen Ong, developed in his
 personal capacity using his own resources outside of working hours. It is

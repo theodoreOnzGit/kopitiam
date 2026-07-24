@@ -2,7 +2,7 @@
 name = "rmux-proto"
 version = "0.8.0-kopitiam.1"
 edition = "2021"
-license = "AGPL-3.0-only"
+license = "GPL-3.0-only"
 repository = "https://github.com/theodoreOnzGit/kopitiam"
 description = "RMUX detached IPC protocol DTOs, framing, and wire-safe error types."
 keywords = ["terminal", "multiplexer", "protocol"]

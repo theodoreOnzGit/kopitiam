@@ -45,7 +45,7 @@ integrations are allowed, but the core stays Cargo-buildable.
 
 ## Licensing posture
 
-KOPITIAM is licensed **AGPL-3.0-only**, in its entirety, without exception. Every
+KOPITIAM is licensed **GPL-3.0-only**, in its entirety, without exception. Every
 crate carries the same license.
 
 Everything KOPITIAM forks, adapts, vendors for reference, or studies is credited

@@ -15,8 +15,8 @@
 //! * **Upstream license:** MIT OR Apache-2.0. Both license texts travel with
 //!   this fork, unmodified, as `LICENSE-MIT` and `LICENSE-APACHE` in this
 //!   crate's directory, and the upstream copyright notices are retained.
-//! * **This fork's license:** **AGPL-3.0-only**, like everything else in
-//!   KOPITIAM. A permissive upstream may be absorbed into an AGPLv3 work
+//! * **This fork's license:** **GPL-3.0-only**, like everything else in
+//!   KOPITIAM. A permissive upstream may be absorbed into a GPLv3 work
 //!   provided its notices travel with the code, which is what the two license
 //!   files above are for. Relicensing the *fork* does not and cannot relicense
 //!   upstream rmux.

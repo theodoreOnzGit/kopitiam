@@ -18,7 +18,7 @@ members = [
 version = "0.1.7"
 edition = "2024"
 authors = ["Theodore Kay Chen Ong"]
-license = "AGPL-3.0-only"
+license = "GPL-3.0-only"
 repository = "https://github.com/theodoreOnzGit/kopitiam"
 
 [workspace.dependencies]

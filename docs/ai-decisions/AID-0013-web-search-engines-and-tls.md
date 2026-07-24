@@ -47,7 +47,7 @@ exactly one way to satisfy that for web search: the user owns the engine.
   assume a ten-year horizon. Most search-API companies will not see it.
 * **No cost**, so the bottom rung of the Offline First ladder stops being a
   financial cliff.
-* **AGPL-3.0** — the same licence as KOPITIAM. Not decisive, but not nothing:
+* **AGPL-3.0** — the same licence as KOPITIAM [KOPITIAM has since relicensed to GPL-3.0-only, 2026-07]. Not decisive, but not nothing:
   it is a project with the same theory of ownership.
 * You can point it at a **private, institutional, or air-gapped** index.
 

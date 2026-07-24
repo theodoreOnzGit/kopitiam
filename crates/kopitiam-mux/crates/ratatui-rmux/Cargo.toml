@@ -2,7 +2,7 @@
 name = "ratatui-rmux"
 version = "0.8.0-kopitiam.1"
 edition = "2021"
-license = "AGPL-3.0-only"
+license = "GPL-3.0-only"
 repository = "https://github.com/theodoreOnzGit/kopitiam"
 description = "Ratatui integration crate for the RMUX terminal multiplexer that paints daemon-backed pane state into a ratatui Buffer."
 keywords = ["terminal", "multiplexer", "ratatui"]

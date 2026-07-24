@@ -18,7 +18,7 @@ The upstream license texts are included, unmodified, alongside this file:
     LICENSE-APACHE
 
 As permitted by both licenses, this fork is distributed as part of KOPITIAM
-under the GNU Affero General Public License, version 3 only (AGPL-3.0-only).
+under the GNU General Public License, version 3 only (GPL-3.0-only).
 See the repository root LICENSE.
 
 Relicensing this fork does not relicense upstream rmux. rmux remains available

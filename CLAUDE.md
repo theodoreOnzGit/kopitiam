@@ -4,7 +4,7 @@
 
 > **K**nowledge-**O**riented **O**pen-source **P**latform for **I**ntelligent **T**ranslation, **I**ntegrated **A**nalysis and **M**odelling
 
-*An AGPLv3 knowledge, translation, and documentation workbench built in Rust.*
+*A GPLv3 knowledge, translation, and documentation workbench built in Rust.*
 
 ---
 
@@ -760,9 +760,9 @@ Practical consequence: when reading vendored code, read the *source* you came
 for. Do not go looking for its contributor docs, and never `grep` the whole
 vendor tree — it is gigabytes, and it will bury your context for nothing.
 
-## Attribution is mandatory. The license is AGPLv3, always.
+## Attribution is mandatory. The license is GPLv3, always.
 
-**Everything in KOPITIAM is licensed AGPL-3.0-only.** Every crate, without
+**Everything in KOPITIAM is licensed GPL-3.0-only.** Every crate, without
 exception. There is no permissively-licensed corner of this project.
 
 **Everything forked, translated, ported, or closely adapted from someone else's
@@ -787,13 +787,14 @@ algorithm, write original Rust) and forking (take the code, keep the notices)
 have different obligations, and conflating them is how a project acquires a
 license problem it cannot unwind.
 
-License compatibility, for the record: permissive upstreams (MIT, Apache-2.0,
-BSD) can be absorbed into an AGPLv3 work provided their notices travel with the
-code. GPL-3.0 upstreams are compatible via the mutual-combination
-clause GPLv3 and AGPLv3 both carry. Fonts under OFL-1.1 ship as a distinct work
-alongside the program and do not infect it. Anything GPLv2-**only**, LGPL (as
-linked), source-available-but-not-OSI, or carrying field-of-use restrictions
-needs analysis before it comes anywhere near this repository.
+License compatibility, for the record: GPLv3 is strong copyleft with a
+no-further-restrictions rule — nothing combined into KOPITIAM may add terms that
+restrict the rights GPLv3 grants. Permissive upstreams (MIT, Apache-2.0, BSD) can
+be absorbed into a GPLv3 work provided their notices travel with the code. Other
+GPL-3.0(-or-later) upstreams combine directly. Fonts under OFL-1.1 ship as a
+distinct work alongside the program and do not infect it. Anything GPLv2-**only**,
+LGPL (as linked), source-available-but-not-OSI, or carrying field-of-use
+restrictions needs analysis before it comes anywhere near this repository.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker

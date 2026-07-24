@@ -23,7 +23,8 @@
 //! **SearXNG is the recommended provider**, and the ordering above is not
 //! alphabetical. It is a metasearch aggregator you run yourself: no API key, no
 //! account, no bill, no vendor, no terms of service that can change under you,
-//! and — happily — AGPL-3.0, the same licence as KOPITIAM. For a project whose
+//! and — happily — AGPL-3.0, a copyleft licence in the same spirit as
+//! KOPITIAM's GPL-3.0. For a project whose
 //! founding principle is that no external service may be *required*, an engine
 //! the user owns outright is not merely a nice option; it is the only one that
 //! is philosophically consistent. Renting Google through a proxy is the exact

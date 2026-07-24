@@ -36,7 +36,7 @@
 //! licensed **OFL-1.1**; its license text ships beside it in
 //! `assets/LICENSE-JetBrainsMono-OFL.txt` and is embedded as [`FONT_LICENSE`].
 //! The Nerd Fonts patcher is MIT. The OFL governs the font as a distinct work:
-//! it does not infect this AGPLv3 program, but it does require that the license
+//! it does not infect this GPLv3 program, but it does require that the license
 //! travel with the font, which is why it is embedded rather than merely linked.
 
 use std::path::{Path, PathBuf};

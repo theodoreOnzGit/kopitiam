@@ -14,7 +14,7 @@
 //! This crate's code was written by **The RMUX Authors** and is reused directly
 //! under its original **MIT OR Apache-2.0** license (see `LICENSE-MIT` and
 //! `LICENSE-APACHE` in `crates/kopitiam-mux/`). It is distributed as part of
-//! KOPITIAM under **AGPL-3.0-only**. See `crates/kopitiam-mux/NOTICE`.
+//! KOPITIAM under **GPL-3.0-only**. See `crates/kopitiam-mux/NOTICE`.
 //!
 //! KOPITIAM's changes add Android/Termux support. `rmux_os::runtime_dir`
 //! documents every Android decision in the fork; read it before changing a

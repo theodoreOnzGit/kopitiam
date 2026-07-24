@@ -67,7 +67,7 @@ Regular weight only — shipping bold/italic/light would quadruple the size for
 a terminal that mostly synthesizes those anyway.
 
 **Licensing.** JetBrains Mono is **OFL-1.1** (SIL Open Font License). This is
-compatible with distributing it alongside an AGPLv3 program: the OFL governs
+compatible with distributing it alongside an AGPLv3 program [KOPITIAM has since relicensed to GPL-3.0-only, 2026-07; the OFL analysis is unchanged]: the OFL governs
 the font as a distinct work, does not infect the program that ships it, and
 explicitly permits bundling. The two constraints it *does* impose, both of
 which are honoured: the font's copyright and license text must travel with it

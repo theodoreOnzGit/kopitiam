@@ -27,8 +27,8 @@ const DEFAULT_REQUESTS_PER_SECOND: u32 = 1;
 /// # Why this one is first
 ///
 /// SearXNG is a metasearch aggregator that you run. It queries the upstream
-/// engines on your behalf and returns their results, and it is AGPL-3.0 — the
-/// same licence as KOPITIAM.
+/// engines on your behalf and returns their results, and it is AGPL-3.0 — a
+/// strong copyleft licence, like KOPITIAM's own GPL-3.0.
 ///
 /// For a platform whose founding principle is that no external service may ever
 /// be *required*, an engine the user owns outright is not just an attractive
