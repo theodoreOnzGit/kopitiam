@@ -772,7 +772,7 @@ in some cases, ethical in all of them. Concretely:
 * **Every vendored or referenced project** goes in `docs/ACKNOWLEDGEMENTS.md`
   with its name, license, and what it was used for. No exceptions, including
   projects only *read* for architecture.
-* **A fork or a direct code reuse** (e.g. `kopitiam-mux` from rmux) must retain
+* **A fork or a direct code reuse** (e.g. `kmux` from rmux) must retain
   the upstream copyright notices and license text, and must say plainly in the
   crate's rustdoc that it is a fork, of what, and under what license.
 * **A translation or close adaptation** of a specific algorithm names its source

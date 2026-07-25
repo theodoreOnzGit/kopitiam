@@ -33,7 +33,7 @@ kopitiam-index.workspace = true
 # every reader of the knowledge graph regardless of where they sit. The `now`
 # feature gives `Utc::now()` from `SystemTime` alone.
 #
-# chrono is already in this workspace's Cargo.lock (kopitiam-mux, lopdf), so
+# chrono is already in this workspace's Cargo.lock (kmux, lopdf), so
 # this adds no new crate to the dependency tree.
 chrono = { version = "0.4", default-features = false, features = ["std", "now", "serde"] }
 

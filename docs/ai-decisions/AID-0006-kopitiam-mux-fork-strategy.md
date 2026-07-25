@@ -6,6 +6,12 @@
 * **Decided by:** AI (Claude) proposed; **the maintainer ruled**
 * **Implemented:** yes — `crates/kopitiam-mux/`, 2026-07-14
 
+> **Note (later):** the fork package was subsequently renamed `kopitiam-mux` →
+> `kmux`, and its directory moved to `crates/kmux/`. The sub-crates kept their
+> upstream `rmux-*` / `ratatui-rmux` names. This ADR preserves the original
+> `kopitiam-mux` narrative as the historical record; read `kopitiam-mux` as
+> `kmux` and `crates/kopitiam-mux/` as `crates/kmux/` throughout.
+
 ## Resolution — what implementing it taught us
 
 The full fork is built and lives at `crates/kopitiam-mux/`. It builds, tests

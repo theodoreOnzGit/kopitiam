@@ -69,7 +69,7 @@ their copyright notices are retained, and the crate's rustdoc says so.
 
 | Project | License | KOPITIAM crate | Why forked |
 | --- | --- | --- | --- |
-| [rmux](https://github.com/helvesec/rmux) | MIT OR Apache-2.0 | `kopitiam-mux` (`kmux`) | Terminal multiplexer, already Rust, but it does not run on Android. Forked to add Android/Termux support alongside Linux, macOS and Windows. Upstream copyright: **"The RMUX Authors"**. |
+| [rmux](https://github.com/helvesec/rmux) | MIT OR Apache-2.0 | `kmux` | Terminal multiplexer, already Rust, but it does not run on Android. Forked to add Android/Termux support alongside Linux, macOS and Windows. Upstream copyright: **"The RMUX Authors"**. |
 
 ### What the rmux fork actually consists of
 
@@ -79,12 +79,12 @@ Recorded plainly, because "fork" is doing a lot of work in that table row.
 (`rmux-core`, `rmux-os`, `rmux-pty`, `rmux-ipc`, `rmux-proto`, `rmux-types`,
 `rmux-client`, `rmux-server`, `rmux-sdk`, `rmux-render-core`, `rmux-web-crypto`,
 `ratatui-rmux`) plus its top-level binary — roughly 325k lines. They live under
-`crates/kopitiam-mux/crates/`, keeping their upstream names so that diffs
+`crates/kmux/crates/`, keeping their upstream names so that diffs
 against upstream remain readable. **The overwhelming majority of the code in
-`kopitiam-mux` was written by The RMUX Authors, not by KOPITIAM.**
+`kmux` was written by The RMUX Authors, not by KOPITIAM.**
 
 * Upstream's `LICENSE-MIT` and `LICENSE-APACHE` ship unmodified in
-  `crates/kopitiam-mux/`, and `crates/kopitiam-mux/NOTICE` records the fork.
+  `crates/kmux/`, and `crates/kmux/NOTICE` records the fork.
 * Every forked sub-crate's rustdoc names The RMUX Authors and its original
   license.
 * The fork is distributed under **GPL-3.0-only** as part of KOPITIAM, which the

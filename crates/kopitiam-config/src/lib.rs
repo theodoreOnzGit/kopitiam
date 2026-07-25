@@ -6,7 +6,7 @@
 //! ```text
 //! ~/.kopitiam/
 //! ├── kopitiam-neovim/     <- kvim: config.json, init.lua, lua/*.lua
-//! ├── kopitiam-mux/        <- kmux
+//! ├── kmux/               <- kmux
 //! └── ...                  <- one directory per app, named for its crate
 //! ```
 //!

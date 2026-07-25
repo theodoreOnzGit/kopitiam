@@ -4,14 +4,14 @@ resolver = "2"
 members = [
     "apps/*",
     "crates/*",
-    # kopitiam-mux is a fork of rmux and nests its twelve forked sub-crates under
-    # its own `crates/` (see crates/kopitiam-mux/README.md). They are listed
+    # kmux is a fork of rmux and nests its twelve forked sub-crates under
+    # its own `crates/` (see crates/kmux/README.md). They are listed
     # explicitly rather than being left to arrive as path dependencies of
-    # `kopitiam-mux`, because two of them (`ratatui-rmux`, `rmux-render-core`)
+    # `kmux`, because two of them (`ratatui-rmux`, `rmux-render-core`)
     # are integration crates nothing else depends on -- without this line they
     # would sit on disk in no build graph at all, never compiled, never tested,
     # silently rotting. Membership is what keeps `--workspace` honest.
-    "crates/kopitiam-mux/crates/*",
+    "crates/kmux/crates/*",
 ]
 
 [workspace.package]

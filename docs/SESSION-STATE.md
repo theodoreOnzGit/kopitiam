@@ -93,7 +93,7 @@ nothing unpushed.
 | `kopitiam-neovim` (`kvim`) | Modal editor. **Installed, awaiting maintainer testing.** | 305 |
 | `kopitiam-lua` | Pure-Rust Lua 5.1 VM. Runs the maintainer's real config, live from disk. | 224 |
 | `kopitiam-finance` | CPF + HDB policy + HDB resale market | 213 |
-| `kopitiam-mux` (`kmux`) | rmux fork. Builds, runs, **type-checks for aarch64-linux-android**. | — |
+| `kmux` | rmux fork. Builds, runs, **type-checks for aarch64-linux-android**. | — |
 | `kopitiam-tensor` / `-runtime` / `-loader` / `-tokenizer` | CPU inference (Qwen). Quantized matmul: 3.3× smaller, 4.7× faster decode. | 200+ |
 | `kopitiam-semantic` | Rust + Python + C# + C++ + Visual Basic adapters | 105 |
 | `kopitiam-insurance` | Generic insurance-document engine | 100 |

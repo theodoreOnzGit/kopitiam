@@ -1654,6 +1654,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kmux"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "embed-manifest",
+ "libc",
+ "qrcode",
+ "ratatui",
+ "rmux-client",
+ "rmux-core",
+ "rmux-os",
+ "rmux-proto",
+ "rmux-pty",
+ "rmux-sdk",
+ "rmux-server",
+ "rustix 1.1.4",
+ "serde_json",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "kopitiam"
 version = "0.1.0"
 dependencies = [
@@ -1873,29 +1896,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "ureq",
-]
-
-[[package]]
-name = "kopitiam-mux"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "embed-manifest",
- "libc",
- "qrcode",
- "ratatui",
- "rmux-client",
- "rmux-core",
- "rmux-os",
- "rmux-proto",
- "rmux-pty",
- "rmux-sdk",
- "rmux-server",
- "rustix 1.1.4",
- "serde_json",
- "tokio",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
