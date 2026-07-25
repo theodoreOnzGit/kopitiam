@@ -8,8 +8,15 @@
 # published crate to already exist on the registry at a matching version --
 # local path deps are not enough -- so these go up one at a time, deps first.
 #
-# This script does NOT run automatically as part of any workflow, and an agent
-# must NEVER run it. Run it yourself, deliberately, after `cargo login <token>`:
+# This script does NOT run automatically as part of any workflow. It is
+# maintainer-gated: per CLAUDE.md's 2026-07-18 amendment, the main assistant may
+# run it ONLY when the maintainer explicitly says so in a prompt ("publish kvim",
+# "run publish-kvim.sh"). Never autonomously, never inferred, never folded in as
+# a silent step of a bigger task, and NEVER by a subagent -- agents prep to the
+# edge (green build, `--dry-run`) and hand the command back. Publishing cannot be
+# undone; a version, once live, cannot be recalled.
+#
+# Run it yourself, deliberately, after `cargo login <token>`:
 #
 #   ./scripts/publish-kvim.sh            # publish everything not yet published
 #   ./scripts/publish-kvim.sh --dry-run  # show what would happen, publish nothing
