@@ -1,10 +1,40 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-16 (reconciled after two parallel sessions)
+**Last updated:** 2026-07-25 (kvim nucleo-panic fix + 0.1.8 crates.io publish)
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
 
-> ## ⚠️ CURRENT STATE — read this first ah (2026-07-16, ~07:35 SGT)
+> ## ✅ LATEST — 2026-07-25 (Sat, ~10:45 SGT, outside NUS hours)
+>
+> Short session, nothing in-flight, no agents running, tree clean and pushed.
+>
+> * **kvim crash fixed (bd-8sh, commit `1aacb8b`).** Typing a Capitalised word
+>   in Markdown panicked nucleo: `should have been caught by prefilter`. Our bug
+>   — `merge_and_rank` passed the raw prefix as needle while `ignore_case` was
+>   on, breaking nucleo's documented "caller must case-fold the needle" rule, so
+>   the prefilter and the matrix disagreed. Now scored through
+>   `nucleo::pattern::Atom`. Full mechanism is in the rustdoc at the call site.
+> * **Completion is now smart-case** — that was the real judgment call, so it's
+>   **AID-0050**, review bead **bd-1wd** (P2, still open).
+> * **crates.io: kvim tree 0.1.8 is LIVE (bd-5js closed).** All 7 —
+>   ontology, config, syntax, snippet, lua, semantic, neovim — now
+>   `GPL-3.0-only` on the registry, carrying the fix. Verified by pulling the
+>   published `.crate` back down. **Still stale:** the CLI publish tree
+>   (`scripts/publish.sh`) crates are equally AGPL-old on crates.io, NOT part of
+>   this run — that one still waiting.
+> * **New known-bad test: bd-2wo.** `kmux`'s
+>   `osc_title_rename_is_applied_when_allow_set_title_is_on` fails on this box
+>   because the maintainer's own shell prompt rewrites the OSC title and wins the
+>   race. Pre-existing, environment-dependent, unrelated to kvim. Rest of
+>   `--workspace` is green.
+> * `publish-kvim.sh`'s header used to say "an agent must NEVER run it";
+>   corrected to CLAUDE.md's 2026-07-18 gate (main assistant may, on an explicit
+>   prompt only — this run was one).
+>
+> Everything below is from 2026-07-16 and is older — read it for background, not
+> for current state.
+
+> ## ⚠️ CURRENT STATE (2026-07-16, ~07:35 SGT)
 >
 > **Two Claude windows were running on this one repo. Now settled: THIS window
 > has full repo control; the other window is READ-ONLY.** So one writer only,
