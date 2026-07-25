@@ -18,4 +18,4 @@ Cargo.lock.bak
 
 # Vendored reference sources for translation (not part of the Pure Rust Core;
 # local-only, never committed — see README.md's "Scientific Translation" plan)
-crates/kopitiam-ai/vendor/
+crates/*/vendor/

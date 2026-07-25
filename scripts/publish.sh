@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 #
-# Publishes the KOPITIAM crates that `kopitiam` (the CLI, apps/cli) depends
-# on, in dependency order, followed by `kopitiam` itself.
+# Publishes the full `kopitiam` CLI tree: every internal KOPITIAM crate that
+# the `kopitiam` binary (apps/cli) transitively depends on, in dependency
+# order, followed by `kopitiam` itself.
 #
 # crates.io requires every dependency of a published crate to already exist
 # on the registry at a matching version -- local path dependencies are not
-# enough. That means these 9 crates must go up one at a time, in an order
-# where each crate's dependencies are already live before it publishes.
+# enough. So these crates go up one at a time, in an order where each crate's
+# dependencies are already live before it publishes.
+#
+# The CRATES list below is the topological order (deps first, `kopitiam`
+# last) of the set produced by:
+#
+#   cargo tree -p kopitiam -e normal --prefix none | grep -oE '^kopitiam[a-z-]*' | sort -u
+#
+# MIXED VERSIONS: the tree no longer shares one version. Most crates release
+# in lockstep at the workspace version (0.1.8), but the first-time Runtime /
+# workflow / ai crates debut at 0.1.0 (their own manifests pin it). So there
+# is NO single WORKSPACE_VERSION constant here: `cargo publish -p <crate>`
+# already uses each crate's own manifest version, and the already-published
+# skip-check resolves EACH crate's own version via `cargo pkgid`.
 #
 # This script does NOT run automatically as part of any other workflow. Run
 # it yourself, deliberately, after `cargo login <your-token>`:
@@ -21,11 +34,10 @@
 # crates.io rate-limits *publishing a brand-new crate name* to a burst of 5,
 # refilling at 1 every 10 minutes (see https://crates.io/docs/rate-limits;
 # confirmed against the exact numbers in rust-lang/crates.io's
-# src/rate_limiter.rs). Since every crate below is a first-time publish,
-# publishing all 9 back-to-back *will* hit that limit after the 5th. This
-# script detects the resulting 429 and waits out crates.io's own
-# `Retry-After` deadline rather than failing -- expect it to pause for
-# stretches of ~10 minutes partway through a full run.
+# src/rate_limiter.rs). Several crates below are first-time publishes, so a
+# full run can hit that limit. This script detects the resulting 429 and
+# waits out crates.io's own `Retry-After` deadline rather than failing --
+# expect it to pause for stretches of ~10 minutes partway through a full run.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -35,29 +47,39 @@ if [[ "${1:-}" == "--dry-run" ]]; then
     DRY_RUN=true
 fi
 
-# Topological order: every crate here depends only on crates earlier in
-# this list (or on nothing internal at all).
+# Topological order: every crate here depends only on crates earlier in this
+# list (or on nothing internal at all). Derived from `cargo tree -p kopitiam`
+# (see header). `kopitiam` itself goes last.
 CRATES=(
-    kopitiam-ontology
-    kopitiam-index
-    kopitiam-pdf
-    kopitiam-workspace   # depends on: kopitiam-index
-    kopitiam-document    # depends on: kopitiam-pdf
+    kopitiam-core        # leaf: only thiserror
+    kopitiam-ontology    # leaf
+    kopitiam-index       # leaf
+    kopitiam-pdf         # leaf
+    kopitiam-models      # leaf (net feature -> ureq)
+    kopitiam-tensor      # depends on: kopitiam-core
+    kopitiam-loader      # depends on: kopitiam-core
+    kopitiam-tokenizer   # depends on: kopitiam-core
     kopitiam-semantic    # depends on: kopitiam-ontology
     kopitiam-knowledge   # depends on: kopitiam-ontology
+    kopitiam-document    # depends on: kopitiam-pdf
+    kopitiam-workspace   # depends on: kopitiam-index
     kopitiam-markdown    # depends on: kopitiam-document
+    kopitiam-runtime     # depends on: kopitiam-{core,loader,tensor,tokenizer}
+    kopitiam-ai          # depends on: kopitiam-{loader,runtime,tokenizer}
+    kopitiam-workflow    # depends on: kopitiam-{ai,knowledge,ontology,workspace}
     kopitiam             # depends on: all of the above
 )
 
-# All 9 crates share one version via [workspace.package] in the root
-# Cargo.toml, so there is exactly one place to read it from -- no need to
-# parse `cargo metadata` JSON (and no new tool dependency, e.g. `jq`, for
-# a shell script whose whole point is being easy to just run).
-WORKSPACE_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-if [[ -z "$WORKSPACE_VERSION" ]]; then
-    echo "error: could not read [workspace.package].version from Cargo.toml" >&2
-    exit 1
-fi
+# Resolves a crate's OWN published version straight from Cargo's own view of
+# the manifest -- correct whether the crate pins its version explicitly
+# (0.1.0) or inherits it from [workspace.package] (0.1.8). `cargo pkgid`
+# prints e.g. `path+file:///...#0.1.8` or `path+file:///...#kopitiam@0.1.0`;
+# stripping everything up to the last `#` or `@` leaves just the version. No
+# single workspace-version constant, and no `jq`.
+crate_version() {
+    local name="$1"
+    cargo pkgid -p "$name" 2>/dev/null | sed -E 's/.*[#@]//'
+}
 
 # Queries the crates.io HTTP API directly, rather than `cargo info`: run
 # from inside this workspace, `cargo info <name>` happily reports the
@@ -72,6 +94,26 @@ already_published() {
     local name="$1" version="$2"
     curl -fsS -o /dev/null -H "User-Agent: ${CRATES_IO_USER_AGENT}" \
         "https://crates.io/api/v1/crates/${name}/${version}"
+}
+
+# Refuses to publish a crate that keeps vendored reference sources under
+# vendor/ (e.g. kopitiam-ai's ~255MB of llama.cpp + OpenFOAM, GPL, local-only)
+# unless its Cargo.toml explicitly excludes them with `exclude = ["vendor/"]`.
+# Without that line `cargo publish` would try to pack hundreds of MB of
+# third-party source into the .crate tarball. Belt-and-braces alongside the
+# .gitignore rule: .gitignore keeps vendor/ out of git, this keeps it out of
+# the published tarball.
+preflight_vendor_check() {
+    local name="$1"
+    local dir manifest
+    dir="$(cargo pkgid -p "$name" 2>/dev/null | sed -E 's#^.*file://##; s/#.*$//')"
+    manifest="${dir}/Cargo.toml"
+    if [[ -d "${dir}/vendor" ]] && ! grep -qE '^[[:space:]]*exclude[[:space:]]*=.*"vendor/"' "$manifest"; then
+        echo "error: $name has a vendor/ dir but its Cargo.toml lacks exclude = [\"vendor/\"];" >&2
+        echo "       refusing to publish (would pack vendored third-party sources into the .crate)." >&2
+        return 1
+    fi
+    return 0
 }
 
 # Polls the crates.io API for up to ~2 minutes so the *next* crate in the
@@ -133,8 +175,18 @@ publish_with_retry() {
     return 1
 }
 
+# Preflight the whole set BEFORE publishing anything, so a vendor/ misconfig
+# fails fast rather than partway through a multi-crate (rate-limited) run.
 for crate in "${CRATES[@]}"; do
-    version="$WORKSPACE_VERSION"
+    preflight_vendor_check "$crate"
+done
+
+for crate in "${CRATES[@]}"; do
+    version="$(crate_version "$crate")"
+    if [[ -z "$version" ]]; then
+        echo "error: could not resolve a version for $crate via cargo pkgid" >&2
+        exit 1
+    fi
 
     if already_published "$crate" "$version"; then
         echo "== $crate@$version already published, skipping =="

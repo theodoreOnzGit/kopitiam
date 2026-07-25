@@ -1,6 +1,10 @@
 [package]
 name = "kopitiam-ai"
-version.workspace = true
+# First crates.io release at 0.1.0; the workspace is 0.1.8 but these debut at 0.1.0 (maintainer directive).
+version = "0.1.0"
+# llama.cpp + OpenFOAM reference sources live under vendor/ (~255MB GPL, gitignored
+# and local-only). Keep them out of the published .crate tarball.
+exclude = ["vendor/"]
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

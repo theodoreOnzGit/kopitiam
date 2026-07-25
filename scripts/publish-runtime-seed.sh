@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# SUPERSEDED: the seed crates (kopitiam-core, kopitiam-tensor, kopitiam-models)
+# have graduated to the workspace version and now release in lockstep via
+# scripts/publish.sh; this seed script is kept only for historical reference.
+#
 # Seeds the FIRST three Kopitiam Runtime / model-layer crate NAMES onto
 # crates.io at v0.0.1, as an early name reservation while the Runtime engine is
 # still mid-build. This is NOT the real Runtime release -- 0.0.1 sits behind the
