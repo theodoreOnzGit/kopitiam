@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use kopitiam_semantic::CompletionItemKind;
+use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Utf32Str};
 
 /// Where a [`CompletionItem`] came from. Ordering here **is** priority order:
@@ -256,10 +257,52 @@ pub fn path_candidates(typed: &str, base: &Path) -> Vec<CompletionItem> {
 /// An empty `prefix` (nothing typed yet, e.g. right after `<C-space>`)
 /// matches everything with a flat score, preserving priority-then-alphabetic
 /// order. Otherwise every surviving item is scored by
-/// [`nucleo::Matcher::fuzzy_match`] against `prefix`; anything that doesn't
+/// [`nucleo::pattern::Atom`] against `prefix`; anything that doesn't
 /// match at all (`None`) is filtered out (this is where "filter by the
 /// typed prefix" happens), and the rest are sorted by score descending,
 /// breaking ties alphabetically for determinism.
+///
+/// Case handling is **smart-case**, same as the picker: all-lowercase prefix
+/// matches case-insensitively, any uppercase char in the prefix makes the whole
+/// match case-sensitive.
+///
+/// # Why go through `Atom` and not call `Matcher::fuzzy_match` straight
+///
+/// Hard-won one, this. `nucleo_matcher::Matcher`'s raw `..._match` /
+/// `..._indices` methods say in their own docs that the **caller** must hand
+/// over a needle that is already unicode-normalised and case-folded. Pass a raw
+/// user string with `Config::ignore_case = true` (which `Config::DEFAULT` has)
+/// and you don't just get wrong scores — you get a **panic**:
+///
+/// ```text
+/// nucleo-matcher-0.3.1/src/fuzzy_optimal.rs:37: should have been caught by prefilter
+/// ```
+///
+/// The mechanism, so nobody has to rediscover it: `prefilter_ascii` folds case
+/// one-way only — for a needle byte `'t'` it looks for `'t'` *or* `'T'`, but for
+/// a needle byte `'T'` it looks for `'T'` alone. The matrix setup right after it
+/// normalises the *haystack* to lowercase and compares against the needle
+/// verbatim. So the prefilter says "can match" (it found a literal `'T'`) while
+/// the matrix says "cannot" (`'t' != 'T'`), the two disagree, and since both
+/// sides are ASCII nucleo asserts that its own invariant broke. It is nucleo's
+/// assert, but our bug — we broke the documented precondition.
+///
+/// It needs a *gap* to fire, which is why it looked intermittent. When the
+/// prefilter's window comes back exactly `needle.len()` wide, `fuzzy_match`
+/// short-circuits to `calculate_score` and never touches the matrix — so
+/// prefix `"Th"` against `"Theorem"` is fine. Give the last needle char a
+/// second occurrence further along (`"Th"` against `"Through"` — the `h` in
+/// `-gh`) and the window widens, the matrix runs, and it panics.
+///
+/// Why it bit in Markdown and (nearly) never in Rust: prose is full of
+/// Capitalised words, so buffer-word completion in a `.md` file gets uppercase
+/// prefixes typed at it all day. Code identifiers are mostly lowercase, so the
+/// same code path looked fine for months.
+///
+/// [`Atom::new`] does the normalisation + case folding for us, and
+/// [`Atom::score`] sets `ignore_case`/`normalize` on the matcher to match the
+/// needle it actually holds — so prefilter and matrix can never disagree again.
+/// It leaves `prefer_prefix` alone, so the autocompletion tuning below survives.
 pub fn merge_and_rank(
     prefix: &str,
     lsp_items: Vec<CompletionItem>,
@@ -275,6 +318,11 @@ pub fn merge_and_rank(
     let mut config = Config::DEFAULT;
     config.prefer_prefix = true;
     let mut matcher = Matcher::new(config);
+    // Build the needle once, not once per candidate -- `Atom::new` allocates a
+    // normalised `Utf32String`, and the prefix is the same for every item.
+    // `escape_whitespace = false`: a completion prefix is one word, `\ ` in it
+    // is a literal backslash-space, not an escape.
+    let atom = Atom::new(prefix, CaseMatching::Smart, Normalization::Smart, AtomKind::Fuzzy, false);
     let mut seen = HashSet::new();
     let mut scored: Vec<(u32, CompletionItem)> = Vec::new();
 
@@ -287,10 +335,8 @@ pub fn merge_and_rank(
             continue;
         }
         let mut haystack_buf = Vec::new();
-        let mut needle_buf = Vec::new();
         let haystack = Utf32Str::new(&item.label, &mut haystack_buf);
-        let needle = Utf32Str::new(prefix, &mut needle_buf);
-        if let Some(score) = matcher.fuzzy_match(haystack, needle) {
+        if let Some(score) = atom.score(haystack, &mut matcher) {
             scored.push((score as u32, item));
         }
     }
@@ -368,6 +414,48 @@ mod tests {
     }
 
     #[test]
+    fn merge_and_rank_survives_an_uppercase_prefix() {
+        // Regression: passing a raw (un-case-folded) needle to
+        // `Matcher::fuzzy_match` while `ignore_case` was on made nucleo's
+        // prefilter and its matrix disagree, and nucleo asserted:
+        //   fuzzy_optimal.rs:37: should have been caught by prefilter
+        // Editing Markdown hit this constantly -- prose is full of Capitalised
+        // words, so buffer-word completion sees uppercase prefixes all the time.
+        // See `merge_and_rank`'s doc comment for the full mechanism.
+        //
+        // `"Through"` is load-bearing, don't swap it for a shorter word: the
+        // needle's last char `h` must appear *again* later in the haystack, so
+        // that nucleo's prefilter widens the window past `needle.len()` and the
+        // matrix path actually runs. Something like `"Theorem"` short-circuits
+        // on the exact-window fast path and never panicked even before the fix.
+        let ranked = merge_and_rank("Th", vec![], vec![], vec![buf("Through"), buf("The")], vec![]);
+        let labels: Vec<&str> = ranked.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Through"), "uppercase prefix must still match, got {labels:?}");
+        assert!(labels.contains(&"The"));
+    }
+
+    #[test]
+    fn merge_and_rank_is_smart_case() {
+        // Lowercase prefix -> case-insensitive, catches the Capitalised word.
+        let ranked = merge_and_rank("th", vec![], vec![], vec![buf("The"), buf("this")], vec![]);
+        let labels: HashSet<&str> = ranked.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, HashSet::from(["The", "this"]));
+
+        // Any uppercase in the prefix -> case-sensitive, so lowercase drops out.
+        let ranked = merge_and_rank("Th", vec![], vec![], vec![buf("The"), buf("this")], vec![]);
+        let labels: Vec<&str> = ranked.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["The"], "an uppercase prefix must not match a lowercase label");
+    }
+
+    #[test]
+    fn merge_and_rank_survives_a_non_ascii_prefix() {
+        // Same precondition (needle must be normalised) applies on the unicode
+        // path; `Atom` handles it, so this must neither panic nor come back empty.
+        let ranked = merge_and_rank("日本", vec![], vec![], vec![buf("日本語"), buf("plain")], vec![]);
+        assert_eq!(ranked.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["日本語"]);
+    }
+
+    #[test]
     fn merge_and_rank_returns_everything_in_priority_order_when_prefix_is_empty() {
         let ranked = merge_and_rank("", vec![lsp("alpha")], vec![], vec![buf("beta")], vec![]);
         assert_eq!(ranked.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["alpha", "beta"]);
@@ -426,3 +514,4 @@ mod tests {
         assert!(builtin_snippets("cobol").is_empty(), "an unknown filetype yields no snippets, not a wrong-language set");
     }
 }
+
