@@ -24,11 +24,12 @@
 //!
 //! ## Deferred
 //!
-//! Only Form XObjects recurse; `/Image` (and PostScript) XObjects are recognised
-//! and skipped (image extraction is a later wave). The XObject `/BBox` clip and
-//! transparency-group setup are not modelled -- neither affects glyph positions.
-//! `UserUnit` is treated as 1, and only the MediaBox is used for the base CTM
-//! (CropBox/ArtBox/etc. box selection is deferred).
+//! Form XObjects recurse and `/Image` XObjects are decoded + painted (via
+//! [`Processor::draw_image_xobject`], driving the draw device's fill-image
+//! callback); PostScript / unknown XObjects are skipped. The XObject `/BBox` clip
+//! and transparency-group setup are not modelled -- neither affects glyph
+//! positions. `UserUnit` is treated as 1, and only the MediaBox is used for the
+//! base CTM (CropBox/ArtBox/etc. box selection is deferred).
 
 use super::geometry::{Matrix, Rect};
 use super::interpret::Processor;
@@ -164,15 +165,20 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             return Ok(());
         }
 
-        // Only Form XObjects are on the text path (Subtype2 overrides Subtype).
+        // Form XObjects recurse; Image XObjects are painted (Subtype2 overrides
+        // Subtype for a form).
         let subtype = self.doc.resolve_get(&xobj, "Subtype").unwrap_or(Object::Null);
         let subtype = if xobj.dict_gets("Subtype2").is_some() {
             self.doc.resolve_get(&xobj, "Subtype2").unwrap_or(subtype)
         } else {
             subtype
         };
+        if subtype.to_name() == b"Image" {
+            self.draw_image_xobject(&xobj, &xobj_ref);
+            return Ok(());
+        }
         if subtype.to_name() != b"Form" {
-            return Ok(()); // /Image, /PS, unknown: skip
+            return Ok(()); // /PS, unknown: skip
         }
 
         // Content bytes come from the stream body (always an indirect stream).
@@ -223,6 +229,27 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         self.op_q_restore();
 
         result
+    }
+
+    // MuPDF: pdf_show_image (pdf-op-run.c:1043) -- decode the image and paint it
+    // through the fill-image device callback under the current CTM.
+    /// Paint an Image XObject (`dict`/`stream_ref`) at the current CTM. The image's
+    /// unit square is placed with `[1 0 0 -1 0 1]` folded into the CTM so its top
+    /// row lands at the top of the user-space unit square (PDF image space). A
+    /// decode failure (deferred codec / colorspace) is a safe skip.
+    fn draw_image_xobject(&mut self, dict: &Object, stream_ref: &Object) {
+        let img = match super::page_image::decode_image_xobject(self.doc, dict, stream_ref) {
+            Ok(img) => img,
+            Err(_) => return, // deferred codec / unsupported colorspace: skip
+        };
+        let (ctm, clip) = {
+            let g = self.gstate();
+            (g.ctm, g.clip)
+        };
+        // fitz image space (0,0 top-left, unit square) -> PDF user space unit square
+        // (image top row at y=1): flip y, then apply the page/user CTM.
+        let image_ctm = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0).concat(ctm);
+        self.dev.draw_image(&img, image_ctm, 1.0, clip);
     }
 
     // MuPDF: pdf_lookup_resource (pdf-interpret.c:33), returning the *raw*

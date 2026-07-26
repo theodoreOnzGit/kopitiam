@@ -16,10 +16,10 @@
 //! [`run_page`](super::run_page) drives it straight away) and exposes the fuller
 //! MuPDF device surface -- [`fill_path`](DrawDevice::fill_path),
 //! [`stroke_path`](DrawDevice::stroke_path),
-//! [`draw_image`](DrawDevice::draw_image) -- as inherent methods a later
-//! interpreter wave (or the viewer) can call once the content interpreter emits
-//! path/colour/image operators (today it emits only glyphs; see
-//! [`interpret`](super::interpret)).
+//! [`draw_image`](DrawDevice::draw_image) -- both as inherent methods (for the
+//! viewer / direct callers) and as [`TextDevice`] callbacks the content
+//! interpreter now drives for path/colour/image operators (see
+//! [`interpret`](super::interpret) / [`op_run`](super::op_run)).
 //!
 //! Everything composes through the CTM (a [`Matrix`]) onto a device-space
 //! [`Pixmap`]; the working colourspace is **DeviceRGB** (gray and CMYK inputs are
@@ -37,9 +37,11 @@
 //! * **Invisible text.** The glyph sink has no render-mode, so `Tr 3/7`
 //!   (invisible, e.g. an OCR text layer over a scan) still paints a box. A future
 //!   render-mode-aware sink should suppress it.
-//! * **Colour.** The content interpreter does not emit colour operators yet, so
-//!   fills default to black; the colour plumbing (gray/RGB/CMYK -> RGB) is here
-//!   and correct, just not yet fed by the interpreter.
+//! * **Colour.** The content interpreter now emits colour operators (`g/rg/k`,
+//!   `cs/sc/scn`), tracked in the graphics state and converted to DeviceRGB
+//!   ([`resources`](super::resources)); fills/strokes and glyph boxes pick up the
+//!   fill colour. Separation/DeviceN and Indexed spaces are approximated (see
+//!   [`ColorSpace`](super::resources)); ICCBased maps by component count.
 //! * **Not implemented at all** (safe no-ops / skips, never corruption): mesh &
 //!   gradient shadings (`draw-mesh.c`), blend modes beyond Normal
 //!   (`draw-blend.c`), soft masks, clip masks beyond a rectangular clip,
@@ -49,7 +51,7 @@
 use super::draw_edge::{fill_polygons, FillRule};
 use super::draw_path::Path;
 use super::font::Font;
-use super::geometry::{IRect, Matrix, Point};
+use super::geometry::{IRect, Matrix, Point, Rect};
 use super::object::Object;
 use super::page_image::DecodedImage;
 use super::pixmap::Pixmap;
@@ -101,12 +103,19 @@ impl DrawDevice {
 
     // MuPDF: fz_draw_fill_path (draw-device.c:672).
     /// Fill `path` (path space) with `color` (DeviceRGB 0..=1) at `alpha`,
-    /// transformed by `ctm`, using the winding rule `rule`.
+    /// transformed by `ctm`, using the winding rule `rule`. Clipped to the whole
+    /// pixmap (use the [`TextDevice`] path for content-stream `W`/`W*` clipping).
     pub fn fill_path(&mut self, path: &Path, rule: FillRule, ctm: Matrix, color: [f32; 3], alpha: f32) {
+        let clip = self.clip;
+        self.fill_path_clipped(path, rule, ctm, color, alpha, clip);
+    }
+
+    /// [`fill_path`](DrawDevice::fill_path) with an explicit device-pixel clip.
+    fn fill_path_clipped(&mut self, path: &Path, rule: FillRule, ctm: Matrix, color: [f32; 3], alpha: f32, clip: IRect) {
         let m = ctm.concat(self.base);
         let polys = path.flatten(m);
         let c = rgb_to_bytes(color);
-        fill_polygons(&mut self.pix, &polys, rule, &c, alpha, self.clip);
+        fill_polygons(&mut self.pix, &polys, rule, &c, alpha, clip);
     }
 
     // MuPDF: fz_draw_stroke_path (draw-device.c:766).
@@ -114,12 +123,30 @@ impl DrawDevice {
     /// transformed by `ctm`. Uses the width-expansion approximation
     /// ([`Path::stroke_to_polygons`]).
     pub fn stroke_path(&mut self, path: &Path, ctm: Matrix, line_width: f32, color: [f32; 3], alpha: f32) {
+        let clip = self.clip;
+        self.stroke_path_clipped(path, ctm, line_width, color, alpha, clip);
+    }
+
+    /// [`stroke_path`](DrawDevice::stroke_path) with an explicit device-pixel clip.
+    fn stroke_path_clipped(&mut self, path: &Path, ctm: Matrix, line_width: f32, color: [f32; 3], alpha: f32, clip: IRect) {
         let m = ctm.concat(self.base);
         // Convert the path-space width to device pixels via the CTM expansion.
         let dev_w = line_width * m.max_expansion();
         let polys = path.stroke_to_polygons(m, dev_w);
         let c = rgb_to_bytes(color);
-        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, self.clip);
+        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, clip);
+    }
+
+    /// Resolve an optional content-space (pre-`base`) rectangular clip against the
+    /// device's own pixel clip. `None` leaves the device clip unchanged. A non-rect
+    /// clip is bbox-approximated upstream (see the interpreter's `W`/`W*`).
+    fn resolve_clip(&self, clip: Option<Rect>) -> IRect {
+        match clip {
+            None => self.clip,
+            // `base` is the device output transform (dpi scale); an axis-aligned
+            // scale keeps the transformed rect axis-aligned, so its bbox is exact.
+            Some(r) => self.clip.intersect(r.transform(self.base).irect_from_rect()),
+        }
     }
 
     // MuPDF: fz_draw_fill_image (draw-device.c) -> fz_paint_image_imp ->
@@ -129,6 +156,12 @@ impl DrawDevice {
     /// `[0,1]²` (fitz image space, with `(0,0)` top-left) onto the page. Nearest-
     /// neighbour sampling; grayscale (`components == 1`) is expanded to RGB.
     pub fn draw_image(&mut self, img: &DecodedImage, ctm: Matrix, alpha: f32) {
+        let clip = self.clip;
+        self.draw_image_clipped(img, ctm, alpha, clip);
+    }
+
+    /// [`draw_image`](DrawDevice::draw_image) with an explicit device-pixel clip.
+    fn draw_image_clipped(&mut self, img: &DecodedImage, ctm: Matrix, alpha: f32, clip: IRect) {
         if img.width == 0 || img.height == 0 || alpha <= 0.0 {
             return;
         }
@@ -154,7 +187,7 @@ impl DrawDevice {
         }
         let bounds = IRect::new(x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32)
             .intersect(self.pix.bbox())
-            .intersect(self.clip);
+            .intersect(clip);
         if bounds.is_empty() {
             return;
         }
@@ -210,6 +243,28 @@ impl TextDevice for DrawDevice {
         let polys = path.flatten(m);
         fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &self.fill, 1.0, self.clip);
     }
+
+    // The interpreter's path/colour/image operators drive these (see
+    // [`interpret`](super::interpret) / [`op_run`](super::op_run)); each forwards to
+    // the inherent painter with the content-space clip resolved to device pixels.
+    fn fill_path(&mut self, path: &Path, rule: FillRule, ctm: Matrix, color: [f32; 3], alpha: f32, clip: Option<Rect>) {
+        let ic = self.resolve_clip(clip);
+        self.fill_path_clipped(path, rule, ctm, color, alpha, ic);
+    }
+
+    fn stroke_path(&mut self, path: &Path, ctm: Matrix, line_width: f32, color: [f32; 3], alpha: f32, clip: Option<Rect>) {
+        let ic = self.resolve_clip(clip);
+        self.stroke_path_clipped(path, ctm, line_width, color, alpha, ic);
+    }
+
+    fn draw_image(&mut self, img: &DecodedImage, ctm: Matrix, alpha: f32, clip: Option<Rect>) {
+        let ic = self.resolve_clip(clip);
+        self.draw_image_clipped(img, ctm, alpha, ic);
+    }
+
+    fn set_fill_color(&mut self, color: [f32; 3]) {
+        self.fill = rgb_to_bytes(color);
+    }
 }
 
 /// Clamp a DeviceRGB float triple (0..=1) to bytes.
@@ -253,10 +308,10 @@ pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
 /// DeviceRGB [`Pixmap`]. The scale is `dpi / 72`.
 ///
 /// This is the public entry the terminal PDF viewer (`tdf-parity`) and the kmux
-/// LaTeX live-preview call. It drives the existing content interpreter
-/// ([`run_page`](super::run_page)) over a [`DrawDevice`]; today that emits glyph
-/// boxes (see the fidelity-ceiling note on [`DrawDevice`]). Path/image operators
-/// will paint once the interpreter forwards them.
+/// LaTeX live-preview call. It drives the content interpreter
+/// ([`run_page`](super::run_page)) over a [`DrawDevice`], which now paints vector
+/// fills/strokes, colour and images as well as placeholder glyph boxes (see the
+/// fidelity-ceiling note on [`DrawDevice`] -- glyph outlines remain pending).
 pub fn rasterize_page(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<Pixmap> {
     let scale = (dpi / 72.0).max(0.01);
     let page = doc.page(page_index)?.clone();
@@ -424,5 +479,145 @@ mod tests {
         assert_eq!(px, &[255, 0, 0], "image centre should be red");
         // Outside the mapped square stays white.
         assert_eq!(dev.pixmap().pixel(1, 1).unwrap(), &[255, 255, 255]);
+    }
+
+    // -- end-to-end: content-stream operators -> painted pixels --------------
+
+    /// Wrap content-stream operator bytes `ops` as a `/Length`-correct stream object.
+    fn content_stream(ops: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(format!("<< /Length {} >>\nstream\n", ops.len()).as_bytes());
+        v.extend_from_slice(ops);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+
+    /// A one-page (100x100) PDF whose content is `ops`, with an optional page
+    /// `/Resources` body and extra objects (numbered from 5).
+    fn op_doc(ops: &[u8], resources: &str, extra: &[&[u8]]) -> PdfDocument {
+        let content = content_stream(ops);
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources {resources} /Contents 4 0 R >>"
+        );
+        let mut bodies: Vec<&[u8]> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            page.as_bytes(),
+            &content,
+        ];
+        bodies.extend_from_slice(extra);
+        PdfDocument::open(build_pdf(&bodies)).unwrap()
+    }
+
+    #[test]
+    fn rasterize_fills_red_rectangle_via_interpreter() {
+        // `1 0 0 rg` -> red fill; `re f` fills the path-space (20,20)..(80,80) box.
+        let doc = op_doc(b"1 0 0 rg 20 20 60 60 re f", "<< >>", &[]);
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+
+        // Inside the rectangle: red (high R, low G/B) -- not the old default black.
+        let c = pix.pixel(50, 50).unwrap();
+        assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "centre should be red, got {c:?}");
+        // Outside the rectangle: still white.
+        assert_eq!(pix.pixel(5, 5).unwrap(), &[255, 255, 255], "margin not white");
+    }
+
+    #[test]
+    fn colour_operator_changes_fill_from_black() {
+        // The same geometry filled black (default) vs green must differ.
+        let black = op_doc(b"20 20 60 60 re f", "<< >>", &[]);
+        let green = op_doc(b"0 1 0 rg 20 20 60 60 re f", "<< >>", &[]);
+        let pb = rasterize_page(&black, 0, 72.0).unwrap();
+        let pg = rasterize_page(&green, 0, 72.0).unwrap();
+
+        let cb = pb.pixel(50, 50).unwrap();
+        let cg = pg.pixel(50, 50).unwrap();
+        assert!(cb.iter().all(|&v| v < 40), "default fill should be black, got {cb:?}");
+        assert!(cg[1] > 200 && cg[0] < 60 && cg[2] < 60, "rg fill should be green, got {cg:?}");
+        assert_ne!(cb, cg, "colour operator must change the output colour");
+    }
+
+    #[test]
+    fn rasterize_strokes_a_line() {
+        // A 2pt-wide horizontal line at path y=50 (device y=50 after the flip).
+        let doc = op_doc(b"2 w 10 50 m 90 50 l S", "<< >>", &[]);
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+
+        // On the line: dark pixels.
+        assert!(pix.luma(50, 50).unwrap() < 150, "stroke should darken the line");
+        assert!(pix.luma(30, 50).unwrap() < 150, "stroke should darken along the line");
+        // Well away from the line: white.
+        assert_eq!(pix.luma(50, 10).unwrap(), 255, "off-line pixel should be white");
+    }
+
+    #[test]
+    fn nonzero_vs_even_odd_differ_end_to_end() {
+        // A self-intersecting pentagram (5 vertices connected star-wise). Under the
+        // nonzero rule its central pentagon is filled (winding 2); under even-odd it
+        // is a hole. Routed through the interpreter's `f` vs `f*`.
+        let star = b"50 85 m 29.4 21.7 l 83.3 60.8 l 16.7 60.8 l 70.6 21.7 l ";
+        let mut nz_ops = star.to_vec();
+        nz_ops.extend_from_slice(b"f");
+        let mut eo_ops = star.to_vec();
+        eo_ops.extend_from_slice(b"f*");
+
+        let nz = rasterize_page(&op_doc(&nz_ops, "<< >>", &[]), 0, 72.0).unwrap();
+        let eo = rasterize_page(&op_doc(&eo_ops, "<< >>", &[]), 0, 72.0).unwrap();
+
+        // Centre pentagon: filled under nonzero, a hole under even-odd.
+        assert!(nz.luma(50, 50).unwrap() < 100, "nonzero centre should be filled");
+        assert!(eo.luma(50, 50).unwrap() > 200, "even-odd centre should be a hole");
+        // Even-odd still paints the five spikes -- it is not blank.
+        let eo_has_dark = (0..100).any(|y| (0..100).any(|x| eo.luma(x, y).unwrap() < 100));
+        assert!(eo_has_dark, "even-odd star should still paint its spikes");
+    }
+
+    #[test]
+    fn rasterize_paints_image_xobject_via_do() {
+        // A 4x4 solid-red raw DeviceRGB image, placed by `cm` on a 60x60 square at
+        // user (20,20) and painted with `Do`.
+        let pixels: Vec<u8> = std::iter::repeat_n([255u8, 0, 0], 16).flatten().collect();
+        let mut img: Vec<u8> = Vec::new();
+        img.extend_from_slice(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB \
+/BitsPerComponent 8 /Length {} >>\nstream\n",
+                pixels.len()
+            )
+            .as_bytes(),
+        );
+        img.extend_from_slice(&pixels);
+        img.extend_from_slice(b"\nendstream");
+
+        let doc = op_doc(
+            b"q 60 0 0 60 20 20 cm /Im0 Do Q",
+            "<< /XObject << /Im0 5 0 R >> >>",
+            &[&img],
+        );
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+
+        // The image covers device (20,20)..(80,80): its centre is red.
+        let c = pix.pixel(50, 50).unwrap();
+        assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "image centre should be red, got {c:?}");
+        // Outside the placement: white.
+        assert_eq!(pix.pixel(5, 5).unwrap(), &[255, 255, 255], "outside image not white");
+    }
+
+    #[test]
+    fn clip_confines_fill_via_interpreter() {
+        // A rectangular clip (`re W n`) to (40,40)..(60,60), then a full-page red
+        // fill: only the clipped window is painted.
+        let doc = op_doc(
+            b"40 40 20 20 re W n 1 0 0 rg 0 0 100 100 re f",
+            "<< >>",
+            &[],
+        );
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+
+        // Inside the clip window: red.
+        let c = pix.pixel(50, 50).unwrap();
+        assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "clip window should be red, got {c:?}");
+        // Outside the clip window (but inside the fill rect): unpainted white.
+        assert_eq!(pix.pixel(20, 20).unwrap(), &[255, 255, 255], "clip should mask the fill");
     }
 }

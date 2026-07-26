@@ -208,6 +208,16 @@ fn image_xobjects(doc: &PdfDocument, page: &Object) -> Result<Vec<(Object, Objec
 // Single-image decode
 // ---------------------------------------------------------------------------
 
+// MuPDF: pdf_load_image (pdf-image.c) as reached from `Do` in pdf_run_xobject.
+/// Decode an Image XObject named by a content-stream `Do`, given its resolved
+/// dict and the indirect reference to its stream. The crate-visible entry the
+/// content interpreter ([`Processor::op_do`](super::interpret::Processor)) uses to
+/// paint image XObjects; a deferred codec / colorspace returns an error the caller
+/// treats as a safe skip.
+pub(crate) fn decode_image_xobject(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result<DecodedImage> {
+    decode_image(doc, dict, stream_ref)
+}
+
 // MuPDF: pdf_load_image_imp (pdf-image.c:33).
 /// Decode one Image XObject to a [`DecodedImage`].
 fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result<DecodedImage> {

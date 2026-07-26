@@ -34,8 +34,11 @@
 //! this trait exposes only the glyph sink (plus an image hook kept as a
 //! documented no-op default for a later wave).
 
+use super::draw_edge::FillRule;
+use super::draw_path::Path;
 use super::font::Font;
-use super::geometry::Matrix;
+use super::geometry::{Matrix, Rect};
+use super::page_image::DecodedImage;
 
 /// The sink the content-stream interpreter emits positioned glyphs to.
 ///
@@ -65,10 +68,45 @@ pub trait TextDevice {
     /// * `wmode` -- writing mode: 0 = horizontal, 1 = vertical.
     fn show_glyph(&mut self, font: &Font, trm: Matrix, adv: f32, unicode: char, cid: u32, wmode: u8);
 
-    // MuPDF: fz_fill_image / op_Do_image (pdf-op-run.c). Not on the text path.
-    /// Emit an image (an XObject `/Image` or inline `BI` image). Images are **not**
-    /// on the text-extraction path, so the interpreter never calls this yet and the
-    /// default is a no-op; the hook exists so a later (image) wave can extend the
-    /// same sink without breaking existing implementors.
-    fn fill_image(&mut self) {}
+    // MuPDF: the fz_device fill_path callback (fz_fill_path -> dev->fill_path,
+    // device.h). Wired by the content interpreter's path-painting operators.
+    /// Fill `path` (path space) with `color` (DeviceRGB 0..=1) at `alpha`, under
+    /// `ctm`, using winding rule `rule`. `clip` is an optional device-space (before
+    /// any device output transform) rectangular clip from `W`/`W*`. Default no-op:
+    /// the extraction sinks ignore vector fills.
+    fn fill_path(
+        &mut self,
+        _path: &Path,
+        _rule: FillRule,
+        _ctm: Matrix,
+        _color: [f32; 3],
+        _alpha: f32,
+        _clip: Option<Rect>,
+    ) {
+    }
+
+    // MuPDF: the fz_device stroke_path callback (fz_stroke_path -> dev->stroke_path).
+    /// Stroke `path` with `color` at `alpha`, `line_width` in *path* units, under
+    /// `ctm`, honouring an optional rectangular `clip`. Default no-op.
+    fn stroke_path(
+        &mut self,
+        _path: &Path,
+        _ctm: Matrix,
+        _line_width: f32,
+        _color: [f32; 3],
+        _alpha: f32,
+        _clip: Option<Rect>,
+    ) {
+    }
+
+    // MuPDF: the fz_device fill_image callback (fz_fill_image -> dev->fill_image).
+    /// Paint the decoded image `img` under `ctm` (which maps the fitz image unit
+    /// square onto the page) at `alpha`, honouring an optional rectangular `clip`.
+    /// Default no-op: extraction sinks handle images out of band.
+    fn draw_image(&mut self, _img: &DecodedImage, _ctm: Matrix, _alpha: f32, _clip: Option<Rect>) {}
+
+    // MuPDF: the fill material of pdf_gstate carried into fz_fill_text.
+    /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph
+    /// boxes pick up the content stream's fill colour; extraction sinks ignore it.
+    fn set_fill_color(&mut self, _color: [f32; 3]) {}
 }

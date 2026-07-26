@@ -31,25 +31,35 @@
 //! [`super::page_run`] (`pdf-page.c` / `pdf-run.c` / `pdf-xobject.c`). They share
 //! this [`Processor`] via additional `impl` blocks.
 //!
-//! ## Deferred (parsed-and-ignored so the stream still runs)
+//! ## Wired to the draw device (rasterisation)
 //!
-//! Path construction/painting (`m l c v y h re S s f B b n`), clipping (`W W*`),
-//! colour (`CS cs SC sc SCN scn G g RG rg K k`), Type3 glyph metrics (`d0 d1`),
-//! shadings (`sh`), the ExtGState body (`gs`), marked content (`MP DP BMC BDC
-//! EMC`) and the compatibility bracket (`BX EX`) are all recognised and skipped;
-//! their operands are consumed so the operator stream stays in sync. Inline
-//! images (`BI … ID … EI`) are skipped as a raw byte span (see
-//! [`Processor::skip_inline_image`]) -- a best-effort resync, not a decode.
+//! Path construction/painting (`m l c v y h re S s f f* B B* b b* n`),
+//! rectangular clipping (`W W*`), fill/stroke colour (`g G rg RG k K cs CS sc SC
+//! scn SCN`), the line width (`w`) and image/form XObjects (`Do`) now drive the
+//! [`DrawDevice`](super::draw_device) via the [`TextDevice`] sink's path/colour/
+//! image callbacks. Colour is tracked in the graphics state and converted to
+//! DeviceRGB; see [`super::op_run`] and [`super::resources`].
+//!
+//! ## Still deferred (parsed-and-ignored so the stream still runs)
+//!
+//! Type3 glyph metrics (`d0 d1`), shadings (`sh`), the ExtGState body (`gs`),
+//! marked content (`MP DP BMC BDC EMC`) and the compatibility bracket (`BX EX`)
+//! are recognised and skipped; their operands are consumed so the operator stream
+//! stays in sync. Inline images (`BI … ID … EI`) are skipped as a raw byte span
+//! (see [`Processor::skip_inline_image`]) -- a best-effort resync, not a decode.
 //! Render modes 3 and 7 ("invisible") still emit glyphs: extraction needs them.
 
 use std::collections::HashMap;
 
+use super::draw_edge::FillRule;
+use super::draw_path::Path;
 use super::error::Result;
 use super::font::Font;
-use super::geometry::Matrix;
+use super::geometry::{Matrix, Point, Rect};
 use super::lex::{lex, Token};
 use super::object::Object;
 use super::parse::{parse_array, parse_dict};
+use super::resources::ColorSpace;
 use super::stream::Stream;
 use super::text_device::TextDevice;
 use super::xref::PdfDocument;
@@ -95,21 +105,49 @@ impl Default for TextState {
 
 /// The graphics state slice the text path needs: the CTM and the text state.
 ///
-/// MuPDF's `pdf_gstate` also carries fill/stroke material, stroke state, blend
-/// mode and soft masks; none affect glyph *positioning or identity*, so they are
-/// dropped here (colours/blends are deferred). This is what `q`/`Q` push/pop.
-// MuPDF: struct pdf_gstate (pdf-op-run.c, gstate.h) reduced to the text path.
+/// MuPDF's `pdf_gstate` also carries stroke state, blend mode and soft masks;
+/// those beyond the fill/stroke material don't affect this port's output, so they
+/// are dropped (blends/soft-masks deferred). The fill/stroke **colour**, current
+/// **colourspace**, **line width** and the rectangular **clip** are carried here
+/// (all `q`/`Q` push/pop) now that the draw device paints. This is what `q`/`Q`
+/// push/pop.
+// MuPDF: struct pdf_gstate (pdf-op-run.c, gstate.h) reduced to the drawn path.
 #[derive(Clone)]
 pub(crate) struct GState {
     /// The current transformation matrix (device space).
     pub ctm: Matrix,
     /// The text state (`Tc`/`Tw`/`Tz`/`TL`/`Tf`/`Tr`/`Ts`).
     pub text: TextState,
+    /// The fill colour, already converted to DeviceRGB (0..=1). Default black.
+    pub fill_color: [f32; 3],
+    /// The stroke colour, DeviceRGB (0..=1). Default black.
+    pub stroke_color: [f32; 3],
+    /// The fill colourspace (`cs`), for interpreting `sc`/`scn` operands.
+    pub fill_cs: ColorSpace,
+    /// The stroke colourspace (`CS`), for interpreting `SC`/`SCN` operands.
+    pub stroke_cs: ColorSpace,
+    /// The line width (`w`), in path-space units. Default 1.0.
+    pub line_width: f32,
+    /// The current rectangular clip (`W`/`W*`), in device space *before* the
+    /// device's own output transform. `None` = unclipped. Non-rect clips are
+    /// bbox-approximated (see [`Processor::end_path`]).
+    pub clip: Option<Rect>,
 }
 
 impl GState {
+    // MuPDF: pdf_init_gstate (pdf-op-run.c:1672) -- fill/stroke default to black
+    // DeviceGray, line width 1, no clip.
     fn new(ctm: Matrix) -> GState {
-        GState { ctm, text: TextState::default() }
+        GState {
+            ctm,
+            text: TextState::default(),
+            fill_color: [0.0, 0.0, 0.0],
+            stroke_color: [0.0, 0.0, 0.0],
+            fill_cs: ColorSpace::Gray,
+            stroke_cs: ColorSpace::Gray,
+            line_width: 1.0,
+            clip: None,
+        }
     }
 }
 
@@ -214,6 +252,16 @@ pub struct Processor<'a, D: TextDevice + ?Sized> {
     /// Object numbers of Form XObjects currently being run -- the recursion guard
     /// (`pdf_cycle` in pdf-xobject.c). Depth-bounded as a belt-and-braces guard.
     pub(crate) cycle: Vec<i32>,
+    /// The path being constructed by `m`/`l`/`c`/`v`/`y`/`re`/`h`, painted (and
+    /// cleared) by `f`/`S`/`B`/`n`/… (MuPDF's `csi->path`).
+    pub(crate) path: Path,
+    /// The current point (path space), for the `v`/`y` bezier shorthands and `h`.
+    pub(crate) cur: Point,
+    /// The start of the current sub-path, restored as the current point by `h`.
+    pub(crate) subpath_start: Point,
+    /// A pending clip requested by `W`/`W*`; applied (with its winding rule) by the
+    /// next path-painting operator (MuPDF's `csi->clip` / `clip_even_odd`).
+    pub(crate) pending_clip: Option<FillRule>,
 }
 
 impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
@@ -229,6 +277,10 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             resources: vec![resources],
             fonts: HashMap::new(),
             cycle: Vec::new(),
+            path: Path::new(),
+            cur: Point::new(0.0, 0.0),
+            subpath_start: Point::new(0.0, 0.0),
+            pending_clip: None,
         }
     }
 
@@ -379,7 +431,46 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
                 }
             }
 
-            // -- XObjects (Form recursion; images deferred) ----------------
+            // -- path construction -----------------------------------------
+            b"m" => self.op_moveto(s(0), s(1)),
+            b"l" => self.op_lineto(s(0), s(1)),
+            b"c" => self.op_curveto(s(0), s(1), s(2), s(3), s(4), s(5)),
+            b"v" => self.op_curveto_v(s(0), s(1), s(2), s(3)),
+            b"y" => self.op_curveto_y(s(0), s(1), s(2), s(3)),
+            b"re" => self.op_re(s(0), s(1), s(2), s(3)),
+            b"h" => self.op_closepath(),
+
+            // -- path painting (fill / stroke / clip / end) ----------------
+            b"S" => self.op_paint(false, false, FillRule::NonZero, true),
+            b"s" => self.op_paint(true, false, FillRule::NonZero, true),
+            b"f" | b"F" => self.op_paint(false, true, FillRule::NonZero, false),
+            b"f*" => self.op_paint(false, true, FillRule::EvenOdd, false),
+            b"B" => self.op_paint(false, true, FillRule::NonZero, true),
+            b"B*" => self.op_paint(false, true, FillRule::EvenOdd, true),
+            b"b" => self.op_paint(true, true, FillRule::NonZero, true),
+            b"b*" => self.op_paint(true, true, FillRule::EvenOdd, true),
+            b"n" => self.op_paint(false, false, FillRule::NonZero, false),
+
+            // -- clipping (the pending clip is applied by the next paint) ---
+            b"W" => self.pending_clip = Some(FillRule::NonZero),
+            b"W*" => self.pending_clip = Some(FillRule::EvenOdd),
+
+            // -- stroke state ----------------------------------------------
+            b"w" => self.gstate_mut().line_width = s(0),
+
+            // -- colour ----------------------------------------------------
+            b"g" => self.op_set_gray(s(0), true),
+            b"G" => self.op_set_gray(s(0), false),
+            b"rg" => self.op_set_rgb(s(0), s(1), s(2), true),
+            b"RG" => self.op_set_rgb(s(0), s(1), s(2), false),
+            b"k" => self.op_set_cmyk(s(0), s(1), s(2), s(3), true),
+            b"K" => self.op_set_cmyk(s(0), s(1), s(2), s(3), false),
+            b"cs" => self.op_set_colorspace(name.as_deref(), true),
+            b"CS" => self.op_set_colorspace(name.as_deref(), false),
+            b"sc" | b"scn" => self.op_set_color(stack, name.is_some(), true),
+            b"SC" | b"SCN" => self.op_set_color(stack, name.is_some(), false),
+
+            // -- XObjects (Form recursion + Image painting) ----------------
             b"Do" => self.op_do(name.as_deref())?,
 
             // -- inline images: skip the BI … ID <binary> EI span ----------
