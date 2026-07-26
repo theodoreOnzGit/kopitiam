@@ -7,11 +7,15 @@
 //! (or a different interface) can resume.
 
 mod conclusion;
+mod digest;
 mod state;
 mod translation_memory;
 
 pub use conclusion::{
     Conclusion, ConclusionLog, SourceDrift, SourceHash, StaleConclusion, content_hash,
+};
+pub use digest::{
+    ArchitectureDigest, CrateDigest, build_digest, run_cargo_metadata, source_hash,
 };
 pub use state::{ProjectState, WORKING_SET_CAPACITY};
 pub use translation_memory::{
