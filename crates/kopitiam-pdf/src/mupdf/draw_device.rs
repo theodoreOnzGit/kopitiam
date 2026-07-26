@@ -224,22 +224,40 @@ impl DrawDevice {
 // with no outline source, reduced to the advance-box placeholder (see the module
 // header's fidelity-ceiling note).
 impl TextDevice for DrawDevice {
-    fn show_glyph(&mut self, font: &Font, trm: Matrix, adv: f32, unicode: char, _cid: u32, _wmode: u8) {
+    fn show_glyph(&mut self, font: &Font, trm: Matrix, adv: f32, unicode: char, cid: u32, _wmode: u8) {
         // Whitespace and zero-width glyphs paint nothing (keeps inter-word gaps).
         if adv <= 0.0 || unicode.is_whitespace() {
             return;
         }
-        // TODO(draw): fill the real glyph outline. No outline source exists in
-        // this port (font.rs is FreeType-free), so paint the glyph's advance box:
-        // a legible block at the correct position/size, inset so adjacent glyphs
-        // stay visually distinct and lines do not merge vertically.
+
+        let m = trm.concat(self.base);
+
+        // Preferred path: fill the glyph's real outline from the embedded font
+        // program (TrueType `glyf` / CFF Type2). The outline is in em space
+        // (y-up, 1 em = 1.0), exactly the space `trm` maps -- the same space the
+        // advance-box fallback below uses. `glyph_outline` returns `None` for a
+        // non-embedded / undecodable font or an empty glyph, in which case we fall
+        // back to the advance box (never a panic, never a solid block over a real
+        // letterform).
+        if let Some(path) = font.glyph_outline(cid) {
+            let polys = path.flatten(m);
+            // Nonzero winding: a glyph's counter (the hole in 'o'/'A') is wound
+            // opposite its outer contour, so nonzero leaves it unfilled -- the
+            // interior white that distinguishes a real letterform from the box.
+            fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &self.fill, 1.0, self.clip);
+            return;
+        }
+
+        // Fallback: no decodable outline, so paint the glyph's advance box -- a
+        // legible block at the correct position/size, inset so adjacent glyphs
+        // stay visually distinct and lines do not merge vertically. TODO(glyph):
+        // Type1 (`/FontFile`) and predefined-encoding simple CFF still land here.
         let asc = font.ascender().min(0.9); // ~cap height mass
         let x0 = adv * 0.08;
         let x1 = adv * 0.92;
         let mut path = Path::new();
         path.rect(x0, 0.0, x1, asc);
 
-        let m = trm.concat(self.base);
         let polys = path.flatten(m);
         fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &self.fill, 1.0, self.clip);
     }
@@ -619,5 +637,64 @@ mod tests {
         assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "clip window should be red, got {c:?}");
         // Outside the clip window (but inside the fill rect): unpainted white.
         assert_eq!(pix.pixel(20, 20).unwrap(), &[255, 255, 255], "clip should mask the fill");
+    }
+
+    // -- end-to-end: embedded-font glyph OUTLINES (not the advance box) --------
+
+    /// Wrap raw font-program bytes as a `/FontFile2` stream object.
+    fn fontfile2_body(ttf: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(format!("<< /Length {} /Length1 {} >>\nstream\n", ttf.len(), ttf.len()).as_bytes());
+        v.extend_from_slice(ttf);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+
+    #[test]
+    fn embedded_truetype_renders_letterform_with_interior_white() {
+        // A simple TrueType font whose one glyph (code 0x41) is a ring: an outer
+        // square with an oppositely-wound inner square, so a correct nonzero fill
+        // leaves the centre a HOLE. This is the acceptance discriminator: the
+        // advance-box fallback would fill the centre solid; a real outline does not.
+        let ttf = super::super::glyph_truetype::ring_font();
+        let font = b"<< /Type /Font /Subtype /TrueType /BaseFont /Ring \
+/FirstChar 65 /LastChar 65 /Widths [1000] /FontDescriptor 6 0 R >>";
+        let descriptor = b"<< /Type /FontDescriptor /FontName /Ring /Flags 4 /FontFile2 7 0 R >>";
+        let content = b"<< /Length 32 >>\nstream\nBT /F1 150 Tf 20 30 Td (A) Tj ET\nendstream";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>";
+        let ff = fontfile2_body(&ttf);
+        let bodies: [&[u8]; 7] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            page,
+            content,
+            font,
+            descriptor,
+            &ff,
+        ];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+
+        // The glyph outer ring spans device ~(35,35)-(155,155); its counter (hole)
+        // spans device ~(65,65)-(125,125). Centre of the hole must stay WHITE --
+        // the real letterform's interior, impossible under the solid advance box.
+        assert!(pix.luma(95, 95).unwrap() > 200, "glyph counter should be white (interior), got {}", pix.luma(95, 95).unwrap());
+        // The ring wall (left of the hole) must be painted dark.
+        assert!(pix.luma(40, 95).unwrap() < 120, "ring wall should be dark, got {}", pix.luma(40, 95).unwrap());
+        // Sanity: the page is not blank.
+        let any_dark = (0..200).any(|y| (0..200).any(|x| pix.luma(x, y).unwrap() < 100));
+        assert!(any_dark, "glyph should paint some dark pixels");
+    }
+
+    #[test]
+    fn non_embedded_font_falls_back_to_filled_box() {
+        // A standard-14 font with NO embedded program: show_glyph must fall back to
+        // the advance box (a solid block), never panic. The centre is filled.
+        let doc = text_page_doc(); // Helvetica, no FontFile
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        // "HELLO" at size 24 near the top-left paints solid blocks (no outlines).
+        let any_dark = (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 100));
+        assert!(any_dark, "advance-box fallback should still paint text");
     }
 }

@@ -50,10 +50,25 @@
 
 use super::agl::{unicode_from_glyph_name, REPLACEMENT_CHARACTER};
 use super::cmap::{self, CMap};
+use super::draw_path::Path;
 use super::encodings::BaseEncoding;
 use super::error::Result;
+use super::glyph::FontProgram;
 use super::object::Object;
 use super::xref::PdfDocument;
+use std::sync::Arc;
+
+/// How a CID maps to a glyph index (GID) for CIDFontType2 (TrueType) descendants.
+/// `CIDFontType0` (CFF) fonts select through the CFF charset instead (see
+/// [`FontProgram`]); this is the `/CIDToGIDMap` of the descendant CID font.
+// MuPDF: pdf_load_font_descriptor's cid_to_gid handling (pdf-font.c:1230).
+#[derive(Clone, Debug)]
+enum CidToGid {
+    /// `/CIDToGIDMap /Identity`: `gid == cid`.
+    Identity,
+    /// `/CIDToGIDMap` stream: `gid = table[cid]` (2 bytes big-endian per CID).
+    Table(Vec<u16>),
+}
 
 /// One horizontal-metrics entry: codes/CIDs in `lo..=hi` advance by `w` (in
 /// 1/1000 em). Mirrors `pdf_hmtx`.
@@ -100,6 +115,18 @@ pub struct Font {
     /// Default advance for CIDs outside every `hmtx` range (`/MissingWidth` for
     /// simple fonts, `/DW` -- default 1000 -- for CID fonts).
     dhmtx_w: i32,
+    /// The decoded embedded font program (glyph outlines), when the descriptor
+    /// embeds a decodable `/FontFile2` (TrueType) or `/FontFile3` (CFF/OpenType).
+    /// `None` for non-embedded / Type1 / undecodable programs -- the draw device
+    /// then keeps its advance-box fallback. Shared (`Arc`) across the font's
+    /// clones so the font cache does not duplicate the program bytes.
+    program: Option<Arc<FontProgram>>,
+    /// `true` for a Type0/CID font (glyph selection is by CID via the charset /
+    /// `/CIDToGIDMap`); `false` for a simple font (selection is by character code
+    /// through the embedded font's cmap / CFF encoding).
+    is_cid: bool,
+    /// The CIDFontType2 `/CIDToGIDMap` (CID fonts only; `Identity` otherwise).
+    cid_to_gid: CidToGid,
 }
 
 impl Font {
@@ -184,6 +211,11 @@ impl Font {
             wmode: 0,
             hmtx: Vec::new(),
             dhmtx_w: missing_width,
+            // The embedded font program (glyph outlines); simple fonts select by
+            // code through the program's own cmap / CFF encoding.
+            program: load_font_program(doc, &descriptor),
+            is_cid: false,
+            cid_to_gid: CidToGid::Identity,
         };
 
         // cid_to_ucs from the glyph names (pdf_load_to_unicode's `strings` path).
@@ -252,6 +284,12 @@ impl Font {
 
         let wmode = encoding.wmode();
 
+        // The embedded font program lives on the descendant CID font's descriptor;
+        // CIDFontType2 additionally carries a /CIDToGIDMap (CID -> GID).
+        let descriptor = doc.resolve_get(&dfont, "FontDescriptor")?;
+        let program = load_font_program(doc, &descriptor);
+        let cid_to_gid = load_cid_to_gid(doc, &dfont);
+
         let mut font = Font {
             encoding,
             to_unicode: None,
@@ -259,6 +297,9 @@ impl Font {
             wmode,
             hmtx: Vec::new(),
             dhmtx_w: 1000,
+            program,
+            is_cid: true,
+            cid_to_gid,
         };
 
         // /ToUnicode, remapped from code->Unicode to CID->Unicode.
@@ -380,6 +421,65 @@ impl Font {
         -0.2
     }
 
+    // MuPDF: fz_outline_glyph (font.c:1870) -- FreeType loads the glyph outline
+    // for `gid`; here the pure-Rust decoders ([`FontProgram`]) do, and the caller
+    // ([`show_glyph`](super::draw_device)) applies the text-rendering matrix.
+    /// The vector outline of the glyph that character/CID `cid` selects, in **em
+    /// space** (y-up, 1 em = 1.0), or `None` when there is no decodable embedded
+    /// program, the glyph is empty (e.g. space), or selection fails. A `None`
+    /// return is the signal to fall back to the advance box.
+    ///
+    /// `cid` is what [`Font::decode`] returns: the character *code* for a simple
+    /// font (selected through the embedded cmap / CFF encoding) or the *CID* for a
+    /// Type0 font (selected through `/CIDToGIDMap` or the CFF charset).
+    pub fn glyph_outline(&self, cid: u32) -> Option<Path> {
+        let program = self.program.as_ref()?;
+        let gid = self.select_gid(cid, program);
+        program.outline(gid)
+    }
+
+    /// Resolve the glyph index (GID) for `cid` against the embedded `program`,
+    /// per the font's kind (simple vs CID) and glyph-selection rules.
+    fn select_gid(&self, cid: u32, program: &FontProgram) -> u16 {
+        match program {
+            FontProgram::TrueType(ttf) => {
+                if self.is_cid {
+                    // CIDFontType2: /CIDToGIDMap.
+                    self.map_cid_to_gid(cid)
+                } else {
+                    // Simple TrueType: code -> GID via the embedded cmap, falling
+                    // back to identity when the font has no usable cmap.
+                    ttf.gid_for_code(cid).unwrap_or(cid as u16)
+                }
+            }
+            FontProgram::Cff(cff) => {
+                if self.is_cid {
+                    if cff.is_cid_keyed() {
+                        // CIDFontType0 CID-keyed CFF: charset maps CID -> GID.
+                        cff.gid_for_cid(cid)
+                    } else {
+                        // Non-CID CFF wrapped as CIDFontType0: /CIDToGIDMap (usually
+                        // Identity).
+                        self.map_cid_to_gid(cid)
+                    }
+                } else {
+                    // Simple CFF (Type1C): code -> GID via the custom CFF Encoding;
+                    // predefined-encoding CFF falls back to identity (see the CFF
+                    // module's documented ceiling).
+                    cff.gid_for_code(cid).unwrap_or(cid as u16)
+                }
+            }
+        }
+    }
+
+    /// Apply the CIDFontType2 `/CIDToGIDMap` to `cid`.
+    fn map_cid_to_gid(&self, cid: u32) -> u16 {
+        match &self.cid_to_gid {
+            CidToGid::Identity => cid as u16,
+            CidToGid::Table(t) => t.get(cid as usize).copied().unwrap_or(0),
+        }
+    }
+
     // MuPDF: pdf_decode_cmap over fontdesc->encoding (pdf-op-run.c:1577).
     /// Split the front of `buf` into one character code, returning
     /// `(code, bytes_consumed)`. Use this to iterate a PDF string's codes (1- or
@@ -499,6 +599,48 @@ fn has_font_file(descriptor: &Object) -> bool {
     descriptor.dict_gets("FontFile").is_some()
         || descriptor.dict_gets("FontFile2").is_some()
         || descriptor.dict_gets("FontFile3").is_some()
+}
+
+// MuPDF: pdf_load_font_descriptor -> fz_new_font_from_buffer over the embedded
+// /FontFile* stream (pdf-font.c). MuPDF hands the bytes to FreeType; this port
+// hands them to the pure-Rust [`FontProgram`] outline decoders.
+/// Decode the embedded font program from `descriptor` (`/FontFile2` = TrueType,
+/// `/FontFile3` = CFF/OpenType; `/FontFile` = Type1, not decoded this wave).
+/// Returns `None` when no decodable program is embedded (the draw device then
+/// keeps its advance-box fallback). Never fails the font load.
+fn load_font_program(doc: &PdfDocument, descriptor: &Object) -> Option<Arc<FontProgram>> {
+    // FontFile2 (TrueType) and FontFile3 (CFF/OpenType) are decoded; FontFile
+    // (Type1) is tried last and currently returns None (see FontProgram::parse).
+    for key in ["FontFile2", "FontFile3", "FontFile"] {
+        let Some(obj) = descriptor.dict_gets(key) else { continue };
+        let Ok(bytes) = doc.open_stream(obj) else { continue };
+        if let Some(prog) = FontProgram::parse(&bytes) {
+            return Some(Arc::new(prog));
+        }
+    }
+    None
+}
+
+// MuPDF: the /CIDToGIDMap branch of load_cid_font (pdf-font.c:1230).
+/// Load the descendant CID font's `/CIDToGIDMap`: `/Identity` (or absent) ->
+/// [`CidToGid::Identity`]; a stream -> a `cid -> gid` table (2 bytes big-endian
+/// per CID). A malformed stream degrades to `Identity` rather than failing.
+fn load_cid_to_gid(doc: &PdfDocument, dfont: &Object) -> CidToGid {
+    // A name (/Identity) or a missing entry means gid == cid; only an indirect
+    // stream reference carries an explicit table.
+    match dfont.dict_gets("CIDToGIDMap") {
+        Some(raw @ Object::Ref { .. }) => match doc.open_stream(raw) {
+            Ok(bytes) => {
+                let mut table = Vec::with_capacity(bytes.len() / 2);
+                for pair in bytes.chunks_exact(2) {
+                    table.push(((pair[0] as u16) << 8) | pair[1] as u16);
+                }
+                CidToGid::Table(table)
+            }
+            Err(_) => CidToGid::Identity,
+        },
+        _ => CidToGid::Identity,
+    }
 }
 
 /// Resolve `obj` against `doc` if it is an indirect reference, else clone it.
@@ -663,6 +805,9 @@ endcmap\nend\nend";
             wmode: 0,
             hmtx: Vec::new(),
             dhmtx_w: 500,
+            program: None,
+            is_cid: false,
+            cid_to_gid: CidToGid::Identity,
         };
         let d = font.decode(0x41);
         assert_eq!(d.unicode, '\u{FFFD}');
