@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use rmux_client::{connect_or_absent, ConnectResult};
-use rmux_core::{
+use kmux::client::{connect_or_absent, ConnectResult};
+use kmux::core::{
     formats::{render_template, FormatContext},
     key_code_lookup_bits, key_string_lookup_string, KeyBindingDisplay, KeyBindingSortOrder,
     KeyBindingStore, KEYC_NONE, KEYC_UNKNOWN, LIST_KEYS_TEMPLATE,
 };
-use rmux_proto::{
+use kmux::proto::{
     BindKeyRequest, CommandOutput, ListKeysRequest, SendKeysExt2Request, SendKeysExtRequest,
     UnbindKeyRequest,
 };

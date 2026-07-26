@@ -2,7 +2,7 @@ use std::env;
 use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use rmux_proto::WebShareCreatedResponse;
+use kmux::proto::WebShareCreatedResponse;
 
 use super::{DEFAULT_WIDTH, OSC8_URL_LABEL_WIDTH};
 
@@ -28,7 +28,7 @@ impl OutputStyle {
             return Self::Plain;
         }
 
-        if rmux_os::terminal::enable_virtual_terminal_output() {
+        if kmux::os::terminal::enable_virtual_terminal_output() {
             Self::Ansi
         } else {
             Self::Plain
@@ -75,7 +75,7 @@ impl LinkMode {
 }
 
 pub(super) fn terminal_width() -> u16 {
-    rmux_os::terminal::current_size()
+    kmux::os::terminal::current_size()
         .map(|size| size.cols)
         .or_else(|| {
             env::var("COLUMNS")

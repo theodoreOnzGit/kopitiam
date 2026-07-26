@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use rmux_client::{connect, ClientError, Connection};
-use rmux_proto::{CommandOutput, PaneTarget, ResolveTargetType, Response, RmuxError, Target};
+use kmux::client::{connect, ClientError, Connection};
+use kmux::proto::{CommandOutput, PaneTarget, ResolveTargetType, Response, RmuxError, Target};
 
 use crate::cli_response::{expect_command_output, expect_command_success, response_name};
 
@@ -358,8 +358,8 @@ pub(super) fn write_lines_output(lines: &[String]) -> Result<i32, ExitFailure> {
 
 #[cfg(test)]
 mod tests {
-    use rmux_client::ClientError;
-    use rmux_proto::{ErrorResponse, Response, RmuxError};
+    use kmux::client::ClientError;
+    use kmux::proto::{ErrorResponse, Response, RmuxError};
 
     use super::{capture_target_action_needs_legacy_retry, target_action_needs_legacy_retry};
 

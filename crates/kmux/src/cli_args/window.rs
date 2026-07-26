@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::RotateWindowDirection;
+use kmux::proto::RotateWindowDirection;
 
 use super::{parse_command_args, parse_target_spec, QueuedCommand, TargetSpec};
 

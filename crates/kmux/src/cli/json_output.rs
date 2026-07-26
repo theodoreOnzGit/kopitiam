@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind, Write};
 
-use rmux_core::formats::is_truthy;
-use rmux_proto::{CommandOutput, ListClientsResponse, ListWindowsResponse};
+use kmux::core::formats::is_truthy;
+use kmux::proto::{CommandOutput, ListClientsResponse, ListWindowsResponse};
 use serde_json::{json, Map, Value};
 
 use super::ExitFailure;

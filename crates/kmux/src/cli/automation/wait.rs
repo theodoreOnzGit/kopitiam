@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rmux_client::Connection;
-use rmux_proto::{
+use kmux::client::Connection;
+use kmux::proto::{
     ErrorResponse, ListClientsRequest, PaneOutputSubscriptionId, PaneOutputSubscriptionStart,
     PaneTarget, PaneTargetRef, ResolveTargetType, Response, SendKeysExt2Request,
     SendKeysExtRequest, Target,

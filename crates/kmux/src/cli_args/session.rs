@@ -1,5 +1,5 @@
 use clap::{ArgAction, Args};
-use rmux_proto::SessionName;
+use kmux::proto::SessionName;
 
 use super::{parse_session_name, parse_target_spec, TargetSpec};
 

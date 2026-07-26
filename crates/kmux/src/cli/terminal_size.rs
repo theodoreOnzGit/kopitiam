@@ -1,4 +1,4 @@
-use rmux_proto::TerminalSize;
+use kmux::proto::TerminalSize;
 
 const DEFAULT_SESSION_COLS: u16 = 80;
 const DEFAULT_SESSION_ROWS: u16 = 24;
@@ -14,5 +14,5 @@ pub(super) fn build_terminal_size(cols: Option<u16>, rows: Option<u16>) -> Optio
 }
 
 pub(super) fn current_terminal_size() -> Option<TerminalSize> {
-    rmux_os::terminal::current_size()
+    kmux::os::terminal::current_size()
 }

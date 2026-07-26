@@ -8,7 +8,7 @@ fn split_window_defaults_to_vertical_direction_when_unspecified() {
         super::super::Command::SplitWindow(args) => {
             assert!(!args.horizontal);
             assert!(!args.vertical);
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Vertical);
+            assert_eq!(args.direction(), kmux::proto::SplitDirection::Vertical);
         }
         _ => panic!("expected SplitWindow command"),
     }
@@ -77,7 +77,7 @@ fn split_window_accepts_horizontal_direction() {
         super::super::Command::SplitWindow(args) => {
             assert!(args.horizontal);
             assert!(!args.vertical);
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.direction(), kmux::proto::SplitDirection::Horizontal);
         }
         _ => panic!("expected SplitWindow command"),
     }
@@ -94,7 +94,7 @@ fn split_window_direction_flags_follow_tmux_priority() {
             super::super::Command::SplitWindow(args) => {
                 assert!(matches!(
                     args.direction(),
-                    rmux_proto::SplitDirection::Horizontal
+                    kmux::proto::SplitDirection::Horizontal
                 ));
             }
             _ => panic!("expected SplitWindow command"),
@@ -107,7 +107,7 @@ fn split_window_attached_cluster_values_preserve_target_and_size() {
     let cli = parse_args(&["split-window", "-htalpha:0", "sleep", "1"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::SplitWindow(args) => {
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.direction(), kmux::proto::SplitDirection::Horizontal);
             assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:0");
             assert_eq!(args.command, ["sleep".to_owned(), "1".to_owned()]);
         }
@@ -117,7 +117,7 @@ fn split_window_attached_cluster_values_preserve_target_and_size() {
     let cells = parse_args(&["split-window", "-hl10", "-t", "alpha"]).unwrap();
     match cells.command.expect("parsed command") {
         super::super::Command::SplitWindow(args) => {
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.direction(), kmux::proto::SplitDirection::Horizontal);
             assert_eq!(args.size_spec().as_deref(), Some("10"));
         }
         _ => panic!("expected SplitWindow command"),
@@ -542,7 +542,7 @@ fn join_pane_defaults_to_vertical_direction() {
                 "alpha:0.1"
             );
             assert_eq!(target_text(&args.target), "alpha:1.0");
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Vertical);
+            assert_eq!(args.direction(), kmux::proto::SplitDirection::Vertical);
         }
         _ => panic!("expected JoinPane command"),
     }
@@ -575,7 +575,7 @@ fn join_and_move_pane_direction_flags_follow_tmux_priority() {
         let cli = parse_args(argv).unwrap();
         match cli.command.expect("parsed command") {
             super::super::Command::JoinPane(args) => {
-                assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+                assert_eq!(args.direction(), kmux::proto::SplitDirection::Horizontal);
             }
             _ => panic!("expected JoinPane command"),
         }
@@ -606,7 +606,7 @@ fn join_and_move_pane_direction_flags_follow_tmux_priority() {
         let cli = parse_args(argv).unwrap();
         match cli.command.expect("parsed command") {
             super::super::Command::MovePane(args) => {
-                assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+                assert_eq!(args.direction(), kmux::proto::SplitDirection::Horizontal);
             }
             _ => panic!("expected MovePane command"),
         }
@@ -673,7 +673,7 @@ fn move_pane_parses_the_full_join_pane_flag_surface() {
             assert!(args.before);
             assert!(args.detached);
             assert!(args.full_size);
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.direction(), kmux::proto::SplitDirection::Horizontal);
             assert_eq!(args.size_spec().as_deref(), Some("12"));
             assert_eq!(
                 args.source.as_ref().expect("source exists").to_string(),

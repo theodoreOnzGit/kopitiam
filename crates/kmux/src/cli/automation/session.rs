@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use rmux_proto::{KillSessionRequest, Response, SessionName};
+use kmux::proto::{KillSessionRequest, Response, SessionName};
 
 use crate::cli_args::WithSessionArgs;
 use crate::cli_response::tmux_cli_error_message;
@@ -86,7 +86,7 @@ struct Lease {
 }
 
 fn create_lease(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     session_name: SessionName,
     ttl_millis: u64,
 ) -> Result<Lease, ExitFailure> {
@@ -112,7 +112,7 @@ fn create_lease(
 }
 
 fn renew_lease(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     session_name: SessionName,
     token: u64,
     ttl_millis: u64,
@@ -138,7 +138,7 @@ fn renew_lease(
 }
 
 fn release_lease(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     session_name: SessionName,
     token: u64,
 ) -> Result<(), ExitFailure> {
@@ -166,7 +166,7 @@ fn release_lease(
 }
 
 fn kill_owned_session(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     session_name: SessionName,
 ) -> Result<(), ExitFailure> {
     match connection
@@ -179,7 +179,7 @@ fn kill_owned_session(
     {
         Response::KillSession(_) => Ok(()),
         Response::Error(error)
-            if matches!(error.error, rmux_proto::RmuxError::SessionNotFound(_)) =>
+            if matches!(error.error, kmux::proto::RmuxError::SessionNotFound(_)) =>
         {
             Ok(())
         }

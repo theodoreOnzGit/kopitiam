@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rmux_client::connect;
-use rmux_proto::{ResolveTargetType, Response, Target};
+use kmux::client::connect;
+use kmux::proto::{ResolveTargetType, Response, Target};
 use serde_json::json;
 
 use super::command_runner::{
@@ -95,10 +95,10 @@ fn display_message_can_use_direct_request(args: &DisplayMessageArgs) -> bool {
 }
 
 fn resolve_display_message_target(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     socket_path: &Path,
     target: Option<&str>,
-) -> Result<Option<rmux_proto::Target>, ExitFailure> {
+) -> Result<Option<kmux::proto::Target>, ExitFailure> {
     match target {
         Some(target) => {
             let target = parse_target_spec(target).map_err(|error| ExitFailure::new(1, error))?;

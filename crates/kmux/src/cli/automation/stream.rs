@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response};
+use kmux::proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response};
 use serde_json::json;
 
 use crate::cli_args::{CollectPaneOutputArgs, StreamPaneArgs};
@@ -91,8 +91,8 @@ enum LagSnapshotSeed {
 }
 
 fn write_lag_snapshot_seed(
-    connection: &mut rmux_client::Connection,
-    target: rmux_proto::PaneTargetRef,
+    connection: &mut kmux::client::Connection,
+    target: kmux::proto::PaneTargetRef,
     line_mode: bool,
 ) -> Result<LagSnapshotSeed, ExitFailure> {
     let snapshot = pane_snapshot(connection, target)?;
@@ -224,8 +224,8 @@ pub(super) struct OutputBatch {
 }
 
 pub(super) fn subscribe(
-    connection: &mut rmux_client::Connection,
-    target: rmux_proto::PaneTargetRef,
+    connection: &mut kmux::client::Connection,
+    target: kmux::proto::PaneTargetRef,
     start: PaneOutputSubscriptionStart,
 ) -> Result<PaneOutputSubscriptionId, ExitFailure> {
     match connection
@@ -248,7 +248,7 @@ pub(super) fn subscribe(
 }
 
 pub(super) fn poll_output(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     subscription_id: PaneOutputSubscriptionId,
     command_name: &'static str,
 ) -> Result<OutputBatch, ExitFailure> {
@@ -256,7 +256,7 @@ pub(super) fn poll_output(
 }
 
 pub(super) fn poll_output_silent_lag(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     subscription_id: PaneOutputSubscriptionId,
     command_name: &'static str,
 ) -> Result<OutputBatch, ExitFailure> {
@@ -264,7 +264,7 @@ pub(super) fn poll_output_silent_lag(
 }
 
 fn poll_output_inner(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     subscription_id: PaneOutputSubscriptionId,
     command_name: &'static str,
     report_lag: bool,

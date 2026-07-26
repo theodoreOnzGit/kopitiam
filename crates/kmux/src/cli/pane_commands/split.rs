@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rmux_client::connect;
-use rmux_proto::{
+use kmux::client::connect;
+use kmux::proto::{
     ErrorResponse, ProcessCommand, Request, Response, SplitWindowExtRequest, SplitWindowRequest,
     SplitWindowTargetActionRequest,
 };
@@ -82,7 +82,7 @@ pub(in crate::cli) fn run_split_window(
         print_target_format(
             &mut connection,
             "split-window",
-            rmux_proto::Target::Pane(pane.clone()),
+            kmux::proto::Target::Pane(pane.clone()),
             &print_format,
         )?;
     }
@@ -108,7 +108,7 @@ fn run_split_window_legacy_with_stdin(
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target = match args.target.as_ref() {
         Some(target) => resolve_split_window_target_spec(&mut connection, target)?,
-        None => rmux_proto::SplitWindowTarget::Pane(resolve_current_pane_target(
+        None => kmux::proto::SplitWindowTarget::Pane(resolve_current_pane_target(
             &mut connection,
             "split-window",
         )?),
@@ -178,7 +178,7 @@ fn run_split_window_legacy_with_stdin(
         print_target_format(
             &mut connection,
             "split-window",
-            rmux_proto::Target::Pane(pane.clone()),
+            kmux::proto::Target::Pane(pane.clone()),
             &print_format,
         )?;
     }

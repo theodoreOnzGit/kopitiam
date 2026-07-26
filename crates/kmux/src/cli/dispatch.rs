@@ -1,8 +1,8 @@
 use std::io::Read;
 use std::path::Path;
 
-use rmux_client::connect;
-use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
+use kmux::client::connect;
+use kmux::proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
 
 use super::automation::{
     run_broadcast_keys, run_collect_pane_output, run_expect_pane, run_find_panes,
@@ -287,7 +287,7 @@ fn dispatch(
                 return run_command_resolved(socket_path, "select-layout", move |connection| {
                     let target = match args.target.as_ref() {
                         Some(target) => resolve_select_layout_target_spec(connection, target)?,
-                        None => rmux_proto::SelectLayoutTarget::Window(
+                        None => kmux::proto::SelectLayoutTarget::Window(
                             resolve_window_target_or_current(connection, None, "select-layout")?,
                         ),
                     };
@@ -324,7 +324,7 @@ fn dispatch(
                 return run_command_resolved(socket_path, "select-layout", move |connection| {
                     let target = match args.target.as_ref() {
                         Some(target) => resolve_select_layout_target_spec(connection, target)?,
-                        None => rmux_proto::SelectLayoutTarget::Window(
+                        None => kmux::proto::SelectLayoutTarget::Window(
                             resolve_window_target_or_current(connection, None, "select-layout")?,
                         ),
                     };
@@ -339,7 +339,7 @@ fn dispatch(
             run_command_resolved(socket_path, "select-layout", move |connection| {
                 let target = match args.target.as_ref() {
                     Some(target) => resolve_select_layout_target_spec(connection, target)?,
-                    None => rmux_proto::SelectLayoutTarget::Window(
+                    None => kmux::proto::SelectLayoutTarget::Window(
                         resolve_window_target_or_current(connection, None, "select-layout")?,
                     ),
                 };

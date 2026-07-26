@@ -1,6 +1,6 @@
 //! Client-side terminal capability detection shared by the full and tiny CLIs.
 
-use rmux_proto::ClientTerminalContext;
+use kmux::proto::ClientTerminalContext;
 
 pub(crate) fn client_terminal_context_from_parts(
     terminal_features: Vec<String>,
@@ -59,7 +59,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_terminal_features_are_sent_by_client_context() {
-        let mut context = rmux_proto::ClientTerminalContext::default();
+        let mut context = kmux::proto::ClientTerminalContext::default();
 
         super::apply_windows_terminal_features(&mut context);
 
@@ -70,7 +70,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detected_windows_terminal_features_are_not_duplicated() {
-        let mut context = rmux_proto::ClientTerminalContext {
+        let mut context = kmux::proto::ClientTerminalContext {
             terminal_features: vec!["SYNC".to_owned(), "BPASTE".to_owned(), "MOUSE".to_owned()],
             utf8: false,
         };

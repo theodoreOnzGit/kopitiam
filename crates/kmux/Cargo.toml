@@ -1,58 +1,45 @@
+# kmux: a single-crate collapse of the multi-crate `rmux` fork.
+#
+# Upstream `rmux` is a workspace of many crates (rmux-core, rmux-server, ...).
+# This package folds the ten sub-crates the `kmux` binary needs
+# (rmux-client, rmux-core, rmux-ipc, rmux-os, rmux-proto, rmux-pty, rmux-sdk,
+# rmux-server, rmux-types, rmux-web-crypto) into ONE publishable crate so it can
+# go to crates.io WITHOUT squatting upstream rmux's crate names. Those sub-crates
+# are now the intra-crate modules client/core/ipc/os/proto/pty/sdk/server/types/
+# web_crypto (see src/lib.rs). The two upstream integration crates nothing links
+# (ratatui-rmux, rmux-render-core) are intentionally dropped, not folded.
+#
+# Dependency versions/pins are the rmux fork's own, carried verbatim (this crate
+# does NOT inherit KOPITIAM's root workspace dependency set, mirroring kopi-beans).
+# Provenance: LICENSE-MIT / LICENSE-APACHE / NOTICE (upstream MIT OR Apache-2.0,
+# relicensed AGPL-3.0-only). See NOTICE for the record of the collapse.
 [package]
 name = "kmux"
 version = "0.1.0"
-# NOT `edition.workspace = true`. KOPITIAM's root workspace is edition 2024;
-# this crate and its nested sub-crates are a fork of rmux, which is edition
-# 2021. Silently pulling 325k lines of upstream code into a newer edition is a
-# behavioural change nobody asked for, and makes every future upstream merge
-# harder. The edition is pinned here deliberately; moving it is its own task.
+# NOT `edition.workspace = true`. KOPITIAM's root workspace is edition 2024; the
+# folded rmux source is edition 2021. Pinning the edition here avoids silently
+# pulling the upstream code into a newer edition; moving it is its own task.
 edition = "2021"
-publish = false
+publish = true
 license = "AGPL-3.0-only"
 repository = "https://github.com/theodoreOnzGit/kopitiam"
-description = "kmux: a terminal multiplexer for KOPITIAM. A fork of rmux (MIT OR Apache-2.0) with Android/Termux support, relicensed AGPL-3.0-only."
+authors = ["Theodore Kay Chen Ong"]
+description = "kmux: a terminal multiplexer for KOPITIAM. Single-crate collapse of a Windows/Termux-capable fork of rmux (MIT OR Apache-2.0), relicensed AGPL-3.0-only."
 readme = "README.md"
+keywords = ["terminal", "multiplexer", "tmux", "pty", "tui"]
+categories = ["command-line-utilities", "command-line-interface"]
+# Keep the packaged .crate lean: dev-only trees and docs are not needed to build
+# the binaries or the library. (src/**/tests and include!'d test files stay --
+# they are part of the folded modules; only the top-level integration trees go.)
+exclude = ["/tests", "/docs", "/scripts", "/nextest.toml", "/README.md"]
 
-[dependencies]
-chrono = { version = "0.4.42", default-features = false, features = ["std"] }
-clap = { version = "=4.5.39", features = ["derive"] }
-libc = "0.2"
-qrcode = { version = "0.14", default-features = false }
-ratatui = { version = "=0.29.0", default-features = false }
-rmux-client = { path = "crates/rmux-client" }
-rmux-core = { path = "crates/rmux-core" }
-rmux-os = { path = "crates/rmux-os" }
-rmux-proto = { path = "crates/rmux-proto" }
-# The root binary owns the hidden internal daemon mode, so it links the server
-# and Tokio runtime directly for that top-level re-exec path.
-rmux-server = { path = "crates/rmux-server", default-features = false }
-serde_json = "1.0"
-tokio = { version = "1.48.0", features = ["net", "rt", "rt-multi-thread", "time"] }
+[lib]
+name = "kmux"
+path = "src/lib.rs"
 
-[features]
-default = ["web"]
-perf-instrument = ["rmux-server/perf-instrument"]
-tiny-cli = []
-web = ["rmux-server/web"]
-
-[dev-dependencies]
-libc = "0.2"
-rmux-core = { path = "crates/rmux-core" }
-rmux-pty = { path = "crates/rmux-pty" }
-rmux-proto = { path = "crates/rmux-proto" }
-rmux-sdk = { path = "crates/rmux-sdk" }
-rustix = { version = "1.1.4", features = ["event", "termios"] }
-
-[build-dependencies]
-embed-manifest = "=1.4.0"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes"] }
-
-# The binaries are renamed from upstream's `rmux` / `rmux-daemon`. KOPITIAM ships
-# `kmux`; the daemon is an internal re-exec target and is renamed in lockstep,
-# because the client discovers it *by file name* next to the client binary
-# (see crates/rmux-client/src/auto_start.rs).
+# Binaries renamed from upstream's `rmux` / `rmux-daemon`. The daemon is an
+# internal re-exec target discovered *by file name* next to the client binary
+# (see src/client/auto_start.rs), so it is renamed in lockstep.
 [[bin]]
 name = "kmux"
 path = "src/main.rs"
@@ -60,3 +47,110 @@ path = "src/main.rs"
 [[bin]]
 name = "kmux-daemon"
 path = "src/daemon_main.rs"
+
+[dependencies]
+# --- former rmux sub-crate deps, unioned ---
+async-recursion = "=1.1.1"                                                                        # rmux-server
+bincode = "1.3.3"                                                                                 # rmux-proto
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }            # kmux + core + server
+clap = { version = "=4.5.39", features = ["derive"] }                                             # kmux bins
+compact_str = "0.8.1"                                                                             # rmux-core
+glob = "0.3"                                                                                      # rmux-server
+libc = "0.2"                                                                                      # kmux bins (+ cfg(unix) modules)
+qrcode = { version = "0.14", default-features = false }                                           # kmux bins
+ratatui = { version = "=0.29.0", default-features = false }                                       # kmux bins
+regex = "1.12.2"                                                                                  # core + server (sdk gates extra use behind the `regex` feature)
+serde = { version = "1.0", features = ["derive"] }                                               # proto + sdk + types
+serde_json = "1.0"                                                                                # sdk + kmux bins
+thiserror = "2.0"                                                                                 # rmux-proto
+tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"                                                                                   # client + ipc + pty + server
+unicode-width = "0.1"                                                                             # rmux-core
+
+# --- web-share E2EE surface (former rmux-server/web + rmux-web-crypto), gated on `web` ---
+base64 = { version = "0.22", optional = true }
+getrandom = { version = "0.3", optional = true }
+hkdf = { version = "0.12", optional = true }
+httparse = { version = "1.9", optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2.6", optional = true }
+toml = { version = "0.8", optional = true }
+zeroize = { version = "1", default-features = false, features = ["derive"], optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
+libcrux-ml-kem = { version = "0.0.9", default-features = false, features = ["mlkem768"], optional = true }
+x25519-dalek = { version = "2", features = ["zeroize", "getrandom"], optional = true }
+
+# --- optional SDK extras (former rmux-sdk features), off by default as upstream had them ---
+crossterm = { version = "0.29.0", default-features = false, features = ["events", "windows"], optional = true }
+# WASM bindings for the web_crypto module (former rmux-web-crypto/wasm), off for native builds.
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = ["web", "serde"]
+# Web-share end-to-end-encrypted sharing. Pulls the server's web deps and the
+# web_crypto module (X25519 + ML-KEM-768 hybrid). Mirrors upstream
+# `rmux-server/web` + the `dep:rmux-web-crypto` it pulled, plus native X25519.
+web = [
+    "dep:base64",
+    "dep:getrandom",
+    "dep:hkdf",
+    "dep:httparse",
+    "dep:sha1",
+    "dep:sha2",
+    "dep:subtle",
+    "dep:toml",
+    "dep:zeroize",
+    "dep:chacha20poly1305",
+    "dep:libcrux-ml-kem",
+    "x25519",
+]
+# Native ephemeral X25519 in web_crypto (former rmux-web-crypto/x25519).
+x25519 = ["dep:x25519-dalek"]
+# Browser/WASM bindings for web_crypto (former rmux-web-crypto/wasm). Native off.
+wasm = ["dep:wasm-bindgen"]
+wasm-test = ["wasm"]
+# former rmux-sdk features; the gated code stays off in the default build, exactly
+# as `rmux-client -> rmux-sdk` (default = web only) had it. `serde`/`regex` are
+# marker features (the deps are unconditional here); they only toggle the
+# `#[cfg(feature = ...)]` code the sub-crates gated internally.
+crossterm = ["dep:crossterm"]
+serde = []
+regex = []
+# former rmux-server features.
+perf-instrument = []
+fuzzing = []
+# kmux bin-only knob (thin CLI surface).
+tiny-cli = []
+
+[target.'cfg(unix)'.dependencies]
+# Union of the cfg(unix) rustix feature sets across os/ipc/client/pty/sdk/server.
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "pty", "runtime", "termios", "thread"] }
+signal-hook = "0.3.18"
+
+[target.'cfg(windows)'.dependencies]
+# Union of the cfg(windows) windows-sys feature sets across kmux/client/ipc/os/pty/sdk.
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[build-dependencies]
+embed-manifest = "=1.4.0"
+
+[dev-dependencies]
+static_assertions = "1.1"
+hex-literal = "0.4"

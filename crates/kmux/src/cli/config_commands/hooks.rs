@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rmux_client::Connection;
-use rmux_proto::{HookLifecycle, HookName, ResolveTargetType, ScopeSelector, Target, WindowTarget};
+use kmux::client::Connection;
+use kmux::proto::{HookLifecycle, HookName, ResolveTargetType, ScopeSelector, Target, WindowTarget};
 
 use crate::cli::{
     resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
@@ -50,7 +50,7 @@ pub(crate) fn run_show_hooks(args: ShowHooksArgs, socket_path: &Path) -> Result<
     run_payload_command_resolved(socket_path, "show-hooks", move |connection| {
         let scope = scope.resolve(connection, "show-hooks")?;
         if let Some(hook) = hook {
-            rmux_core::validate_hook_scope(hook, &scope)
+            kmux::core::validate_hook_scope(hook, &scope)
                 .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         }
         connection
@@ -213,7 +213,7 @@ fn resolve_unresolved_hook_scope(
 }
 
 fn validate_hook_registration(hook: HookName, scope: &ScopeSelector) -> Result<(), ExitFailure> {
-    rmux_core::validate_hook_registration(hook, scope)
+    kmux::core::validate_hook_registration(hook, scope)
         .map_err(|error| ExitFailure::new(1, error.to_string()))
 }
 

@@ -30,8 +30,8 @@ fn set_option_accepts_global_and_target_for_server_scope_compatibility() {
                 args.target
                     .as_ref()
                     .and_then(|target| target.exact().cloned()),
-                Some(rmux_proto::Target::Session(
-                    rmux_proto::SessionName::new("alpha").unwrap()
+                Some(kmux::proto::Target::Session(
+                    kmux::proto::SessionName::new("alpha").unwrap()
                 ))
             );
         }
@@ -103,9 +103,9 @@ fn set_option_accepts_window_scope_and_optional_value() {
                 args.target
                     .as_ref()
                     .and_then(|target| target.exact().cloned()),
-                Some(rmux_proto::Target::Pane(
-                    rmux_proto::PaneTarget::with_window(
-                        rmux_proto::SessionName::new("alpha").unwrap(),
+                Some(kmux::proto::Target::Pane(
+                    kmux::proto::PaneTarget::with_window(
+                        kmux::proto::SessionName::new("alpha").unwrap(),
                         2,
                         3,
                     )
@@ -189,9 +189,9 @@ fn show_window_options_parses_as_a_distinct_public_command() {
                 args.target
                     .as_ref()
                     .and_then(|target| target.exact().cloned()),
-                Some(rmux_proto::Target::Pane(
-                    rmux_proto::PaneTarget::with_window(
-                        rmux_proto::SessionName::new("alpha").unwrap(),
+                Some(kmux::proto::Target::Pane(
+                    kmux::proto::PaneTarget::with_window(
+                        kmux::proto::SessionName::new("alpha").unwrap(),
                         2,
                         3,
                     )

@@ -1,5 +1,5 @@
 use ratatui::style::Color;
-use rmux_proto::{CommandOutput, WebShareCreatedResponse, WebShareScope};
+use kmux::proto::{CommandOutput, WebShareCreatedResponse, WebShareScope};
 
 use super::qr;
 use super::support::{url_label, LinkMode, OutputStyle, UrlLabel};

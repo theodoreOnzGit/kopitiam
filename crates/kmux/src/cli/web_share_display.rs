@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
-use rmux_proto::{CommandOutput, WebShareCreatedResponse};
+use kmux::proto::{CommandOutput, WebShareCreatedResponse};
 
 #[path = "web_share_display/ansi.rs"]
 mod ansi;

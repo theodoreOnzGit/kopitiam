@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_proto::{PaneBroadcastInputRequest, Response};
+use kmux::proto::{PaneBroadcastInputRequest, Response};
 use serde_json::{json, Value};
 
 use crate::cli_args::{

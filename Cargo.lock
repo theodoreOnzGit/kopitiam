@@ -2857,23 +2857,42 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 name = "kmux"
 version = "0.1.0"
 dependencies = [
+ "async-recursion",
+ "base64",
+ "bincode",
+ "chacha20poly1305",
  "chrono",
  "clap",
+ "compact_str",
+ "crossterm 0.29.0",
  "embed-manifest",
+ "getrandom 0.3.4",
+ "glob",
+ "hex-literal",
+ "hkdf",
+ "httparse",
  "libc",
+ "libcrux-ml-kem",
  "qrcode",
  "ratatui",
- "rmux-client",
- "rmux-core",
- "rmux-os",
- "rmux-proto",
- "rmux-pty",
- "rmux-sdk",
- "rmux-server",
+ "regex",
  "rustix 1.1.4",
+ "serde",
  "serde_json",
+ "sha1",
+ "sha2",
+ "signal-hook",
+ "static_assertions",
+ "subtle",
+ "thiserror 2.0.18",
  "tokio",
+ "toml",
+ "tracing",
+ "unicode-width 0.1.14",
+ "wasm-bindgen",
  "windows-sys 0.61.2",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -4516,15 +4535,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ratatui-rmux"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "ratatui",
- "rmux-sdk",
- "tokio",
-]
-
-[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4687,162 +4697,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rmux-client"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "libc",
- "rmux-core",
- "rmux-ipc",
- "rmux-os",
- "rmux-proto",
- "rmux-pty",
- "rmux-sdk",
- "rmux-server",
- "rustix 1.1.4",
- "signal-hook",
- "tokio",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rmux-core"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "chrono",
- "compact_str",
- "regex",
- "rmux-proto",
- "unicode-width 0.1.14",
-]
-
-[[package]]
-name = "rmux-ipc"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "libc",
- "rmux-os",
- "rustix 1.1.4",
- "tokio",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rmux-os"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "libc",
- "rmux-types",
- "rustix 1.1.4",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rmux-proto"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "bincode",
- "rmux-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rmux-pty"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "libc",
- "rmux-os",
- "rmux-types",
- "rustix 1.1.4",
- "tokio",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rmux-render-core"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "ratatui",
- "serde",
-]
-
-[[package]]
-name = "rmux-sdk"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "bincode",
- "crossterm 0.29.0",
- "libc",
- "regex",
- "rmux-ipc",
- "rmux-os",
- "rmux-proto",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "signal-hook",
- "tokio",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rmux-server"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "async-recursion",
- "base64",
- "chrono",
- "getrandom 0.3.4",
- "glob",
- "hkdf",
- "httparse",
- "regex",
- "rmux-core",
- "rmux-ipc",
- "rmux-os",
- "rmux-proto",
- "rmux-pty",
- "rmux-web-crypto",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "static_assertions",
- "subtle",
- "tokio",
- "toml",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "rmux-types"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "rmux-web-crypto"
-version = "0.8.0-kopitiam.1"
-dependencies = [
- "chacha20poly1305",
- "hex-literal",
- "hkdf",
- "libcrux-ml-kem",
- "sha2",
- "subtle",
- "wasm-bindgen",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]

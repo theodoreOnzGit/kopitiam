@@ -2,8 +2,8 @@ use std::ffi::CStr;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use rmux_client::{default_socket_path, ClientError};
-use rmux_proto::RmuxError;
+use kmux::client::{default_socket_path, ClientError};
+use kmux::proto::RmuxError;
 
 pub(crate) fn tmux_client_connect_error_message(
     socket_path: &Path,

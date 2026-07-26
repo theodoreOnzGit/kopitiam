@@ -2,12 +2,12 @@ use std::path::Path;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use rmux_client::{connect, ClientError, Connection, StartServerError};
+use kmux::client::{connect, ClientError, Connection, StartServerError};
 #[cfg(not(windows))]
-use rmux_client::{connect_or_absent, ConnectResult};
-use rmux_proto::ListSessionsRequest;
+use kmux::client::{connect_or_absent, ConnectResult};
+use kmux::proto::ListSessionsRequest;
 #[cfg(not(windows))]
-use rmux_proto::RmuxError;
+use kmux::proto::RmuxError;
 
 use super::{
     expect_command_output, resolve_session_target_or_current, run_command, run_command_resolved,
@@ -128,7 +128,7 @@ pub(super) fn run_server_access(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     run_payload_command(socket_path, "server-access", move |connection| {
-        connection.server_access(rmux_proto::ServerAccessRequest {
+        connection.server_access(kmux::proto::ServerAccessRequest {
             add: args.add,
             deny: args.deny,
             list: args.list,

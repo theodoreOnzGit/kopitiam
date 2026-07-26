@@ -71,7 +71,7 @@ mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
-use rmux_client::{
+use kmux::client::{
     connect, ensure_server_running_with_config, resolve_socket_path,
     resolve_tmux_compatible_socket_path, Connection,
 };

@@ -1,6 +1,6 @@
-use rmux_client::Connection;
-use rmux_proto::types::OptionScopeSelector;
-use rmux_proto::{ResolveTargetType, RmuxError, Target, WindowTarget};
+use kmux::client::Connection;
+use kmux::proto::types::OptionScopeSelector;
+use kmux::proto::{ResolveTargetType, RmuxError, Target, WindowTarget};
 
 use crate::cli::ExitFailure;
 use crate::cli_args::{ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec};
@@ -37,7 +37,7 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
         }),
         (false, true, None) => Ok(ShowOptionsScope::CurrentPane),
         (false, false, _) if args.global => Ok(if let Some(name) = args.name.as_deref() {
-            rmux_core::default_global_scope_for_option_name(name)
+            kmux::core::default_global_scope_for_option_name(name)
                 .map_err(option_lookup_exit_failure)?
         } else if force_window {
             OptionScopeSelector::WindowGlobal
@@ -154,7 +154,7 @@ fn show_options_scope_for_target(
         });
     };
 
-    match rmux_core::default_global_scope_for_option_name(name)
+    match kmux::core::default_global_scope_for_option_name(name)
         .map_err(option_lookup_exit_failure)?
     {
         OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal.into()),

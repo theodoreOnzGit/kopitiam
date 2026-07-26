@@ -41,7 +41,7 @@ fn troff_literal_block(contents: &str, heading: &str, next_heading: &str) -> Vec
         .collect()
 }
 
-fn rendered_surface_entry(entry: &rmux_core::command_parser::CommandEntry) -> String {
+fn rendered_surface_entry(entry: &kmux::core::command_parser::CommandEntry) -> String {
     match entry.alias {
         Some(alias) => format!("{} ({alias})", entry.name),
         None => entry.name.to_owned(),

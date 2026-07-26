@@ -1,8 +1,8 @@
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 
-use rmux_client::ClientError;
-use rmux_proto::Response;
+use kmux::client::ClientError;
+use kmux::proto::Response;
 
 use crate::tmux_error_surface::{tmux_cli_error_message, tmux_client_connect_error_message};
 

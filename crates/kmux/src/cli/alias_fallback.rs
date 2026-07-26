@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use rmux_client::Connection;
+use kmux::client::Connection;
 
 use super::command_runner::run_queued_server_command_with_connection;
 use super::ExitFailure;

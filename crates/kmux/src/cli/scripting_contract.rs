@@ -121,13 +121,13 @@ mod tests {
 
     fn emitted_control_prefixes() -> BTreeSet<&'static str> {
         [
-            include_str!("../../crates/rmux-proto/src/control.rs"),
-            include_str!("../../crates/rmux-server/src/control.rs"),
-            include_str!("../../crates/rmux-server/src/control/subscriptions.rs"),
-            include_str!("../../crates/rmux-server/src/control/output_queue.rs"),
-            include_str!("../../crates/rmux-server/src/control_notifications.rs"),
-            include_str!("../../crates/rmux-server/src/handler_control.rs"),
-            include_str!("../../crates/rmux-server/src/handler_pane/inspection.rs"),
+            include_str!("../proto/control.rs"),
+            include_str!("../server/control.rs"),
+            include_str!("../server/control/subscriptions.rs"),
+            include_str!("../server/control/output_queue.rs"),
+            include_str!("../server/control_notifications.rs"),
+            include_str!("../server/handler_control.rs"),
+            include_str!("../server/handler_pane/inspection.rs"),
         ]
         .into_iter()
         .flat_map(control_prefixes_in_source)

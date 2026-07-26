@@ -128,7 +128,7 @@ fn prepare_claude_leader_environment_impl(
     command: &mut ProcessCommand,
     main_socket: &str,
 ) -> Result<(), ExitFailure> {
-    let socket_path = rmux_client::socket_path_for_label(main_socket).map_err(|error| {
+    let socket_path = kmux::client::socket_path_for_label(main_socket).map_err(|error| {
         ExitFailure::new(
             1,
             format!("rmux claude: failed to resolve private tmux socket: {error}"),
@@ -1123,7 +1123,7 @@ fn stale_windows_claude_temp_dir_pid(name: &str) -> Option<u32> {
 
 #[cfg(windows)]
 fn windows_process_is_running(pid: u32) -> bool {
-    rmux_os::process::is_live(pid)
+    kmux::os::process::is_live(pid)
 }
 
 #[cfg(windows)]
@@ -1459,11 +1459,11 @@ fn tmux_file_name() -> OsString {
     name
 }
 
-/// The public client binary's file name. Sourced from `rmux_os::host` so the
+/// The public client binary's file name. Sourced from `kmux::os::host` so the
 /// fork's rename to `kmux` cannot drift out of sync here -- this is a runtime
 /// file lookup, so a stale name is a silent failure, not a build error.
 fn rmux_file_name() -> OsString {
-    rmux_os::host::public_binary_file_name()
+    kmux::os::host::public_binary_file_name()
 }
 
 fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {

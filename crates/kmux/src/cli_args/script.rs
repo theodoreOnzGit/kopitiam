@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::{Target, WaitForMode};
+use kmux::proto::{Target, WaitForMode};
 
 use super::{parse_command_args, parse_target, parse_target_spec, TargetSpec};
 

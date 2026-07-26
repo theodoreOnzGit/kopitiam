@@ -5,8 +5,8 @@ mod hooks;
 #[path = "config_commands/options.rs"]
 mod options;
 
-use rmux_client::{connect, ClientError};
-use rmux_proto::{
+use kmux::client::{connect, ClientError};
+use kmux::proto::{
     ErrorResponse, Request, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
     SetOptionByNameRequest,
 };
@@ -194,7 +194,7 @@ pub(crate) fn run_show_environment(
 }
 
 fn resolve_environment_scope(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     global: bool,
     target: Option<TargetSpec>,
 ) -> Result<ScopeSelector, ExitFailure> {
@@ -252,7 +252,7 @@ mod tests {
         parse_target_spec, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind,
         ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec,
     };
-    use rmux_proto::{OptionScopeSelector, SessionName, WindowTarget};
+    use kmux::proto::{OptionScopeSelector, SessionName, WindowTarget};
     use std::path::Path;
 
     fn target_spec(value: &str) -> TargetSpec {

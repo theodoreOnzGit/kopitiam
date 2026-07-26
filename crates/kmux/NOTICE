@@ -1,9 +1,7 @@
 kmux
 ===================
 
-This crate, and every crate nested beneath it under `crates/` (rmux-core,
-rmux-os, rmux-pty, rmux-ipc, rmux-proto, rmux-types, rmux-client, rmux-server,
-rmux-sdk, rmux-render-core, rmux-web-crypto, ratatui-rmux), is a FORK of:
+This crate is a FORK of:
 
     rmux — https://github.com/helvesec/rmux
     Copyright (c) The RMUX Authors
@@ -42,10 +40,25 @@ What was changed
         and `libc` binds neither `nl_langinfo` nor `CODESET` there).
 
   * The binaries are renamed `kmux` and `kmux-daemon`. Executable names are now
-    sourced from `rmux_os::host` rather than being spelled inline.
+    sourced from `rmux_os::host` (now `kmux::os::host`) rather than being spelled
+    inline.
 
-  * Sub-crates keep their upstream names, carry a `-kopitiam` version suffix,
-    and are `publish = false`.
+  * Single-crate collapse. Upstream rmux is a workspace of many crates, and this
+    fork originally nested them under `crates/kmux/crates/` (rmux-client,
+    rmux-core, rmux-ipc, rmux-os, rmux-proto, rmux-pty, rmux-sdk, rmux-server,
+    rmux-types, rmux-web-crypto, plus the unused integration crates
+    ratatui-rmux and rmux-render-core). To publish to crates.io WITHOUT squatting
+    upstream rmux's crate names, those ten sub-crates the `kmux` binary needs were
+    folded into ONE self-contained `kmux` crate as the intra-crate modules
+    `client`, `core`, `ipc`, `os`, `proto`, `pty`, `sdk`, `server`, `types`, and
+    `web_crypto` (see `src/lib.rs`). Every cross-crate path `rmux_core::X` became
+    `crate::core::X` (and `kmux::core::X` from the binaries), each sub-crate's
+    `lib.rs` became a module `mod.rs`, and the sub-crates' Cargo manifests were
+    unioned into this one. `ratatui-rmux` and `rmux-render-core` were dropped
+    (nothing in the `kmux` binary links them). The former `rmux-server` build
+    script (tunnel-preset codegen) was merged into this crate's `build.rs`. The
+    package is `publish = true` at version 0.1.0; the library keeps the name
+    `kmux`. Upstream dependency pins were carried verbatim.
 
 Upstream's own release/packaging/CI scripts, benchmarks, `xtask`, and
 contributor documentation were not carried into the fork.

@@ -1,7 +1,7 @@
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::HookName;
+use kmux::proto::HookName;
 #[cfg(test)]
-use rmux_proto::{ScopeSelector, SessionName};
+use kmux::proto::{ScopeSelector, SessionName};
 
 use super::{parse_target_spec, TargetSpec};
 

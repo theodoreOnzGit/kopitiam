@@ -2,24 +2,24 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use rmux_client::attach_terminal_with_initial_bytes;
+use kmux::client::attach_terminal_with_initial_bytes;
 #[cfg(unix)]
-use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
+use kmux::client::attach_terminal_with_initial_bytes_and_resize_geometry;
 #[cfg(windows)]
-use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
+use kmux::client::attach_terminal_with_initial_bytes_and_windows_console_key;
 #[cfg(unix)]
-use rmux_client::AttachError;
-use rmux_client::{
+use kmux::client::AttachError;
+use kmux::client::{
     connect, detect_context, drive_control_mode, AttachTransition, ClientContext, ClientError,
     Connection, ControlTransition,
 };
-use rmux_proto::request::{
+use kmux::proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, DetachClientExtRequest, ListClientsRequest,
     RefreshClientRequest, SuspendClientRequest, SwitchClientExt3Request,
 };
 #[cfg(windows)]
-use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
-use rmux_proto::{
+use kmux::proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
+use kmux::proto::{
     ClientTerminalContext, ControlMode, ErrorResponse, Response, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY,
 };

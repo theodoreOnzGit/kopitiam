@@ -3,14 +3,14 @@ use super::*;
 #[test]
 fn build_scope_global_produces_global_selector() {
     let scope = super::super::build_scope(true, None);
-    assert!(matches!(scope, rmux_proto::ScopeSelector::Global));
+    assert!(matches!(scope, kmux::proto::ScopeSelector::Global));
 }
 
 #[test]
 fn build_scope_target_produces_session_selector() {
-    let name = rmux_proto::SessionName::new("test").unwrap();
+    let name = kmux::proto::SessionName::new("test").unwrap();
     let scope = super::super::build_scope(false, Some(name.clone()));
-    assert!(matches!(scope, rmux_proto::ScopeSelector::Session(n) if n == name));
+    assert!(matches!(scope, kmux::proto::ScopeSelector::Session(n) if n == name));
 }
 
 #[test]

@@ -40,9 +40,9 @@
 //!    alone, so Android takes the portable filesystem-socket path instead.
 //! 2. **Hardcoded `/tmp` and `/var/run`.** Termux is not FHS — its root is
 //!    `/data/data/com.termux/files/` and it has no usable `/tmp`. All runtime
-//!    paths now go through a single resolver, `rmux_os::runtime_dir`.
+//!    paths now go through a single resolver, `kmux::os::runtime_dir`.
 //!
-//! `rmux_os::runtime_dir`'s module documentation is the canonical write-up of
+//! `kmux::os::runtime_dir`'s module documentation is the canonical write-up of
 //! every Android-specific decision in this fork. Read it before changing any
 //! `cfg` gate here.
 //!
@@ -55,7 +55,7 @@
 //!   diffs against upstream stay readable for the next decade. They carry a
 //!   `-kopitiam` version suffix and `publish = false`, so a modified `rmux-os`
 //!   can never be mistaken for the real one.
-//! * `rmux_os::runtime_dir` (new) and `rmux_os::host`'s binary-name constants
+//! * `kmux::os::runtime_dir` (new) and `kmux::os::host`'s binary-name constants
 //!   (new) are the only substantive additions.
 //!
 //! # The binary
@@ -96,9 +96,9 @@ use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-use rmux_client::INTERNAL_DAEMON_FLAG;
+use kmux::client::INTERNAL_DAEMON_FLAG;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-use rmux_server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig, ServerDaemon};
+use kmux::server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig, ServerDaemon};
 
 #[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
 fn main() {
@@ -368,7 +368,7 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     if let Some(ready_event) = args.startup_ready_event {
         config = config.with_startup_ready_event(ready_event);
     }
-    rmux_os::memory::configure_daemon_allocator();
+    kmux::os::memory::configure_daemon_allocator();
     let runtime = server_runtime::build_daemon_runtime()?;
 
     runtime.block_on(async move {
@@ -398,8 +398,8 @@ fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
 #[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 mod tests {
     use super::{parse_internal_daemon_args, parse_internal_socket_path, try_main};
-    use rmux_client::INTERNAL_DAEMON_FLAG;
-    use rmux_server::ConfigFileSelection;
+    use kmux::client::INTERNAL_DAEMON_FLAG;
+    use kmux::server::ConfigFileSelection;
     use std::ffi::OsString;
     use std::path::PathBuf;
 

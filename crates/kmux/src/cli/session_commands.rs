@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use rmux_client::connect;
-use rmux_client::{detect_context, detect_parent, ClientContext, ClientContextParent};
-use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
-use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
-use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
+use kmux::client::connect;
+use kmux::client::{detect_context, detect_parent, ClientContext, ClientContextParent};
+use kmux::proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
+use kmux::proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
+use kmux::proto::{ClientTerminalContext, ErrorResponse, Response};
 
 use super::json_output::{list_sessions_json_format, write_list_sessions_json};
 use super::{attach_with_connection, current_terminal_size, run_switch_client_on_connection};
@@ -171,8 +171,8 @@ where
 
 #[cfg(windows)]
 fn invoking_client_shell() -> Option<String> {
-    let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
-    let parent_name = rmux_os::process::command_name(parent_pid)?;
+    let parent_pid = kmux::os::process::parent_pid(std::process::id())?;
+    let parent_name = kmux::os::process::command_name(parent_pid)?;
     windows_client_shell_for_parent_name(&parent_name)
 }
 

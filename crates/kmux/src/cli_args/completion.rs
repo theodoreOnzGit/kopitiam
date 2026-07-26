@@ -1,5 +1,5 @@
 use clap::{ArgAction, Args};
-use rmux_core::command_parser::CommandEntry;
+use kmux::core::command_parser::CommandEntry;
 
 use super::*;
 

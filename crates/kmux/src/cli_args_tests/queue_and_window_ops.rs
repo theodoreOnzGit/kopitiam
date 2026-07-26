@@ -200,7 +200,7 @@ fn rotate_window_defaults_to_up_direction() {
     match cli.command.expect("parsed command") {
         super::super::Command::RotateWindow(args) => {
             assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:2");
-            assert_eq!(args.direction(), rmux_proto::RotateWindowDirection::Up);
+            assert_eq!(args.direction(), kmux::proto::RotateWindowDirection::Up);
         }
         _ => panic!("expected RotateWindow command"),
     }

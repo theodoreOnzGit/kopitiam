@@ -1,5 +1,5 @@
 use clap::ValueEnum;
-use rmux_proto::LayoutName;
+use kmux::proto::LayoutName;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum LayoutValue {

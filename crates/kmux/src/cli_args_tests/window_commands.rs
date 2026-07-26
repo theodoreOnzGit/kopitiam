@@ -162,7 +162,7 @@ fn select_window_accepts_exact_match_targets() {
             assert_eq!(target.to_string(), "=alpha:1");
             assert!(matches!(
                 target.exact(),
-                Some(rmux_proto::Target::Window(window))
+                Some(kmux::proto::Target::Window(window))
                     if window.session_name().as_str() == "alpha" && window.window_index() == 1
             ));
         }
@@ -618,9 +618,9 @@ fn top_level_parse_preserves_hyphenated_split_window_flags() {
             assert_eq!(target.raw(), "alpha:0.0");
             assert_eq!(
                 target.exact(),
-                Some(&rmux_proto::Target::Pane(
-                    rmux_proto::PaneTarget::with_window(
-                        rmux_proto::SessionName::new("alpha").expect("valid session"),
+                Some(&kmux::proto::Target::Pane(
+                    kmux::proto::PaneTarget::with_window(
+                        kmux::proto::SessionName::new("alpha").expect("valid session"),
                         0,
                         0,
                     )

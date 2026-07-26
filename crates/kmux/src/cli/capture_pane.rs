@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rmux_client::{connect, Connection};
-use rmux_proto::{CapturePaneRequest, CapturePaneTargetActionRequest, Response};
+use kmux::client::{connect, Connection};
+use kmux::proto::{CapturePaneRequest, CapturePaneTargetActionRequest, Response};
 
 use crate::cli_args::{CapturePaneArgs, TargetSpec};
 

@@ -208,11 +208,11 @@ fn daemon_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// The public client binary's file name. Sourced from `rmux_os::host` so the
+/// The public client binary's file name. Sourced from `kmux::os::host` so the
 /// fork's rename to `kmux` cannot drift out of sync here -- this is a runtime
 /// file lookup, so a stale name is a silent failure, not a build error.
 fn helper_file_name() -> OsString {
-    rmux_os::host::public_binary_file_name()
+    kmux::os::host::public_binary_file_name()
 }
 
 #[cfg(not(windows))]

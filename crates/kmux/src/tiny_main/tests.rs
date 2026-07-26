@@ -7,7 +7,7 @@ use parse::{
 };
 #[cfg(windows)]
 use parse::{windows_client_shell_for_parent_name, windows_invoking_client_environment};
-use rmux_proto::{
+use kmux::proto::{
     ErrorResponse, ResizePaneAdjustment, Response, RmuxError, SourceFileResponse, SplitDirection,
     Target,
 };
@@ -36,7 +36,7 @@ fn assert_tiny_fallback(args: &[&str]) {
 
 fn explicit_socket_path() -> String {
     if cfg!(windows) {
-        rmux_client::resolve_socket_path(Some(OsStr::new("benchsock")), None)
+        kmux::client::resolve_socket_path(Some(OsStr::new("benchsock")), None)
             .expect("valid Windows explicit pipe path")
             .to_string_lossy()
             .into_owned()
@@ -54,7 +54,7 @@ fn long_version_stays_on_full_helper_path_for_tmux_compatibility() {
 fn tiny_connect_error_uses_tmux_shape() {
     let message = client_error(
         std::path::Path::new("/tmp/rmux-missing.sock"),
-        rmux_client::ClientError::Io(std::io::ErrorKind::NotFound.into()),
+        kmux::client::ClientError::Io(std::io::ErrorKind::NotFound.into()),
     );
 
     assert!(message.starts_with("error connecting to /tmp/rmux-missing.sock ("));
@@ -672,7 +672,7 @@ fn resize_pane_composed_adjustments_stay_tiny_parseable() {
         ResizePaneAdjustment::Composite {
             columns: Some(80),
             rows: None,
-            relative: Some(rmux_proto::ResizePaneRelativeDirection::Right),
+            relative: Some(kmux::proto::ResizePaneRelativeDirection::Right),
             cells: 1
         }
     ));

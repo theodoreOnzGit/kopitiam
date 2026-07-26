@@ -2,8 +2,8 @@ use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use rmux_proto::request::{AttachSessionExt2Request, NewSessionExtRequest};
-use rmux_proto::{
+use kmux::proto::request::{AttachSessionExt2Request, NewSessionExtRequest};
+use kmux::proto::{
     CapturePaneTargetActionRequest, OptionScopeSelector, PaneTarget, ResizePaneAdjustment,
     ResizePaneRelativeDirection, ResizePaneTargetActionRequest, SessionName, SplitDirection,
     SplitWindowTargetActionRequest, Target, TerminalSize, WindowTarget,
@@ -542,7 +542,7 @@ pub(super) fn parse_set_option(args: &[OsString], force_window: bool) -> Option<
     let scope = if force_window {
         OptionScopeSelector::WindowGlobal
     } else {
-        rmux_core::default_global_scope_for_option_name(&option).ok()?
+        kmux::core::default_global_scope_for_option_name(&option).ok()?
     };
 
     Some(TinySetOption {
@@ -600,7 +600,7 @@ pub(super) fn parse_attach_session(args: &[OsString]) -> Option<AttachSessionExt
             Vec::new(),
             infer_client_utf8_from_env(),
         ),
-        client_size: rmux_os::terminal::current_size(),
+        client_size: kmux::os::terminal::current_size(),
     })
 }
 
@@ -797,7 +797,7 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
         .iter()
         .map(|arg| arg.to_str().map(ToOwned::to_owned))
         .collect::<Option<Vec<_>>>()?;
-    let args = rmux_core::tmux_precedence::normalize_tmux_precedence("resize-pane", normalized)
+    let args = kmux::core::tmux_precedence::normalize_tmux_precedence("resize-pane", normalized)
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
@@ -1122,8 +1122,8 @@ where
 
 #[cfg(windows)]
 pub(super) fn invoking_client_shell() -> Option<String> {
-    let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
-    let parent_name = rmux_os::process::command_name(parent_pid)?;
+    let parent_pid = kmux::os::process::parent_pid(std::process::id())?;
+    let parent_name = kmux::os::process::command_name(parent_pid)?;
     windows_client_shell_for_parent_name(&parent_name)
 }
 

@@ -232,7 +232,7 @@ impl BroadcastKeysArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct WithSessionArgs {
     #[arg(value_parser = parse_session_name)]
-    pub(crate) session_name: rmux_proto::SessionName,
+    pub(crate) session_name: kmux::proto::SessionName,
     #[arg(long = "kill-on-owner-exit", action = ArgAction::SetTrue)]
     pub(crate) kill_on_owner_exit: bool,
     #[arg(long = "ttl", value_parser = parse_duration, default_value = "30s")]

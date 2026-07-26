@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rmux_client::{default_socket_path, AutoStartError, ClientError, NestedContextError};
-use rmux_proto::RmuxError;
+use kmux::client::{default_socket_path, AutoStartError, ClientError, NestedContextError};
+use kmux::proto::RmuxError;
 
 use crate::tmux_error_surface::tmux_client_connect_error_message;
 

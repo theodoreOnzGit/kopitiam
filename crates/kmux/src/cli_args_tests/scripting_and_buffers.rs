@@ -313,7 +313,7 @@ fn set_hook_accepts_target_scope_and_indexed_hook() {
     match cli.command.expect("parsed command") {
         super::super::Command::SetHook(args) => {
             assert_eq!(args.target.expect("target").to_string(), "alpha");
-            assert_eq!(args.hook.hook, rmux_proto::HookName::ClientAttached);
+            assert_eq!(args.hook.hook, kmux::proto::HookName::ClientAttached);
             assert_eq!(args.hook.index, Some(2));
             assert_eq!(args.command.as_deref(), Some("true"));
         }
@@ -327,7 +327,7 @@ fn show_hooks_accepts_global_and_target_scope_flags() {
     match cli.command.expect("parsed command") {
         super::super::Command::ShowHooks(args) => {
             assert!(args.global);
-            assert_eq!(args.hook, Some(rmux_proto::HookName::ClientAttached));
+            assert_eq!(args.hook, Some(kmux::proto::HookName::ClientAttached));
             assert_eq!(args.target, None);
         }
         _ => panic!("expected ShowHooks command"),
@@ -338,7 +338,7 @@ fn show_hooks_accepts_global_and_target_scope_flags() {
         super::super::Command::ShowHooks(args) => {
             assert!(args.pane);
             assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
-            assert_eq!(args.hook, Some(rmux_proto::HookName::ClientAttached));
+            assert_eq!(args.hook, Some(kmux::proto::HookName::ClientAttached));
         }
         _ => panic!("expected ShowHooks command"),
     }
@@ -347,9 +347,9 @@ fn show_hooks_accepts_global_and_target_scope_flags() {
 #[test]
 fn wait_for_accepts_all_modes() {
     for (flag, expected) in [
-        ("-S", rmux_proto::WaitForMode::Signal),
-        ("-L", rmux_proto::WaitForMode::Lock),
-        ("-U", rmux_proto::WaitForMode::Unlock),
+        ("-S", kmux::proto::WaitForMode::Signal),
+        ("-L", kmux::proto::WaitForMode::Lock),
+        ("-U", kmux::proto::WaitForMode::Unlock),
     ] {
         let cli = parse_args(&["wait-for", flag, "channel"]).unwrap();
         match cli.command.expect("parsed command") {
@@ -361,7 +361,7 @@ fn wait_for_accepts_all_modes() {
     let cli = parse_args(&["wait-for", "channel"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::WaitFor(args) => {
-            assert_eq!(args.mode(), rmux_proto::WaitForMode::Wait)
+            assert_eq!(args.mode(), kmux::proto::WaitForMode::Wait)
         }
         _ => panic!("expected WaitFor command"),
     }
@@ -470,7 +470,7 @@ fn wait_alias_accepts_lock_mode() {
     match cli.command.expect("parsed command") {
         super::super::Command::WaitFor(args) => {
             assert_eq!(args.channel, "channel");
-            assert_eq!(args.mode(), rmux_proto::WaitForMode::Lock);
+            assert_eq!(args.mode(), kmux::proto::WaitForMode::Lock);
         }
         _ => panic!("expected WaitFor command"),
     }

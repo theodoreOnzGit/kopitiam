@@ -1,6 +1,6 @@
 use std::fmt;
 
-use rmux_proto::{
+use kmux::proto::{
     MoveWindowTarget, PaneTarget, SelectLayoutTarget, SessionName, SplitWindowTarget, Target,
     WindowTarget,
 };

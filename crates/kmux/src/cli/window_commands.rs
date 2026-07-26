@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use rmux_client::{connect, Connection};
-use rmux_core::formats::{is_truthy, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT};
-use rmux_proto::{
+use kmux::client::{connect, Connection};
+use kmux::core::formats::{is_truthy, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT};
+use kmux::proto::{
     CommandOutput, ErrorResponse, KillSessionRequest, KillWindowResponse, ListWindowsResponse,
     MoveWindowTarget, OptionScopeSelector, ResolveTargetType, Response,
 };
@@ -60,14 +60,14 @@ fn resolve_link_window_target(
     after: bool,
     before: bool,
     command_name: &str,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<kmux::proto::WindowTarget, ExitFailure> {
     let Some(target) = target else {
         if after || before {
             return resolve_window_placement_anchor_target(connection, None, command_name);
         }
         let session_name = resolve_session_target_or_current(connection, None, command_name)?;
         let index = first_available_window_index(connection, &session_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(kmux::proto::WindowTarget::with_window(session_name, index));
     };
 
     if after || before {
@@ -93,7 +93,7 @@ fn link_target_is_explicit_session_only(target: &TargetSpec) -> bool {
     {
         return true;
     }
-    raw.starts_with('=') && matches!(target.exact(), Some(rmux_proto::Target::Session(_)))
+    raw.starts_with('=') && matches!(target.exact(), Some(kmux::proto::Target::Session(_)))
 }
 
 fn is_special_window_token(raw: &str) -> bool {
@@ -107,7 +107,7 @@ fn resolve_window_destination_target(
     connection: &mut Connection,
     target: &TargetSpec,
     command_name: &str,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<kmux::proto::WindowTarget, ExitFailure> {
     if let Some(target) =
         resolve_bare_relative_window_target(connection, target.raw(), command_name)?
     {
@@ -115,15 +115,15 @@ fn resolve_window_destination_target(
     }
     if let Some(index) = parse_bare_window_index(target.raw())? {
         let session_name = resolve_session_target_or_current(connection, None, command_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(kmux::proto::WindowTarget::with_window(session_name, index));
     }
-    if let Some(rmux_proto::Target::Window(target)) = target.exact() {
+    if let Some(kmux::proto::Target::Window(target)) = target.exact() {
         return Ok(target.clone());
     }
     if link_target_is_explicit_session_only(target) {
         let session_name = resolve_session_only_destination(connection, target)?;
         let index = first_available_window_index(connection, &session_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(kmux::proto::WindowTarget::with_window(session_name, index));
     }
     if let Some(target) =
         resolve_exact_current_window_name_destination(connection, target.raw(), command_name)?
@@ -141,7 +141,7 @@ fn resolve_exact_current_window_name_destination(
     connection: &mut Connection,
     raw_target: &str,
     command_name: &str,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<kmux::proto::WindowTarget>, ExitFailure> {
     if !link_target_is_bare_session_candidate(raw_target) {
         return Ok(None);
     }
@@ -152,7 +152,7 @@ fn resolve_exact_current_window_name_destination(
 fn resolve_bare_session_window_destination(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<kmux::proto::WindowTarget>, ExitFailure> {
     if !link_target_is_bare_session_candidate(target.raw()) {
         return Ok(None);
     }
@@ -161,7 +161,7 @@ fn resolve_bare_session_window_destination(
         Err(_) => return Ok(None),
     };
     let index = first_available_window_index(connection, &session_name)?;
-    Ok(Some(rmux_proto::WindowTarget::with_window(
+    Ok(Some(kmux::proto::WindowTarget::with_window(
         session_name,
         index,
     )))
@@ -182,13 +182,13 @@ fn resolve_bare_relative_window_target(
     connection: &mut Connection,
     raw_target: &str,
     command_name: &str,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<kmux::proto::WindowTarget>, ExitFailure> {
     let Some(offset) = parse_bare_relative_window_offset(raw_target)? else {
         return Ok(None);
     };
     let current = resolve_window_target_or_current(connection, None, command_name)?;
     let index = apply_window_index_offset(current.window_index(), offset)?;
-    Ok(Some(rmux_proto::WindowTarget::with_window(
+    Ok(Some(kmux::proto::WindowTarget::with_window(
         current.session_name().clone(),
         index,
     )))
@@ -198,10 +198,10 @@ fn resolve_window_placement_anchor_target(
     connection: &mut Connection,
     target: Option<&TargetSpec>,
     command_name: &str,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<kmux::proto::WindowTarget, ExitFailure> {
     let Some(target) = target else {
         let pane = resolve_current_pane_target(connection, command_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(
+        return Ok(kmux::proto::WindowTarget::with_window(
             pane.session_name().clone(),
             pane.window_index(),
         ));
@@ -214,7 +214,7 @@ fn resolve_window_placement_anchor_target(
             let session_name = resolve_session_target_spec(connection, &session_target, false)?;
             let window_index =
                 resolve_active_window_index(connection, &session_name, command_name)?;
-            return Ok(rmux_proto::WindowTarget::with_window(
+            return Ok(kmux::proto::WindowTarget::with_window(
                 session_name,
                 window_index,
             ));
@@ -227,7 +227,7 @@ fn resolve_window_placement_anchor_target(
 
 fn resolve_active_window_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
     command_name: &str,
 ) -> Result<u32, ExitFailure> {
     let response = connection
@@ -305,7 +305,7 @@ fn parse_bare_window_index(value: &str) -> Result<Option<u32>, ExitFailure> {
 fn resolve_session_only_destination(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<rmux_proto::SessionName, ExitFailure> {
+) -> Result<kmux::proto::SessionName, ExitFailure> {
     if let Some(session) = target.raw().strip_suffix(':') {
         let session_target = crate::cli_args::parse_target_spec(session)
             .map_err(|error| ExitFailure::new(1, error))?;
@@ -316,7 +316,7 @@ fn resolve_session_only_destination(
 
 fn first_available_window_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
 ) -> Result<u32, ExitFailure> {
     let response = connection
         .list_windows(session_name.clone(), Some("#{window_index}".to_owned()))
@@ -345,7 +345,7 @@ fn first_available_window_index(
 
 fn session_base_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
 ) -> Result<u32, ExitFailure> {
     let response = connection
         .show_options(
@@ -437,7 +437,7 @@ pub(super) fn run_swap_window(
 fn resolve_window_source_or_marked_or_current(
     connection: &mut Connection,
     source: Option<&TargetSpec>,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<kmux::proto::WindowTarget, ExitFailure> {
     if let Some(source) = source {
         return resolve_window_target_spec(connection, source, false);
     }
@@ -474,17 +474,17 @@ pub(super) fn run_resize_window(
 ) -> Result<i32, ExitFailure> {
     let adjust = args.adjustment.unwrap_or(1);
     let adjustment = if args.up {
-        Some(rmux_proto::ResizeWindowAdjustment::Up(adjust))
+        Some(kmux::proto::ResizeWindowAdjustment::Up(adjust))
     } else if args.down {
-        Some(rmux_proto::ResizeWindowAdjustment::Down(adjust))
+        Some(kmux::proto::ResizeWindowAdjustment::Down(adjust))
     } else if args.left {
-        Some(rmux_proto::ResizeWindowAdjustment::Left(adjust))
+        Some(kmux::proto::ResizeWindowAdjustment::Left(adjust))
     } else if args.right {
-        Some(rmux_proto::ResizeWindowAdjustment::Right(adjust))
+        Some(kmux::proto::ResizeWindowAdjustment::Right(adjust))
     } else if args.expand {
-        Some(rmux_proto::ResizeWindowAdjustment::LargestLinkedSession)
+        Some(kmux::proto::ResizeWindowAdjustment::LargestLinkedSession)
     } else if args.shrink {
-        Some(rmux_proto::ResizeWindowAdjustment::SmallestLinkedSession)
+        Some(kmux::proto::ResizeWindowAdjustment::SmallestLinkedSession)
     } else {
         None
     };
@@ -538,7 +538,7 @@ pub(super) fn run_unlink_window(
 }
 
 struct ResolvedMoveWindowArgs {
-    source: Option<rmux_proto::WindowTarget>,
+    source: Option<kmux::proto::WindowTarget>,
     target: MoveWindowTarget,
     renumber: bool,
     kill_destination: bool,
@@ -546,7 +546,7 @@ struct ResolvedMoveWindowArgs {
 }
 
 fn resolve_move_window_args(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     args: MoveWindowArgs,
 ) -> Result<ResolvedMoveWindowArgs, ExitFailure> {
     let effective_reindex = args.reindex;
@@ -585,7 +585,7 @@ fn resolve_move_window_args(
 }
 
 fn resolve_move_window_reindex_target(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     target: &TargetSpec,
 ) -> Result<MoveWindowTarget, ExitFailure> {
     if let Some((session_part, window_part)) = target.raw().split_once(':') {
@@ -605,28 +605,28 @@ fn resolve_move_window_reindex_target(
 }
 
 fn resolve_move_window_destination(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     target: Option<&TargetSpec>,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<kmux::proto::WindowTarget, ExitFailure> {
     match target {
         Some(target) => resolve_window_destination_target(connection, target, "move-window"),
         None => {
             let session_name = resolve_current_session(connection)?;
             let index = first_available_window_index(connection, &session_name)?;
-            Ok(rmux_proto::WindowTarget::with_window(session_name, index))
+            Ok(kmux::proto::WindowTarget::with_window(session_name, index))
         }
     }
 }
 
 fn resolve_current_session(
-    connection: &mut rmux_client::Connection,
-) -> Result<rmux_proto::SessionName, ExitFailure> {
+    connection: &mut kmux::client::Connection,
+) -> Result<kmux::proto::SessionName, ExitFailure> {
     match connection
-        .resolve_target(None, rmux_proto::ResolveTargetType::Session, false, false)
+        .resolve_target(None, kmux::proto::ResolveTargetType::Session, false, false)
         .map_err(ExitFailure::from_client)?
     {
-        rmux_proto::Response::ResolveTarget(response) => match response.target {
-            rmux_proto::Target::Session(session_name) => Ok(session_name),
+        kmux::proto::Response::ResolveTarget(response) => match response.target {
+            kmux::proto::Target::Session(session_name) => Ok(session_name),
             other => Err(ExitFailure::new(
                 1,
                 format!(
@@ -635,7 +635,7 @@ fn resolve_current_session(
                 ),
             )),
         },
-        rmux_proto::Response::Error(rmux_proto::ErrorResponse { error }) => {
+        kmux::proto::Response::Error(kmux::proto::ErrorResponse { error }) => {
             Err(ExitFailure::new(1, error.to_string()))
         }
         other => Err(super::unexpected_response("resolve-target", &other)),
@@ -676,7 +676,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
                     .map_err(ExitFailure::from_client)?;
             }
             if print_target {
-                let pane = rmux_proto::PaneTarget::with_window(
+                let pane = kmux::proto::PaneTarget::with_window(
                     existing.session_name().clone(),
                     existing.window_index(),
                     0,
@@ -684,7 +684,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
                 print_target_format(
                     &mut connection,
                     "new-window",
-                    rmux_proto::Target::Pane(pane),
+                    kmux::proto::Target::Pane(pane),
                     &print_format,
                 )?;
             }
@@ -741,7 +741,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
     };
 
     if print_target {
-        let pane = rmux_proto::PaneTarget::with_window(
+        let pane = kmux::proto::PaneTarget::with_window(
             target.session_name().clone(),
             target.window_index(),
             0,
@@ -749,7 +749,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
         print_target_format(
             &mut connection,
             "new-window",
-            rmux_proto::Target::Pane(pane),
+            kmux::proto::Target::Pane(pane),
             &print_format,
         )?;
     }
@@ -759,9 +759,9 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
 
 fn find_window_by_name(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
     name: &str,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<kmux::proto::WindowTarget>, ExitFailure> {
     let response = connection
         .list_windows(
             session_name.clone(),
@@ -779,7 +779,7 @@ fn find_window_by_name(
             let window_index = index
                 .parse::<u32>()
                 .map_err(|_| ExitFailure::new(1, format!("invalid window index: {index}")))?;
-            return Ok(Some(rmux_proto::WindowTarget::with_window(
+            return Ok(Some(kmux::proto::WindowTarget::with_window(
                 session_name.clone(),
                 window_index,
             )));
@@ -790,10 +790,10 @@ fn find_window_by_name(
 
 fn kill_existing_window_at(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
     window_index: u32,
 ) -> Result<(), ExitFailure> {
-    let target = rmux_proto::WindowTarget::with_window(session_name.clone(), window_index);
+    let target = kmux::proto::WindowTarget::with_window(session_name.clone(), window_index);
     let response = connection
         .kill_window(target, false)
         .map_err(ExitFailure::from_client)?;
@@ -813,12 +813,12 @@ fn only_window_kill_failure(error: &ExitFailure) -> bool {
 
 fn move_created_window_to_replacement_index(
     connection: &mut Connection,
-    created: rmux_proto::WindowTarget,
+    created: kmux::proto::WindowTarget,
     window_index: u32,
     detached: bool,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<kmux::proto::WindowTarget, ExitFailure> {
     let target =
-        rmux_proto::WindowTarget::with_window(created.session_name().clone(), window_index);
+        kmux::proto::WindowTarget::with_window(created.session_name().clone(), window_index);
     let response = connection
         .move_window(
             Some(created),
@@ -835,13 +835,13 @@ fn move_created_window_to_replacement_index(
     }
 }
 
-fn missing_window_error(error: &rmux_proto::RmuxError) -> bool {
+fn missing_window_error(error: &kmux::proto::RmuxError) -> bool {
     match error {
-        rmux_proto::RmuxError::InvalidTarget { reason, .. } => {
+        kmux::proto::RmuxError::InvalidTarget { reason, .. } => {
             reason.contains("window index does not exist")
                 || reason.starts_with("can't find window:")
         }
-        rmux_proto::RmuxError::Server(message) => message.starts_with("can't find window:"),
+        kmux::proto::RmuxError::Server(message) => message.starts_with("can't find window:"),
         _ => false,
     }
 }
@@ -851,7 +851,7 @@ fn resolve_new_window_placement_target(
     target: Option<&TargetSpec>,
     after: bool,
     command_name: &str,
-) -> Result<(rmux_proto::SessionName, Option<u32>), ExitFailure> {
+) -> Result<(kmux::proto::SessionName, Option<u32>), ExitFailure> {
     let window = resolve_window_placement_anchor_target(connection, target, command_name)?;
     let window_index = if after {
         window.window_index().checked_add(1).ok_or_else(|| {
@@ -872,7 +872,7 @@ fn resolve_new_window_placement_target(
 fn resolve_new_window_target_spec(
     connection: &mut Connection,
     target: Option<&TargetSpec>,
-) -> Result<(rmux_proto::SessionName, Option<u32>), ExitFailure> {
+) -> Result<(kmux::proto::SessionName, Option<u32>), ExitFailure> {
     let Some(target) = target else {
         return resolve_current_session_target(connection).map(|session| (session, None));
     };
@@ -891,7 +891,7 @@ fn resolve_new_window_target_spec(
             true,
             false,
         )? {
-            rmux_proto::Target::Window(window) => {
+            kmux::proto::Target::Window(window) => {
                 Ok((window.session_name().clone(), Some(window.window_index())))
             }
             other => Err(ExitFailure::new(
@@ -912,16 +912,16 @@ fn resolve_new_window_target_spec(
     }
 
     match target.exact() {
-        Some(rmux_proto::Target::Session(session_name)) => {
+        Some(kmux::proto::Target::Session(session_name)) => {
             return Ok((session_name.clone(), None));
         }
-        Some(rmux_proto::Target::Window(window_target)) => {
+        Some(kmux::proto::Target::Window(window_target)) => {
             return Ok((
                 window_target.session_name().clone(),
                 Some(window_target.window_index()),
             ));
         }
-        Some(rmux_proto::Target::Pane(_)) => {}
+        Some(kmux::proto::Target::Pane(_)) => {}
         None => {
             if let Some(session_name) = resolve_new_window_session_only_target(connection, target)?
             {
@@ -931,7 +931,7 @@ fn resolve_new_window_target_spec(
     }
 
     match resolve_target_spec(connection, target, ResolveTargetType::Session, false, false)? {
-        rmux_proto::Target::Session(session_name) => Ok((session_name, None)),
+        kmux::proto::Target::Session(session_name) => Ok((session_name, None)),
         other => Err(ExitFailure::new(
             1,
             format!(
@@ -968,16 +968,16 @@ fn signed_window_index_target(value: &str) -> bool {
 fn resolve_new_window_bare_window_target(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<kmux::proto::WindowTarget>, ExitFailure> {
     let raw = target.raw();
     if !new_window_target_is_bare_lookup(raw)
-        || !matches!(target.exact(), None | Some(rmux_proto::Target::Session(_)))
+        || !matches!(target.exact(), None | Some(kmux::proto::Target::Session(_)))
     {
         return Ok(None);
     }
 
     match resolve_target_spec(connection, target, ResolveTargetType::Window, false, false) {
-        Ok(rmux_proto::Target::Window(window)) => {
+        Ok(kmux::proto::Target::Window(window)) => {
             if window_name_matches_target(connection, &window, raw)? {
                 Ok(Some(window))
             } else {
@@ -1000,7 +1000,7 @@ fn new_window_target_is_bare_lookup(raw_target: &str) -> bool {
 
 fn window_name_matches_target(
     connection: &mut Connection,
-    window: &rmux_proto::WindowTarget,
+    window: &kmux::proto::WindowTarget,
     target: &str,
 ) -> Result<bool, ExitFailure> {
     let response = connection
@@ -1021,7 +1021,7 @@ fn window_name_matches_target(
         }
         return Ok(window_name == target
             || window_name.starts_with(target)
-            || rmux_core::fnmatch(target, window_name));
+            || kmux::core::fnmatch(target, window_name));
     }
     Ok(false)
 }
@@ -1029,7 +1029,7 @@ fn window_name_matches_target(
 fn resolve_new_window_session_only_target(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<Option<rmux_proto::SessionName>, ExitFailure> {
+) -> Result<Option<kmux::proto::SessionName>, ExitFailure> {
     let raw_target = target.raw();
     let Some((session_name, window_part)) = raw_target.split_once(':') else {
         return Ok(None);
@@ -1122,7 +1122,7 @@ pub(super) fn run_select_window(
 
 fn window_target_is_current(
     connection: &mut Connection,
-    target: &rmux_proto::WindowTarget,
+    target: &kmux::proto::WindowTarget,
 ) -> Result<bool, ExitFailure> {
     let current = resolve_current_pane_target(connection, "select-window")?;
     Ok(target.session_name() == current.session_name()

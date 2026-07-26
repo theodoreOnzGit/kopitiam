@@ -1,6 +1,6 @@
-use rmux_client::Connection;
-use rmux_proto::types::OptionScopeSelector;
-use rmux_proto::{PaneTarget, ResolveTargetType, SetOptionMode, Target, WindowTarget};
+use kmux::client::Connection;
+use kmux::proto::types::OptionScopeSelector;
+use kmux::proto::{PaneTarget, ResolveTargetType, SetOptionMode, Target, WindowTarget};
 
 #[path = "options/show_scope.rs"]
 mod show_scope;
@@ -82,7 +82,7 @@ fn build_resolved_set_option_command(
     };
 
     if !args.format {
-        rmux_core::validate_option_name_mutation(
+        kmux::core::validate_option_name_mutation(
             &args.option,
             &scope,
             mode,
@@ -148,9 +148,9 @@ impl From<OptionScopeSelector> for ResolvedSetOptionScope {
 }
 
 fn validate_set_option_name(name: &str) -> Result<(), ExitFailure> {
-    match rmux_core::resolve_option_name(name) {
+    match kmux::core::resolve_option_name(name) {
         Ok(_) => Ok(()),
-        Err(rmux_proto::RmuxError::Server(message))
+        Err(kmux::proto::RmuxError::Server(message))
             if message.starts_with("unknown option: ")
                 || message.starts_with("invalid option: ") =>
         {
@@ -195,7 +195,7 @@ fn resolve_set_option_scope(
         .next()
         .is_some_and(|base| base.starts_with('@'));
     let supports_scope = |scope: &OptionScopeSelector| {
-        rmux_core::validate_option_name_mutation(
+        kmux::core::validate_option_name_mutation(
             request.option,
             scope,
             SetOptionMode::Replace,
@@ -212,7 +212,7 @@ fn resolve_set_option_scope(
         && !force_window
         && !is_user
     {
-        let scope = rmux_core::default_global_scope_for_option_name(request.option)
+        let scope = kmux::core::default_global_scope_for_option_name(request.option)
             .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         if supports_scope(&scope) {
             return Ok(scope.into());
@@ -291,7 +291,7 @@ fn resolve_set_option_scope(
     }
 
     if request.global {
-        let scope = rmux_core::default_global_scope_for_option_name(request.option)
+        let scope = kmux::core::default_global_scope_for_option_name(request.option)
             .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         if !is_user && !supports_scope(&scope) {
             return Err(ExitFailure::new(
@@ -307,7 +307,7 @@ fn resolve_set_option_scope(
     };
 
     if !is_user {
-        let global_scope = rmux_core::default_global_scope_for_option_name(request.option)
+        let global_scope = kmux::core::default_global_scope_for_option_name(request.option)
             .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         if matches!(global_scope, OptionScopeSelector::ServerGlobal)
             && supports_scope(&global_scope)
@@ -392,7 +392,7 @@ fn resolve_implicit_set_option_scope(
     option: &str,
     resolver: &mut impl SetOptionTargetResolver,
 ) -> Result<ResolvedSetOptionScope, ExitFailure> {
-    match rmux_core::default_global_scope_for_option_name(option)
+    match kmux::core::default_global_scope_for_option_name(option)
         .map_err(|error| ExitFailure::new(1, error.to_string()))?
     {
         OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal.into()),
@@ -416,7 +416,7 @@ trait SetOptionTargetResolver {
     fn current_session(
         &mut self,
         command_name: &str,
-    ) -> Result<rmux_proto::SessionName, ExitFailure>;
+    ) -> Result<kmux::proto::SessionName, ExitFailure>;
 
     fn current_pane(&mut self, command_name: &str) -> Result<PaneTarget, ExitFailure>;
 
@@ -439,7 +439,7 @@ impl SetOptionTargetResolver for ConnectionSetOptionTargetResolver<'_> {
     fn current_session(
         &mut self,
         _command_name: &str,
-    ) -> Result<rmux_proto::SessionName, ExitFailure> {
+    ) -> Result<kmux::proto::SessionName, ExitFailure> {
         resolve_current_session_target(self.connection)
     }
 
@@ -471,7 +471,7 @@ impl SetOptionTargetResolver for ExactSetOptionTargetResolver {
     fn current_session(
         &mut self,
         _command_name: &str,
-    ) -> Result<rmux_proto::SessionName, ExitFailure> {
+    ) -> Result<kmux::proto::SessionName, ExitFailure> {
         Err(ExitFailure::new(
             1,
             "test path does not provide a current session",

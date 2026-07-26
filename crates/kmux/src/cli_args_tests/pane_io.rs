@@ -227,7 +227,7 @@ fn select_pane_accepts_directional_flags_with_optional_target() {
             );
             assert_eq!(
                 args.direction(),
-                Some(rmux_proto::SelectPaneDirection::Right)
+                Some(kmux::proto::SelectPaneDirection::Right)
             );
         }
         _ => panic!("expected SelectPane command"),
@@ -239,7 +239,7 @@ fn select_pane_accepts_directional_flags_with_optional_target() {
             assert!(args.target.is_none());
             assert_eq!(
                 args.direction(),
-                Some(rmux_proto::SelectPaneDirection::Down)
+                Some(kmux::proto::SelectPaneDirection::Down)
             );
         }
         _ => panic!("expected SelectPane command"),
@@ -257,7 +257,7 @@ fn select_pane_directional_flags_follow_tmux_priority() {
             super::super::Command::SelectPane(args) => {
                 assert_eq!(
                     args.direction(),
-                    Some(rmux_proto::SelectPaneDirection::Left)
+                    Some(kmux::proto::SelectPaneDirection::Left)
                 );
             }
             _ => panic!("expected SelectPane command"),
@@ -271,7 +271,7 @@ fn select_pane_directional_flags_follow_tmux_priority() {
         let cli = parse_args(&argv).unwrap();
         match cli.command.expect("parsed command") {
             super::super::Command::SelectPane(args) => {
-                assert_eq!(args.direction(), Some(rmux_proto::SelectPaneDirection::Up));
+                assert_eq!(args.direction(), Some(kmux::proto::SelectPaneDirection::Up));
             }
             _ => panic!("expected SelectPane command"),
         }

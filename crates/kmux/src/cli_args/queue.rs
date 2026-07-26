@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 
 use clap::{ArgAction, Args, FromArgMatches};
-use rmux_core::command_parser::{
+use kmux::core::command_parser::{
     CommandArgument, CommandParseError, CommandParser as TmuxCommandParser, ParsedCommand,
     ParsedCommands,
 };

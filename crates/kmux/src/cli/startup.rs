@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use rmux_client::AutoStartConfig;
-use rmux_server::{DaemonConfig, ServerDaemon};
+use kmux::client::AutoStartConfig;
+use kmux::server::{DaemonConfig, ServerDaemon};
 
 use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs};
 use crate::server_runtime::build_daemon_runtime;

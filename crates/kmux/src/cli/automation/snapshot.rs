@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_proto::{PaneSnapshotCell, PaneSnapshotResponse};
+use kmux::proto::{PaneSnapshotCell, PaneSnapshotResponse};
 use serde_json::{json, Value};
 
 use crate::cli_args::{PaneSnapshotArgs, SnapshotRegion};
@@ -149,7 +149,7 @@ fn snapshot_json(
 
 #[cfg(test)]
 mod tests {
-    use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
+    use kmux::proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
 
     use crate::cli_args::SnapshotRegion;
 

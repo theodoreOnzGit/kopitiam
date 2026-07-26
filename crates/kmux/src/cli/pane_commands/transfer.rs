@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_proto::{BreakPaneRequest, JoinPaneRequest, MovePaneRequest, PaneSplitSize};
+use kmux::proto::{BreakPaneRequest, JoinPaneRequest, MovePaneRequest, PaneSplitSize};
 
 use super::super::{
     resolve_pane_target_or_current, resolve_pane_target_spec, resolve_window_target_spec,
@@ -119,9 +119,9 @@ pub(in crate::cli) fn run_move_pane(
 }
 
 fn resolve_pane_source_or_marked(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     source: Option<&TargetSpec>,
-) -> Result<rmux_proto::PaneTarget, ExitFailure> {
+) -> Result<kmux::proto::PaneTarget, ExitFailure> {
     if let Some(source) = source {
         return resolve_pane_target_spec(connection, source);
     }

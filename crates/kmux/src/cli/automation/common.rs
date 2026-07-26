@@ -2,8 +2,8 @@ use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rmux_client::{connect, Connection};
-use rmux_proto::{
+use kmux::client::{connect, Connection};
+use kmux::proto::{
     PaneId, PaneSnapshotCell, PaneSnapshotResponse, PaneTarget, PaneTargetRef, Response,
 };
 use serde_json::{json, Value};
@@ -529,7 +529,7 @@ fn pane_process_state_for_slot(
 
 fn pane_process_state_for_id(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
     pane_id: PaneId,
 ) -> Result<PaneProcessState, ExitFailure> {
     let response = connection
@@ -597,7 +597,7 @@ fn parse_i32_field(value: Option<&str>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
+    use kmux::proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
 
     use super::{find_visible_text, visible_lines};
 

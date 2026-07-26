@@ -1,5 +1,5 @@
-use rmux_client::Connection;
-use rmux_proto::Target;
+use kmux::client::Connection;
+use kmux::proto::Target;
 
 use super::{expect_command_output, write_command_output, ExitFailure};
 

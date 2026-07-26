@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use rmux_server::{ConfigFileSelection, DaemonConfig, ServerDaemon};
+use kmux::server::{ConfigFileSelection, DaemonConfig, ServerDaemon};
 
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 
@@ -235,7 +235,7 @@ fn run_hidden_daemon(args: DaemonArgs) -> io::Result<()> {
     if let Some(ready_event) = args.startup_ready_event {
         config = config.with_startup_ready_event(ready_event);
     }
-    rmux_os::memory::configure_daemon_allocator();
+    kmux::os::memory::configure_daemon_allocator();
     let runtime = server_runtime::build_daemon_runtime()?;
 
     runtime.block_on(async move {

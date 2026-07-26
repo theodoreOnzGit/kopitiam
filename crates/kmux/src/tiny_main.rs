@@ -9,26 +9,26 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
-use rmux_client::attach_terminal_with_initial_bytes;
+use kmux::client::attach_terminal_with_initial_bytes;
 #[cfg(unix)]
-use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
+use kmux::client::attach_terminal_with_initial_bytes_and_resize_geometry;
 #[cfg(windows)]
-use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
-use rmux_client::{
+use kmux::client::attach_terminal_with_initial_bytes_and_windows_console_key;
+use kmux::client::{
     connect, ensure_server_running_with_config, resolve_socket_path,
     resolve_tmux_compatible_socket_path, AttachTransition, AutoStartConfig, ClientError,
     Connection, StartServerError,
 };
 #[cfg(not(windows))]
-use rmux_client::{connect_or_absent, ConnectResult};
-use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
-use rmux_proto::request::{
+use kmux::client::{connect_or_absent, ConnectResult};
+use kmux::core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
+use kmux::proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, DisplayMessageRequest, KillSessionRequest,
     NewSessionExtRequest,
 };
 #[cfg(windows)]
-use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
-use rmux_proto::{
+use kmux::proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
+use kmux::proto::{
     CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest, Request,
     ResizePaneTargetActionRequest, Response, RmuxError, SetOptionMode, SourceFileResponse,
     SplitDirection, SplitWindowTargetActionRequest, CAPABILITY_ATTACH_RENDER,
@@ -918,7 +918,7 @@ fn run_list_panes_all_sessions(connection: &mut Connection) -> Result<i32, Strin
         .map_err(|error| format!("failed to write list-panes command output: {error}"))
 }
 
-fn list_session_names(connection: &mut Connection) -> Result<Vec<rmux_proto::SessionName>, String> {
+fn list_session_names(connection: &mut Connection) -> Result<Vec<kmux::proto::SessionName>, String> {
     let response = connection
         .list_sessions(ListSessionsRequest {
             format: Some("#{session_name}".to_owned()),
@@ -932,7 +932,7 @@ fn list_session_names(connection: &mut Connection) -> Result<Vec<rmux_proto::Ses
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            rmux_proto::SessionName::new(line)
+            kmux::proto::SessionName::new(line)
                 .map_err(|error| format!("invalid session name from list-sessions: {error}"))
         })
         .collect()
@@ -950,7 +950,7 @@ fn response_stdout(response: Response, command: &str) -> Result<Vec<u8>, String>
 
 fn resolve_active_window_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
 ) -> Result<u32, String> {
     let response = connection
         .list_windows(
@@ -1270,7 +1270,7 @@ fn run_target_action(
     socket_path: &Path,
     command: &str,
     retry_policy: RetryPolicy,
-    send: impl FnOnce(&mut rmux_client::Connection) -> Result<Response, ClientError>,
+    send: impl FnOnce(&mut kmux::client::Connection) -> Result<Response, ClientError>,
 ) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = send(&mut connection);

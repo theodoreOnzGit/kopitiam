@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
-use rmux_client::{detect_context, ClientContext};
-use rmux_proto::{
+use kmux::client::{detect_context, ClientContext};
+use kmux::proto::{
     CommandOutput, CreateWebShareRequest, ErrorResponse, ListWebSharesRequest,
     LookupWebShareRequest, PaneTargetRef, Response, SessionName, StopAllWebSharesRequest,
     StopWebShareRequest, WebShareConfigRequest, WebShareCreatedResponse, WebShareRequest,
@@ -94,7 +94,7 @@ fn write_created_share_output(created: &WebShareCreatedResponse) -> Result<(), E
 
 fn build_web_share_request(
     args: WebShareArgs,
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
 ) -> Result<WebShareRequest, ExitFailure> {
     if args.list {
         return Ok(WebShareRequest::List(ListWebSharesRequest));
@@ -234,7 +234,7 @@ fn validate_role_pin(value: Option<&str>, flag: &str) -> Result<(), ExitFailure>
 }
 
 fn resolve_web_share_scope(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     target: Option<&TargetSpec>,
 ) -> Result<WebShareScope, ExitFailure> {
     match target {
@@ -249,7 +249,7 @@ fn resolve_web_share_scope(
 }
 
 fn create_detached_web_share_session(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
 ) -> Result<SessionName, ExitFailure> {
     let seed = auto_web_share_session_seed();
     for attempt in 0..AUTO_WEB_SHARE_SESSION_ATTEMPTS {
@@ -293,13 +293,13 @@ fn auto_web_share_session_name(seed: u64, attempt: u32) -> Result<SessionName, E
         .map_err(|error| ExitFailure::new(1, error.to_string()))
 }
 
-fn session_already_exists(error: &rmux_proto::RmuxError) -> bool {
-    matches!(error, rmux_proto::RmuxError::DuplicateSession(_))
+fn session_already_exists(error: &kmux::proto::RmuxError) -> bool {
+    matches!(error, kmux::proto::RmuxError::DuplicateSession(_))
         || error.to_string().contains("already exists")
 }
 
 fn resolve_web_share_target_spec(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     target: &TargetSpec,
 ) -> Result<WebShareScope, ExitFailure> {
     if target_requests_pane_scope(target) {
@@ -307,15 +307,15 @@ fn resolve_web_share_target_spec(
         return Ok(WebShareScope::Pane(PaneTargetRef::slot(pane)));
     }
     match target.exact() {
-        Some(rmux_proto::Target::Session(_)) => {
+        Some(kmux::proto::Target::Session(_)) => {
             let session_name = resolve_session_target_spec(connection, target, false)?;
             Ok(WebShareScope::Session(session_name))
         }
-        Some(rmux_proto::Target::Pane(_)) | None => {
+        Some(kmux::proto::Target::Pane(_)) | None => {
             let pane = resolve_pane_target_spec(connection, target)?;
             Ok(WebShareScope::Pane(PaneTargetRef::slot(pane)))
         }
-        Some(rmux_proto::Target::Window(_)) => Err(ExitFailure::new(
+        Some(kmux::proto::Target::Window(_)) => Err(ExitFailure::new(
             1,
             "web-share -t accepts pane or session targets, not window targets",
         )),
@@ -323,7 +323,7 @@ fn resolve_web_share_target_spec(
 }
 
 fn target_requests_pane_scope(target: &TargetSpec) -> bool {
-    matches!(target.exact(), Some(rmux_proto::Target::Pane(_)) | None)
+    matches!(target.exact(), Some(kmux::proto::Target::Pane(_)) | None)
         || raw_target_is_pane_id(target.raw())
 }
 
@@ -368,7 +368,7 @@ fn parse_expires_at(value: Option<&str>) -> Result<Option<u64>, ExitFailure> {
 
 #[cfg(test)]
 mod tests {
-    use rmux_proto::WebTerminalTheme;
+    use kmux::proto::WebTerminalTheme;
 
     use super::{
         auto_web_share_session_name, disconnect_share_output, parse_expires_at,
@@ -383,14 +383,14 @@ mod tests {
 
         assert!(matches!(
             target.exact(),
-            Some(rmux_proto::Target::Session(_))
+            Some(kmux::proto::Target::Session(_))
         ));
     }
 
     #[test]
     fn web_share_pane_target_stays_exact() {
         let target = parse_target_spec("webdemo:1.2").expect("pane target should parse");
-        assert!(matches!(target.exact(), Some(rmux_proto::Target::Pane(_))));
+        assert!(matches!(target.exact(), Some(kmux::proto::Target::Pane(_))));
     }
 
     #[test]
@@ -398,7 +398,7 @@ mod tests {
         let target = parse_target_spec("%0").expect("percent pane target should parse");
         assert!(matches!(
             target.exact(),
-            Some(rmux_proto::Target::Session(_))
+            Some(kmux::proto::Target::Session(_))
         ));
         assert!(target_requests_pane_scope(&target));
     }
@@ -408,7 +408,7 @@ mod tests {
         let target = parse_target_spec("%prod").expect("percent session target should parse");
         assert!(matches!(
             target.exact(),
-            Some(rmux_proto::Target::Session(_))
+            Some(kmux::proto::Target::Session(_))
         ));
         assert!(!target_requests_pane_scope(&target));
     }

@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use rmux_client::{connect, Connection};
-use rmux_core::formats::{
+use kmux::client::{connect, Connection};
+use kmux::core::formats::{
     is_truthy, DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT,
     DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
-use rmux_proto::{
+use kmux::proto::{
     CommandOutput, ResizePaneAdjustment, ResizePaneRelativeDirection,
     ResizePaneTargetActionRequest, ResolveTargetType, RespawnPaneRequest,
 };
@@ -195,7 +195,7 @@ fn resolve_list_panes_target(
     connection: &mut Connection,
     target: Option<TargetSpec>,
     command_name: &str,
-) -> Result<(rmux_proto::SessionName, Option<u32>), ExitFailure> {
+) -> Result<(kmux::proto::SessionName, Option<u32>), ExitFailure> {
     let Some(target) = target else {
         let session_name = resolve_session_listing_target(connection, None, command_name)?;
         let window_index = resolve_active_window_index(connection, &session_name, command_name)?;
@@ -203,13 +203,13 @@ fn resolve_list_panes_target(
     };
 
     match target.exact() {
-        Some(rmux_proto::Target::Window(window_target)) => {
+        Some(kmux::proto::Target::Window(window_target)) => {
             return Ok((
                 window_target.session_name().clone(),
                 Some(window_target.window_index()),
             ));
         }
-        Some(rmux_proto::Target::Pane(pane_target)) => {
+        Some(kmux::proto::Target::Pane(pane_target)) => {
             return Ok((
                 pane_target.session_name().clone(),
                 Some(pane_target.window_index()),
@@ -219,15 +219,15 @@ fn resolve_list_panes_target(
     }
 
     match resolve_target_spec(connection, &target, ResolveTargetType::Window, false, false)? {
-        rmux_proto::Target::Window(window_target) => Ok((
+        kmux::proto::Target::Window(window_target) => Ok((
             window_target.session_name().clone(),
             Some(window_target.window_index()),
         )),
-        rmux_proto::Target::Pane(pane_target) => Ok((
+        kmux::proto::Target::Pane(pane_target) => Ok((
             pane_target.session_name().clone(),
             Some(pane_target.window_index()),
         )),
-        rmux_proto::Target::Session(session_name) => {
+        kmux::proto::Target::Session(session_name) => {
             let window_index =
                 resolve_active_window_index(connection, &session_name, command_name)?;
             Ok((session_name, Some(window_index)))
@@ -237,7 +237,7 @@ fn resolve_list_panes_target(
 
 fn resolve_active_window_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &kmux::proto::SessionName,
     command_name: &str,
 ) -> Result<u32, ExitFailure> {
     let response = connection
@@ -456,7 +456,7 @@ fn resize_pane_adjustment(
 
 fn resize_pane_window_size(
     connection: &mut Connection,
-    target: &rmux_proto::PaneTarget,
+    target: &kmux::proto::PaneTarget,
 ) -> Result<(u16, u16), ExitFailure> {
     let response = connection
         .list_panes_in_window(

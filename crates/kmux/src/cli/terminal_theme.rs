@@ -1,4 +1,4 @@
-use rmux_proto::WebTerminalPalette;
+use kmux::proto::WebTerminalPalette;
 
 #[cfg(unix)]
 mod imp {

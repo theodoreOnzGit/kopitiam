@@ -171,10 +171,10 @@ fn default_key_bindings_reference_only_implemented_commands() {
         .iter()
         .map(|entry| entry.name.to_owned())
         .collect::<BTreeSet<_>>();
-    let store = rmux_core::KeyBindingStore::default();
+    let store = kmux::core::KeyBindingStore::default();
     let mut referenced = BTreeSet::new();
 
-    for binding in store.list_bindings(None, rmux_core::KeyBindingSortOrder::Name, false) {
+    for binding in store.list_bindings(None, kmux::core::KeyBindingSortOrder::Name, false) {
         collect_nested_command_names(binding.binding().commands(), &mut referenced);
     }
 
@@ -238,13 +238,13 @@ fn manpage_surface_matches_implemented_commands_and_aliases() {
 }
 
 fn collect_nested_command_names(
-    commands: &rmux_core::command_parser::ParsedCommands,
+    commands: &kmux::core::command_parser::ParsedCommands,
     names: &mut BTreeSet<String>,
 ) {
     for command in commands.commands() {
         names.insert(command.name().to_owned());
         for argument in command.arguments() {
-            if let rmux_core::command_parser::CommandArgument::Commands(nested) = argument {
+            if let kmux::core::command_parser::CommandArgument::Commands(nested) = argument {
                 collect_nested_command_names(nested, names);
             }
         }

@@ -3,8 +3,8 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use rmux_client::{connect, resolve_socket_path};
-use rmux_proto::Response;
+use kmux::client::{connect, resolve_socket_path};
+use kmux::proto::Response;
 
 use super::ExitFailure;
 

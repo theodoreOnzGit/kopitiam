@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser};
-use rmux_core::{
+use kmux::core::{
     command_parser::{CommandEntry, ParsedCommands, COMMAND_TABLE},
     tmux_precedence,
 };
 
 #[cfg(test)]
-use rmux_core::command_parser::CommandParser as TmuxCommandParser;
+use kmux::core::command_parser::CommandParser as TmuxCommandParser;
 
 #[path = "cli_args/buffer.rs"]
 mod buffer;

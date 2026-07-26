@@ -1,4 +1,4 @@
-use rmux_proto::{CommandOutput, ErrorResponse, Response};
+use kmux::proto::{CommandOutput, ErrorResponse, Response};
 
 use crate::cli::ExitFailure;
 pub(crate) use crate::tmux_error_surface::tmux_cli_error_message;
@@ -258,7 +258,7 @@ mod tests {
     use super::{
         expect_command_success, queued_source_file_success_command, tmux_cli_error_message,
     };
-    use rmux_proto::{ErrorResponse, KillSessionResponse, Response, RmuxError, SourceFileResponse};
+    use kmux::proto::{ErrorResponse, KillSessionResponse, Response, RmuxError, SourceFileResponse};
 
     #[test]
     fn cluster_a_queued_commands_accept_source_file_success() {

@@ -4,14 +4,12 @@ resolver = "2"
 members = [
     "apps/*",
     "crates/*",
-    # kmux is a fork of rmux and nests its twelve forked sub-crates under
-    # its own `crates/` (see crates/kmux/README.md). They are listed
-    # explicitly rather than being left to arrive as path dependencies of
-    # `kmux`, because two of them (`ratatui-rmux`, `rmux-render-core`)
-    # are integration crates nothing else depends on -- without this line they
-    # would sit on disk in no build graph at all, never compiled, never tested,
-    # silently rotting. Membership is what keeps `--workspace` honest.
-    "crates/kmux/crates/*",
+    # kmux WAS a fork of rmux that nested its forked sub-crates under its own
+    # `crates/`. It has since been collapsed into ONE self-contained crate
+    # (crates/kmux) so it can publish to crates.io without squatting upstream
+    # rmux's crate names -- the former rmux-* sub-crates are now intra-crate
+    # modules of `kmux` (see crates/kmux/src/lib.rs and NOTICE). It is now a
+    # plain `crates/*` member picked up by the glob above; no nested members.
 ]
 # kopi-beans (the `bn` work-item tracker) is a single-crate collapse of the
 # former multi-crate kopitiam-bds fork of beads-rs. It is a normal member

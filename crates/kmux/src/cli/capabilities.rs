@@ -1,8 +1,8 @@
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Write};
 
-use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
-use rmux_proto::{RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES};
+use kmux::core::formats::TMUX_FORMAT_TABLE_NAMES;
+use kmux::proto::{RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES};
 use serde_json::json;
 
 use super::scripting_contract::{BINARY_CONTRACT_VERSION, CONTROL_NOTIFICATIONS, JSON_COMMANDS};

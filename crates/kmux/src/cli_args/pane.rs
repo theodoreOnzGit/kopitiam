@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_core::tmux_precedence;
-use rmux_proto::{SelectPaneDirection, SplitDirection};
+use kmux::core::tmux_precedence;
+use kmux::proto::{SelectPaneDirection, SplitDirection};
 
 use super::{parse_command_args, parse_target_spec, TargetSpec};
 
