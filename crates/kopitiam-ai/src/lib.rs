@@ -32,6 +32,7 @@
 //!   are real; the network layer itself is a deliberate follow-up.
 
 mod adapter;
+mod bilingual;
 mod cloud;
 mod echo;
 mod glossary;
@@ -44,6 +45,10 @@ mod translate;
 mod local;
 
 pub use adapter::ModelAdapter;
+pub use bilingual::{
+    BilingualOptions, BilingualSegment, Layout, ReviewCoverage, DEFAULT_REVIEW_THRESHOLD,
+    REVIEW_MARKER, from_two_pass, render_bilingual, review_coverage, review_targets,
+};
 pub use cloud::{CloudAdapter, CloudStub, CloudUnavailable, CloudVendor};
 pub use echo::EchoAdapter;
 pub use glossary::{Applied, Entry, Glossary, SourceKind, Substitution};
