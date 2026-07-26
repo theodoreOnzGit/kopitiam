@@ -41,6 +41,10 @@
 //!   wires the above into `encode`/`decode`.
 //! * [`loader`] -- parses the HuggingFace `tokenizer.json` shape into a
 //!   [`bpe::BpeTokenizer`].
+//! * [`estimate`] -- a dependency-free, deterministic *token count
+//!   estimator* ([`estimate::estimate_tokens`]) for when there is no
+//!   loaded vocab to run the real BPE against. It exists to make LLM cost
+//!   visible (read-vs-outline) rather than to reproduce exact ids.
 //!
 //! # What this crate does *not* do
 //!
@@ -52,6 +56,7 @@
 
 pub mod bpe;
 pub mod byte_map;
+pub mod estimate;
 pub mod loader;
 pub mod merges;
 pub mod pretokenize;
@@ -59,6 +64,7 @@ pub mod specials;
 pub mod vocab;
 
 pub use bpe::BpeTokenizer;
+pub use estimate::{LineEstimate, estimate_tokens, estimate_tokens_by_line};
 pub use loader::from_tokenizer_json;
 
 use kopitiam_core::Result;
