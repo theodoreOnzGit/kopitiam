@@ -20,6 +20,10 @@ mod softmax;
 mod reduce;
 mod norm;
 mod activation;
+mod lstm;
+pub use lstm::LstmState;
+mod conv;
+mod tessdata;
 mod gather;
 mod concat;
 
