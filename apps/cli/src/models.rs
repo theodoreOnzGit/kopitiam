@@ -135,19 +135,35 @@ pub fn run(args: ModelsArgs) -> Result<ExitCode> {
 /// ([`kopitiam_models::Architecture`]), license, total download size, and
 /// whether it is present in the local store or not.
 fn list() -> Result<()> {
+    print!("{}", list_string()?);
+    Ok(())
+}
+
+/// Build the same catalog table `list` prints, as a `String`.
+///
+/// Factored out so the TUI's Models view can render the catalog (and each
+/// model's present/absent status) into a scrollable pane without capturing
+/// stdout — which would need platform-specific fd redirection that breaks
+/// Android/Termux. `list` prints exactly what this returns.
+pub fn list_string() -> Result<String> {
+    use std::fmt::Write as _;
+
     let catalog = Catalog::builtin();
     let store = ModelStore::with_default_root()?;
+    let mut out = String::new();
 
     // Column widths are chosen wide enough for the current catalog's longest
     // ids and names so the table stay aligned. If a future entry overflow, the
     // row just wrap a bit — still readable, never wrong.
-    println!(
+    writeln!(
+        out,
         "{:<28} {:<30} {:<8} {:<22} {:>10}  present?",
         "ID", "NAME", "FAMILY", "LICENSE", "SIZE"
-    );
+    )?;
     for spec in &catalog {
         let present = if store.is_present(spec) { "yes" } else { "no" };
-        println!(
+        writeln!(
+            out,
             "{:<28} {:<30} {:<8} {:<22} {:>10}  {}",
             spec.id,
             spec.display_name,
@@ -155,10 +171,10 @@ fn list() -> Result<()> {
             spec.license,
             human_bytes(total_size(spec)),
             present,
-        );
+        )?;
     }
 
-    Ok(())
+    Ok(out)
 }
 
 /// Implements `kopitiam models pull <id>` — the autofetch path.

@@ -1688,13 +1688,16 @@ dependencies = [
  "kopitiam-knowledge",
  "kopitiam-markdown",
  "kopitiam-models",
+ "kopitiam-neovim",
  "kopitiam-ontology",
  "kopitiam-pdf",
  "kopitiam-semantic",
  "kopitiam-workflow",
  "kopitiam-workspace",
+ "nucleo-matcher",
  "ratatui",
  "tempfile",
+ "walkdir",
 ]
 
 [[package]]

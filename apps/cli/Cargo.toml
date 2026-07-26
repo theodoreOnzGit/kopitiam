@@ -30,6 +30,20 @@ anyhow = { workspace = true }
 # crossterm. crossterm is used via `ratatui::crossterm` (ratatui's default
 # feature re-exports it), so versions never skew.
 ratatui = "0.29"
+# Recursive PDF discovery for the TUI file pickers. Pure Rust over `std::fs`
+# (no platform syscalls of our own), already present in Cargo.lock as a
+# transitive dep, so it builds for the Android/Termux target and adds no new
+# supply-chain surface.
+walkdir = "2"
+# Fuzzy filtering/ranking for the TUI's PDF finder. Pure Rust, fast, by the
+# Helix authors; already in Cargo.lock transitively (via `nucleo`), so it is
+# Android-safe and adds nothing new to the tree.
+nucleo-matcher = "0.3"
+# The kvim editor, launched in-process from the TUI's "kvim (Editor)" menu
+# entry via `kopitiam_neovim::ui::run`. A direct path dep (kopitiam-neovim is
+# not in [workspace.dependencies]); the crate itself targets aarch64-linux-android,
+# so it does not compromise the Android build. Pinned to the workspace version.
+kopitiam-neovim = { path = "../../crates/kopitiam-neovim", version = "0.2.0" }
 
 [dev-dependencies]
 # Used by adapter-selection tests to build throwaway model stores in a
