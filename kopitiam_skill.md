@@ -90,6 +90,27 @@ Options:
   -o, --output <OUTPUT>
           Output Markdown file. Defaults to the input path with a .md extension
 
+      --engine <ENGINE>
+          Extraction engine. `mupdf` (default) is the ported MuPDF `stext` engine: true reading order (columns linearised) and correct inter-word spacing. `legacy` is the older `pdf-extract`-based path, kept as a fallback
+          
+          [default: mupdf]
+
+          Possible values:
+          - mupdf:  The ported MuPDF `stext` engine (default): true reading order with columns linearised and correct inter-word spacing
+          - legacy: The legacy `pdf-extract`-based path, kept as a fallback
+
+      --report-json
+          Print the validation report as JSON on stdout instead of the human-readable prose. The JSON carries the computed `recovery_ratio`, `passes`, and per-page ratios so a caller can gate on recovery without parsing prose (card I-F). The "Wrote ..." notices go to stderr in this mode so stdout is clean JSON
+
+      --index
+          Also write a `<output>.index.json` sidecar mapping each heading and each source page to its 1-based line range in the Markdown, turning grep-and-probe into lookup-then-slice (card I-G). The `.md` itself is untouched. With `--split-by-heading-level`, one sidecar per part
+
+      --pages <A-B>
+          Convert only source pages `A-B` (matched against the PDF's own 1-based page numbers, inclusive; a bare `N` means just page N), applied before reconstruction so a 59 MB PDF is not fully converted just to read a few pages (card I-H). The selection is a standalone document: its page anchors are renumbered from 1 across the kept pages, not carried over from the source
+
+      --split-by-heading-level <N>
+          Split the output into one `.md` per section at this heading level (1-6), instead of a single combined file, so a large multi-chapter document becomes individually safe per-chapter files (card I-H). Files are named `<stem>.NN-<slug>.md` beside `--output`
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -212,6 +233,9 @@ Options:
           Directory containing the project's `.kopitiam` state directory. Defaults to the current directory
           
           [default: .]
+
+      --stale
+          Instead of the session summary, list conclusions whose source files have drifted (content hash mismatch) and can no longer be trusted
 
   -h, --help
           Print help (see a summary with '-h')
@@ -407,6 +431,223 @@ Arguments:
           Catalog id of the model to check (see `kopitiam models list`)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `kopitiam outline`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Print a file's items-only skeleton (declarations + line numbers, no bodies) — token-max Task II-2.
+
+A ~10x-smaller orientation pass than reading the whole file. See `apps/cli/src/outline.rs`; the real work is `kopitiam_semantic::outline`.
+
+Usage: kopitiam.exe outline [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+          The Rust source file to outline
+
+Options:
+      --root <ROOT>
+          Directory containing the workspace `Cargo.toml` that `file` belongs to. Defaults to the current directory; passed to rust-analyzer as the root
+          
+          [default: .]
+
+      --json
+          Emit the outline as JSON (the serialized [`Outline`]: `items` with `line`/`kind`/`name`/`detail`/`depth`) instead of the human skeleton. Progress notices go to stderr so stdout stays clean JSON (§0.2)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `kopitiam refs`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+List every reference/call site of a symbol as `file:line:character` coordinates — token-max Task II-1. See `apps/cli/src/semq.rs`
+
+Usage: kopitiam.exe refs [OPTIONS] --file <FILE> <SYMBOL>
+
+Arguments:
+  <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
+
+Options:
+      --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
+      --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
+      --json         Emit JSON coordinates instead of the human `file:line:character` form
+  -h, --help         Print help
+```
+
+### `kopitiam def`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Print where a symbol is defined plus its signature — token-max Task II-1
+
+Usage: kopitiam.exe def [OPTIONS] --file <FILE> <SYMBOL>
+
+Arguments:
+  <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
+
+Options:
+      --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
+      --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
+      --json         Emit JSON coordinates instead of the human `file:line:character` form
+  -h, --help         Print help
+```
+
+### `kopitiam sig`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Print a symbol's signature alone — token-max Task II-1
+
+Usage: kopitiam.exe sig [OPTIONS] --file <FILE> <SYMBOL>
+
+Arguments:
+  <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
+
+Options:
+      --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
+      --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
+      --json         Emit JSON coordinates instead of the human `file:line:character` form
+  -h, --help         Print help
+```
+
+### `kopitiam callers`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+List a function's callers (call sites + enclosing function), recursed to `--depth` — token-max Task II-1
+
+Usage: kopitiam.exe callers [OPTIONS] --file <FILE> <SYMBOL>
+
+Arguments:
+  <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
+
+Options:
+      --file <FILE>    The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
+      --root <ROOT>    Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
+      --json           Emit JSON coordinates instead of the human `file:line:character` form
+      --depth <DEPTH>  How many hops of the call graph to follow (1 = direct callers/callees) [default: 1]
+  -h, --help           Print help
+```
+
+### `kopitiam callees`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+List the functions a function calls, recursed to `--depth` — token-max Task II-1
+
+Usage: kopitiam.exe callees [OPTIONS] --file <FILE> <SYMBOL>
+
+Arguments:
+  <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
+
+Options:
+      --file <FILE>    The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
+      --root <ROOT>    Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
+      --json           Emit JSON coordinates instead of the human `file:line:character` form
+      --depth <DEPTH>  How many hops of the call graph to follow (1 = direct callers/callees) [default: 1]
+  -h, --help           Print help
+```
+
+### `kopitiam impls`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+List a trait's `impl` sites — token-max Task II-1
+
+Usage: kopitiam.exe impls [OPTIONS] --file <FILE> <SYMBOL>
+
+Arguments:
+  <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
+
+Options:
+      --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
+      --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
+      --json         Emit JSON coordinates instead of the human `file:line:character` form
+  -h, --help         Print help
+```
+
+### `kopitiam check`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Run `cargo check` and report one deduplicated line per distinct diagnostic, sorted by file — token-max Task II-4.
+
+The dedup is the win: one bad type produces the same diagnostic across every target, and this collapses them. See `apps/cli/src/diagnostics.rs`.
+
+Usage: kopitiam.exe check [OPTIONS]
+
+Options:
+      --root <ROOT>
+          Directory to run `cargo check` in. Defaults to the current directory
+          
+          [default: .]
+
+  -p, --package <PACKAGE>
+          Restrict to one package (`cargo check -p <PACKAGE>`)
+
+      --compact
+          Collapse the diagnostics to one deduplicated line per distinct problem, sorted by file. Without this (and without `--json`) the raw cargo output streams through unchanged
+
+      --json
+          Emit the deduplicated diagnostics as JSON (implies the compact analysis)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `kopitiam test`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Run `cargo test` and report each failure as `name — assertion @ file:line`, not the full captured stdout — token-max Task II-4
+
+Usage: kopitiam.exe test [OPTIONS]
+
+Options:
+      --root <ROOT>        Directory to run `cargo test` in. Defaults to the current directory [default: .]
+  -p, --package <PACKAGE>  Restrict to one package (`cargo test -p <PACKAGE>`)
+      --compact            Report each failure as one line (`name — assertion @ file:line`) instead of the full captured output. Without this (and without `--json`) the raw cargo output streams through unchanged
+      --json               Emit the failures as JSON (implies the compact analysis)
+  -h, --help               Print help
+```
+
+### `kopitiam tokens`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Estimate the BPE token cost of a file or directory, so an agent chooses read-vs-outline informed — token-max Task II-7.
+
+A thin shell over `kopitiam_tokenizer::estimate_tokens`. See `apps/cli/src/tokens.rs`.
+
+Usage: kopitiam.exe tokens [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>
+          File or directory to estimate. A directory is walked recursively and every readable UTF-8 file is summed; unreadable or non-UTF-8 files (binaries) are skipped, not counted
+
+Options:
+      --json
+          Emit machine-readable JSON: a per-file breakdown — each with its total and a per-line token count (`estimate_tokens_by_line`) — plus the grand total, instead of the human summary. (§0.2: a caller gates on the number without parsing prose.)
+
+      --by-line
+          Also print the per-line breakdown in the human output (it is always in `--json`). Off by default so a single-file estimate stays one line
+
   -h, --help
           Print help (see a summary with '-h')
 ```

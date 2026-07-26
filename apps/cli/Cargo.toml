@@ -20,6 +20,13 @@ kopitiam-document = { workspace = true, features = ["serde"] }
 kopitiam-markdown = { workspace = true }
 kopitiam-ontology = { workspace = true }
 kopitiam-semantic = { workspace = true }
+# `kopitiam tokens` (token-max Task II-7): the dependency-free BPE token
+# estimator (`estimate_tokens`/`estimate_tokens_by_line`). Already a workspace
+# member — this is the only card that adds a CLI dependency, so it is the sole
+# Cargo.lock change of this wave (the `kopitiam` package gains one edge; no new
+# transitive crates, since the tokenizer's own deps — regex, serde_json,
+# kopitiam-core — are all already in the tree).
+kopitiam-tokenizer = { workspace = true }
 kopitiam-knowledge = { workspace = true }
 kopitiam-index = { workspace = true }
 kopitiam-workspace = { workspace = true }

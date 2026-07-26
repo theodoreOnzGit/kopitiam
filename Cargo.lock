@@ -2231,6 +2231,7 @@ dependencies = [
  "kopitiam-ontology",
  "kopitiam-pdf",
  "kopitiam-semantic",
+ "kopitiam-tokenizer",
  "kopitiam-workflow",
  "kopitiam-workspace",
  "nucleo-matcher",

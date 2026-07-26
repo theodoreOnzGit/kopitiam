@@ -24,11 +24,15 @@
 mod adapter;
 mod ai;
 mod code_actions;
+mod diagnostics;
 mod models;
+mod outline;
 mod plan;
 mod rename;
 mod scan;
+mod semq;
 mod status;
+mod tokens;
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -190,6 +194,52 @@ enum Command {
     /// This keeps `CLAUDE.md`'s Offline-First promise real: no local weights,
     /// no local model. See `apps/cli/src/models.rs` for the full story.
     Models(models::ModelsArgs),
+
+    /// Print a file's items-only skeleton (declarations + line numbers, no
+    /// bodies) — token-max Task II-2.
+    ///
+    /// A ~10x-smaller orientation pass than reading the whole file. See
+    /// `apps/cli/src/outline.rs`; the real work is `kopitiam_semantic::outline`.
+    Outline(outline::OutlineArgs),
+
+    /// List every reference/call site of a symbol as `file:line:character`
+    /// coordinates — token-max Task II-1. See `apps/cli/src/semq.rs`.
+    Refs(semq::Locator),
+
+    /// Print where a symbol is defined plus its signature — token-max Task II-1.
+    Def(semq::Locator),
+
+    /// Print a symbol's signature alone — token-max Task II-1.
+    Sig(semq::Locator),
+
+    /// List a function's callers (call sites + enclosing function), recursed to
+    /// `--depth` — token-max Task II-1.
+    Callers(semq::DepthArgs),
+
+    /// List the functions a function calls, recursed to `--depth` — token-max
+    /// Task II-1.
+    Callees(semq::DepthArgs),
+
+    /// List a trait's `impl` sites — token-max Task II-1.
+    Impls(semq::Locator),
+
+    /// Run `cargo check` and report one deduplicated line per distinct
+    /// diagnostic, sorted by file — token-max Task II-4.
+    ///
+    /// The dedup is the win: one bad type produces the same diagnostic across
+    /// every target, and this collapses them. See `apps/cli/src/diagnostics.rs`.
+    Check(diagnostics::CheckArgs),
+
+    /// Run `cargo test` and report each failure as `name — assertion @
+    /// file:line`, not the full captured stdout — token-max Task II-4.
+    Test(diagnostics::TestArgs),
+
+    /// Estimate the BPE token cost of a file or directory, so an agent chooses
+    /// read-vs-outline informed — token-max Task II-7.
+    ///
+    /// A thin shell over `kopitiam_tokenizer::estimate_tokens`. See
+    /// `apps/cli/src/tokens.rs`.
+    Tokens(tokens::TokensArgs),
 }
 
 // `main` return `anyhow::Result<ExitCode>` (not `Result<()>`) because one
@@ -251,6 +301,46 @@ fn main() -> anyhow::Result<ExitCode> {
             ExitCode::SUCCESS
         }
         Command::Models(args) => models::run(args)?,
+        Command::Outline(args) => {
+            outline::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Refs(args) => {
+            semq::run_refs(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Def(args) => {
+            semq::run_def(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Sig(args) => {
+            semq::run_sig(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Callers(args) => {
+            semq::run_callers(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Callees(args) => {
+            semq::run_callees(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Impls(args) => {
+            semq::run_impls(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Check(args) => {
+            diagnostics::run_check(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Test(args) => {
+            diagnostics::run_test(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Tokens(args) => {
+            tokens::run(args)?;
+            ExitCode::SUCCESS
+        }
     };
     Ok(code)
 }
