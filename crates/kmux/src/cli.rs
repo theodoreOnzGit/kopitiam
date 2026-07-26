@@ -38,6 +38,8 @@ mod format_print;
 mod json_output;
 #[path = "cli/key_commands.rs"]
 mod key_commands;
+#[path = "cli/latex.rs"]
+mod latex;
 #[path = "cli/message_commands.rs"]
 mod message_commands;
 #[path = "cli/pane_commands.rs"]
@@ -149,6 +151,9 @@ where
     }
     if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return capabilities::run(invocation);
+    }
+    if let Some(invocation) = latex::parse_invocation(args.get(1..).unwrap_or(&[]))? {
+        return latex::run(invocation);
     }
     let mut cli = match parse(args.clone()) {
         Ok(cli) => cli,
