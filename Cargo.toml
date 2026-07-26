@@ -12,6 +12,22 @@ members = [
     # would sit on disk in no build graph at all, never compiled, never tested,
     # silently rotting. Membership is what keeps `--workspace` honest.
     "crates/kmux/crates/*",
+    # kopitiam-bds is a fork of beads-rs (the `bd` work-item tracker) and, like
+    # kmux, nests its forked sub-crates under its own `crates/`. The `crates/*`
+    # glob above already covers `crates/kopitiam-bds` itself (the top package
+    # that ships the `bd` binary); the nested sub-crates are listed here.
+    "crates/kopitiam-bds/crates/*",
+]
+
+# Two nested kopitiam-bds sub-crates are deliberately NOT workspace members:
+#   * `fuzz` (beads-rs-fuzz) needs `cargo-fuzz` / libfuzzer-sys and a nightly
+#     toolchain; it must never enter a stable `--workspace` build.
+#   * `beads_stateright_models` is a model-checking harness (pulls `stateright`)
+#     that depends on the pre-fork `beads-rs` package path; test-only, not part
+#     of shipping `bd`.
+exclude = [
+    "crates/kopitiam-bds/crates/fuzz",
+    "crates/kopitiam-bds/crates/beads_stateright_models",
 ]
 
 [workspace.package]

@@ -1,0 +1,345 @@
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use thiserror::Error;
+
+use beads_core::{ActorId, BeadType, NamespaceId, Priority};
+use beads_surface::ipc::{
+    CreatePayload, IpcClient, IpcError, MutationCtx, MutationMeta, Request, Response,
+};
+
+use super::ipc_client::runtime_bound_client;
+use super::timing;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Autostart {
+    Enabled,
+    Disabled,
+}
+
+impl Autostart {
+    fn is_enabled(self) -> bool {
+        matches!(self, Autostart::Enabled)
+    }
+}
+
+impl Default for Autostart {
+    fn default() -> Self {
+        Autostart::Enabled
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum LoadError {
+    #[error(transparent)]
+    Ipc(#[from] IpcError),
+    #[error("remote error: {0:?}")]
+    Remote(beads_core::ErrorPayload),
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct LoadConfig {
+    pub workers: usize,
+    pub total_requests: usize,
+    pub rate_per_sec: Option<u64>,
+    pub namespace: Option<NamespaceId>,
+    pub actor_id: Option<ActorId>,
+    pub autostart: Autostart,
+    pub max_errors: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct LoadReport {
+    pub attempts: usize,
+    pub successes: usize,
+    pub failures: usize,
+    pub errors: Vec<LoadError>,
+    pub elapsed: Duration,
+}
+
+pub struct LoadGenerator {
+    repo: PathBuf,
+    client: IpcClient,
+    config: LoadConfig,
+    counter: Arc<AtomicUsize>,
+}
+
+impl LoadGenerator {
+    pub fn for_runtime_dir(repo: PathBuf, runtime_dir: &Path) -> Self {
+        Self::with_client(repo, runtime_bound_client(runtime_dir))
+    }
+
+    pub fn with_client(repo: PathBuf, client: IpcClient) -> Self {
+        Self {
+            repo,
+            client,
+            config: LoadConfig {
+                workers: 1,
+                total_requests: 1,
+                rate_per_sec: None,
+                namespace: None,
+                actor_id: None,
+                autostart: Autostart::Enabled,
+                max_errors: 16,
+            },
+            counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn config_mut(&mut self) -> &mut LoadConfig {
+        &mut self.config
+    }
+
+    pub fn run(&self) -> LoadReport {
+        let _phase = timing::scoped_phase_with_context(
+            "fixture.load_gen.run",
+            format!(
+                "repo={} workers={} total={}",
+                self.repo.display(),
+                self.config.workers.max(1),
+                self.config.total_requests.max(1)
+            ),
+        );
+        let workers = self.config.workers.max(1);
+        let total = self.config.total_requests.max(1);
+        let started = Instant::now();
+        if workers == 1 {
+            let config = self.config.clone();
+            let client = self
+                .client
+                .clone()
+                .with_autostart(config.autostart.is_enabled());
+            let interval = config
+                .rate_per_sec
+                .filter(|rate| *rate > 0)
+                .map(|rate| Duration::from_secs_f64(1.0 / rate as f64));
+            let mut errors = Vec::new();
+            let mut attempts = 0;
+            let mut successes = 0;
+            let mut failures = 0;
+            let mut seq = self.counter.fetch_add(total, Ordering::Relaxed);
+            let mut connect_error = None;
+            let mut connection = match client.connect() {
+                Ok(conn) => Some(conn),
+                Err(err) => {
+                    connect_error = Some(err);
+                    None
+                }
+            };
+
+            for _ in 0..total {
+                attempts += 1;
+                let title = format!("load-{seq:06}");
+                seq = seq.saturating_add(1);
+                let request = Request::Create {
+                    ctx: MutationCtx::new(
+                        self.repo.clone(),
+                        MutationMeta {
+                            namespace: config.namespace.clone(),
+                            durability: None,
+                            client_request_id: None,
+                            actor_id: config.actor_id.clone(),
+                        },
+                    ),
+                    payload: CreatePayload {
+                        id: None,
+                        parent: None,
+                        title,
+                        bead_type: BeadType::Task,
+                        priority: Priority::MEDIUM,
+                        description: None,
+                        design: None,
+                        acceptance_criteria: None,
+                        assignee: None,
+                        external_ref: None,
+                        estimated_minutes: None,
+                        labels: Vec::new(),
+                        dependencies: Vec::new(),
+                    },
+                };
+                match connection.as_mut() {
+                    Some(conn) => match conn.send_request(&request) {
+                        Ok(Response::Ok { .. }) => successes += 1,
+                        Ok(Response::Err { err }) => {
+                            failures += 1;
+                            if errors.len() < config.max_errors {
+                                errors.push(LoadError::Remote(err));
+                            }
+                        }
+                        Err(err) => {
+                            failures += 1;
+                            if errors.len() < config.max_errors {
+                                errors.push(LoadError::Ipc(err));
+                            }
+                        }
+                    },
+                    None => {
+                        failures += 1;
+                        if errors.len() < config.max_errors {
+                            if let Some(err) = connect_error.take() {
+                                errors.push(LoadError::Ipc(err));
+                            }
+                        }
+                    }
+                }
+                if let Some(interval) = interval {
+                    thread::sleep(interval);
+                }
+            }
+
+            return LoadReport {
+                attempts,
+                successes,
+                failures,
+                errors,
+                elapsed: started.elapsed(),
+            };
+        }
+
+        let per_worker = total.div_ceil(workers);
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let client = self.client.clone();
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let repo = self.repo.clone();
+            let config = self.config.clone();
+            let client = client.clone().with_autostart(config.autostart.is_enabled());
+            let errors = Arc::clone(&errors);
+            let attempts = Arc::clone(&attempts);
+            let successes = Arc::clone(&successes);
+            let failures = Arc::clone(&failures);
+            let counter = Arc::clone(&self.counter);
+            handles.push(thread::spawn(move || {
+                let interval = config
+                    .rate_per_sec
+                    .filter(|rate| *rate > 0)
+                    .map(|rate| Duration::from_secs_f64(1.0 / rate as f64));
+                let mut connect_error = None;
+                let mut connection = match client.connect() {
+                    Ok(conn) => Some(conn),
+                    Err(err) => {
+                        connect_error = Some(err);
+                        None
+                    }
+                };
+                for i in 0..per_worker {
+                    let idx = worker * per_worker + i;
+                    if idx >= total {
+                        break;
+                    }
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    let seq = counter.fetch_add(1, Ordering::Relaxed);
+                    let title = format!("load-{seq:06}");
+                    let request = Request::Create {
+                        ctx: MutationCtx::new(
+                            repo.clone(),
+                            MutationMeta {
+                                namespace: config.namespace.clone(),
+                                durability: None,
+                                client_request_id: None,
+                                actor_id: config.actor_id.clone(),
+                            },
+                        ),
+                        payload: CreatePayload {
+                            id: None,
+                            parent: None,
+                            title,
+                            bead_type: BeadType::Task,
+                            priority: Priority::MEDIUM,
+                            description: None,
+                            design: None,
+                            acceptance_criteria: None,
+                            assignee: None,
+                            external_ref: None,
+                            estimated_minutes: None,
+                            labels: Vec::new(),
+                            dependencies: Vec::new(),
+                        },
+                    };
+                    match connection.as_mut() {
+                        Some(conn) => match conn.send_request(&request) {
+                            Ok(Response::Ok { .. }) => {
+                                successes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(Response::Err { err }) => {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                                record_error(&errors, LoadError::Remote(err), config.max_errors);
+                            }
+                            Err(err) => {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                                record_error(&errors, LoadError::Ipc(err), config.max_errors);
+                            }
+                        },
+                        None => {
+                            failures.fetch_add(1, Ordering::Relaxed);
+                            if let Some(err) = connect_error.take() {
+                                record_error(&errors, LoadError::Ipc(err), config.max_errors);
+                            }
+                        }
+                    }
+                    if let Some(interval) = interval {
+                        thread::sleep(interval);
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        let mut guard = errors.lock().expect("errors lock");
+        let errors = std::mem::take(&mut *guard);
+        LoadReport {
+            attempts: attempts.load(Ordering::Relaxed),
+            successes: successes.load(Ordering::Relaxed),
+            failures: failures.load(Ordering::Relaxed),
+            errors,
+            elapsed: started.elapsed(),
+        }
+    }
+}
+
+fn record_error(errors: &Mutex<Vec<LoadError>>, error: LoadError, max: usize) {
+    let mut guard = errors.lock().expect("errors lock");
+    if guard.len() < max {
+        guard.push(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn fixtures_load_gen_for_runtime_dir_uses_runtime_socket() {
+        let generator =
+            LoadGenerator::for_runtime_dir(PathBuf::from("/tmp/repo"), Path::new("/tmp/runtime"));
+        assert_eq!(
+            generator.client.socket_path(),
+            Path::new("/tmp/runtime/beads/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn fixtures_load_gen_reports_failures_when_daemon_missing() {
+        let temp = tempfile::TempDir::new().expect("temp repo");
+        let runtime = tempfile::TempDir::new().expect("temp runtime");
+        let mut generator =
+            LoadGenerator::for_runtime_dir(temp.path().to_path_buf(), runtime.path());
+        generator.config_mut().autostart = Autostart::Disabled;
+        generator.config_mut().total_requests = 1;
+        let report = generator.run();
+        assert_eq!(report.attempts, report.successes + report.failures);
+        assert!(report.failures > 0);
+    }
+}

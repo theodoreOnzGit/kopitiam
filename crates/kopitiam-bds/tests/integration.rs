@@ -1,0 +1,10 @@
+#[path = "integration/fixtures/mod.rs"]
+mod fixtures;
+
+#[path = "integration/cli/mod.rs"]
+mod cli;
+#[path = "integration/daemon/mod.rs"]
+mod daemon;
+
+#[path = "integration/realtime_errors.rs"]
+mod realtime_errors;

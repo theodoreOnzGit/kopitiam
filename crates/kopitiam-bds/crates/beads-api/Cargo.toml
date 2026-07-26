@@ -1,0 +1,15 @@
+[package]
+name = "beads-api"
+version = "0.2.0-kopitiam.1"
+edition = "2024"
+rust-version = "1.91"
+license = "AGPL-3.0-only"
+repository = "https://github.com/theodoreOnzGit/kopitiam"
+description = "API types and IPC protocol for beads-rs"
+
+[dependencies]
+beads-core = { path = "../beads-core" }
+serde = { version = "1", features = ["derive"] }
+[dev-dependencies]
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4", "v5"] }

@@ -1,0 +1,26 @@
+[package]
+name = "beads-cli"
+version = "0.2.0-kopitiam.1"
+edition = "2024"
+rust-version = "1.91"
+license = "AGPL-3.0-only"
+repository = "https://github.com/theodoreOnzGit/kopitiam"
+description = "Typed CLI entrypoint surface for beads-rs command migration"
+
+[dependencies]
+beads-api = { path = "../beads-api" }
+beads-core = { path = "../beads-core" }
+beads-surface = { path = "../beads-surface" }
+clap = { version = "4", features = ["derive"] }
+dirs = "6.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5"] }
+whoami = "1.4"
+
+[dev-dependencies]
+tempfile = "3"

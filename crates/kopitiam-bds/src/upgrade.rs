@@ -1,0 +1,549 @@
+//! Auto-upgrade support.
+
+mod release;
+
+use std::fs;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use beads_surface::ipc::{Request, send_request_no_autostart, socket_path, wait_for_daemon_ready};
+
+use crate::OpError;
+use crate::config::{Config, load_or_init};
+use crate::{Error, Result};
+use release::{
+    ReleaseAsset, ReleaseInfo, UpgradeSupportError, detect_platform,
+    fetch_asset_checksum as fetch_asset_checksum_support,
+    fetch_latest_release as fetch_latest_release_support, find_asset, is_newer_version,
+    normalize_version,
+};
+
+const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone)]
+pub struct UpgradeOutcome {
+    pub updated: bool,
+    pub from_version: String,
+    pub to_version: Option<String>,
+    pub install_path: PathBuf,
+    pub method: UpgradeMethod,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeMethod {
+    Prebuilt,
+    Cargo,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct UpgradeState {
+    last_check_wall_ms: Option<u64>,
+}
+
+pub fn maybe_spawn_auto_upgrade() {
+    if std::env::var("BD_NO_AUTO_UPGRADE").is_ok() {
+        return;
+    }
+
+    let cfg = load_or_init();
+    if !cfg.auto_upgrade {
+        return;
+    }
+
+    if let Ok(Some(state)) = read_state()
+        && let Some(last) = state.last_check_wall_ms
+    {
+        let now = wall_ms();
+        if now.saturating_sub(last) < AUTO_CHECK_INTERVAL.as_millis() as u64 {
+            return;
+        }
+    }
+
+    let _ = write_state(&UpgradeState {
+        last_check_wall_ms: Some(wall_ms()),
+    });
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("upgrade").arg("--background");
+    cmd.env("BD_NO_AUTO_UPGRADE", "1");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = cmd.spawn();
+}
+
+pub fn run_upgrade(config: Config, background: bool) -> Result<UpgradeOutcome> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let release = fetch_latest_release()?;
+    let latest = normalize_version(&release.tag_name);
+
+    if !is_newer_version(latest, &current_version) {
+        return Ok(UpgradeOutcome {
+            updated: false,
+            from_version: current_version,
+            to_version: Some(latest.to_string()),
+            install_path: resolve_install_path()?,
+            method: UpgradeMethod::None,
+        });
+    }
+
+    if !config.auto_upgrade && background {
+        return Ok(UpgradeOutcome {
+            updated: false,
+            from_version: current_version,
+            to_version: Some(latest.to_string()),
+            install_path: resolve_install_path()?,
+            method: UpgradeMethod::None,
+        });
+    }
+
+    let install_path = resolve_install_path()?;
+    let platform = detect_platform();
+    let asset = platform.and_then(|p| find_asset(&release, p));
+
+    let mut was_running = false;
+    if std::env::var("BD_UPGRADE_SKIP_DAEMON").is_err() {
+        was_running = stop_daemon().unwrap_or(false);
+    }
+
+    let method = if let Some(asset) = asset {
+        let checksum = fetch_asset_checksum(&release, asset)?;
+        let temp_bin = download_prebuilt(asset, checksum)?;
+        install_binary(temp_bin.as_ref(), &install_path)?;
+        UpgradeMethod::Prebuilt
+    } else {
+        let temp_bin = build_with_cargo()?;
+        install_binary(temp_bin.as_ref(), &install_path)?;
+        UpgradeMethod::Cargo
+    };
+
+    if was_running && std::env::var("BD_UPGRADE_SKIP_DAEMON").is_err() {
+        let _ = start_daemon(&install_path);
+    }
+
+    Ok(UpgradeOutcome {
+        updated: true,
+        from_version: current_version,
+        to_version: Some(latest.to_string()),
+        install_path,
+        method,
+    })
+}
+
+fn fetch_latest_release() -> Result<ReleaseInfo> {
+    fetch_latest_release_support().map_err(map_support_error)
+}
+
+fn download_prebuilt(
+    asset: &ReleaseAsset,
+    expected_checksum: Option<String>,
+) -> Result<tempfile::TempPath> {
+    if let Ok(fake) = std::env::var("BD_UPGRADE_FAKE_BIN") {
+        let temp = tempfile::NamedTempFile::new()
+            .map_err(|e| upgrade_error(format!("failed to create temp file: {e}")))?;
+        fs::copy(&fake, temp.path())
+            .map_err(|e| upgrade_error(format!("failed to copy fake bin: {e}")))?;
+        return Ok(temp.into_temp_path());
+    }
+
+    let archive_file = tempfile::NamedTempFile::new()
+        .map_err(|e| upgrade_error(format!("failed to create temp archive: {e}")))?;
+
+    download_asset(
+        &asset.name,
+        &asset.browser_download_url,
+        archive_file.path(),
+    )?;
+    verify_archive_checksum(&asset.name, archive_file.path(), expected_checksum)?;
+
+    let archive = fs::File::open(archive_file.path())
+        .map_err(|e| upgrade_error(format!("failed to open archive: {e}")))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    let mut extracted = false;
+    let temp_bin = tempfile::NamedTempFile::new()
+        .map_err(|e| upgrade_error(format!("failed to create temp binary: {e}")))?;
+    let temp_path = temp_bin.into_temp_path();
+    for entry in archive
+        .entries()
+        .map_err(|e| upgrade_error(format!("{e}")))?
+    {
+        let mut entry = entry.map_err(|e| upgrade_error(format!("{e}")))?;
+        let path = entry.path().map_err(|e| upgrade_error(format!("{e}")))?;
+        if path.file_name().and_then(|s| s.to_str()) == Some("bd") {
+            entry
+                .unpack(&temp_path)
+                .map_err(|e| upgrade_error(format!("failed to unpack: {e}")))?;
+            extracted = true;
+            break;
+        }
+    }
+    if !extracted {
+        return Err(upgrade_error("archive missing bd binary".to_string()));
+    }
+    Ok(temp_path)
+}
+
+fn fetch_asset_checksum(release: &ReleaseInfo, asset: &ReleaseAsset) -> Result<Option<String>> {
+    fetch_asset_checksum_support(release, asset).map_err(map_support_error)
+}
+
+fn download_asset(name: &str, url: &str, dest: &Path) -> Result<()> {
+    if let Ok(dir) = std::env::var("BD_UPGRADE_ASSET_DIR") {
+        let src = PathBuf::from(dir).join(name);
+        fs::copy(&src, dest)
+            .map_err(|e| upgrade_error(format!("failed to copy asset {}: {e}", src.display())))?;
+        return Ok(());
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build();
+    let resp = agent
+        .get(url)
+        .set("User-Agent", "beads-rs-upgrade")
+        .call()
+        .map_err(|e| upgrade_error(format!("failed to download asset: {e}")))?;
+    let mut reader = resp.into_reader();
+    let mut file = fs::File::create(dest)
+        .map_err(|e| upgrade_error(format!("failed to create archive: {e}")))?;
+    std::io::copy(&mut reader, &mut file)
+        .map_err(|e| upgrade_error(format!("failed to write archive: {e}")))?;
+    Ok(())
+}
+
+fn verify_archive_checksum(
+    asset_name: &str,
+    archive_path: &Path,
+    expected_checksum: Option<String>,
+) -> Result<()> {
+    let Some(expected) = expected_checksum else {
+        return Err(upgrade_error(format!(
+            "missing checksum for asset {}",
+            asset_name
+        )));
+    };
+
+    let actual = sha256_file_hex(archive_path)?;
+    if actual != expected {
+        return Err(upgrade_error(format!(
+            "checksum mismatch for {}: expected {}, got {}",
+            asset_name, expected, actual
+        )));
+    }
+    Ok(())
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| upgrade_error(format!("failed to open archive: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| upgrade_error(format!("failed to read archive: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn build_with_cargo() -> Result<tempfile::TempPath> {
+    if let Ok(fake) = std::env::var("BD_UPGRADE_FAKE_BIN") {
+        let temp = tempfile::NamedTempFile::new()
+            .map_err(|e| upgrade_error(format!("failed to create temp file: {e}")))?;
+        fs::copy(&fake, temp.path())
+            .map_err(|e| upgrade_error(format!("failed to copy fake bin: {e}")))?;
+        return Ok(temp.into_temp_path());
+    }
+
+    let temp_dir = tempfile::tempdir().map_err(|e| upgrade_error(format!("{e}")))?;
+    let root = temp_dir.path().to_path_buf();
+
+    // Install from GitHub to get the latest release version
+    // (crates.io may lag behind GitHub releases)
+    let status = Command::new("cargo")
+        .args([
+            "install",
+            "--git",
+            "https://github.com/delightful-ai/beads-rs.git",
+            "--root",
+            root.to_str().unwrap_or("."),
+            "--force",
+            "--locked",
+        ])
+        .status()
+        .map_err(|e| upgrade_error(format!("failed to run cargo install: {e}")))?;
+
+    if !status.success() {
+        return Err(upgrade_error(format!(
+            "cargo install failed with status {status}"
+        )));
+    }
+
+    let bin = root.join("bin").join("bd");
+    let temp = tempfile::NamedTempFile::new()
+        .map_err(|e| upgrade_error(format!("failed to create temp binary: {e}")))?;
+    fs::copy(&bin, temp.path())
+        .map_err(|e| upgrade_error(format!("failed to copy cargo binary: {e}")))?;
+    Ok(temp.into_temp_path())
+}
+
+fn resolve_install_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("BD_UPGRADE_INSTALL_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+
+    // Try current exe location if its parent dir is writable
+    // (skip on NixOS/read-only locations like /nix/store)
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && is_dir_writable(dir)
+    {
+        return Ok(exe);
+    }
+
+    // Try finding bd in PATH, but only if its location is writable
+    if let Some(path) = find_in_path("bd")
+        && let Some(dir) = path.parent()
+        && is_dir_writable(dir)
+    {
+        return Ok(path);
+    }
+
+    Ok(default_install_dir()?.join("bd"))
+}
+
+fn default_install_dir() -> Result<PathBuf> {
+    let usr = PathBuf::from("/usr/local/bin");
+    if is_dir_writable(&usr) {
+        return Ok(usr);
+    }
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| upgrade_error("failed to get home directory".to_string()))?;
+    Ok(home.join(".local").join("bin"))
+}
+
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(bin);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_dir_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    tempfile::NamedTempFile::new_in(dir).is_ok()
+}
+
+fn install_binary(src: &Path, dest: &Path) -> Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| upgrade_error("install path missing parent dir".to_string()))?;
+    fs::create_dir_all(dir)
+        .map_err(|e| upgrade_error(format!("failed to create {}: {e}", dir.display())))?;
+
+    let temp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| upgrade_error(format!("failed to create temp file: {e}")))?;
+    fs::copy(src, temp.path()).map_err(|e| upgrade_error(format!("failed to copy binary: {e}")))?;
+    // Executable bit only exists on unix; on Windows the `.exe` extension makes
+    // the copied binary runnable, so no permission change is needed.
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))
+        .map_err(|e| upgrade_error(format!("failed to set permissions: {e}")))?;
+    temp.persist(dest).map_err(|e| {
+        upgrade_error(format!(
+            "failed to install binary to {}: {e}",
+            dest.display()
+        ))
+    })?;
+
+    if std::env::consts::OS == "macos" {
+        let _ = resign_macos(dest);
+    }
+
+    Ok(())
+}
+
+fn resign_macos(path: &Path) -> Result<()> {
+    if Command::new("codesign").arg("--version").output().is_err() {
+        return Ok(());
+    }
+
+    let _ = Command::new("codesign")
+        .args(["--remove-signature", path.to_str().unwrap_or("")])
+        .status();
+    let _ = Command::new("codesign")
+        .args(["--force", "--sign", "-", path.to_str().unwrap_or("")])
+        .status();
+    Ok(())
+}
+
+fn stop_daemon() -> Result<bool> {
+    use beads_surface::ipc::uds::UnixStream;
+    let socket = socket_path();
+    if UnixStream::connect(&socket).is_err() {
+        return Ok(false);
+    }
+
+    // Try graceful shutdown first
+    let _ = send_request_no_autostart(&Request::Shutdown);
+
+    // Wait for graceful stop (3 seconds)
+    let deadline = SystemTime::now() + Duration::from_secs(3);
+    while SystemTime::now() < deadline {
+        if UnixStream::connect(&socket).is_err() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Try to read PID from meta file and force kill
+    let meta_path = socket.with_file_name("daemon.meta.json");
+    if let Ok(contents) = fs::read_to_string(&meta_path)
+        && let Ok(meta) = serde_json::from_str::<beads_api::DaemonInfo>(&contents)
+    {
+        tracing::warn!("daemon did not stop gracefully, killing pid {}", meta.pid);
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, kill};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(meta.pid as i32), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = beads_surface::ipc::proc_util::terminate(meta.pid);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Clean up socket and meta files
+    let _ = fs::remove_file(&socket);
+    let _ = fs::remove_file(&meta_path);
+
+    Ok(true)
+}
+
+fn start_daemon(install_path: &Path) -> Result<()> {
+    // Get expected version from the new binary
+    let expected_version = get_binary_version(install_path)?;
+
+    let mut cmd = Command::new(install_path);
+    cmd.arg("daemon").arg("run");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.spawn()
+        .map_err(|e| upgrade_error(format!("failed to start daemon: {e}")))?;
+
+    // Wait for new daemon to be responsive with correct version
+    wait_for_daemon_ready(&expected_version)
+        .map_err(|e| upgrade_error(format!("new daemon failed to start: {e}")))
+}
+
+fn get_binary_version(path: &Path) -> Result<String> {
+    let output = Command::new(path).arg("--version").output().map_err(|e| {
+        upgrade_error(format!(
+            "failed to get version from {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    let version_line = String::from_utf8_lossy(&output.stdout);
+    // Parse "bd X.Y.Z" format
+    version_line
+        .split_whitespace()
+        .nth(1)
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            upgrade_error(format!(
+                "failed to parse version from: {}",
+                version_line.trim()
+            ))
+        })
+}
+
+fn read_state() -> Result<Option<UpgradeState>> {
+    let path = state_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|e| upgrade_error(format!("failed to read state {}: {e}", path.display())))?;
+    let state = serde_json::from_str(&contents)
+        .map_err(|e| upgrade_error(format!("failed to parse state: {e}")))?;
+    Ok(Some(state))
+}
+
+fn write_state(state: &UpgradeState) -> Result<()> {
+    let path = state_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)
+            .map_err(|e| upgrade_error(format!("failed to create {}: {e}", dir.display())))?;
+    }
+    let payload = serde_json::to_vec(state)
+        .map_err(|e| upgrade_error(format!("failed to encode state: {e}")))?;
+    fs::write(&path, payload).map_err(|e| upgrade_error(format!("failed to write state: {e}")))?;
+    Ok(())
+}
+
+fn state_path() -> PathBuf {
+    crate::paths::data_dir().join("upgrade_state.json")
+}
+
+fn wall_ms() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() as u64
+}
+
+fn map_support_error(err: UpgradeSupportError) -> Error {
+    upgrade_error(err.to_string())
+}
+
+fn upgrade_error(reason: String) -> Error {
+    Error::Op(OpError::ValidationFailed {
+        field: "upgrade".into(),
+        reason,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_binary_copies_and_sets_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("bd-src");
+        fs::write(&src, b"dummy").expect("write src");
+        let dest = dir.path().join("bd-dest");
+
+        install_binary(&src, &dest).expect("install");
+        let meta = fs::metadata(&dest).expect("dest meta");
+        assert!(meta.is_file());
+    }
+}

@@ -1,0 +1,505 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
+
+use crate::paths;
+use beads_bootstrap::config::{FileLoggingConfig, LogFormat, LogRotation, LoggingConfig};
+
+const LOG_FILE_PREFIX: &str = "beads.log";
+
+#[derive(Clone)]
+pub struct TelemetryConfig {
+    pub verbosity: u8,
+    pub logging: LoggingConfig,
+}
+
+impl TelemetryConfig {
+    pub fn new(verbosity: u8, logging: LoggingConfig) -> Self {
+        Self { verbosity, logging }
+    }
+}
+
+pub fn is_test_env() -> bool {
+    std::env::var_os("BD_TESTING").is_some() || std::env::var_os("RUST_TEST_THREADS").is_some()
+}
+
+pub fn apply_daemon_logging_defaults(logging: &mut LoggingConfig) {
+    apply_daemon_logging_defaults_inner(logging, logging_defaults_mode());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoggingDefaultsMode {
+    TestEnv,
+    LogFileEnv,
+    Default,
+}
+
+fn logging_defaults_mode() -> LoggingDefaultsMode {
+    if is_test_env() {
+        LoggingDefaultsMode::TestEnv
+    } else if std::env::var_os("BD_LOG_FILE").is_some() {
+        LoggingDefaultsMode::LogFileEnv
+    } else {
+        LoggingDefaultsMode::Default
+    }
+}
+
+fn apply_daemon_logging_defaults_inner(logging: &mut LoggingConfig, mode: LoggingDefaultsMode) {
+    match mode {
+        LoggingDefaultsMode::TestEnv | LoggingDefaultsMode::LogFileEnv => {}
+        LoggingDefaultsMode::Default => {
+            if !logging.file.enabled {
+                logging.file.enabled = true;
+            }
+        }
+    }
+}
+
+pub struct TelemetryGuard {
+    _guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+pub fn init(config: TelemetryConfig) -> TelemetryGuard {
+    // Build a fresh EnvFilter per layer — EnvFilter isn't Clone, and pushing a
+    // single filter into a Vec<Layer> is ineffective: the Vec's
+    // register_callsite short-circuits on the first layer that returns
+    // Interest::always(), so the filter never gets consulted.
+    let build_filter = || build_env_filter(config.verbosity, config.logging.filter.as_deref());
+
+    let mut guards = Vec::new();
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
+
+    if config.logging.stdout {
+        layers.push(build_stdout_layer(
+            config.logging.stdout_format,
+            build_filter(),
+        ));
+    }
+
+    let mut file_prune_report = None;
+    let mut file_setup_error = None;
+    if config.logging.file.enabled {
+        let dir = resolve_log_dir(&config.logging.file);
+        match fs::create_dir_all(&dir) {
+            Ok(()) => {
+                let retention = RetentionLimits::from_file_config(&config.logging.file);
+                if retention.is_enabled() {
+                    match prune_logs(&dir, LOG_FILE_PREFIX, retention, SystemTime::now()) {
+                        Ok(report) => file_prune_report = Some(report),
+                        Err(err) => {
+                            file_setup_error = Some(format!("log retention failed: {err}"));
+                        }
+                    }
+                }
+
+                let (layer, guard) = build_file_layer(&config.logging.file, &dir, build_filter());
+                layers.push(layer);
+                guards.push(guard);
+            }
+            Err(err) => {
+                file_setup_error =
+                    Some(format!("log dir init failed for {}: {err}", dir.display()));
+            }
+        }
+    }
+
+    Registry::default().with(layers).init();
+
+    if let Some(report) = file_prune_report {
+        tracing::info!(
+            pruned = report.removed,
+            failed = report.failed,
+            candidates = report.candidates,
+            "log retention applied"
+        );
+    }
+    if let Some(error) = file_setup_error {
+        tracing::warn!("{error}");
+    }
+
+    TelemetryGuard { _guards: guards }
+}
+
+fn build_env_filter(verbosity: u8, config_filter: Option<&str>) -> EnvFilter {
+    build_env_filter_inner(
+        verbosity,
+        config_filter,
+        std::env::var("LOG").ok().as_deref(),
+    )
+}
+
+fn build_env_filter_inner(
+    verbosity: u8,
+    config_filter: Option<&str>,
+    log_env: Option<&str>,
+) -> EnvFilter {
+    let default_directive = level_from_verbosity(verbosity).into();
+    let builder = EnvFilter::builder()
+        .with_default_directive(default_directive)
+        .with_env_var("LOG");
+
+    if let Some(raw) = log_env {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let filter = builder.parse(trimmed).unwrap_or_else(|err| {
+                eprintln!("invalid LOG filter: {err}");
+                builder.from_env_lossy()
+            });
+            return add_default_metrics_filter(filter);
+        }
+    }
+
+    if let Some(raw) = config_filter {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let filter = builder.parse(trimmed).unwrap_or_else(|err| {
+                eprintln!("invalid logging.filter: {err}");
+                builder.from_env_lossy()
+            });
+            return add_default_metrics_filter(filter);
+        }
+    }
+
+    add_default_metrics_filter(builder.from_env_lossy())
+}
+
+fn add_default_metrics_filter(filter: EnvFilter) -> EnvFilter {
+    let directive = "metrics=info".parse().expect("metrics filter directive");
+    filter.add_directive(directive)
+}
+
+fn build_stdout_layer(
+    format: LogFormat,
+    filter: EnvFilter,
+) -> Box<dyn Layer<Registry> + Send + Sync> {
+    match format {
+        LogFormat::Tree => Box::new(tracing_tree::HierarchicalLayer::new(2).with_filter(filter)),
+        LogFormat::Pretty => Box::new(
+            tracing_subscriber::fmt::layer()
+                .pretty()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_filter(filter),
+        ),
+        LogFormat::Compact => Box::new(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_filter(filter),
+        ),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_filter(filter),
+        ),
+    }
+}
+
+fn build_file_layer(
+    config: &FileLoggingConfig,
+    dir: &Path,
+    filter: EnvFilter,
+) -> (
+    Box<dyn Layer<Registry> + Send + Sync>,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    let rotation = match config.rotation {
+        LogRotation::Daily => tracing_appender::rolling::Rotation::DAILY,
+        LogRotation::Hourly => tracing_appender::rolling::Rotation::HOURLY,
+        LogRotation::Minutely => tracing_appender::rolling::Rotation::MINUTELY,
+        LogRotation::Never => tracing_appender::rolling::Rotation::NEVER,
+    };
+    let appender =
+        tracing_appender::rolling::RollingFileAppender::new(rotation, dir, LOG_FILE_PREFIX);
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let layer: Box<dyn Layer<Registry> + Send + Sync> = match config.format {
+        LogFormat::Tree => Box::new(
+            tracing_tree::HierarchicalLayer::new(2)
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(filter),
+        ),
+        LogFormat::Pretty => Box::new(
+            tracing_subscriber::fmt::layer()
+                .pretty()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_filter(filter),
+        ),
+        LogFormat::Compact => Box::new(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_filter(filter),
+        ),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_target(true)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_filter(filter),
+        ),
+    };
+    (layer, guard)
+}
+
+fn level_from_verbosity(verbosity: u8) -> tracing::metadata::LevelFilter {
+    match verbosity {
+        0 => tracing::metadata::LevelFilter::ERROR,
+        1 => tracing::metadata::LevelFilter::INFO,
+        _ => tracing::metadata::LevelFilter::DEBUG,
+    }
+}
+
+fn resolve_log_dir(config: &FileLoggingConfig) -> PathBuf {
+    config.dir.clone().unwrap_or_else(paths::log_dir)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RetentionLimits {
+    max_age: Option<Duration>,
+    max_files: Option<usize>,
+}
+
+impl RetentionLimits {
+    fn from_file_config(config: &FileLoggingConfig) -> Self {
+        let max_age = config
+            .retention_max_age_days
+            .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60)));
+        Self {
+            max_age,
+            max_files: config.retention_max_files,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.max_age.is_some() || self.max_files.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LogEntry {
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PruneReport {
+    candidates: usize,
+    removed: usize,
+    failed: usize,
+}
+
+fn prune_logs(
+    dir: &Path,
+    prefix: &str,
+    retention: RetentionLimits,
+    now: SystemTime,
+) -> std::io::Result<PruneReport> {
+    let mut entries = collect_log_entries(dir, prefix, now)?;
+    let candidates = entries.len();
+    let to_remove = prune_log_entries(&mut entries, retention, now);
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    for path in to_remove {
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    Ok(PruneReport {
+        candidates,
+        removed,
+        failed,
+    })
+}
+
+fn collect_log_entries(
+    dir: &Path,
+    prefix: &str,
+    now: SystemTime,
+) -> std::io::Result<Vec<LogEntry>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        entries.push(LogEntry { path, modified });
+    }
+    Ok(entries)
+}
+
+fn prune_log_entries(
+    entries: &mut Vec<LogEntry>,
+    retention: RetentionLimits,
+    now: SystemTime,
+) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+
+    if let Some(max_age) = retention.max_age {
+        let mut keep = Vec::new();
+        for entry in entries.drain(..) {
+            let age = now.duration_since(entry.modified).unwrap_or(Duration::ZERO);
+            if age > max_age {
+                removed.push(entry.path);
+            } else {
+                keep.push(entry);
+            }
+        }
+        *entries = keep;
+    }
+
+    if let Some(max_files) = retention.max_files {
+        entries.sort_by_key(|entry| entry.modified);
+        if entries.len() > max_files {
+            let excess = entries.len() - max_files;
+            for entry in entries.drain(..excess) {
+                removed.push(entry.path);
+            }
+        }
+    }
+
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_log_entries_respects_age_and_count() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut entries = vec![
+            LogEntry {
+                path: PathBuf::from("old.log"),
+                modified: now - Duration::from_secs(9_000),
+            },
+            LogEntry {
+                path: PathBuf::from("mid.log"),
+                modified: now - Duration::from_secs(500),
+            },
+            LogEntry {
+                path: PathBuf::from("new.log"),
+                modified: now - Duration::from_secs(40),
+            },
+            LogEntry {
+                path: PathBuf::from("newest.log"),
+                modified: now - Duration::from_secs(5),
+            },
+        ];
+        let retention = RetentionLimits {
+            max_age: Some(Duration::from_secs(1_000)),
+            max_files: Some(2),
+        };
+
+        let removed = prune_log_entries(&mut entries, retention, now);
+
+        assert!(removed.contains(&PathBuf::from("old.log")));
+        assert!(removed.contains(&PathBuf::from("mid.log")));
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path.as_path() == std::path::Path::new("new.log"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path.as_path() == std::path::Path::new("newest.log"))
+        );
+    }
+
+    #[test]
+    fn daemon_logging_defaults_skip_in_tests() {
+        let mut logging = LoggingConfig::default();
+        logging.file.enabled = false;
+        apply_daemon_logging_defaults_inner(&mut logging, LoggingDefaultsMode::TestEnv);
+        assert!(
+            !logging.file.enabled,
+            "daemon logging defaults should skip in tests"
+        );
+    }
+
+    #[test]
+    fn daemon_logging_defaults_skip_with_log_file_env() {
+        let mut logging = LoggingConfig::default();
+        logging.file.enabled = false;
+        apply_daemon_logging_defaults_inner(&mut logging, LoggingDefaultsMode::LogFileEnv);
+        assert!(
+            !logging.file.enabled,
+            "daemon logging defaults should skip when BD_LOG_FILE is set"
+        );
+    }
+
+    #[test]
+    fn daemon_logging_defaults_apply_in_default_mode() {
+        let mut logging = LoggingConfig::default();
+        logging.file.enabled = false;
+        apply_daemon_logging_defaults_inner(&mut logging, LoggingDefaultsMode::Default);
+        assert!(
+            logging.file.enabled,
+            "daemon logging defaults should enable file logging in default mode"
+        );
+    }
+
+    #[test]
+    fn log_filter_prefers_log_env_over_config() {
+        let filter = build_env_filter_inner(1, Some("beads_rs=debug"), Some("beads_rs=info"));
+        let rendered = filter.to_string();
+        assert!(rendered.contains("beads_rs=info"));
+        assert!(!rendered.contains("beads_rs=debug"));
+    }
+
+    #[test]
+    fn log_filter_uses_config_when_env_missing() {
+        let filter = build_env_filter_inner(1, Some("beads_rs=debug"), None);
+        let rendered = filter.to_string();
+        assert!(rendered.contains("beads_rs=debug"));
+    }
+
+    #[test]
+    fn log_filter_falls_back_to_verbosity() {
+        let filter = build_env_filter_inner(0, None, None);
+        let rendered = filter.to_string();
+        assert!(rendered.contains("error"));
+    }
+}
