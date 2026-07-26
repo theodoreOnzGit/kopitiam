@@ -28,11 +28,39 @@
 //!
 //! Only the read/parse path is ported; the write/combine path is deferred (each
 //! module's header says what and why).
+//!
+//! ## Phase 2: the character set + CJK recoder
+//!
+//! This phase ports the read path of Tesseract's character machinery, so a
+//! KOPITIAM crate can turn the LSTM model's numeric outputs back into text:
+//!
+//! * [`unichar`] — [`Unichar`], Tesseract's single-codepoint UTF-8 handling
+//!   (`src/ccutil/unichar.{cpp,h}`).
+//! * [`unicharmap`] — [`Unicharmap`], the UTF-8 → id trie (`src/ccutil/unicharmap.{cpp,h}`).
+//! * [`unicharset`] — [`Unicharset`], the id↔UTF-8 table with per-char
+//!   properties and the text-format load path (`src/ccutil/unicharset.{cpp,h}`).
+//! * [`unicharcompress`] — [`UnicharCompress`]/[`RecodedCharID`], the **CJK
+//!   recoder** that maps each unichar id to a short sequence of small codes and
+//!   back — why chi_sim/jpn work (`src/ccutil/unicharcompress.{cpp,h}`).
 
 pub mod error;
 pub mod serialis;
 pub mod tessdata;
+pub mod unichar;
+pub mod unicharcompress;
+pub mod unicharmap;
+pub mod unicharset;
 
 pub use error::{Error, ErrorKind, Result};
 pub use serialis::TFile;
 pub use tessdata::{FILE_SUFFIXES, MAX_NUM_TESSDATA_ENTRIES, NUM_ENTRIES, TessdataManager, TessdataType};
+pub use unichar::{
+    Char32, INVALID_UNICHAR, INVALID_UNICHAR_ID, UNICHAR_LEN, Unichar, UnicharId, utf8_step,
+    utf8_to_utf32, utf32_to_utf8,
+};
+pub use unicharcompress::{RecodedCharID, UnicharCompress};
+pub use unicharmap::Unicharmap;
+pub use unicharset::{
+    CharFragment, SPECIAL_UNICHAR_CODES, SPECIAL_UNICHAR_CODES_COUNT, UNICHAR_BROKEN,
+    UNICHAR_JOINED, UNICHAR_SPACE, Unicharset,
+};

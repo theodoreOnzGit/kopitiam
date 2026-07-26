@@ -271,6 +271,29 @@ impl<'a> TFile<'a> {
         self.read_bytes(size as usize)
     }
 
+    /// Read one line, `fgets`-style: consume bytes up to and including the next
+    /// `\n` (or end-of-buffer), returning at most `buffer_size - 1` bytes.
+    ///
+    /// Tesseract: `TFile::FGets` (serialis.cpp:213), the parsing primitive the
+    /// text unicharset loader ([`crate::unicharset`]) reads through. Returns
+    /// [`None`] at end-of-buffer (the C's `nullptr`); a line longer than
+    /// `buffer_size - 1` bytes is truncated there, and its tail is returned by
+    /// the following call — exactly as the fixed 256-byte C buffer behaves. The
+    /// returned bytes include the trailing `\n` when one was reached. Does
+    /// nothing and returns [`None`] if `buffer_size <= 1`.
+    pub fn fgets(&mut self, buffer_size: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        while out.len() + 1 < buffer_size && self.offset < self.data.len() {
+            let b = self.data[self.offset];
+            self.offset += 1;
+            out.push(b);
+            if b == b'\n' {
+                break;
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
     /// Skip `count` bytes.
     ///
     /// Tesseract: `TFile::Skip` (serialis.cpp:145). On failure (not enough bytes
