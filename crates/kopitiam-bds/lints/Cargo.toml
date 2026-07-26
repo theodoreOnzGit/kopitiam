@@ -1,3 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["beads_lints", "clippy_utils"]

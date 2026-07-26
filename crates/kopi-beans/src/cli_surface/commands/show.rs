@@ -1,0 +1,883 @@
+use clap::Args;
+
+use super::common::{fmt_issue_ref, fmt_labels, fmt_wall_ms};
+use super::{CommandError, CommandResult};
+use crate::cli_surface::render::{print_json, print_line};
+use crate::cli_surface::runtime::{CliRuntimeCtx, send};
+use crate::cli_surface::validation::{normalize_bead_id, validation_error};
+use crate::api::{Issue, IssueSummary, Note, QueryResult, ShowDetails};
+use crate::core::{BeadId, BeadType, IssueStatus, NamespaceId};
+use crate::surface::ipc::{IdPayload, ListPayload, Request, ResponsePayload};
+use crate::surface::{Filters, SortField};
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+use std::process::Command as ProcessCommand;
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    /// Bead id(s) to inspect.
+    #[arg(value_name = "ID", num_args = 0..)]
+    pub id: Vec<String>,
+
+    /// Bead id to inspect, useful when the id could be mistaken for a flag.
+    #[arg(long = "id", value_name = "ID", num_args = 1..)]
+    pub id_flag: Vec<String>,
+
+    /// Resolve the current bead from the active jj change or your most recent in-progress work.
+    #[arg(long)]
+    pub current: bool,
+
+    /// Compact one-line output.
+    #[arg(long, conflicts_with = "long")]
+    pub short: bool,
+
+    /// Full output including dependency and comment sections.
+    #[arg(long, conflicts_with = "short")]
+    pub long: bool,
+
+    /// Show only incoming references to the bead.
+    #[arg(long, conflicts_with = "children")]
+    pub refs: bool,
+
+    /// Show only direct children of the bead.
+    #[arg(long)]
+    pub children: bool,
+}
+
+pub fn handle(ctx: &CliRuntimeCtx, args: ShowArgs) -> CommandResult<()> {
+    let ids = resolve_show_ids(ctx, args.id, args.id_flag, args.current)?;
+
+    if ctx.json {
+        let mut details = Vec::with_capacity(ids.len());
+        for id in &ids {
+            details.push(fetch_show_details(ctx, id)?);
+        }
+        print_json(&crate::cli_surface::render::show_details_array_json_value(&details))?;
+        return Ok(());
+    }
+
+    let mut views = Vec::with_capacity(ids.len());
+    for id in &ids {
+        views.push(fetch_show_view(ctx, id)?);
+    }
+
+    let mut output = String::new();
+    for (idx, view) in views.iter().enumerate() {
+        if idx > 0 && !args.short {
+            output.push_str("\n------------------------------------------------------------\n");
+        }
+        let rendered = if args.refs {
+            render_show_refs(&view.issue, &view.incoming, args.short)
+        } else if args.children {
+            render_show_children(&view.issue, &view.incoming.children, args.short)
+        } else if args.short {
+            render_issue_summary(&view.issue)
+        } else if args.long {
+            render_show_long(&view.issue, &view.outgoing, &view.incoming, &view.notes)
+        } else {
+            render_show(&view.issue, &view.outgoing, &view.incoming, &view.notes)
+        };
+        output.push_str(rendered.trim_end());
+        output.push('\n');
+    }
+
+    print_line(output.trim_end())?;
+    Ok(())
+}
+
+fn fetch_show_details(ctx: &CliRuntimeCtx, id: &BeadId) -> CommandResult<ShowDetails> {
+    let req = Request::ShowDetails {
+        ctx: ctx.read_ctx(),
+        payload: IdPayload { id: id.clone() },
+    };
+    match send(&req)? {
+        ResponsePayload::Query(QueryResult::ShowDetails(details)) => Ok(details),
+        ResponsePayload::Query(QueryResult::Issue(issue)) => Ok(ShowDetails {
+            issue,
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            summaries: Vec::new(),
+        }),
+        other => Err(CommandError::Ipc(
+            crate::surface::ipc::IpcError::DaemonUnavailable(format!(
+                "unexpected response for show details: {other:?}"
+            )),
+        )),
+    }
+}
+
+fn fetch_show_view(ctx: &CliRuntimeCtx, id: &BeadId) -> CommandResult<ShowView> {
+    let req = Request::ShowDetails {
+        ctx: ctx.read_ctx(),
+        payload: IdPayload { id: id.clone() },
+    };
+    match send(&req)? {
+        ResponsePayload::Query(QueryResult::ShowDetails(details)) => build_show_view(
+            ctx,
+            details.issue,
+            details.incoming,
+            details.outgoing,
+            details.summaries,
+        ),
+        ResponsePayload::Query(QueryResult::Issue(view)) => fetch_show_view_legacy(ctx, id, view),
+        other => Err(CommandError::Ipc(
+            crate::surface::ipc::IpcError::DaemonUnavailable(format!(
+                "unexpected response for show details: {other:?}"
+            )),
+        )),
+    }
+}
+
+fn fetch_show_view_legacy(
+    ctx: &CliRuntimeCtx,
+    id: &BeadId,
+    view: Issue,
+) -> CommandResult<ShowView> {
+    let deps_payload = send(&Request::Deps {
+        ctx: ctx.read_ctx(),
+        payload: IdPayload { id: id.clone() },
+    })?;
+    let (incoming_edges, outgoing_edges) = match deps_payload {
+        ResponsePayload::Query(QueryResult::Deps { incoming, outgoing }) => (incoming, outgoing),
+        _ => (Vec::new(), Vec::new()),
+    };
+    let notes_payload = send(&Request::Notes {
+        ctx: ctx.read_ctx(),
+        payload: IdPayload { id: id.clone() },
+    })?;
+    let notes = match notes_payload {
+        ResponsePayload::Query(QueryResult::Notes(n)) => n,
+        _ => Vec::new(),
+    };
+    let show_view = build_show_view(ctx, view, incoming_edges, outgoing_edges, Vec::new())?;
+    Ok(ShowView { notes, ..show_view })
+}
+
+fn build_show_view(
+    ctx: &CliRuntimeCtx,
+    view: Issue,
+    incoming_edges: Vec<crate::api::DepEdge>,
+    outgoing_edges: Vec<crate::api::DepEdge>,
+    summaries: Vec<IssueSummary>,
+) -> CommandResult<ShowView> {
+    let mut summary_map: HashMap<String, IssueSummary> = summaries
+        .into_iter()
+        .map(|summary| (summary.id.clone(), summary))
+        .collect();
+    let outgoing_ids: BTreeSet<String> = outgoing_edges.iter().map(|e| e.to.clone()).collect();
+    let mut blocks_ids: BTreeSet<String> = BTreeSet::new();
+    let mut children_ids: BTreeSet<String> = BTreeSet::new();
+    let mut related_ids: BTreeSet<String> = BTreeSet::new();
+    let mut discovered_ids: BTreeSet<String> = BTreeSet::new();
+    for e in &incoming_edges {
+        match e.kind.as_str() {
+            "parent" | "parent-child" => {
+                children_ids.insert(e.from.clone());
+            }
+            "related" => {
+                related_ids.insert(e.from.clone());
+            }
+            "discovered_from" | "discovered-from" => {
+                discovered_ids.insert(e.from.clone());
+            }
+            _ => {
+                blocks_ids.insert(e.from.clone());
+            }
+        }
+    }
+
+    let mut all_ids = BTreeSet::new();
+    all_ids.extend(outgoing_ids.iter().cloned());
+    all_ids.extend(blocks_ids.iter().cloned());
+    all_ids.extend(children_ids.iter().cloned());
+    all_ids.extend(related_ids.iter().cloned());
+    all_ids.extend(discovered_ids.iter().cloned());
+    let has_all_summaries = all_ids
+        .iter()
+        .all(|dep_id| summary_map.contains_key(dep_id));
+    if !has_all_summaries {
+        summary_map.extend(fetch_summary_map(ctx, &all_ids)?);
+    }
+
+    let outgoing_views = summaries_for(&outgoing_ids, &summary_map);
+    let blocks = summaries_for(&blocks_ids, &summary_map);
+    let children = summaries_for(&children_ids, &summary_map);
+    let related = summaries_for(&related_ids, &summary_map);
+    let discovered = summaries_for(&discovered_ids, &summary_map);
+
+    let incoming = IncomingGroups {
+        children,
+        blocks,
+        related,
+        discovered,
+    };
+
+    let notes = view.notes.clone();
+    Ok(ShowView {
+        issue: view,
+        outgoing: outgoing_views,
+        incoming,
+        notes,
+    })
+}
+
+fn resolve_show_ids(
+    ctx: &CliRuntimeCtx,
+    positional: Vec<String>,
+    id_flag: Vec<String>,
+    current: bool,
+) -> CommandResult<Vec<BeadId>> {
+    if current && (!positional.is_empty() || !id_flag.is_empty()) {
+        return Err(validation_error(
+            "current",
+            "--current cannot be combined with explicit bead ids",
+        )
+        .into());
+    }
+
+    if current {
+        return Ok(vec![resolve_current_issue_id(ctx)?]);
+    }
+
+    let raw_ids = positional.into_iter().chain(id_flag).collect::<Vec<_>>();
+    if raw_ids.is_empty() {
+        return Err(validation_error(
+            "id",
+            "show requires at least one bead id (or use --current)",
+        )
+        .into());
+    }
+
+    raw_ids
+        .into_iter()
+        .map(|raw| normalize_bead_id(&raw).map_err(Into::into))
+        .collect()
+}
+
+fn fetch_summary_map(
+    ctx: &CliRuntimeCtx,
+    ids: &BTreeSet<String>,
+) -> CommandResult<HashMap<String, IssueSummary>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let bead_ids = ids
+        .iter()
+        .map(|id| BeadId::parse(id))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let filters = Filters {
+        ids: Some(bead_ids),
+        ..Filters::default()
+    };
+    let req = Request::List {
+        ctx: ctx.read_ctx(),
+        payload: ListPayload { filters },
+    };
+    match send(&req)? {
+        ResponsePayload::Query(QueryResult::Issues(summaries)) => Ok(summaries
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect()),
+        _ => Ok(HashMap::new()),
+    }
+}
+
+fn summaries_for(
+    ids: &BTreeSet<String>,
+    summaries: &HashMap<String, IssueSummary>,
+) -> Vec<IssueSummary> {
+    ids.iter()
+        .filter_map(|id| summaries.get(id).cloned())
+        .collect()
+}
+
+pub struct IncomingGroups {
+    pub children: Vec<IssueSummary>,
+    pub blocks: Vec<IssueSummary>,
+    pub related: Vec<IssueSummary>,
+    pub discovered: Vec<IssueSummary>,
+}
+
+struct ShowView {
+    issue: Issue,
+    outgoing: Vec<IssueSummary>,
+    incoming: IncomingGroups,
+    notes: Vec<Note>,
+}
+
+fn render_show(
+    bead: &Issue,
+    outgoing: &[IssueSummary],
+    incoming: &IncomingGroups,
+    notes: &[Note],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n{}: {}\n",
+        fmt_show_issue_ref(&bead.namespace, &bead.id),
+        bead.title
+    ));
+    if bead.namespace != NamespaceId::core() {
+        out.push_str(&format!("Namespace: {}\n", bead.namespace.as_str()));
+    }
+    out.push_str(&format!("Status: {}\n", bead.status.as_str()));
+    out.push_str(&format!("Priority: P{}\n", bead.priority));
+    out.push_str(&format!("Type: {}\n", bead.issue_type.as_str()));
+    if let Some(a) = &bead.assignee
+        && !a.is_empty()
+    {
+        out.push_str(&format!("Assignee: {}\n", a));
+    }
+    out.push_str(&format!(
+        "Created: {}\n",
+        fmt_wall_ms(bead.created_at.wall_ms)
+    ));
+    out.push_str(&format!(
+        "Updated: {}\n",
+        fmt_wall_ms(bead.updated_at.wall_ms)
+    ));
+
+    if !bead.description.is_empty() {
+        out.push_str(&format!("\nDescription:\n{}\n", bead.description));
+    }
+    if let Some(d) = &bead.design
+        && !d.is_empty()
+    {
+        out.push_str(&format!("\nDesign:\n{}\n", d));
+    }
+    if let Some(a) = &bead.acceptance_criteria
+        && !a.is_empty()
+    {
+        out.push_str(&format!("\nAcceptance Criteria:\n{}\n", a));
+    }
+
+    if !bead.labels.is_empty() {
+        out.push_str(&format!("\nLabels: {}\n", fmt_labels(&bead.labels)));
+    }
+
+    if !outgoing.is_empty() {
+        out.push_str(&format!("\nDepends on ({}):\n", outgoing.len()));
+        for dep in outgoing {
+            out.push_str(&format!(
+                "  → {}: {} [P{}]\n",
+                fmt_show_issue_ref(&dep.namespace, &dep.id),
+                dep.title,
+                dep.priority
+            ));
+        }
+    }
+
+    if !incoming.children.is_empty() {
+        // For epics, show detailed progress with done/remaining breakdown
+        if bead.issue_type == BeadType::Epic {
+            render_epic_children(&mut out, &incoming.children);
+        } else {
+            out.push_str(&format!("\nChildren ({}):\n", incoming.children.len()));
+            for dep in &incoming.children {
+                out.push_str(&format!(
+                    "  ↳ {}: {} [P{}]\n",
+                    fmt_show_issue_ref(&dep.namespace, &dep.id),
+                    dep.title,
+                    dep.priority
+                ));
+            }
+        }
+    }
+    if !incoming.blocks.is_empty() {
+        out.push_str(&format!("\nBlocks ({}):\n", incoming.blocks.len()));
+        for dep in &incoming.blocks {
+            out.push_str(&format!(
+                "  ← {}: {} [P{}]\n",
+                fmt_show_issue_ref(&dep.namespace, &dep.id),
+                dep.title,
+                dep.priority
+            ));
+        }
+    }
+    if !incoming.related.is_empty() {
+        out.push_str(&format!("\nRelated ({}):\n", incoming.related.len()));
+        for dep in &incoming.related {
+            out.push_str(&format!(
+                "  ↔ {}: {} [P{}]\n",
+                fmt_show_issue_ref(&dep.namespace, &dep.id),
+                dep.title,
+                dep.priority
+            ));
+        }
+    }
+    if !incoming.discovered.is_empty() {
+        out.push_str(&format!("\nDiscovered ({}):\n", incoming.discovered.len()));
+        for dep in &incoming.discovered {
+            out.push_str(&format!(
+                "  ◊ {}: {} [P{}]\n",
+                fmt_show_issue_ref(&dep.namespace, &dep.id),
+                dep.title,
+                dep.priority
+            ));
+        }
+    }
+
+    if !notes.is_empty() {
+        out.push_str(&format!("\nComments ({}):\n", notes.len()));
+        for n in notes {
+            out.push_str(&format!(
+                "  [{} at {}]\n  {}\n\n",
+                n.author,
+                fmt_wall_ms(n.at.wall_ms),
+                n.content
+            ));
+        }
+    }
+
+    out.push('\n');
+    out
+}
+
+fn render_show_long(
+    bead: &Issue,
+    outgoing: &[IssueSummary],
+    incoming: &IncomingGroups,
+    notes: &[Note],
+) -> String {
+    render_show(bead, outgoing, incoming, notes)
+}
+
+pub fn render_issue_detail(v: &Issue) -> String {
+    // Default detail renderer (used for `show --json=false` fallback).
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n{}: {}\n",
+        fmt_show_issue_ref(&v.namespace, &v.id),
+        v.title
+    ));
+    if v.namespace != NamespaceId::core() {
+        out.push_str(&format!("Namespace: {}\n", v.namespace.as_str()));
+    }
+    out.push_str(&format!("Status: {}\n", v.status.as_str()));
+    out.push_str(&format!("Priority: P{}\n", v.priority));
+    out.push_str(&format!("Type: {}\n", v.issue_type.as_str()));
+    if let Some(a) = &v.assignee
+        && !a.is_empty()
+    {
+        out.push_str(&format!("Assignee: {}\n", a));
+    }
+    out.push_str(&format!("Created: {}\n", fmt_wall_ms(v.created_at.wall_ms)));
+    out.push_str(&format!("Updated: {}\n", fmt_wall_ms(v.updated_at.wall_ms)));
+
+    if !v.description.is_empty() {
+        out.push_str(&format!("\nDescription:\n{}\n", v.description));
+    }
+    if let Some(d) = &v.design
+        && !d.is_empty()
+    {
+        out.push_str(&format!("\nDesign:\n{}\n", d));
+    }
+    if let Some(a) = &v.acceptance_criteria
+        && !a.is_empty()
+    {
+        out.push_str(&format!("\nAcceptance Criteria:\n{}\n", a));
+    }
+    if !v.labels.is_empty() {
+        out.push_str(&format!("\nLabels: {}\n", fmt_labels(&v.labels)));
+    }
+    if !v.notes.is_empty() {
+        out.push_str("\nComments:\n\n");
+        for n in &v.notes {
+            out.push_str(&format!(
+                "[{}] {} at {}\n\n",
+                n.author,
+                n.content,
+                fmt_wall_ms(n.at.wall_ms)
+            ));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn render_issue_summary(v: &Issue) -> String {
+    let assignee = v
+        .assignee
+        .as_ref()
+        .filter(|assignee| !assignee.is_empty())
+        .map(|assignee| format!(" @{}", assignee))
+        .unwrap_or_default();
+    format!(
+        "{} [P{}] [{}] {}{} - {}",
+        fmt_show_issue_ref(&v.namespace, &v.id),
+        v.priority,
+        v.issue_type.as_str(),
+        v.status.as_str(),
+        assignee,
+        v.title
+    )
+}
+
+fn render_show_refs(bead: &Issue, incoming: &IncomingGroups, short: bool) -> String {
+    let mut out = String::new();
+    let total = incoming.blocks.len()
+        + incoming.related.len()
+        + incoming.discovered.len()
+        + incoming.children.len();
+
+    if short {
+        if total == 0 {
+            return format!("{} refs=0", fmt_show_issue_ref(&bead.namespace, &bead.id));
+        }
+        for summary in incoming
+            .blocks
+            .iter()
+            .chain(incoming.related.iter())
+            .chain(incoming.discovered.iter())
+            .chain(incoming.children.iter())
+        {
+            out.push_str(&format!(
+                "{} -> {}\n",
+                fmt_show_issue_ref(&summary.namespace, &summary.id),
+                fmt_show_issue_ref(&bead.namespace, &bead.id)
+            ));
+        }
+        return out;
+    }
+
+    out.push_str(&format!(
+        "{} references ({total})\n",
+        fmt_show_issue_ref(&bead.namespace, &bead.id)
+    ));
+    append_summary_group(&mut out, "Blocks", &incoming.blocks, "  <-");
+    append_summary_group(&mut out, "Related", &incoming.related, "  <>");
+    append_summary_group(&mut out, "Discovered From", &incoming.discovered, "  <>");
+    append_summary_group(&mut out, "Children", &incoming.children, "  <-");
+    out
+}
+
+fn render_show_children(bead: &Issue, children: &[IssueSummary], short: bool) -> String {
+    if short {
+        if children.is_empty() {
+            return format!(
+                "{} children=0",
+                fmt_show_issue_ref(&bead.namespace, &bead.id)
+            );
+        }
+        let mut out = String::new();
+        for child in children {
+            out.push_str(&format!(
+                "{} [P{}] [{}] {} - {}\n",
+                fmt_show_issue_ref(&child.namespace, &child.id),
+                child.priority,
+                child.issue_type.as_str(),
+                child.status.as_str(),
+                child.title
+            ));
+        }
+        return out;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} children ({})\n",
+        fmt_show_issue_ref(&bead.namespace, &bead.id),
+        children.len()
+    ));
+    if children.is_empty() {
+        out.push_str("  (none)\n");
+        return out;
+    }
+    for child in children {
+        out.push_str(&format!(
+            "  -> {}: {} [P{}] [{}]\n",
+            fmt_show_issue_ref(&child.namespace, &child.id),
+            child.title,
+            child.priority,
+            child.status.as_str()
+        ));
+    }
+    out
+}
+
+fn append_summary_group(out: &mut String, label: &str, summaries: &[IssueSummary], prefix: &str) {
+    if summaries.is_empty() {
+        return;
+    }
+    out.push_str(&format!("\n{label} ({}):\n", summaries.len()));
+    for summary in summaries {
+        out.push_str(&format!(
+            "{prefix} {}: {} [P{}] [{}]\n",
+            fmt_show_issue_ref(&summary.namespace, &summary.id),
+            summary.title,
+            summary.priority,
+            summary.status.as_str()
+        ));
+    }
+}
+
+fn fmt_show_issue_ref(namespace: &NamespaceId, id: &str) -> String {
+    if *namespace == NamespaceId::core() {
+        id.to_string()
+    } else {
+        fmt_issue_ref(namespace, id)
+    }
+}
+
+/// Render epic children with progress breakdown and priority sorting.
+fn render_epic_children(out: &mut String, children: &[IssueSummary]) {
+    let mut done: Vec<&IssueSummary> = Vec::new();
+    let mut remaining: Vec<&IssueSummary> = Vec::new();
+
+    for child in children {
+        if child.status.is_terminal() {
+            done.push(child);
+        } else {
+            remaining.push(child);
+        }
+    }
+
+    // Sort remaining by priority (P0 first), then by status (In Progress before Todo)
+    remaining.sort_by_key(|child| {
+        (
+            child.priority,
+            std::cmp::Reverse(child.status == IssueStatus::InProgress),
+        )
+    });
+
+    // Sort done by updated_at (most recent first)
+    done.sort_by_key(|child| std::cmp::Reverse(child.updated_at.wall_ms));
+
+    let total = children.len();
+    let done_count = done.len();
+    let pct = done_count
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0);
+
+    out.push_str(&format!(
+        "\nProgress: {}/{} done ({}%)\n",
+        done_count, total, pct
+    ));
+
+    if !remaining.is_empty() {
+        out.push_str(&format!("\nRemaining ({}):\n", remaining.len()));
+        for child in &remaining {
+            let status_marker = if child.status == IssueStatus::InProgress {
+                ">"
+            } else {
+                " "
+            };
+            let assignee = child
+                .assignee
+                .as_ref()
+                .filter(|a| !a.is_empty())
+                .map(|a| format!(" @{}", a))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                " {}[P{}] {}: {}{}\n",
+                status_marker,
+                child.priority,
+                fmt_show_issue_ref(&child.namespace, &child.id),
+                child.title,
+                assignee
+            ));
+        }
+    }
+
+    if !done.is_empty() {
+        out.push_str(&format!("\nDone ({}):\n", done.len()));
+        for child in &done {
+            out.push_str(&format!(
+                "  [x] {}: {}\n",
+                fmt_show_issue_ref(&child.namespace, &child.id),
+                child.title
+            ));
+        }
+    }
+}
+
+fn resolve_current_issue_id(ctx: &CliRuntimeCtx) -> CommandResult<BeadId> {
+    if let Some(id) = current_jj_bead_id(&ctx.repo) {
+        return Ok(id);
+    }
+
+    let filters = Filters {
+        assignee: Some(ctx.actor_id()?),
+        status: Some(IssueStatus::InProgress),
+        sort_by: Some(SortField::UpdatedAt),
+        ascending: false,
+        limit: Some(1),
+        ..Filters::default()
+    };
+    let req = Request::List {
+        ctx: ctx.read_ctx(),
+        payload: ListPayload { filters },
+    };
+    match send(&req)? {
+        ResponsePayload::Query(QueryResult::Issues(mut issues)) => issues
+            .drain(..)
+            .next()
+            .map(|summary| BeadId::parse(&summary.id))
+            .transpose()?
+            .ok_or_else(|| {
+                validation_error(
+                    "current",
+                    "no current bead found (no bead id in the current jj change and no in-progress bead assigned to you)",
+                )
+                .into()
+            }),
+        other => Err(CommandError::Ipc(crate::surface::ipc::IpcError::DaemonUnavailable(
+            format!("unexpected response while resolving current bead: {other:?}"),
+        ))),
+    }
+}
+
+fn current_jj_bead_id(repo: &Path) -> Option<BeadId> {
+    let output = ProcessCommand::new("jj")
+        .current_dir(repo)
+        .args(["log", "-r", "@", "--no-graph", "-T", "description"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let description = String::from_utf8(output.stdout).ok()?;
+    extract_bead_id_from_text(&description)
+}
+
+fn extract_bead_id_from_text(text: &str) -> Option<BeadId> {
+    text.split_whitespace().find_map(|token| {
+        let candidate =
+            token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '.');
+        if candidate.is_empty() {
+            return None;
+        }
+        normalize_bead_id(candidate).ok()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BeadType, IssueStatus, NamespaceId, WriteStamp};
+
+    fn sample_issue(namespace: &str, id: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            namespace: NamespaceId::parse(namespace).expect("namespace"),
+            title: "Title".to_string(),
+            description: String::new(),
+            design: None,
+            acceptance_criteria: None,
+            status: IssueStatus::Todo,
+            priority: 1,
+            issue_type: BeadType::Task,
+            labels: Vec::new(),
+            assignee: None,
+            assignee_at: None,
+            assignee_expires: None,
+            created_at: WriteStamp::new(0, 0),
+            created_by: "tester".to_string(),
+            created_on_branch: None,
+            updated_at: WriteStamp::new(0, 0),
+            updated_by: "tester".to_string(),
+            closed_at: None,
+            closed_by: None,
+            closed_reason: None,
+            closed_on_branch: None,
+            external_ref: None,
+            source_repo: None,
+            estimated_minutes: None,
+            content_hash: "hash".to_string(),
+            notes: Vec::new(),
+            deps_incoming: Vec::new(),
+            deps_outgoing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_show_omits_core_namespace() {
+        let issue = sample_issue("core", "bd-123");
+        let incoming = IncomingGroups {
+            children: Vec::new(),
+            blocks: Vec::new(),
+            related: Vec::new(),
+            discovered: Vec::new(),
+        };
+
+        let output = render_show(&issue, &[], &incoming, &[]);
+        let expected = concat!(
+            "\nbd-123: Title\n",
+            "Status: Todo\n",
+            "Priority: P1\n",
+            "Type: task\n",
+            "Created: 1970-01-01 00:00\n",
+            "Updated: 1970-01-01 00:00\n",
+            "\n",
+        );
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn render_show_includes_non_core_namespace() {
+        let issue = sample_issue("wf", "bd-123");
+        let incoming = IncomingGroups {
+            children: Vec::new(),
+            blocks: Vec::new(),
+            related: Vec::new(),
+            discovered: Vec::new(),
+        };
+
+        let output = render_show(&issue, &[], &incoming, &[]);
+        let expected = concat!(
+            "\nwf/bd-123: Title\n",
+            "Namespace: wf\n",
+            "Status: Todo\n",
+            "Priority: P1\n",
+            "Type: task\n",
+            "Created: 1970-01-01 00:00\n",
+            "Updated: 1970-01-01 00:00\n",
+            "\n",
+        );
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn resolve_show_ids_accepts_repeated_flag_ids() {
+        let ids = resolve_show_ids(
+            &CliRuntimeCtx {
+                repo: std::path::PathBuf::from("/tmp/beads"),
+                json: false,
+                namespace: None,
+                durability: None,
+                client_request_id: None,
+                require_min_seen: None,
+                wait_timeout_ms: None,
+                actor_id: None,
+            },
+            Vec::new(),
+            vec!["beads-rs-k8u3".to_string(), "beads-rs-k8u3.5".to_string()],
+            false,
+        )
+        .expect("show ids");
+        assert_eq!(ids[0].as_str(), "beads-rs-k8u3");
+        assert_eq!(ids[1].as_str(), "beads-rs-k8u3.5");
+    }
+
+    #[test]
+    fn render_issue_detail_is_compact_for_core_namespace() {
+        let issue = sample_issue("core", "bd-123");
+        let output = render_issue_detail(&issue);
+        assert!(!output.contains("Namespace: core"));
+        assert!(output.contains("\nbd-123: Title\n"));
+    }
+
+    #[test]
+    fn render_issue_summary_is_one_line() {
+        let issue = sample_issue("core", "bd-123");
+        let output = render_issue_summary(&issue);
+        assert_eq!(output, "bd-123 [P1] [task] Todo - Title");
+    }
+
+    #[test]
+    fn extract_bead_id_from_text_accepts_jj_style_descriptions() {
+        let id = extract_bead_id_from_text("beads-rs-k8u3.5: show affordances").expect("bead id");
+        assert_eq!(id.as_str(), "beads-rs-k8u3.5");
+    }
+}

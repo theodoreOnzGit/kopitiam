@@ -1,0 +1,127 @@
+# kopi-beans: a single-crate collapse of the `kopitiam-bds` fork of beads-rs
+# (github.com/delightful-ai/beads-rs, MIT), relicensed AGPL-3.0-only as part of
+# KOPITIAM, with Windows/Termux build support added. See NOTICE for provenance
+# and the list of changes.
+#
+# This crate folds the former top `kopitiam-bds` package PLUS its nine sub-crates
+# (beads-core, beads-api, beads-bootstrap, beads-surface, beads-macros, beads-cli,
+# beads-git, beads-daemon, beads-daemon-core) into ONE publishable crate so it can
+# go to crates.io without squatting upstream beads-rs's crate names. The nine
+# sub-crates are now the intra-crate modules core/api/bootstrap/surface/macros/
+# cli_surface/git/daemon/daemon_core.
+#
+# Dependency versions are pinned here deliberately (thiserror 1, uuid v5, git2
+# 0.20, ...) exactly as the upstream fork pinned them; this crate does NOT inherit
+# KOPITIAM's root workspace dependency set (mirrors how crates/kmux keeps the rmux
+# fork's own pins).
+[package]
+name = "kopi-beans"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = true
+license = "AGPL-3.0-only"
+repository = "https://github.com/theodoreOnzGit/kopitiam"
+description = "A distributed, git-backed work-item tracker (the `bn` CLI). Single-crate collapse of a Windows/Termux-capable fork of beads-rs (MIT), relicensed AGPL-3.0-only."
+authors = ["Darin <darinkishore@protonmail.com>", "Theodore Kay Chen Ong"]
+keywords = ["cli", "git", "crdt", "issue-tracker", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+# Keep the packaged .crate lean and free of local dev state.
+exclude = [".beads/", "**/*.md"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+tracing = "0.1"
+tracing-tree = "0.3"
+tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "json"] }
+tracing-appender = "0.2"
+rand = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+crc32c = "0.6"
+# `vendored-openssl` is added only on unix (below). libgit2's HTTPS transport on
+# Windows uses the native WinHTTP/SChannel backend, so building OpenSSL from
+# source there is both unnecessary and painful.
+git2 = { version = "0.20", features = ["vendored-libgit2"] }
+crossbeam = "0.8"
+signal-hook = "0.3"
+whoami = "1.4"
+# `dirs` is cross-platform (Windows/macOS/Linux/Android).
+dirs = "6.0.0"
+time = { version = "0.3", features = ["parsing", "formatting"] }
+chrono = "0.4"
+flate2 = "1"
+tar = "0.4"
+toml = "0.8"
+ureq = { version = "2", default-features = true }
+tempfile = "3"
+bytes = "1"
+minicbor = { version = "0.24", features = ["std"] }
+# `bundled` compiles SQLite from source via `cc` on every platform, so the `bn`
+# binary does not depend on a system libsqlite3 being present (there is none on a
+# stock Windows box).
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Unix-only process/user/signal facilities. On Windows the code paths that need
+# these are replaced under `#[cfg(windows)]` (see the surface/ and daemon/ modules,
+# src/paths.rs, src/telemetry.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "signal", "user"] }
+# On unix, libgit2 needs a TLS backend built from source for portable HTTPS.
+git2 = { version = "0.20", features = ["vendored-openssl"] }
+
+# Windows equivalents. `uds_windows` provides std-compatible UnixStream/
+# UnixListener over Windows AF_UNIX (used by the surface module's `ipc::uds`
+# alias); `fs2` backs the `LockFileEx` advisory-lock shim in the daemon module;
+# `windows-sys` backs process liveness/termination (there is no `kill(pid, 0)`).
+[target.'cfg(windows)'.dependencies]
+fs2 = "0.4"
+uds_windows = "1.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[features]
+default = ["cli", "wal-sqlite", "wal-fs"]
+# `cli` gates the top-level `cli` module + `run_cli_entrypoint`/`bn` binary.
+cli = []
+# WAL backends in the daemon_core module (formerly beads-daemon-core features).
+# rusqlite/dirs/rand/toml/tracing are non-optional here, so these are pure gates.
+wal-sqlite = []
+wal-fs = []
+# Was `beads-*/test-harness`; now a single crate-wide gate.
+test-harness = []
+slow-tests = []
+model-testing = []
+e2e-tests = ["test-harness"]
+
+# The library keeps the upstream crate name `beads_rs`: the folded source, the
+# `bn` binary, and the fault-injection `tailnet_proxy` binary refer to
+# `beads_rs::...`. The published PACKAGE is `kopi-beans`; the lib name is a
+# separate namespace and squats nothing on crates.io.
+[lib]
+name = "beads_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bn"
+path = "src/bin/main.rs"
+required-features = ["cli"]
+
+# Tailnet-style replication proxy for fault injection (dev tooling). Kept from the
+# upstream fork; refers to the library as `beads_rs::core` / `beads_rs::daemon_core`.
+[[bin]]
+name = "tailnet_proxy"
+path = "src/bin/tailnet_proxy.rs"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+bytes = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+tokio = { version = "1", features = ["rt", "net"] }

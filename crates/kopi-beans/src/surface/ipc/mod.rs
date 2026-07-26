@@ -1,0 +1,179 @@
+pub mod client;
+pub mod codec;
+pub mod ctx;
+pub mod payload;
+mod spawn_sanitizer;
+pub mod types;
+pub mod uds;
+#[cfg(windows)]
+pub mod proc_util;
+
+use crate::api::DaemonInfo;
+use crate::core::error::details as error_details;
+use crate::core::{
+    CliErrorCode, Effect, ErrorCode, ErrorPayload, IntoErrorPayload, InvalidId, ProtocolErrorCode,
+    Transience,
+};
+use thiserror::Error;
+
+pub use client::*;
+pub use codec::*;
+pub use ctx::*;
+pub use payload::*;
+pub use types::*;
+
+pub(crate) fn default_lease_secs() -> u64 {
+    3600 // 1 hour default
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IpcError {
+    #[error("failed to decode payload: {source}")]
+    PayloadDecode {
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("failed to encode payload: {source}")]
+    PayloadEncode {
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("transport error: {source}")]
+    Transport {
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(transparent)]
+    InvalidId(#[from] InvalidId),
+
+    #[error("invalid request: {reason}")]
+    InvalidRequest {
+        field: Option<String>,
+        reason: String,
+    },
+
+    #[error("client disconnected")]
+    Disconnected,
+
+    #[error("daemon unavailable: {0}")]
+    DaemonUnavailable(String),
+
+    #[error("daemon version mismatch; restart the daemon and retry")]
+    DaemonVersionMismatch {
+        daemon: Option<DaemonInfo>,
+        client_version: String,
+        protocol_version: u32,
+        /// If set, the mismatch was detected via a parse failure.
+        parse_error: Option<String>,
+    },
+
+    #[error("frame too large: max {max_bytes} bytes, got {got_bytes} bytes")]
+    FrameTooLarge { max_bytes: usize, got_bytes: usize },
+}
+
+impl IpcError {
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            IpcError::PayloadDecode { .. } | IpcError::PayloadEncode { .. } => {
+                ProtocolErrorCode::MalformedPayload.into()
+            }
+            IpcError::Transport { .. } => CliErrorCode::IoError.into(),
+            IpcError::InvalidId(_) => CliErrorCode::InvalidId.into(),
+            IpcError::InvalidRequest { .. } => ProtocolErrorCode::InvalidRequest.into(),
+            IpcError::Disconnected => CliErrorCode::Disconnected.into(),
+            IpcError::DaemonUnavailable(_) => CliErrorCode::DaemonUnavailable.into(),
+            IpcError::DaemonVersionMismatch { .. } => CliErrorCode::DaemonVersionMismatch.into(),
+            IpcError::FrameTooLarge { .. } => ProtocolErrorCode::FrameTooLarge.into(),
+        }
+    }
+
+    /// Whether retrying the IPC operation may succeed.
+    pub fn transience(&self) -> Transience {
+        match self {
+            IpcError::DaemonUnavailable(_)
+            | IpcError::Transport { .. }
+            | IpcError::Disconnected => Transience::Retryable,
+            IpcError::DaemonVersionMismatch { .. } => Transience::Retryable,
+            IpcError::PayloadDecode { .. }
+            | IpcError::PayloadEncode { .. }
+            | IpcError::InvalidId(_)
+            | IpcError::InvalidRequest { .. }
+            | IpcError::FrameTooLarge { .. } => Transience::Permanent,
+        }
+    }
+
+    /// What we know about side effects when this IPC error is returned.
+    pub fn effect(&self) -> Effect {
+        match self {
+            IpcError::Transport { .. } | IpcError::Disconnected => Effect::Unknown,
+            IpcError::DaemonUnavailable(_)
+            | IpcError::PayloadDecode { .. }
+            | IpcError::PayloadEncode { .. }
+            | IpcError::InvalidId(_)
+            | IpcError::InvalidRequest { .. } => Effect::None,
+            IpcError::DaemonVersionMismatch { .. } => Effect::None,
+            IpcError::FrameTooLarge { .. } => Effect::None,
+        }
+    }
+}
+
+impl IntoErrorPayload for IpcError {
+    fn into_error_payload(self) -> ErrorPayload {
+        let message = self.to_string();
+        let retryable = self.transience().is_retryable();
+        match self {
+            IpcError::PayloadDecode { source } => ErrorPayload::new(
+                ProtocolErrorCode::MalformedPayload.into(),
+                message,
+                retryable,
+            )
+            .with_details(error_details::MalformedPayloadDetails {
+                parser: error_details::ParserKind::Json,
+                reason: Some(source.to_string()),
+            }),
+            IpcError::PayloadEncode { source } => ErrorPayload::new(
+                ProtocolErrorCode::MalformedPayload.into(),
+                message,
+                retryable,
+            )
+            .with_details(error_details::MalformedPayloadDetails {
+                parser: error_details::ParserKind::Json,
+                reason: Some(source.to_string()),
+            }),
+            IpcError::Transport { .. } => {
+                ErrorPayload::new(CliErrorCode::IoError.into(), message, retryable)
+            }
+            IpcError::InvalidId(err) => err.into_error_payload(),
+            IpcError::InvalidRequest { field, reason } => {
+                ErrorPayload::new(ProtocolErrorCode::InvalidRequest.into(), message, retryable)
+                    .with_details(error_details::InvalidRequestDetails {
+                        field,
+                        reason: Some(reason),
+                    })
+            }
+            IpcError::Disconnected => {
+                ErrorPayload::new(CliErrorCode::Disconnected.into(), message, retryable)
+            }
+            IpcError::DaemonUnavailable(_) => {
+                ErrorPayload::new(CliErrorCode::DaemonUnavailable.into(), message, retryable)
+            }
+            IpcError::DaemonVersionMismatch { .. } => ErrorPayload::new(
+                CliErrorCode::DaemonVersionMismatch.into(),
+                message,
+                retryable,
+            ),
+            IpcError::FrameTooLarge {
+                max_bytes,
+                got_bytes,
+            } => ErrorPayload::new(ProtocolErrorCode::FrameTooLarge.into(), message, retryable)
+                .with_details(error_details::FrameTooLargeDetails {
+                    max_frame_bytes: max_bytes as u64,
+                    got_bytes: got_bytes as u64,
+                }),
+        }
+    }
+}

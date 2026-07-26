@@ -1,0 +1,42 @@
+//! Checkpoint manifest and metadata types.
+
+pub mod cache;
+pub mod export;
+pub mod import;
+pub mod json_canon;
+pub mod layout;
+pub mod manifest;
+pub mod meta;
+pub mod publish;
+pub mod types;
+
+pub const CHECKPOINT_FORMAT_VERSION: u32 =
+    crate::git::core::StoreMetaVersions::CHECKPOINT_FORMAT_VERSION;
+
+pub use cache::{
+    CheckpointCache, CheckpointCacheEntry, CheckpointCacheError, DEFAULT_CHECKPOINT_CACHE_KEEP,
+};
+pub use export::{
+    CheckpointExport, CheckpointExportError, CheckpointExportInput, CheckpointSnapshotError,
+    CheckpointSnapshotFromStateInput, CheckpointSnapshotInput, build_snapshot,
+    build_snapshot_from_state, export_checkpoint, policy_hash, roster_hash,
+};
+pub use import::{
+    CheckpointImport, CheckpointImportError, ParsedCheckpointExport, import_checkpoint,
+    import_checkpoint_export, merge_store_states, parse_checkpoint_export, store_state_from_legacy,
+};
+pub use layout::{
+    CheckpointFileKind, CheckpointShardPath, DEPS_DIR, MANIFEST_FILE, META_FILE, NAMESPACES_DIR,
+    SHARD_COUNT, STATE_DIR, ShardName, TOMBSTONES_DIR, parse_shard_path, shard_for_bead,
+    shard_for_dep, shard_for_tombstone, shard_name, shard_path,
+};
+pub use manifest::{CheckpointManifest, ManifestFile, ParsedCheckpointManifest};
+pub use meta::{
+    CheckpointFormatVersion, CheckpointMeta, CheckpointMetaPreimage, IncludedHeads,
+    IncludedWatermarks, SupportedCheckpointMeta,
+};
+pub use publish::{
+    CheckpointPublishError, CheckpointPublishOutcome, CheckpointStoreMeta, STORE_META_REF,
+    publish_checkpoint, publish_checkpoint_with_retry,
+};
+pub use types::{CheckpointShardPayload, CheckpointSnapshot};

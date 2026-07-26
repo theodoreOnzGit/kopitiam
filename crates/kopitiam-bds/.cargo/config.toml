@@ -1,2 +1,0 @@
-[alias]
-xtest = "nextest run --profile fast --workspace --all-features"
