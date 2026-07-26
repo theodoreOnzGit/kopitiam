@@ -2,6 +2,13 @@
 name = "kopitiam-ocr"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust Tesseract LSTM OCR engine (eng/chi_sim/jpn) -- the automatic OCR fallback for kopitiam pdf2md."
+# Vendored Tesseract/Leptonica C sources (crates/kopitiam-ocr/vendor/) are
+# translation-reference only; the crate is pure Rust and never compiles them,
+# so keep them out of the published package (mirrors kopitiam-pdf's exclude).
+exclude = ["vendor/"]
 
 [dependencies]
 # Phase 4 (LSTM network evaluation) drives the recognizer's forward pass through
