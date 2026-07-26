@@ -66,6 +66,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # PDF extraction (pure Rust: pdf-extract wraps lopdf)
 pdf-extract = "0.12"
+# Pure-Rust DEFLATE/zlib (the algorithm behind PDF's FlateDecode). Used by the
+# MuPDF port's `filter_flate.rs`, which wires miniz_oxide's streaming inflate
+# into an fz_stream-style filter in place of MuPDF's `<zlib.h>` dependency (the
+# C we translate calls zlib; we substitute the pure-Rust equivalent, keeping the
+# filter plumbing faithful). Already present in Cargo.lock as a transitive dep
+# (via flate2), so promoting it to a direct workspace dep adds no new crate to
+# the tree. Pure Rust, no C toolchain.
+miniz_oxide = "0.8"
 # `lopdf` is already pulled in transitively by `pdf-extract` (pinned to the
 # same "0.42" line here so Cargo unifies to the one copy already present,
 # adding no new crate to the dependency tree). kopitiam-pdf depends on it

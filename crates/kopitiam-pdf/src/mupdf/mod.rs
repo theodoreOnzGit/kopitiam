@@ -53,15 +53,23 @@
 //! device + layout analysis (`boxer`/`para`) -- the parts that actually fix the
 //! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.
 
+pub mod buffer;
 pub mod encodings;
 pub mod error;
+pub mod filter_basic;
+pub mod filter_flate;
+pub mod filter_lzw;
+pub mod filter_predict;
 pub mod geometry;
 pub mod hash;
 pub mod pool;
+pub mod stream;
 pub mod string_util;
 
+pub use buffer::Buffer;
 pub use encodings::BaseEncoding;
 pub use error::{Error, ErrorKind, Result};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
 pub use hash::HashTable;
 pub use pool::{Handle, Pool};
+pub use stream::{Stream, StreamSource, Whence};

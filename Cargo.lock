@@ -1943,6 +1943,7 @@ name = "kopitiam-pdf"
 version = "0.2.0"
 dependencies = [
  "lopdf",
+ "miniz_oxide",
  "pdf-extract",
  "thiserror 2.0.18",
 ]

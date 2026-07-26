@@ -436,7 +436,7 @@ mod tests {
     fn iter_visits_every_live_entry() {
         let mut t: HashTable<u32> = HashTable::new(8, 4);
         for i in 0..10u32 {
-            t.insert(&i.to_le_bytes().to_vec(), i);
+            t.insert(i.to_le_bytes().as_ref(), i);
         }
         let mut seen: Vec<u32> = t.iter().map(|(_, &v)| v).collect();
         seen.sort_unstable();
@@ -447,7 +447,7 @@ mod tests {
     fn filter_removes_matching_entries() {
         let mut t: HashTable<u32> = HashTable::new(8, 4);
         for i in 0..20u32 {
-            t.insert(&i.to_le_bytes().to_vec(), i);
+            t.insert(i.to_le_bytes().as_ref(), i);
         }
         // Drop even values.
         t.filter(|_key, &val| val % 2 == 0);

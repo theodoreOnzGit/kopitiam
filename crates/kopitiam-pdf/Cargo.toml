@@ -19,3 +19,8 @@ pdf-extract = { workspace = true }
 # streams for font style recovery (kopitiam-q4f).
 lopdf = { workspace = true }
 thiserror = { workspace = true }
+# Pure-Rust DEFLATE/inflate for the MuPDF port's FlateDecode filter
+# (crates/kopitiam-pdf/src/mupdf/filter_flate.rs). Substitutes MuPDF's C
+# `<zlib.h>` dependency; the filter wiring is still translated from
+# source/fitz/filter-flate.c. See the workspace Cargo.toml note.
+miniz_oxide = { workspace = true }
