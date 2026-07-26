@@ -342,8 +342,27 @@ pub fn rasterize_page(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::
         std::mem::swap(&mut w_pt, &mut h_pt);
     }
 
-    let iw = (w_pt * scale).ceil().max(1.0) as u32;
-    let ih = (h_pt * scale).ceil().max(1.0) as u32;
+    // The MediaBox is attacker-controlled; `dpi` is caller-controlled. Bound the
+    // resulting raster so a pathological page (a huge MediaBox, optionally at a
+    // high dpi) is rejected with an error instead of requesting a multi-GB `Vec`
+    // and aborting the process on OOM. Checked in f64 first so the f32->u32 cast
+    // below can never silently saturate. MAX_PIXELS ~ 100 MP (RGB => ~300 MB).
+    const MAX_DIM: u32 = 30_000;
+    const MAX_PIXELS: u64 = 100_000_000;
+    let wf = (w_pt * scale).ceil() as f64;
+    let hf = (h_pt * scale).ceil() as f64;
+    if !(wf.is_finite() && hf.is_finite())
+        || wf > MAX_DIM as f64
+        || hf > MAX_DIM as f64
+        || wf.max(0.0) * hf.max(0.0) > MAX_PIXELS as f64
+    {
+        return Err(super::error::Error::limit(format!(
+            "page {page_index} rasterizes to {wf}x{hf}px at {dpi}dpi, over the \
+             {MAX_DIM}px / {MAX_PIXELS}px limit"
+        )));
+    }
+    let iw = (wf as u32).max(1);
+    let ih = (hf as u32).max(1);
 
     let mut dev = DrawDevice::new(iw, ih, Matrix::scale(scale, scale));
     super::run_page(doc, page_index, &mut dev)?;
@@ -466,6 +485,27 @@ mod tests {
         assert_eq!((p72.w, p72.h), (200, 200), "72 dpi -> 1:1 with the 200pt MediaBox");
         let p144 = rasterize_page(&doc, 0, 144.0).unwrap();
         assert_eq!((p144.w, p144.h), (400, 400), "144 dpi -> 2x");
+    }
+
+    #[test]
+    fn rasterize_page_rejects_pathological_mediabox() {
+        // A hostile MediaBox must be rejected with an error, not allocate a
+        // multi-GB pixmap and abort on OOM (pre-publish audit hardening).
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100000000 100000000] >>";
+        let bodies: [&[u8]; 3] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            page,
+        ];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+        let err = rasterize_page(&doc, 0, 72.0).unwrap_err();
+        assert!(
+            err.message().contains("limit"),
+            "expected a limit error, got: {}",
+            err.message()
+        );
+        // A sane page at a sane dpi still succeeds (guard doesn't over-reject).
+        assert!(rasterize_page(&text_page_doc(), 0, 300.0).is_ok());
     }
 
     #[test]
