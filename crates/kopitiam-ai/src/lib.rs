@@ -34,6 +34,7 @@
 mod adapter;
 mod cloud;
 mod echo;
+mod glossary;
 mod message;
 mod preprocess;
 mod stream;
@@ -44,6 +45,7 @@ mod local;
 pub use adapter::ModelAdapter;
 pub use cloud::{CloudAdapter, CloudStub, CloudUnavailable, CloudVendor};
 pub use echo::EchoAdapter;
+pub use glossary::{Applied, Entry, Glossary, SourceKind, Substitution};
 #[cfg(feature = "local")]
 pub use local::LocalAdapter;
 pub use message::{CompletionRequest, CompletionResponse, Message, Role};
