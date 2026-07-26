@@ -37,6 +37,7 @@ mod rename;
 mod scan;
 mod semq;
 mod status;
+mod syntactic;
 mod tokens;
 mod translate;
 mod tui;

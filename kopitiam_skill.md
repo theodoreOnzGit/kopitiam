@@ -546,6 +546,14 @@ Options:
       --json
           Emit the outline as JSON (the serialized [`Outline`]: `items` with `line`/`kind`/`name`/`detail`/`depth`) instead of the human skeleton. Progress notices go to stderr so stdout stays clean JSON (§0.2)
 
+      --no-lsp
+          Skip rust-analyzer entirely and produce the outline by a deterministic, dependency-free Rust item scan (no cross-file resolution, no server). Instant, and the guaranteed path on a workspace too large for rust-analyzer to index in a bounded time
+          
+          [aliases: --syntactic]
+
+      --lsp
+          Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back to the syntactic scan
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -566,6 +574,8 @@ Options:
       --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
       --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
       --json         Emit JSON coordinates instead of the human `file:line:character` form
+      --no-lsp       Skip rust-analyzer and answer from a workspace-wide textual search (`refs` only) — grep-grade, not semantic, so each hit is labelled `(syntactic, not semantic — verify)`. The guaranteed path when rust-analyzer cannot index the workspace in a bounded time [aliases: --syntactic]
+      --lsp          Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back
   -h, --help         Print help
 ```
 
@@ -585,6 +595,8 @@ Options:
       --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
       --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
       --json         Emit JSON coordinates instead of the human `file:line:character` form
+      --no-lsp       Skip rust-analyzer and answer from a workspace-wide textual search (`refs` only) — grep-grade, not semantic, so each hit is labelled `(syntactic, not semantic — verify)`. The guaranteed path when rust-analyzer cannot index the workspace in a bounded time [aliases: --syntactic]
+      --lsp          Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back
   -h, --help         Print help
 ```
 
@@ -604,6 +616,8 @@ Options:
       --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
       --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
       --json         Emit JSON coordinates instead of the human `file:line:character` form
+      --no-lsp       Skip rust-analyzer and answer from a workspace-wide textual search (`refs` only) — grep-grade, not semantic, so each hit is labelled `(syntactic, not semantic — verify)`. The guaranteed path when rust-analyzer cannot index the workspace in a bounded time [aliases: --syntactic]
+      --lsp          Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back
   -h, --help         Print help
 ```
 
@@ -623,6 +637,8 @@ Options:
       --file <FILE>    The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
       --root <ROOT>    Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
       --json           Emit JSON coordinates instead of the human `file:line:character` form
+      --no-lsp         Skip rust-analyzer and answer from a workspace-wide textual search (`refs` only) — grep-grade, not semantic, so each hit is labelled `(syntactic, not semantic — verify)`. The guaranteed path when rust-analyzer cannot index the workspace in a bounded time [aliases: --syntactic]
+      --lsp            Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back
       --depth <DEPTH>  How many hops of the call graph to follow (1 = direct callers/callees) [default: 1]
   -h, --help           Print help
 ```
@@ -643,6 +659,8 @@ Options:
       --file <FILE>    The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
       --root <ROOT>    Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
       --json           Emit JSON coordinates instead of the human `file:line:character` form
+      --no-lsp         Skip rust-analyzer and answer from a workspace-wide textual search (`refs` only) — grep-grade, not semantic, so each hit is labelled `(syntactic, not semantic — verify)`. The guaranteed path when rust-analyzer cannot index the workspace in a bounded time [aliases: --syntactic]
+      --lsp            Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back
       --depth <DEPTH>  How many hops of the call graph to follow (1 = direct callers/callees) [default: 1]
   -h, --help           Print help
 ```
@@ -663,6 +681,8 @@ Options:
       --file <FILE>  The file whose `documentSymbol` declares the symbol; its identifier position is resolved there and used as the query anchor
       --root <ROOT>  Directory containing the workspace `Cargo.toml`. Defaults to the current directory; passed to rust-analyzer as the root [default: .]
       --json         Emit JSON coordinates instead of the human `file:line:character` form
+      --no-lsp       Skip rust-analyzer and answer from a workspace-wide textual search (`refs` only) — grep-grade, not semantic, so each hit is labelled `(syntactic, not semantic — verify)`. The guaranteed path when rust-analyzer cannot index the workspace in a bounded time [aliases: --syntactic]
+      --lsp          Require rust-analyzer: on timeout/unavailability fail (non-zero exit) instead of falling back
   -h, --help         Print help
 ```
 

@@ -51,7 +51,9 @@ use anyhow::{Result, bail};
 use clap::Args;
 use kopitiam_semantic::{Location, RustAnalyzerSession};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::syntactic;
 
 /// Shared arguments for the name-based queries (`refs`, `def`, `sig`, `impls`).
 #[derive(Args, Debug)]
@@ -72,6 +74,18 @@ pub struct Locator {
     /// Emit JSON coordinates instead of the human `file:line:character` form.
     #[arg(long)]
     pub json: bool,
+
+    /// Skip rust-analyzer and answer from a workspace-wide textual search
+    /// (`refs` only) — grep-grade, not semantic, so each hit is labelled
+    /// `(syntactic, not semantic — verify)`. The guaranteed path when
+    /// rust-analyzer cannot index the workspace in a bounded time.
+    #[arg(long = "no-lsp", visible_alias = "syntactic")]
+    pub no_lsp: bool,
+
+    /// Require rust-analyzer: on timeout/unavailability fail (non-zero exit)
+    /// instead of falling back.
+    #[arg(long, conflicts_with = "no_lsp")]
+    pub lsp: bool,
 }
 
 /// Arguments for the call-hierarchy queries (`callers`, `callees`), which add a
@@ -91,7 +105,29 @@ pub struct DepthArgs {
 // ---------------------------------------------------------------------------
 
 /// `refs <symbol>` — every reference site as coordinates.
+///
+/// Default behaviour asks rust-analyzer (semantic, cross-file references) and,
+/// on timeout/unavailability, falls back automatically to a workspace-wide
+/// textual search ([`syntactic::grep_symbol`]) whose hits are labelled
+/// `(syntactic, not semantic — verify)`. `--no-lsp`/`--syntactic` forces the
+/// textual search; `--lsp` forces rust-analyzer and makes a failure a hard,
+/// non-zero exit (fix #1).
 pub fn run_refs(args: Locator) -> Result<()> {
+    if args.no_lsp {
+        return refs_syntactic(&args);
+    }
+    syntactic::with_fallback(
+        args.lsp,
+        || refs_via_ra(&args),
+        "rust-analyzer unavailable/timed out",
+        || refs_syntactic(&args),
+    )
+}
+
+/// The semantic `refs`: resolve the symbol in `--file`, ask rust-analyzer for
+/// every reference, and print coordinates. Errors (connect/index timeout, or an
+/// unresolved symbol) bubble up so the caller can fall back or exit non-zero.
+fn refs_via_ra(args: &Locator) -> Result<()> {
     let mut session = connect(&args.root)?;
     let pos = resolve(&mut session, &args.file, &args.symbol)?;
     let locations = session.references(&args.file, pos.line, pos.character, false)?;
@@ -110,8 +146,38 @@ pub fn run_refs(args: Locator) -> Result<()> {
     Ok(())
 }
 
+/// The syntactic `refs` fallback: a whole-word textual search for the symbol
+/// across the workspace's `.rs` files. Hits are grep-grade — a mention in a
+/// comment or an unrelated same-named symbol counts — so every line carries the
+/// honesty label, and `--json` marks the whole result `"syntactic": true`.
+fn refs_syntactic(args: &Locator) -> Result<()> {
+    const LABEL: &str = "(syntactic, not semantic — verify)";
+    let hits = syntactic::grep_symbol(&args.root, &args.symbol)?;
+
+    if args.json {
+        let references: Vec<Value> = hits
+            .iter()
+            .map(|h| json!({ "file": h.file, "line": h.line, "character": h.character }))
+            .collect();
+        emit_json(&json!({
+            "symbol": args.symbol,
+            "syntactic": true,
+            "note": "textual whole-word matches — not rust-analyzer references; verify each",
+            "references": references,
+        }));
+    } else if hits.is_empty() {
+        println!("no textual matches for `{}` {LABEL}", args.symbol);
+    } else {
+        for h in &hits {
+            println!("{}:{}:{}  {LABEL}", h.file, h.line, h.character);
+        }
+    }
+    Ok(())
+}
+
 /// `def <symbol>` — definition location plus signature.
 pub fn run_def(args: Locator) -> Result<()> {
+    reject_no_lsp(&args, "def")?;
     let mut session = connect(&args.root)?;
     let pos = resolve(&mut session, &args.file, &args.symbol)?;
     // The declaration we matched in `--file` *is* the definition location; its
@@ -138,6 +204,7 @@ pub fn run_def(args: Locator) -> Result<()> {
 
 /// `sig <symbol>` — the signature alone.
 pub fn run_sig(args: Locator) -> Result<()> {
+    reject_no_lsp(&args, "sig")?;
     let mut session = connect(&args.root)?;
     let pos = resolve(&mut session, &args.file, &args.symbol)?;
     let hover = session.hover(&args.file, pos.line, pos.character)?;
@@ -159,6 +226,7 @@ pub fn run_sig(args: Locator) -> Result<()> {
 /// function, recursed to `depth`.
 pub fn run_callers(args: DepthArgs) -> Result<()> {
     let loc = args.locator;
+    reject_no_lsp(&loc, "callers")?;
     let mut session = connect(&loc.root)?;
     let pos = resolve(&mut session, &loc.file, &loc.symbol)?;
 
@@ -188,6 +256,7 @@ pub fn run_callers(args: DepthArgs) -> Result<()> {
 /// `callees <fn> [--depth N]` — the functions this one calls.
 pub fn run_callees(args: DepthArgs) -> Result<()> {
     let loc = args.locator;
+    reject_no_lsp(&loc, "callees")?;
     let mut session = connect(&loc.root)?;
     let pos = resolve(&mut session, &loc.file, &loc.symbol)?;
 
@@ -212,6 +281,7 @@ pub fn run_callees(args: DepthArgs) -> Result<()> {
 /// `impls <trait>` — the trait's `impl` sites (references whose source line is
 /// an `impl` header).
 pub fn run_impls(args: Locator) -> Result<()> {
+    reject_no_lsp(&args, "impls")?;
     let mut session = connect(&args.root)?;
     let pos = resolve(&mut session, &args.file, &args.symbol)?;
     let references = session.references(&args.file, pos.line, pos.character, false)?;
@@ -243,14 +313,24 @@ pub fn run_impls(args: Locator) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Spawns rust-analyzer for `root`, announcing progress on stderr so `--json`
-/// stdout stays clean.
+/// stdout stays clean. Delegates to [`syntactic::connect_ra`], which honours the
+/// `KOPITIAM_RA_TIMEOUT_SECS` index-timeout override and emits a "still
+/// indexing…" note instead of a silent hang (fix #3).
 fn connect(root: &Path) -> Result<RustAnalyzerSession> {
-    let root = std::fs::canonicalize(root)?;
-    eprintln!(
-        "Starting rust-analyzer and waiting for it to index {}...",
-        root.display()
-    );
-    RustAnalyzerSession::connect(&root)
+    syntactic::connect_ra(root)
+}
+
+/// The name-based queries other than `refs` have no textual fallback (a
+/// coordinate/def/caller answer needs real resolution). If `--no-lsp` is asked
+/// of one of them, fail clearly rather than silently ignoring the flag.
+fn reject_no_lsp(args: &Locator, command: &str) -> Result<()> {
+    if args.no_lsp {
+        bail!(
+            "`{command}` has no syntactic fallback — only `refs` and `outline` do. \
+             Re-run without --no-lsp/--syntactic (rust-analyzer is required here)."
+        );
+    }
+    Ok(())
 }
 
 /// Resolves `name` to its identifier position in `file` via `document_symbols`.
@@ -731,6 +811,25 @@ mod tests {
     #[test]
     fn locator_requires_a_file() {
         assert!(LocatorCli::try_parse_from(["t", "sym"]).is_err());
+    }
+
+    #[test]
+    fn locator_parses_lsp_toggles_and_rejects_conflicts() {
+        let cli = LocatorCli::try_parse_from(["t", "s", "--file", "a.rs", "--no-lsp"]).unwrap();
+        assert!(cli.args.no_lsp && !cli.args.lsp);
+        // `--syntactic` is an alias for `--no-lsp`.
+        let cli = LocatorCli::try_parse_from(["t", "s", "--file", "a.rs", "--syntactic"]).unwrap();
+        assert!(cli.args.no_lsp);
+        // The two are mutually exclusive.
+        assert!(LocatorCli::try_parse_from(["t", "s", "--file", "a.rs", "--lsp", "--no-lsp"]).is_err());
+    }
+
+    #[test]
+    fn reject_no_lsp_blocks_the_fallback_free_commands() {
+        let with = LocatorCli::try_parse_from(["t", "s", "--file", "a.rs", "--no-lsp"]).unwrap().args;
+        assert!(reject_no_lsp(&with, "def").is_err(), "def has no syntactic fallback");
+        let without = LocatorCli::try_parse_from(["t", "s", "--file", "a.rs"]).unwrap().args;
+        assert!(reject_no_lsp(&without, "def").is_ok());
     }
 
     #[test]

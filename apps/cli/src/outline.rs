@@ -17,7 +17,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use kopitiam_semantic::{RustAnalyzerSession, outline};
+use kopitiam_semantic::{Outline, outline};
+
+use crate::syntactic;
 
 /// Options for `kopitiam outline`.
 #[derive(Args, Debug)]
@@ -35,29 +37,88 @@ pub struct OutlineArgs {
     /// Progress notices go to stderr so stdout stays clean JSON (§0.2).
     #[arg(long)]
     pub json: bool,
+
+    /// Skip rust-analyzer entirely and produce the outline by a deterministic,
+    /// dependency-free Rust item scan (no cross-file resolution, no server).
+    /// Instant, and the guaranteed path on a workspace too large for
+    /// rust-analyzer to index in a bounded time.
+    #[arg(long = "no-lsp", visible_alias = "syntactic")]
+    pub no_lsp: bool,
+
+    /// Require rust-analyzer: on timeout/unavailability fail (non-zero exit)
+    /// instead of falling back to the syntactic scan.
+    #[arg(long, conflicts_with = "no_lsp")]
+    pub lsp: bool,
 }
 
-/// Runs `kopitiam outline`: spawn rust-analyzer, request the file's document
-/// symbols, and print the body-free skeleton.
+/// Runs `kopitiam outline`.
+///
+/// Default behaviour tries rust-analyzer first (real signatures, the server's
+/// own symbol tree) and, on timeout/unavailability, falls back automatically to
+/// the syntactic item scan ([`syntactic::outline_file`]) with a stderr note.
+/// `--no-lsp`/`--syntactic` forces the scan; `--lsp` forces rust-analyzer and
+/// makes a failure a hard, non-zero exit rather than a silent empty outline.
 pub fn run(args: OutlineArgs) -> Result<()> {
-    let root = std::fs::canonicalize(&args.root)?;
-    // The progress line goes to stderr, never stdout, so `--json` output is a
-    // clean document a caller can pipe straight into `jq`.
-    eprintln!(
-        "Starting rust-analyzer and waiting for it to index {}...",
-        root.display()
-    );
-    let mut session = RustAnalyzerSession::connect(&root)?;
-    let result = outline(&mut session, &args.file)?;
-    let _ = session.shutdown();
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        // `to_skeleton` already ends every item with a newline.
-        print!("{}", result.to_skeleton());
-    }
+    let outline = resolve_outline(&args)?;
+    emit(&outline, args.json);
     Ok(())
+}
+
+/// Produces the [`Outline`] per the `--no-lsp`/`--lsp` policy above.
+fn resolve_outline(args: &OutlineArgs) -> Result<Outline> {
+    if args.no_lsp {
+        return syntactic::outline_file(&args.file);
+    }
+
+    let ra = (|| -> Result<Outline> {
+        let mut session = syntactic::connect_ra(&args.root)?;
+        let result = outline(&mut session, &args.file)?;
+        let _ = session.shutdown();
+        Ok(result)
+    })();
+
+    match ra {
+        // A non-empty semantic outline is the best answer.
+        Ok(result) if !result.items.is_empty() => Ok(result),
+        // rust-analyzer answered but with nothing. When forced (`--lsp`), trust
+        // it; otherwise this is usually "the index was not ready", so prefer the
+        // syntactic scan when *it* finds items (fixing the silent empty-outline
+        // exit-0 bug) and only report a truly empty file otherwise.
+        Ok(empty) => {
+            if args.lsp {
+                return Ok(empty);
+            }
+            let scanned = syntactic::outline_file(&args.file)?;
+            if scanned.items.is_empty() {
+                Ok(empty)
+            } else {
+                eprintln!(
+                    "rust-analyzer returned no symbols (index likely not ready); using syntactic fallback"
+                );
+                Ok(scanned)
+            }
+        }
+        Err(err) if args.lsp => {
+            Err(err.context("rust-analyzer outline failed (and --lsp forbids the syntactic fallback)"))
+        }
+        Err(err) => {
+            eprintln!("rust-analyzer unavailable/timed out ({err:#}); using syntactic fallback");
+            syntactic::outline_file(&args.file)
+        }
+    }
+}
+
+/// Prints the outline as the human skeleton or, with `--json`, the serialized
+/// [`Outline`]. `to_skeleton` already newline-terminates each item.
+fn emit(outline: &Outline, json: bool) {
+    if json {
+        match serde_json::to_string_pretty(outline) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed to serialize outline JSON: {e}"),
+        }
+    } else {
+        print!("{}", outline.to_skeleton());
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +147,20 @@ mod tests {
             TestCli::try_parse_from(["t", "a.rs", "--root", "/w", "--json"]).unwrap();
         assert_eq!(cli.args.root, PathBuf::from("/w"));
         assert!(cli.args.json);
+    }
+
+    #[test]
+    fn parses_no_lsp_and_its_syntactic_alias() {
+        let cli = TestCli::try_parse_from(["t", "a.rs", "--no-lsp"]).unwrap();
+        assert!(cli.args.no_lsp);
+        let cli = TestCli::try_parse_from(["t", "a.rs", "--syntactic"]).unwrap();
+        assert!(cli.args.no_lsp, "--syntactic is an alias for --no-lsp");
+        assert!(!cli.args.lsp);
+    }
+
+    #[test]
+    fn lsp_and_no_lsp_conflict() {
+        assert!(TestCli::try_parse_from(["t", "a.rs", "--lsp", "--no-lsp"]).is_err());
     }
 
     #[test]
