@@ -1,7 +1,7 @@
 [package]
 name = "kopitiam-tokenizer"
 # First crates.io release at 0.1.0; the workspace is 0.1.8 but these debut at 0.1.0 (maintainer directive).
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

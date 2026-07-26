@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pure-Rust PDF text extraction for KOPITIAM's Document Engine."
+# Keep vendored MuPDF/PyMuPDF/pdfminer/pypdf reference sources (crates/kopitiam-pdf/vendor/,
+# ~340MB, AGPL/MIT/BSD, local-only for the C->Rust translation) OUT of the published
+# .crate. Belt-and-braces alongside the .gitignore rule; publish.sh's preflight requires it.
+exclude = ["vendor/"]
 
 [dependencies]
 pdf-extract = { workspace = true }
