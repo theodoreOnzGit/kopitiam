@@ -17,7 +17,7 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 
 KOPITIAM used to be personal-time-only, and agent work was banned inside NUS
 working hours to keep that separation clean. **That restriction is removed** —
-KOPITIAM is SNRSI work now, so the split it was protecting no longer exists.
+KOPITIAM is institute work now, so the split it was protecting no longer exists.
 
 Concretely, all of the following are **gone**: the Mon–Fri 08:30–18:00 ban, the
 "are you on leave or is it a public holiday?" ask, the halt-at-the-08:30-boundary
@@ -29,7 +29,7 @@ Two things this change does **not** touch:
 
 * The **sleep-hours rule below still stands, unchanged and still hard.** It
   protects the maintainer's rest, not the work/personal split, so nothing about
-  the SNRSI move weakens it.
+  the move to institute work weakens it.
 * The **AGPL-3.0-only licence still stands**, and is not optional. Becoming
   institute work does not open a path to relicensing.
 

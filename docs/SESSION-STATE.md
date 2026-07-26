@@ -1,13 +1,13 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-27 (NUS working-hours rule removed — KOPITIAM is SNRSI work now)
+**Last updated:** 2026-07-27 (NUS working-hours rule removed — KOPITIAM is institute work now)
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
 
 > ## ✅ LATEST — 2026-07-27 (Mon, ~07:30 SGT)
 >
 > **Governance change: the NUS working-hours restriction is GONE.** KOPITIAM is
-> SNRSI work now, so the personal-time/work split that rule protected no longer
+> institute work now, so the personal-time/work split that rule protected no longer
 > exists. Removed from both `CLAUDE.md` and `AGENTS.md`: the Mon–Fri
 > 08:30–18:00 ban, the "on leave or public holiday?" ask, the
 > halt-at-the-08:30-boundary rule for in-flight agents, and the
@@ -17,7 +17,7 @@ without re-deriving anything.
 >
 > **Still hard, unchanged:** the sleep-hours rule (23:30–06:00 SGT — agents may
 > run, maintainer's prompts get banked as beads, not worked live). It guards
-> rest, not the work/personal split, so the SNRSI move doesn't touch it.
+> rest, not the work/personal split, so the move to institute work doesn't touch it.
 >
 > **Licence clarification worth banking (was stated loosely, now precise):**
 > KOPITIAM is AGPL-3.0-only **because `crates/kopitiam-pdf/src/mupdf/` is a port
@@ -25,7 +25,7 @@ without re-deriving anything.
 > AGPL-3.0 (Artifex). It is *not* merely the vendored reference sources under
 > `vendor/` that bind us; reading inert reference material would not. Practical
 > consequence: **KOPITIAM cannot be relicensed non-AGPL** while that port is in
-> the tree. A closed-source SNRSI distribution would need a commercial MuPDF
+> the tree. A closed-source institutional distribution would need a commercial MuPDF
 > licence from Artifex, or the port ripped out. Becoming institute work does not
 > change this.
 >
