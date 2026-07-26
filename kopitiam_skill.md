@@ -234,6 +234,46 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+### `kopitiam refactor`
+
+**Command group** — not invoked directly; dispatch to one of its subcommands below.
+
+```text
+Deterministic, mechanical refactors over a directory — token-max Task II-8.
+
+`refactor add-derive <Derive> --filter <pattern>` adds a derive to every matching `struct`/`enum`/`union`, previewing a diff unless `--apply` is given. Reuses `rename`'s `edit::{FileEdit, diff, write_file_edits}` machinery, no rust-analyzer needed. See `apps/cli/src/refactor.rs`.
+
+Usage: kopitiam.exe refactor <COMMAND>
+
+Commands:
+  add-derive  Add a derive to every matching type definition across a directory, previewing the change as a diff unless `--apply` is given
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `kopitiam refactor add-derive`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Add a derive to every matching type definition across a directory, previewing the change as a diff unless `--apply` is given
+
+Usage: kopitiam.exe refactor add-derive [OPTIONS] --filter <FILTER> <DERIVE>
+
+Arguments:
+  <DERIVE>  The derive to add, e.g. `Clone`, `PartialEq`, or a path like `serde::Serialize`
+
+Options:
+      --filter <FILTER>  Restrict to type definitions whose name matches this pattern. A pattern containing `*` or `?` is treated as a glob anchored to the whole name (`Config*` matches `ConfigV2` but not `MyConfig`); otherwise it is a case-sensitive substring match (`Config` matches both). Required, so a bare run can never rewrite every type in the tree
+      --root <ROOT>      Directory (or a single `.rs` file) to scan. Defaults to the current directory. This bounds the blast radius: nothing outside it is read or written, and `vendor/`, `target/`, and dot-directories are always skipped [default: .]
+      --apply            Write the computed changes to disk. Without this flag, `add-derive` only prints a preview diff and leaves every file untouched
+      --json             Emit the planned edits as JSON (each file with the type names and 1-based definition line numbers it would touch) instead of a diff. A listing only — it never writes, regardless of `--apply`
+  -h, --help             Print help
+```
+
 ### `kopitiam status`
 
 **Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.

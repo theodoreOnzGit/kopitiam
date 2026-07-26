@@ -32,6 +32,7 @@ mod outline;
 mod plan;
 mod port;
 mod preprocess;
+mod refactor;
 mod rename;
 mod scan;
 mod semq;
@@ -165,6 +166,15 @@ enum Command {
     ///
     /// See `apps/cli/src/code_actions.rs` for the full explanation.
     CodeActions(code_actions::CodeActionsArgs),
+
+    /// Deterministic, mechanical refactors over a directory — token-max Task
+    /// II-8.
+    ///
+    /// `refactor add-derive <Derive> --filter <pattern>` adds a derive to every
+    /// matching `struct`/`enum`/`union`, previewing a diff unless `--apply` is
+    /// given. Reuses `rename`'s `edit::{FileEdit, diff, write_file_edits}`
+    /// machinery, no rust-analyzer needed. See `apps/cli/src/refactor.rs`.
+    Refactor(refactor::RefactorArgs),
 
     /// Print this project's persisted session memory (`.kopitiam/state.redb`).
     ///
@@ -354,6 +364,10 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::CodeActions(args) => {
             code_actions::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Refactor(args) => {
+            refactor::run(args)?;
             ExitCode::SUCCESS
         }
         Command::Status(args) => {
