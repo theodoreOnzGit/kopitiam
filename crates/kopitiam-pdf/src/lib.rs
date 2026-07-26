@@ -7,6 +7,7 @@ mod extractor;
 mod font;
 mod font_resources;
 mod geometry;
+mod mupdf_extract;
 mod page;
 
 // Faithful Rust port of MuPDF's text-extraction vertical (fitz geometry, and
@@ -18,5 +19,6 @@ pub mod mupdf;
 
 pub use extractor::{ExtractError, extract, extract_from_bytes};
 pub use font::FontStyle;
+pub use mupdf_extract::{extract_mupdf, extract_mupdf_from_bytes};
 pub use geometry::Rect;
 pub use page::{Page, TextSpan};

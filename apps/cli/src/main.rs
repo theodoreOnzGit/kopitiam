@@ -34,7 +34,17 @@ mod tui;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Which text-extraction engine [`Command::Pdf2md`] drives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Engine {
+    /// The ported MuPDF `stext` engine (default): true reading order with
+    /// columns linearised and correct inter-word spacing.
+    Mupdf,
+    /// The legacy `pdf-extract`-based path, kept as a fallback.
+    Legacy,
+}
 
 /// Top-level CLI parser. `clap` derives the actual argument parsing from
 /// this struct and the [`Command`] enum below; this file only wires parsed
@@ -67,6 +77,12 @@ enum Command {
         /// Output Markdown file. Defaults to the input path with a .md extension.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Extraction engine. `mupdf` (default) is the ported MuPDF `stext`
+        /// engine: true reading order (columns linearised) and correct
+        /// inter-word spacing. `legacy` is the older `pdf-extract`-based path,
+        /// kept as a fallback.
+        #[arg(long, value_enum, default_value_t = Engine::Mupdf)]
+        engine: Engine,
     },
 
     /// Scan a Rust project's real tooling and report what the Semantic
@@ -153,8 +169,8 @@ enum Command {
 fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let code = match cli.command {
-        Command::Pdf2md { input, output } => {
-            pdf2md(&input, output)?;
+        Command::Pdf2md { input, output, engine } => {
+            pdf2md(&input, output, engine)?;
             ExitCode::SUCCESS
         }
         Command::Scan(args) => {
@@ -192,14 +208,18 @@ fn main() -> anyhow::Result<ExitCode> {
 
 /// Implements [`Command::Pdf2md`]: PDF in, semantic Markdown out, plus a
 /// validation report printed to stdout.
-fn pdf2md(input: &Path, output: Option<PathBuf>) -> anyhow::Result<()> {
-    // `kopitiam_pdf::extract` is panic-safe: even PDFs whose fonts make the
-    // underlying `pdf-extract` crate `panic!` come back as a normal `Err`
+fn pdf2md(input: &Path, output: Option<PathBuf>, engine: Engine) -> anyhow::Result<()> {
+    // Extraction is panic-safe on both paths: even PDFs whose fonts make the
+    // legacy `pdf-extract` crate `panic!` come back as a normal `Err`
     // (`ExtractError::UnsupportedFont`) instead of aborting the process. Turn
     // that into a clear, actionable message so that a user batch-converting
     // many PDFs sees this file fail cleanly and can move on, rather than the
     // whole run dying on one bad document.
-    let pages = match kopitiam_pdf::extract(input) {
+    let extraction = match engine {
+        Engine::Mupdf => kopitiam_pdf::extract_mupdf(input),
+        Engine::Legacy => kopitiam_pdf::extract(input),
+    };
+    let pages = match extraction {
         Ok(pages) => pages,
         Err(err @ kopitiam_pdf::ExtractError::UnsupportedFont(_)) => {
             anyhow::bail!(
@@ -213,7 +233,14 @@ fn pdf2md(input: &Path, output: Option<PathBuf>) -> anyhow::Result<()> {
                 .context(format!("could not extract text from {}", input.display())));
         }
     };
-    let document = kopitiam_document::reconstruct(&pages);
+    // The mupdf engine already returns spans in true reading order (columns
+    // linearised, spacing correct), so it uses the pre-ordered reconstruction
+    // path that trusts that order. The legacy engine's spans are in raw draw
+    // order, so they still go through the full column/baseline analysis.
+    let document = match engine {
+        Engine::Mupdf => kopitiam_document::reconstruct_preordered(&pages),
+        Engine::Legacy => kopitiam_document::reconstruct(&pages),
+    };
     let markdown = kopitiam_markdown::render_document(&document);
     let report = kopitiam_document::validate(&pages, &document, &markdown);
 

@@ -20,6 +20,6 @@ pub use figure::Figure;
 pub use heading::Heading;
 pub use list::List;
 pub use paragraph::Paragraph;
-pub use reconstruction::reconstruct;
+pub use reconstruction::{reconstruct, reconstruct_preordered};
 pub use table::Table;
 pub use validation::{ConversionReport, validate};

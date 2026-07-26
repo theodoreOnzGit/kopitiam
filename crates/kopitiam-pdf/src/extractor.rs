@@ -32,6 +32,11 @@ pub enum ExtractError {
     /// carries the recovered panic message.
     #[error("could not decode PDF text: {0}")]
     UnsupportedFont(String),
+    /// The ported MuPDF engine ([`crate::extract_mupdf`]) failed to open or walk
+    /// the document. Carries the port's own error message (its `fz_error`
+    /// taxonomy mapped to a string) or an I/O error reading the file.
+    #[error("mupdf extraction failed: {0}")]
+    Mupdf(String),
 }
 
 /// Extract physical layout (pages + text spans) from a PDF file on disk.

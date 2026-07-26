@@ -73,6 +73,68 @@ pub fn reconstruct(pages: &[Page]) -> Document {
     }
 }
 
+/// Like [`reconstruct`], but for pages whose spans are **already in true
+/// reading order** — one [`TextSpan`] per visual line, columns already
+/// linearised and inter-word spacing already correct (what
+/// `kopitiam_pdf::extract_mupdf` produces via the ported MuPDF `stext` engine).
+///
+/// # Why a separate entry point (integration choice (a))
+///
+/// [`reconstruct`] does its own layout analysis: `split_columns` re-orders a
+/// page into reading-order column groups and `group_lines` re-groups spans by
+/// shared baseline. Both are exactly the work the MuPDF engine has *already*
+/// done — feeding its pre-ordered output back through them risks double
+/// processing: `split_columns`'s midpoint heuristic could re-interleave a
+/// layout the boxer already linearised, and baseline re-grouping could merge
+/// two already-distinct lines. So this variant **trusts the incoming order**:
+/// it takes each span as one line, in the given sequence, and skips
+/// `split_columns` + baseline re-grouping entirely.
+///
+/// Everything *downstream* of layout is deliberately kept — heading, list,
+/// table, figure, citation, and paragraph detection ([`build_blocks`]) and the
+/// cross-page paragraph merge ([`merge_page_breaks`]) all run unchanged on the
+/// ordered lines. That is the whole point of reusing this pipeline rather than
+/// mapping straight to the AST (option (b)): the semantic classifiers are
+/// engine-independent and worth keeping.
+///
+/// The one capability lost relative to [`reconstruct`] is per-line *cell*
+/// splitting for table detection: with one span per line the line has a single
+/// cell, so multi-column table recognition degrades to best-effort. Headings,
+/// lists, paragraphs, citations, and cross-page merge are unaffected.
+pub fn reconstruct_preordered(pages: &[Page]) -> Document {
+    let body_font_size = estimate_body_font_size(pages);
+    let mut citations = Vec::new();
+    let mut pages_blocks: Vec<Vec<Block>> = Vec::with_capacity(pages.len());
+
+    for page in pages {
+        // Each span is already one line in true reading order. Build one `Line`
+        // per span, preserving order — no `split_columns`, no baseline
+        // re-grouping.
+        let lines: Vec<Line> = page.spans.iter().map(|span| build_line(&[span])).collect();
+
+        let mut page_blocks = Vec::new();
+        for block in build_blocks(&lines, body_font_size) {
+            if let Block::Paragraph(paragraph) = &block {
+                citations.extend(citations::detect(&paragraph.text));
+            }
+            page_blocks.push(block);
+        }
+        pages_blocks.push(page_blocks);
+    }
+
+    let (blocks, block_pages) = merge_page_breaks(pages_blocks);
+
+    Document {
+        title: infer_title(&blocks),
+        metadata: Metadata {
+            source_pages: pages.len(),
+        },
+        blocks,
+        block_pages,
+        citations,
+    }
+}
+
 /// Joins each page's independently-reconstructed blocks into one stream,
 /// repairing a paragraph that a page break cut in two (kopitiam-d3n).
 ///
@@ -773,6 +835,87 @@ mod tests {
         };
         assert_eq!(document.page_of(0), None);
         assert_eq!(document.blocks_with_pages().next().unwrap().1, None);
+    }
+
+    #[test]
+    fn preordered_trusts_span_order_and_does_not_reinterleave_columns() {
+        // Two spans laid out as if they were the LEFT and RIGHT columns of a
+        // two-column page, but already linearised by the mupdf engine into
+        // reading order: left line first, right line second. `reconstruct`'s
+        // column logic keys off x-position; `reconstruct_preordered` must
+        // ignore geometry and keep the given order verbatim.
+        let page = Page {
+            number: 1,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![
+                // Given SECOND in x (right column) but FIRST in reading order.
+                span("Left column sentence one.", 40.0, 700.0, 220.0, 10.0),
+                span("Right column sentence two.", 340.0, 700.0, 220.0, 10.0),
+            ],
+        };
+
+        let document = reconstruct_preordered(&[page]);
+        // The two consecutive lines join into one paragraph (that is normal
+        // paragraph behaviour); what matters is the ORDER — left line first,
+        // right line second, exactly as supplied. `reconstruct`'s column logic
+        // would instead bucket by x and could reorder; the pre-ordered path
+        // must not.
+        let texts: Vec<&str> = document
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["Left column sentence one. Right column sentence two."],
+            "preordered reconstruction must preserve the given reading order"
+        );
+    }
+
+    #[test]
+    fn preordered_still_detects_headings_and_merges_page_breaks() {
+        // Heading detection (font-size ratio) and cross-page paragraph merge
+        // must still run on the pre-ordered path.
+        let page1 = Page {
+            number: 1,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![
+                span("Big Heading", 50.0, 750.0, 200.0, 20.0),
+                span("A paragraph that runs off the bottom of the first page and", 50.0, 700.0, 500.0, 10.0),
+            ],
+        };
+        let page2 = Page {
+            number: 2,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![span("continues onto the second page.", 50.0, 750.0, 400.0, 10.0)],
+        };
+
+        let document = reconstruct_preordered(&[page1, page2]);
+
+        assert!(
+            matches!(&document.blocks[0], Block::Heading(h) if h.text == "Big Heading"),
+            "large-font line must still be a heading, got {:?}",
+            document.blocks[0]
+        );
+        // The split paragraph must be merged across the page break into one.
+        let paragraphs: Vec<&str> = document
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paragraphs,
+            vec!["A paragraph that runs off the bottom of the first page and continues onto the second page."]
+        );
     }
 
     #[test]
