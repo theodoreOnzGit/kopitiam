@@ -951,6 +951,68 @@ mod tests {
         );
     }
 
+    fn cell(text: &str, x: f32) -> Cell {
+        Cell {
+            text: text.to_string(),
+            x,
+            x_end: x + 20.0,
+        }
+    }
+
+    fn line_with_cells(cells: Vec<Cell>) -> Line {
+        Line {
+            text: cells
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            y: 0.0,
+            font_size: 10.0,
+            cells,
+        }
+    }
+
+    #[test]
+    fn ragged_table_row_truncates_the_table_and_the_remainder_survives() {
+        // The one-cell-per-line failure from `kopitiam_token_max.md` §6 card
+        // I-E, exercised through `build_blocks`: a five-line run whose fourth
+        // line is ragged (a merged "subtotal" cell). The three uniform rows
+        // must become a Table, and the ragged row plus what follows must
+        // survive as their own block(s) -- not be swallowed into the table,
+        // and not collapse the whole run into one paragraph per cell.
+        let lines = vec![
+            line_with_cells(vec![cell("Metric", 0.0), cell("Value", 60.0)]),
+            line_with_cells(vec![cell("Commits", 0.0), cell("282", 60.0)]),
+            line_with_cells(vec![cell("Outside", 0.0), cell("81", 60.0)]),
+            line_with_cells(vec![cell("Subtotal across both columns", 0.0)]),
+            line_with_cells(vec![cell("Reviews", 0.0), cell("7", 60.0)]),
+        ];
+
+        let blocks = build_blocks(&lines, 10.0);
+
+        assert!(
+            matches!(&blocks[0], Block::Table(t)
+                if t.headers == vec!["Metric", "Value"]
+                && t.rows == vec![vec!["Commits", "282"], vec!["Outside", "81"]]),
+            "first block must be the uniform table prefix, got {:?}",
+            blocks[0]
+        );
+        // Everything after the prefix is preserved somewhere in the remaining
+        // blocks -- the ragged row is neither lost nor merged into the table.
+        let tail: String = blocks[1..]
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            tail.contains("Subtotal across both columns"),
+            "ragged subtotal row must survive as normal text, got {tail:?}"
+        );
+    }
+
     #[test]
     fn paragraph_ending_a_sentence_does_not_merge_across_a_page_break() {
         let page1 = Page {
