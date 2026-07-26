@@ -2228,6 +2228,7 @@ dependencies = [
  "kopitiam-markdown",
  "kopitiam-models",
  "kopitiam-neovim",
+ "kopitiam-ocr",
  "kopitiam-ontology",
  "kopitiam-pdf",
  "kopitiam-semantic",

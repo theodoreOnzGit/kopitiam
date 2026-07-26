@@ -27,6 +27,7 @@ mod code_actions;
 mod diagnostics;
 mod digest;
 mod models;
+mod ocr_fallback;
 mod outline;
 mod plan;
 mod port;
@@ -123,6 +124,21 @@ enum Command {
         /// Files are named `<stem>.NN-<slug>.md` beside `--output`.
         #[arg(long, value_name = "N")]
         split_by_heading_level: Option<usize>,
+
+        /// Automatic OCR fallback for scanned pages (Task #10). `auto` (default)
+        /// runs OCR only on pages that extracted little or no text (a scanned,
+        /// image-only page) while leaving text pages untouched; `on` forces OCR on
+        /// every page; `off` disables it. A born-digital PDF is unaffected — the
+        /// fallback never triggers on a page that has real text.
+        #[arg(long, value_enum, default_value_t = ocr_fallback::OcrMode::Auto)]
+        ocr: ocr_fallback::OcrMode,
+
+        /// Languages to OCR with, as a comma-separated list of Tesseract codes
+        /// (default `eng,chi_sim,jpn`). Each needs its `.traineddata` in the local
+        /// model store; if one is missing the run fails with the `kopitiam models
+        /// pull …` command to fetch it.
+        #[arg(long, value_name = "LANGS", default_value = ocr_fallback::DEFAULT_OCR_LANGS)]
+        ocr_lang: String,
     },
 
     /// Scan a Rust project's real tooling and report what the Semantic
@@ -310,11 +326,15 @@ fn main() -> anyhow::Result<ExitCode> {
             index,
             pages,
             split_by_heading_level,
+            ocr,
+            ocr_lang,
         } => {
             pdf2md(
                 &input,
                 output,
                 engine,
+                ocr,
+                &ocr_fallback::parse_langs(&ocr_lang),
                 Pdf2mdOptions {
                     report_json,
                     index,
@@ -443,16 +463,20 @@ struct RenderedOutput {
 ///
 /// # Pipeline shape (`kopitiam_token_max.md` §2.2)
 ///
-/// The base pipeline — extract → (optional page filter) → reconstruct → render
-/// → validate → `fs::write` — is the same one `tui/convert.rs::convert_one`
-/// runs. The `Pdf2mdOptions` knobs are all CLI-only, additive, and off by
-/// default: with an all-default `Pdf2mdOptions` this function's observable
-/// behaviour is identical to the previous two-argument `pdf2md`, so the TUI's
-/// mirror of the base pipeline stays correct without gaining these flags.
+/// The base pipeline — extract → (optional page filter) → **OCR fallback** →
+/// reconstruct → render → validate → `fs::write` — is the same one
+/// `tui/convert.rs::convert_one` runs. The OCR fallback is a pipeline-shape step
+/// (§2.2), so it lands in BOTH copies: here it is flag-driven (`--ocr`/
+/// `--ocr-lang`) and there it runs with its defaults (the TUI has no flags). It
+/// only ever mutates the spans of a *scanned* (low-text) page, so a born-digital
+/// PDF is byte-identical to before. The remaining `Pdf2mdOptions` knobs are all
+/// CLI-only, additive, and off by default.
 fn pdf2md(
     input: &Path,
     output: Option<PathBuf>,
     engine: Engine,
+    ocr_mode: ocr_fallback::OcrMode,
+    ocr_langs: &[String],
     options: Pdf2mdOptions<'_>,
 ) -> anyhow::Result<()> {
     // Extraction is panic-safe on both paths: even PDFs whose fonts make the
@@ -501,6 +525,14 @@ fn pdf2md(
         }
     }
 
+    // Automatic OCR fallback (Task #10, §2.2): recognize the scanned (low-text)
+    // pages and splice their text in as normal spans BEFORE reconstruction, so
+    // the same header/figure/table/anchor logic applies to them. This is a no-op
+    // (no model load, no rasterize) unless a page actually qualifies, so a
+    // born-digital PDF's output is unchanged. OCR text counts as real extracted
+    // content, keeping the recovery ratio honest (§2.1).
+    let ocr_summary = ocr_fallback::run_ocr_fallback(input, &mut pages, ocr_mode, ocr_langs)?;
+
     // The mupdf engine already returns spans in true reading order (columns
     // linearised, spacing correct), so it uses the pre-ordered reconstruction
     // path that trusts that order. The legacy engine's spans are in raw draw
@@ -547,6 +579,18 @@ fn pdf2md(
             std::fs::write(&index_path, serde_json::to_string_pretty(&sidecar)?)?;
             notices.push(format!("Wrote {}", index_path.display()));
         }
+    }
+
+    // The OCR notice goes to stderr in both modes: it must never appear on a
+    // born-digital conversion (pages_ocred == 0 -> silent), so stdout — and any
+    // token-harness diff of a text PDF — is byte-identical to the pre-OCR tool.
+    if ocr_summary.pages_ocred > 0 {
+        eprintln!(
+            "OCR fallback: recognized {} scanned page(s) ({} line(s)) with languages {}",
+            ocr_summary.pages_ocred,
+            ocr_summary.lines_recognized,
+            ocr_langs.join("+")
+        );
     }
 
     if options.report_json {

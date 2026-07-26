@@ -225,9 +225,14 @@ EOF
   inspect that document, not necessarily a hard error.
 - **Some PDFs skip unreadable pages.** A page that cannot be extracted may be
   omitted from the Markdown; the report is how you notice.
-- **Do not rely on OCR yet.** An automatic OCR fallback for image-only or
-  scanned pages is *planned* but not something to depend on today. If a PDF is
-  scanned images, `pdf2md` may produce little or no text.
+- **Scanned pages are OCR'd automatically.** `pdf2md` detects image-only
+  (low-text) pages and recognizes them with the built-in Tesseract LSTM engine —
+  `--ocr auto` (the default). It needs the language `.traineddata` in the model
+  store; the default `--ocr-lang eng,chi_sim,jpn`, so first run
+  `kopitiam models pull tessdata-eng` (and `tessdata-chi_sim` / `tessdata-jpn` as
+  needed), or the run fails telling you which to pull. Use `--ocr off` to disable
+  it or `--ocr on` to force OCR on every page. Born-digital PDFs are untouched
+  (the fallback never triggers on a page with real text).
 - **`tui`, `ai chat`, and `view` are interactive** and must never be launched by
   an agent (see CRITICAL agent guidance above). `view` in particular is the
   on-screen page viewer `kmux latex` opens for a human's live preview.

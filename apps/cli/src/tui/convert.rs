@@ -54,8 +54,17 @@ pub struct ConvertOutcome {
 /// and reports how many pages the extractor skipped so the UI can surface a
 /// partial conversion honestly. Any failure comes back as a human-readable
 /// `Err(String)` so the batch loop can record it and carry on.
+///
+/// # OCR fallback (`kopitiam_token_max.md` §2.2)
+///
+/// The automatic per-page OCR fallback (Task #10) is a pipeline-shape step, so it
+/// is mirrored here from [`crate::pdf2md`]. The TUI has no flags, so it runs with
+/// the defaults — `OcrMode::Auto` over the default language set — meaning a
+/// scanned page gets recognized rather than converting to empty Markdown. It is a
+/// no-op on born-digital pages (never loads a model, never rasterizes), so a
+/// text PDF converts exactly as before.
 pub fn convert_one(input: &Path, output: &Path) -> Result<ConvertOutcome, String> {
-    let pages = match kopitiam_pdf::extract(input) {
+    let mut pages = match kopitiam_pdf::extract(input) {
         Ok(pages) => pages,
         Err(err @ kopitiam_pdf::ExtractError::UnsupportedFont(_)) => {
             return Err(format!(
@@ -71,6 +80,18 @@ pub fn convert_one(input: &Path, output: &Path) -> Result<ConvertOutcome, String
     // seen minus how many we actually have is how many were dropped.
     let highest = pages.iter().map(|p| p.number).max().unwrap_or(0);
     let skipped_pages = highest.saturating_sub(pages.len());
+
+    // Automatic OCR fallback on the scanned (low-text) pages, with the TUI's
+    // defaults. A missing model surfaces as a clear `Err(String)` (naming
+    // `kopitiam models pull …`) the batch loop records like any other failure.
+    let ocr_langs = crate::ocr_fallback::parse_langs(crate::ocr_fallback::DEFAULT_OCR_LANGS);
+    crate::ocr_fallback::run_ocr_fallback(
+        input,
+        &mut pages,
+        crate::ocr_fallback::OcrMode::Auto,
+        &ocr_langs,
+    )
+    .map_err(|e| format!("OCR fallback failed: {e}"))?;
 
     let document = kopitiam_document::reconstruct(&pages);
     let markdown = kopitiam_markdown::render_document(&document);

@@ -113,6 +113,21 @@ Options:
       --split-by-heading-level <N>
           Split the output into one `.md` per section at this heading level (1-6), instead of a single combined file, so a large multi-chapter document becomes individually safe per-chapter files (card I-H). Files are named `<stem>.NN-<slug>.md` beside `--output`
 
+      --ocr <OCR>
+          Automatic OCR fallback for scanned pages (Task #10). `auto` (default) runs OCR only on pages that extracted little or no text (a scanned, image-only page) while leaving text pages untouched; `on` forces OCR on every page; `off` disables it. A born-digital PDF is unaffected — the fallback never triggers on a page that has real text
+          
+          [default: auto]
+
+          Possible values:
+          - auto: Automatic fallback: OCR only the pages that yielded little or no text (the scanned pages). Pages with real text are untouched. This is the default — the fallback is on out of the box
+          - on:   Force OCR on *every* page, even ones that extracted fine. For a document whose text layer is present but garbled, or an all-scanned corpus
+          - off:  Disable the fallback entirely: behave exactly as the pre-OCR pipeline did
+
+      --ocr-lang <LANGS>
+          Languages to OCR with, as a comma-separated list of Tesseract codes (default `eng,chi_sim,jpn`). Each needs its `.traineddata` in the local model store; if one is missing the run fails with the `kopitiam models pull …` command to fetch it
+          
+          [default: eng,chi_sim,jpn]
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -879,9 +894,14 @@ Options:
   inspect that document, not necessarily a hard error.
 - **Some PDFs skip unreadable pages.** A page that cannot be extracted may be
   omitted from the Markdown; the report is how you notice.
-- **Do not rely on OCR yet.** An automatic OCR fallback for image-only or
-  scanned pages is *planned* but not something to depend on today. If a PDF is
-  scanned images, `pdf2md` may produce little or no text.
+- **Scanned pages are OCR'd automatically.** `pdf2md` detects image-only
+  (low-text) pages and recognizes them with the built-in Tesseract LSTM engine —
+  `--ocr auto` (the default). It needs the language `.traineddata` in the model
+  store; the default `--ocr-lang eng,chi_sim,jpn`, so first run
+  `kopitiam models pull tessdata-eng` (and `tessdata-chi_sim` / `tessdata-jpn` as
+  needed), or the run fails telling you which to pull. Use `--ocr off` to disable
+  it or `--ocr on` to force OCR on every page. Born-digital PDFs are untouched
+  (the fallback never triggers on a page with real text).
 - **`tui`, `ai chat`, and `view` are interactive** and must never be launched by
   an agent (see CRITICAL agent guidance above). `view` in particular is the
   on-screen page viewer `kmux latex` opens for a human's live preview.

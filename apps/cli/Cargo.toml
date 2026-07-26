@@ -33,6 +33,14 @@ kopitiam-workspace = { workspace = true }
 kopitiam-workflow = { workspace = true }
 kopitiam-ai = { workspace = true }
 kopitiam-models = { workspace = true }
+# The ported Tesseract LSTM OCR engine, driving the automatic per-page OCR
+# fallback in `pdf2md`/`convert_one` (token-max Task #10): rasterize a scanned
+# (low-text) page, binarize + line-find, and recognize each line against the
+# `.traineddata` pulled from the `kopitiam-models` store. A direct path dep
+# (not in [workspace.dependencies]) pinned to the crate's own 0.1.0; its only
+# dependency, `kopitiam-tensor`, is already in the tree, so this adds a single
+# edge to Cargo.lock and no new transitive crates.
+kopitiam-ocr = { path = "../../crates/kopitiam-ocr", version = "0.1.0" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 # `pdf2md --report-json` (card I-F) and the `<output>.index.json` sidecar
