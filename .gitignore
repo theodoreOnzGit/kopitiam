@@ -21,5 +21,7 @@ Cargo.lock.bak
 scripts/token-harness.corpus
 
 # Vendored reference sources for translation (not part of the Pure Rust Core;
-# local-only, never committed — see README.md's "Scientific Translation" plan)
-crates/*/vendor/
+# local-only, NEVER committed — see README.md's "Scientific Translation" plan).
+# `vendor/` (no leading slash) matches a directory named `vendor` at ANY depth,
+# so every reference dropin (crates/*/vendor, apps/*/vendor, ...) is ignored.
+vendor/
