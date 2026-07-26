@@ -123,4 +123,4 @@ cargo clippy --release -p kopitiam-gpu --all-targets
 
 ## Licence
 
-GPL-3.0-only, same as the rest of KOPITIAM. See the workspace root.
+AGPL-3.0-only, same as the rest of KOPITIAM. See the workspace root.

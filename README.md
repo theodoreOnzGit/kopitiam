@@ -47,7 +47,7 @@ crates.io shows once the `kopitiam` package is published.
 
 > **K**nowledge-**O**riented **O**pen-source **P**latform for **I**ntelligent **T**ranslation, **I**ntegrated **A**nalysis and **M**odelling
 
-*A GPLv3 knowledge, translation, and documentation workbench built in Rust.*
+*An AGPLv3 knowledge, translation, and documentation workbench built in Rust.*
 
 ---
 
@@ -245,27 +245,27 @@ The engines own the functionality.
 
 Copyright (C) 2026 Theodore Kay Chen Ong.
 
-KOPITIAM is licensed under the **GNU General Public License v3.0 (GPLv3)**.
+KOPITIAM is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
 
 The intention is to keep the core platform free, open, and community-owned.
 
-### Why GPLv3, specifically?
+### Why AGPLv3, specifically?
 
-This is a deliberate choice, not a default. GPLv3 is chosen because:
+This is a deliberate choice, not a default. AGPLv3 is chosen because:
 
 * **It is copyleft.** Anyone who distributes KOPITIAM, or a work built on
   it, must share their modifications under the same license. Improvements
   flow back to everyone, not just whoever made them.
 * **It has a no-further-restrictions rule.** Nothing combined into
-  KOPITIAM may add terms that restrict the rights GPLv3 grants, so the
+  KOPITIAM may add terms that restrict the rights AGPLv3 grants, so the
   freedoms attached to the platform cannot be stripped away downstream.
 * **Nobody gets to take it away.** The goal is that KOPITIAM, and
-  everything built on it, stays open source, permanently. GPLv3 is a
+  everything built on it, stays open source, permanently. AGPLv3 is a
   strong, widely-used copyleft license well suited to that purpose.
 
-GPLv3 also composes cleanly with the wider free-software ecosystem:
+AGPLv3 also composes cleanly with the wider free-software ecosystem:
 permissive code (MIT, Apache-2.0, BSD) can be incorporated, and other
-GPLv3-or-later works combine directly.
+AGPLv3-or-later works combine directly.
 
 KOPITIAM is a personal project of Theodore Kay Chen Ong, developed in his
 personal capacity using his own resources outside of working hours. It is

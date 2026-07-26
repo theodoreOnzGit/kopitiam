@@ -139,7 +139,7 @@
 //!
 //! # Licence and authorship
 //!
-//! GPL-3.0-only, like all of KOPITIAM. This crate is original work; it forks
+//! AGPL-3.0-only, like all of KOPITIAM. This crate is original work; it forks
 //! and adapts no upstream code. It builds on KOPITIAM's own [`kopitiam_pdf`]
 //! and [`kopitiam_document`] engines rather than parsing PDFs itself.
 

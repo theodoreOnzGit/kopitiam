@@ -2,7 +2,7 @@
 name = "rmux-sdk"
 version = "0.8.0-kopitiam.1"
 edition = "2021"
-license = "GPL-3.0-only"
+license = "AGPL-3.0-only"
 repository = "https://github.com/theodoreOnzGit/kopitiam"
 description = "Public, daemon-backed Rust SDK for the RMUX terminal multiplexer (facade, ensure-session, snapshots, events, detach helpers)."
 keywords = ["terminal", "multiplexer", "sdk"]

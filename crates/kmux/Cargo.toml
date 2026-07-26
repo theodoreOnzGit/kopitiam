@@ -8,9 +8,9 @@ version = "0.1.0"
 # harder. The edition is pinned here deliberately; moving it is its own task.
 edition = "2021"
 publish = false
-license = "GPL-3.0-only"
+license = "AGPL-3.0-only"
 repository = "https://github.com/theodoreOnzGit/kopitiam"
-description = "kmux: a terminal multiplexer for KOPITIAM. A fork of rmux (MIT OR Apache-2.0) with Android/Termux support, relicensed GPL-3.0-only."
+description = "kmux: a terminal multiplexer for KOPITIAM. A fork of rmux (MIT OR Apache-2.0) with Android/Termux support, relicensed AGPL-3.0-only."
 readme = "README.md"
 
 [dependencies]

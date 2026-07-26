@@ -1,7 +1,7 @@
 # kmux
 
 KOPITIAM's terminal multiplexer. A **fork of [rmux](https://github.com/helvesec/rmux)**
-(© The RMUX Authors, MIT OR Apache-2.0), relicensed GPL-3.0-only as part of
+(© The RMUX Authors, MIT OR Apache-2.0), relicensed AGPL-3.0-only as part of
 KOPITIAM, forked to add **Android/Termux** support alongside Linux, macOS and
 Windows.
 

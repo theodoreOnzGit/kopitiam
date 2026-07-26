@@ -243,11 +243,11 @@ walkthrough.
 
 ## License
 
-kvim is licensed [GPL-3.0-only](https://www.gnu.org/licenses/gpl-3.0.html),
+kvim is licensed [AGPL-3.0-only](https://www.gnu.org/licenses/agpl-3.0.html),
 same as the rest of KOPITIAM.
 
 The bundled font — JetBrains Mono Nerd Font Mono, Regular — is licensed
 [OFL-1.1](https://scripts.sil.org/OFL) (SIL Open Font License). The OFL
-governs the font as a distinct work; it does not affect the GPLv3 licensing
+governs the font as a distinct work; it does not affect the AGPLv3 licensing
 of kvim itself, and its license text ships alongside the font both in this
 repository and wherever `kvim --install-font` installs it.

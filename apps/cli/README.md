@@ -180,7 +180,7 @@ Repository: <https://github.com/theodoreOnzGit/kopitiam>
 
 ## License
 
-Copyright (C) 2026 Theodore Kay Chen Ong. Licensed under GPL-3.0-only.
+Copyright (C) 2026 Theodore Kay Chen Ong. Licensed under AGPL-3.0-only.
 
 This is a personal project of Theodore Kay Chen Ong, built in his personal
 capacity outside of working hours. It is not affiliated with, or a work

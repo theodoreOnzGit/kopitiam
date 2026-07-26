@@ -76,7 +76,7 @@ pub struct ModelSpec {
     pub architecture: Architecture,
     /// SPDX licence id of the *model weights themselves*, e.g. `"Apache-2.0"` or
     /// `"Llama-3.2-Community"`. This is the model's licence, separate from
-    /// KOPITIAM's own GPL-3.0-only code licence.
+    /// KOPITIAM's own AGPL-3.0-only code licence.
     pub license: String,
     /// Every file that must be present and verified. Usually one `.gguf`.
     pub artifacts: Vec<Artifact>,

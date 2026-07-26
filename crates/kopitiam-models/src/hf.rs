@@ -202,7 +202,7 @@ pub struct HfModel {
     /// Which family this is -- drives the forward pass downstream.
     pub architecture: Architecture,
     /// SPDX-ish licence id of the *model weights*, separate from KOPITIAM's own
-    /// GPL-3.0-only code licence.
+    /// AGPL-3.0-only code licence.
     pub license: String,
     /// The `owner/name` repo slug, e.g. `Qwen/Qwen2.5-0.5B-Instruct-GGUF`.
     pub repo: String,
