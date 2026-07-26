@@ -13,62 +13,25 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 > source of truth; don't `bd import` during normal operation; don't
 > reach for third-party Dolt hosting before trying the default).
 
-## Do not develop KOPITIAM during NUS working hours
+## Working hours: no restriction
 
-KOPITIAM is a personal-time project, built on personal time and personal
-hardware. That separation is kept clean deliberately, so no development happens
-during NUS working hours.
+KOPITIAM used to be personal-time-only, and agent work was banned inside NUS
+working hours to keep that separation clean. **That restriction is removed** —
+KOPITIAM is institute work now, so the split it was protecting no longer exists.
 
-NUS's standard working hours are **Monday–Thursday 08:30–18:00 and Friday
-08:30–17:30 (SGT)**. Hours vary a little by department; treat that window as the
-rule. Weekends and Singapore public holidays are outside working hours.
+Concretely, all of the following are **gone**: the Mon–Fri 08:30–18:00 ban, the
+"are you on leave or is it a public holiday?" ask, the halt-at-the-08:30-boundary
+rule for in-flight agents, and the `Worked during NUS hours — ...` commit
+trailer. Develop and run agents whenever — weekday, weekend, working hours, no
+ask needed.
 
-This applies to **agent sessions too**: do not run or schedule agent work on
-KOPITIAM inside those hours.
+Two things this change does **not** touch:
 
-**Exception — leave and public holidays.** KOPITIAM work may proceed during NUS
-working hours when the maintainer is on leave or it is a Singapore public
-holiday. Do not assume either way. If a KOPITIAM action would run during NUS
-working hours (Monday–Friday, inside the window above), first **ask** the
-maintainer: "Are you on leave, or is it a public holiday?"
-
-* If they confirm **yes**, continue as normal — and **record it in the git commit
-  message** with the SGT timestamp, noting the work was done during NUS hours
-  under leave or a holiday. Use a trailer line such as
-  `Worked during NUS hours — maintainer on leave (2026-07-15 10:22 SGT)` or
-  `Worked during NUS hours — Singapore public holiday (2026-07-15 10:22 SGT)`.
-* If they say **no**, or do not confirm, do not do KOPITIAM work until outside
-  working hours.
-
-The ask is per working-hours stretch, not per commit — once confirmed for the
-current session, keep the stamp on the commits made under it.
-
-### Agents pause at the boundary, resume after — never run through NUS hours
-
-Standing rule, hor: the working-hours ban is not only "don't start". **No agent
-work may run *inside* the NUS window** (Mon–Thu 08:30–18:00, Fri 08:30–17:30 SGT),
-full stop. Concretely:
-
-* **Don't launch** an agent whose run will spill past the 08:30 boundary. If you
-  only got a short runway before 08:30, either scope the agent to reach a
-  committed-green checkpoint and **halt before the boundary**, or don't start it
-  and defer instead.
-* **In-flight work checkpoints and stops at the boundary.** Any agent still going
-  as 08:30 approaches must reach a committed-green state and **stop** — never let
-  it keep grinding into working hours. A half-done, uncommitted tree left at the
-  boundary is a bug: commit what is green, or reset your own edits clean.
-* **Resume after hours end**, not through them. Deferred KOPITIAM agent work
-  restarts once the window closes — after **17:30 SGT on Friday**, after **18:00
-  SGT Mon–Thu**, or straight away on weekends and Singapore public holidays (no
-  NUS window those days). Schedule the relaunch for *after* the window (e.g. a
-  cron one-shot at 18:00), don't run a job across it.
-* The **leave / public-holiday exception above still applies**: if the maintainer
-  confirms leave or a holiday, agents may run through the window and the commits
-  get the SGT stamp.
-
-Beads carry whatever an agent didn't finish before it stopped, so a post-hours
-session (or the maintainer) can pick the work up cold. Losing 30 min of runway to
-a clean stop beats a tangled half-commit every time.
+* The **sleep-hours rule below still stands, unchanged and still hard.** It
+  protects the maintainer's rest, not the work/personal split, so nothing about
+  the move to institute work weakens it.
+* The **AGPL-3.0-only licence still stands**, and is not optional. Becoming
+  institute work does not open a path to relicensing.
 
 ## HARD RULE: the maintainer stays out of the loop during sleep hours (23:30–06:00 SGT)
 
