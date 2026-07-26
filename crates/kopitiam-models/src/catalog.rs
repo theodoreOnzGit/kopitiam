@@ -38,6 +38,31 @@ pub enum Architecture {
     Other(String),
 }
 
+/// A pointer at a single file inside a HuggingFace repo, kept on an
+/// [`Artifact`] so its sha256 can be **auto-resolved from the HF hub** instead
+/// of hand-pasted.
+///
+/// This is pure data -- the *shape* of "which HF file this artifact is". The
+/// actual hub call that turns it into a sha256 lives in [`crate::hf`] (behind
+/// the `net` feature), exactly like every other network touch in this crate is
+/// kept out of the offline core.
+///
+/// `revision` is a plain string on purpose (a branch/tag like `main`, or a
+/// 40-char commit SHA) -- the same value that goes into the `resolve`/`tree`
+/// URL. The richer [`crate::hf::Revision`] type (which enforces the
+/// reproducible-vs-moving distinction) lives up in `hf`; keeping this one a
+/// bare `String` is what stops `catalog` (pure data) from having to depend on
+/// `hf` (logic + net).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HfSource {
+    /// The `owner/name` repo slug, e.g. `HuggingFaceTB/SmolLM2-360M-Instruct-GGUF`.
+    pub repo: String,
+    /// Which revision to resolve against: a branch/tag (`main`) or a commit SHA.
+    pub revision: String,
+    /// The repo-relative path of the file, e.g. `smollm2-360m-instruct-q8_0.gguf`.
+    pub file: String,
+}
+
 /// One downloadable thing on disk.
 ///
 /// Usually this is the single `.gguf` weights file. But some models need an
@@ -48,6 +73,23 @@ pub enum Architecture {
 /// The [`Artifact::sha256`] is the verification gate: after the bytes are on
 /// disk (whether freshly fetched or bring-your-own), they get hashed and
 /// checked against this exact value. Lowercase hex, always.
+///
+/// ## Auto-resolved checksums
+///
+/// [`Artifact::hf`] (optional) records that this artifact comes from a
+/// HuggingFace repo. When it is `Some`, the acquire path can **resolve the
+/// sha256 from the HF hub** rather than trusting only a hand-pasted value (see
+/// [`crate::hf::resolve_hf_sha256`] and [`crate::hf::resolve_spec`]):
+///
+/// * If [`Artifact::sha256`] is **empty**, it is filled in from the hub -- so a
+///   catalog author can add a `{repo, file}` entry with *no* hash and let the
+///   machine fetch it.
+/// * If [`Artifact::sha256`] is a **real** pinned hash, the resolved one is
+///   cross-checked against it (defense in depth) and a mismatch is a hard
+///   [`crate::Error::ChecksumMismatch`].
+///
+/// When `hf` is `None`, nothing changes: the pinned `sha256` is the whole story,
+/// exactly as before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     /// The local filename to save as, e.g. `"qwen2.5-0.5b-instruct-q4_0.gguf"`.
@@ -57,10 +99,20 @@ pub struct Artifact {
     /// Where autofetch pull the bytes from.
     pub url: String,
     /// Lowercase-hex sha256 of the expected bytes. The verification gate.
+    ///
+    /// May be **empty** *only* when [`Artifact::hf`] is `Some` -- that spells
+    /// "resolve me from the hub". A non-empty value is always a pinned hash and
+    /// must be 64 lowercase-hex chars.
     pub sha256: String,
     /// Expected size in bytes. Handy for progress reporting and a cheap
-    /// sanity-check; the sha256 is the real guarantee though.
+    /// sanity-check; the sha256 is the real guarantee though. `0` is allowed for
+    /// an [`Artifact::hf`] artifact whose size is resolved from the hub.
     pub size_bytes: u64,
+    /// Optional HuggingFace origin, enabling sha256 auto-resolution. `None` for a
+    /// plain URL artifact (the historical shape). Defaults to `None` when a
+    /// serialized catalog omits it, so old data still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf: Option<HfSource>,
 }
 
 /// A catalog entry: one model, everything needed to acquire it and later run it.
@@ -156,9 +208,18 @@ impl Catalog {
                     // Official HuggingFaceTB GGUF repo.
                     url: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q8_0.gguf".to_string(),
                     // REAL sha256 -- HF git-LFS oid, cross-checked via the
-                    // tree API and the /raw/ LFS pointer.
+                    // tree API and the /raw/ LFS pointer. Kept PINNED, and the
+                    // `hf` source below makes the acquire path re-resolve it
+                    // from the hub and cross-check (defense in depth): if
+                    // upstream ever re-quantises, the resolved oid stops matching
+                    // this pin and acquisition fails loudly instead of silently.
                     sha256: "48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201".to_string(),
                     size_bytes: 386_404_992,
+                    hf: Some(HfSource {
+                        repo: "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF".to_string(),
+                        revision: "main".to_string(),
+                        file: "smollm2-360m-instruct-q8_0.gguf".to_string(),
+                    }),
                 }],
             },
             // SmolLM2-1.7B-Instruct, Q4_K_M GGUF. The larger local option --
@@ -172,9 +233,15 @@ impl Catalog {
                     filename: "smollm2-1.7b-instruct-q4_k_m.gguf".to_string(),
                     url: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf".to_string(),
                     // REAL sha256 -- HF git-LFS oid, cross-checked via the
-                    // tree API and the /raw/ LFS pointer.
+                    // tree API and the /raw/ LFS pointer. PINNED + `hf`-resolved
+                    // for the same defense-in-depth as the 360M entry above.
                     sha256: "decd2598bc2c8ed08c19adc3c8fdd461ee19ed5708679d1c54ef54a5a30d4f33".to_string(),
                     size_bytes: 1_055_609_536,
+                    hf: Some(HfSource {
+                        repo: "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF".to_string(),
+                        revision: "main".to_string(),
+                        file: "smollm2-1.7b-instruct-q4_k_m.gguf".to_string(),
+                    }),
                 }],
             },
             // ---- Qwen2 family (kept, but NO LONGER the default) ----------
@@ -197,6 +264,7 @@ impl Catalog {
                     // TODO: record real sha256 after first successful pull.
                     sha256: PLACEHOLDER_SHA256.to_string(),
                     size_bytes: 352_000_000,
+                    hf: None,
                 }],
             },
             // ---- Llama family --------------------------------------------
@@ -218,6 +286,7 @@ impl Catalog {
                     // TODO: record real sha256 after first successful pull.
                     sha256: PLACEHOLDER_SHA256.to_string(),
                     size_bytes: 771_000_000,
+                    hf: None,
                 }],
             },
             // ---- Tesseract LSTM OCR models -------------------------------
@@ -242,6 +311,7 @@ impl Catalog {
                     url: "https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata".to_string(),
                     sha256: "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba".to_string(),
                     size_bytes: 15_400_601,
+                    hf: None,
                 }],
             },
             ModelSpec {
@@ -254,6 +324,7 @@ impl Catalog {
                     url: "https://github.com/tesseract-ocr/tessdata_best/raw/main/chi_sim.traineddata".to_string(),
                     sha256: "4fef2d1306c8e87616d4d3e4c6c67faf5d44be3342290cf8f2f0f6e3aa7e735b".to_string(),
                     size_bytes: 13_077_423,
+                    hf: None,
                 }],
             },
             ModelSpec {
@@ -266,6 +337,7 @@ impl Catalog {
                     url: "https://github.com/tesseract-ocr/tessdata_best/raw/main/jpn.traineddata".to_string(),
                     sha256: "36bdf9ac823f5911e624c30d0553e890b8abc7c31a65b3ef14da943658c40b79".to_string(),
                     size_bytes: 14_330_109,
+                    hf: None,
                 }],
             },
         ]
@@ -406,7 +478,13 @@ impl ModelSpec {
                     filename: a.filename.clone(),
                 });
             }
-            if !is_sha256_hex(&a.sha256) {
+            // An empty sha256 is allowed ONLY for an HF-sourced artifact -- it
+            // means "resolve me from the hub" (see [`Artifact::hf`]). Any other
+            // empty, or any non-empty-but-not-64-lowercase-hex value, is
+            // malformed: the download-time gate compares lowercase hex, so it
+            // could never match real bytes.
+            let unresolved_hf = a.sha256.is_empty() && a.hf.is_some();
+            if !unresolved_hf && !is_sha256_hex(&a.sha256) {
                 problems.push(CatalogProblem::MalformedSha256 {
                     id: self.id.clone(),
                     filename: a.filename.clone(),

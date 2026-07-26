@@ -146,6 +146,40 @@ pub fn ensure_available(
     })
 }
 
+/// Auto-SHA acquire: resolve any HuggingFace-sourced checksums from the hub
+/// first, then acquire exactly like [`ensure_available`].
+///
+/// This is the entry point the CLI's `models pull` gets its auto-SHA from: for
+/// every artifact carrying an [`crate::Artifact::hf`] source, the sha256 (and
+/// size, and url if absent) is fetched from the hub via
+/// [`crate::hf::resolve_spec`] and cross-checked against any pin, then the
+/// resulting concrete-checksum spec is handed to [`ensure_available`], which
+/// downloads whatever is missing and verifies against the resolved sha.
+///
+/// `token` is an optional HF bearer token for gated / private repos (pass
+/// [`crate::hf_token_from_env`]`()` to read `HF_TOKEN`). Artifacts with no HF
+/// source are passed through untouched, so a catalog mixing HF and plain-URL
+/// entries just works.
+///
+/// Only compiled with the `net` feature (resolution talks to the hub). The
+/// returned [`AcquiredModel`]`.spec` carries the *resolved* checksums.
+///
+/// # Errors
+///
+/// Everything [`ensure_available`] can return, plus
+/// [`Error::ChecksumMismatch`] when a pinned sha disagrees with the hub, and
+/// [`Error::NotFound`] / [`Error::Http`] from the resolution step.
+#[cfg(feature = "net")]
+pub fn ensure_available_resolving(
+    store: &ModelStore,
+    spec: &ModelSpec,
+    fetcher: &dyn Fetcher,
+    token: Option<&str>,
+) -> Result<AcquiredModel, Error> {
+    let resolved = crate::hf::resolve_spec(spec, token)?;
+    ensure_available(store, &resolved, fetcher)
+}
+
 // ---------------------------------------------------------------------------
 // The one real Fetcher. Only compiled when the `net` feature is on.
 // ---------------------------------------------------------------------------

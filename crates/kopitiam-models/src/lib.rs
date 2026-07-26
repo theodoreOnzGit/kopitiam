@@ -100,17 +100,19 @@ pub mod hf;
 mod store;
 
 pub use catalog::{
-    Architecture, Artifact, Catalog, CatalogProblem, ModelSpec, DEFAULT_MODEL_ID,
+    Architecture, Artifact, Catalog, CatalogProblem, HfSource, ModelSpec, DEFAULT_MODEL_ID,
 };
 pub use error::Error;
 pub use fetch::{ensure_available, AcquiredModel, Fetcher};
 pub use hf::{
-    hf_resolve_url, hf_token_from_env, normalize_token, HfFile, HfModel, Revision, RevisionError,
+    check_pinned, hf_raw_url, hf_resolve_url, hf_token_from_env, hf_tree_url, normalize_token,
+    parse_hf_tree, parse_lfs_pointer, HfFile, HfModel, HfResolved, HfTreeLookup, Revision,
+    RevisionError,
 };
 pub use store::ModelStore;
 
 #[cfg(feature = "net")]
-pub use fetch::HttpFetcher;
+pub use fetch::{ensure_available_resolving, HttpFetcher};
 
 #[cfg(feature = "net")]
-pub use hf::HfFetcher;
+pub use hf::{resolve_hf_sha256, resolve_hf_sha256_rev, resolve_hf_source, resolve_spec, HfFetcher};

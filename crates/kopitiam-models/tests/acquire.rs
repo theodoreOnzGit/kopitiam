@@ -45,6 +45,7 @@ fn one_artifact_spec(sha256: String) -> ModelSpec {
             url: "https://example.invalid/model.gguf".to_string(),
             sha256,
             size_bytes: FAKE_BYTES.len() as u64,
+            hf: None,
         }],
     }
 }
@@ -376,6 +377,7 @@ fn duplicate_artifact_filename_is_flagged() {
         url: "https://example.invalid/other.gguf".to_string(),
         sha256: fake_sha256(),
         size_bytes: 1,
+        hf: None,
     });
     let problems = spec.validate();
     assert!(
@@ -434,6 +436,7 @@ fn empty_fields_are_flagged() {
             url: String::new(),
             sha256: fake_sha256(),
             size_bytes: 0,
+            hf: None,
         }],
     };
     let problems = spec.validate();

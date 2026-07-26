@@ -57,7 +57,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::catalog::{Architecture, Artifact, ModelSpec};
+use crate::catalog::{Architecture, Artifact, HfSource, ModelSpec};
+use crate::error::Error;
 
 /// The environment variable [`HfFetcher`] reads an optional bearer token from.
 ///
@@ -238,6 +239,15 @@ impl HfModel {
             .into_iter()
             .map(|f| Artifact {
                 url: hf_resolve_url(&self.repo, revision, &f.filename),
+                // Carry the HF origin onto the artifact, so the acquire path can
+                // re-resolve this file's sha256 from the hub and cross-check the
+                // pinned one (defense in depth). A file declared with an empty
+                // `sha256` becomes a fully auto-resolved artifact.
+                hf: Some(HfSource {
+                    repo: self.repo.clone(),
+                    revision: revision.to_string(),
+                    file: f.filename.clone(),
+                }),
                 filename: f.filename,
                 sha256: f.sha256,
                 size_bytes: f.size_bytes,
@@ -322,6 +332,466 @@ pub enum RevisionError {
 fn is_commit_sha(s: &str) -> bool {
     (7..=40).contains(&s.len())
         && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// ===========================================================================
+// SHA-256 auto-resolution from the HF hub.
+//
+// The whole point: a catalog author should be able to name a `{repo, file}`
+// and let the machine fetch the checksum, exactly like `huggingface_hub` /
+// `transformers` do -- no more pasting a 64-char hash by hand. Two hub facts
+// this leans on (hard-won, do NOT paraphrase away):
+//
+//  * `GET https://huggingface.co/api/models/{repo}/tree/{rev}` returns a JSON
+//    array of siblings. For a git-LFS file (every real GGUF), the sibling
+//    carries `"lfs": { "oid": "<sha256>", "size": <bytes> }` -- and `lfs.oid`
+//    IS the sha256 we verify against. No download needed.
+//  * `GET https://huggingface.co/{repo}/raw/{rev}/{file}` returns, for an LFS
+//    file, the LFS *pointer* text (`oid sha256:<hex>` + `size <n>`); for a
+//    small NON-LFS file it returns the actual bytes. So the raw endpoint is
+//    both the fallback-when-the-tree-API-is-unavailable AND the way to handle
+//    a small non-LFS file (hash the bytes it returns).
+//
+// The JSON/pointer parsing is pure and net-free (so it unit-tests against a
+// captured fixture with zero sockets); only the HTTP calls sit behind `net`.
+// ===========================================================================
+
+/// A sha256 resolved from the HF hub, ready to drop onto an [`Artifact`].
+///
+/// This is the return shape of [`resolve_hf_sha256`] -- the checksum, the size,
+/// and the direct-download `resolve` URL for the same file, so a caller has
+/// everything needed to build (or verify) a catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfResolved {
+    /// Lowercase-hex sha256 of the file's bytes -- the git-LFS `oid`, the LFS
+    /// pointer's `oid sha256:`, or (for a small non-LFS file) the hash of the
+    /// bytes themselves. This is the value the verification gate checks against.
+    pub sha256: String,
+    /// The file's size in bytes, as the hub reports it (or the byte count when
+    /// resolved by hashing a non-LFS file).
+    pub size_bytes: u64,
+    /// The direct-download (`resolve`) URL for this exact file.
+    pub url: String,
+}
+
+/// What the `tree` API told us about one file. Pure result of parsing the JSON,
+/// so it can be produced and asserted on with no network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HfTreeLookup {
+    /// A git-LFS file: `sha256` is the `lfs.oid`, `size_bytes` the `lfs.size`.
+    /// This is the fast path -- the checksum is known without any download.
+    Lfs {
+        /// Lowercase-hex sha256 (the LFS object id).
+        sha256: String,
+        /// Size in bytes.
+        size_bytes: u64,
+    },
+    /// The file exists but is NOT git-LFS (a small plain blob). Its git `oid`
+    /// is a SHA-1, not the sha256 we want, so the caller must fetch the raw
+    /// bytes and hash them. `size_bytes` is carried through for progress.
+    NotLfs {
+        /// Size in bytes as reported by the tree API.
+        size_bytes: u64,
+    },
+    /// No sibling in the repo matched the requested filename.
+    NotFound,
+}
+
+/// The tree-API URL for a repo at a revision:
+/// `https://huggingface.co/api/models/{repo}/tree/{revision}`.
+///
+/// Same slash-tidying as [`hf_resolve_url`] so callers can be sloppy.
+pub fn hf_tree_url(repo: &str, revision: &str) -> String {
+    let repo = repo.trim_matches('/');
+    let revision = revision.trim_matches('/');
+    format!("https://huggingface.co/api/models/{repo}/tree/{revision}")
+}
+
+/// The raw-file URL for one file:
+/// `https://huggingface.co/{repo}/raw/{revision}/{file}`.
+///
+/// For a git-LFS file this returns the LFS *pointer* text; for a small non-LFS
+/// file it returns the actual bytes. Contrast [`hf_resolve_url`], which 302s to
+/// the CDN with the real bytes for any file.
+pub fn hf_raw_url(repo: &str, revision: &str, file: &str) -> String {
+    let repo = repo.trim_matches('/');
+    let revision = revision.trim_matches('/');
+    let file = file.trim_start_matches('/');
+    format!("https://huggingface.co/{repo}/raw/{revision}/{file}")
+}
+
+/// Parse a `tree` API JSON body and report what it says about `file`.
+///
+/// Pure -- no network, no I/O. This is the deterministic core of resolution, so
+/// it can be tested against a captured fixture. Looks for the array element
+/// whose `path` equals `file`; if it carries an `lfs.oid` that is the sha256
+/// ([`HfTreeLookup::Lfs`]); otherwise the file is a plain blob
+/// ([`HfTreeLookup::NotLfs`]); no match is [`HfTreeLookup::NotFound`].
+///
+/// # Errors
+///
+/// [`Error::Http`] if the body is not the JSON array shape the tree API is
+/// documented to return (malformed JSON, or a non-array top level -- e.g. an
+/// error object). The variant is `Http` because a shape surprise here means the
+/// hub answered with something other than the tree we asked for.
+pub fn parse_hf_tree(json: &str, file: &str) -> Result<HfTreeLookup, Error> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| Error::Http(format!("HF tree API returned invalid JSON: {e}")))?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| Error::Http("HF tree API JSON was not an array".to_string()))?;
+
+    for entry in entries {
+        if entry.get("path").and_then(|p| p.as_str()) != Some(file) {
+            continue;
+        }
+        // Matched. Prefer the LFS oid (the sha256); fall back to "plain blob".
+        if let Some(oid) = entry
+            .get("lfs")
+            .and_then(|lfs| lfs.get("oid"))
+            .and_then(|o| o.as_str())
+        {
+            let size_bytes = entry
+                .get("lfs")
+                .and_then(|lfs| lfs.get("size"))
+                .and_then(|s| s.as_u64())
+                .or_else(|| entry.get("size").and_then(|s| s.as_u64()))
+                .unwrap_or(0);
+            return Ok(HfTreeLookup::Lfs {
+                sha256: oid.to_ascii_lowercase(),
+                size_bytes,
+            });
+        }
+        let size_bytes = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+        return Ok(HfTreeLookup::NotLfs { size_bytes });
+    }
+    Ok(HfTreeLookup::NotFound)
+}
+
+/// Parse a git-LFS pointer file into `(sha256, size)`, or `None` if the text is
+/// not an LFS pointer (e.g. it is the actual file bytes of a non-LFS file).
+///
+/// Pure -- no network. An LFS pointer looks like:
+///
+/// ```text
+/// version https://git-lfs.github.com/spec/v1
+/// oid sha256:48ab3034...0201
+/// size 386404992
+/// ```
+///
+/// Requires BOTH an `oid sha256:` line and a `size` line, so it does not
+/// mistake arbitrary text for a pointer. The sha is lowercased for the
+/// lowercase-hex comparison the rest of the crate does.
+pub fn parse_lfs_pointer(text: &str) -> Option<(String, u64)> {
+    let mut sha256 = None;
+    let mut size = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("oid sha256:") {
+            sha256 = Some(rest.trim().to_ascii_lowercase());
+        } else if let Some(rest) = line.strip_prefix("size ") {
+            size = rest.trim().parse::<u64>().ok();
+        }
+    }
+    match (sha256, size) {
+        (Some(s), Some(sz)) => Some((s, sz)),
+        _ => None,
+    }
+}
+
+/// Cross-check a resolved sha256 against an optional pinned one.
+///
+/// Pure -- no network, so the defense-in-depth rule is unit-testable without a
+/// socket. When `pinned` is `Some` and non-empty and differs from `resolved`,
+/// that is a hard [`Error::ChecksumMismatch`] (upstream re-quantised, or the
+/// pin was wrong). An empty or absent pin means "trust the resolved value".
+///
+/// # Errors
+///
+/// [`Error::ChecksumMismatch`] on a pinned-vs-resolved disagreement.
+pub fn check_pinned(file: &str, resolved: &str, pinned: Option<&str>) -> Result<(), Error> {
+    match pinned {
+        Some(p) if !p.is_empty() && p != resolved => Err(Error::ChecksumMismatch {
+            artifact: file.to_string(),
+            expected: p.to_string(),
+            actual: resolved.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live hub calls. Only compiled when the `net` feature is on.
+// ---------------------------------------------------------------------------
+
+/// Resolve the sha256 of one HF-hosted file from the hub, anonymously, at the
+/// `main` revision. The convenience front door over [`resolve_hf_sha256_rev`].
+///
+/// Queries the `tree` API for the git-LFS `oid` (no download); falls back to the
+/// `/raw/` LFS pointer, and for a small non-LFS file hashes the bytes it
+/// returns. The result is cached in-process (see [`resolve_hf_sha256_rev`]).
+///
+/// # Errors
+///
+/// * [`Error::NotFound`] -- no such file in the repo.
+/// * [`Error::Http`] -- network failure, or the hub answered with an
+///   unexpected shape.
+///
+/// # Example run (documented; hits the network, so not a default test)
+///
+/// ```no_run
+/// # #[cfg(feature = "net")]
+/// # fn demo() -> Result<(), kopitiam_models::Error> {
+/// let r = kopitiam_models::resolve_hf_sha256(
+///     "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF",
+///     "smollm2-360m-instruct-q8_0.gguf",
+/// )?;
+/// assert_eq!(r.sha256.len(), 64);
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "net")]
+pub fn resolve_hf_sha256(repo: &str, file: &str) -> Result<HfResolved, Error> {
+    resolve_hf_sha256_rev(repo, file, "main", None)
+}
+
+/// Resolve the sha256 of one HF-hosted file at a specific `revision`, with an
+/// optional bearer `token` for gated / private repos.
+///
+/// Strategy, in order:
+///
+/// 1. Consult the in-process cache (keyed by `repo@revision/file`); a hit
+///    returns immediately.
+/// 2. `GET .../api/models/{repo}/tree/{revision}` and look for the file's
+///    git-LFS `oid` -- the fast path, no file download.
+/// 3. If the tree says the file is present but NOT LFS, or the tree API itself
+///    is unreachable, `GET .../{repo}/raw/{revision}/{file}`: parse it as an LFS
+///    pointer, or (a non-LFS file) hash the returned bytes.
+///
+/// A successful resolve is memoised so a repeated lookup (e.g. `models list`
+/// then `models pull`) does not re-hit the hub.
+///
+/// # Errors
+///
+/// * [`Error::NotFound`] -- the tree API had no sibling matching `file`.
+/// * [`Error::Http`] -- both the tree API and the raw fallback failed, or the
+///   hub returned an unexpected shape.
+#[cfg(feature = "net")]
+pub fn resolve_hf_sha256_rev(
+    repo: &str,
+    file: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<HfResolved, Error> {
+    let key = format!("{repo}@{revision}/{file}");
+    if let Some(hit) = resolve_cache_get(&key) {
+        return Ok(hit);
+    }
+
+    let resolved = match try_resolve_via_tree(repo, file, revision, token) {
+        Ok(HfTreeLookup::Lfs { sha256, size_bytes }) => HfResolved {
+            sha256,
+            size_bytes,
+            url: hf_resolve_url(repo, revision, file),
+        },
+        // Present but not LFS -> hash its raw bytes.
+        Ok(HfTreeLookup::NotLfs { .. }) => resolve_via_raw(repo, file, revision, token)?,
+        Ok(HfTreeLookup::NotFound) => {
+            return Err(Error::NotFound(format!(
+                "file `{file}` not found in HF repo `{repo}` at revision `{revision}`"
+            )));
+        }
+        // Tree endpoint unreachable -> last-resort raw fallback; if THAT also
+        // fails, surface the original tree error (the more informative one).
+        Err(tree_err) => resolve_via_raw(repo, file, revision, token).map_err(|_| tree_err)?,
+    };
+
+    resolve_cache_put(key, resolved.clone());
+    Ok(resolved)
+}
+
+/// Resolve straight from an [`HfSource`] declaration, applying the
+/// pinned-vs-resolved cross-check via [`check_pinned`].
+///
+/// `pinned` is the artifact's currently-recorded sha256 (pass `None` or `""`
+/// when it is to be resolved fresh). On success the returned [`HfResolved`] is
+/// guaranteed consistent with any non-empty pin.
+///
+/// # Errors
+///
+/// Everything [`resolve_hf_sha256_rev`] can return, plus
+/// [`Error::ChecksumMismatch`] when a non-empty `pinned` disagrees with the hub.
+#[cfg(feature = "net")]
+pub fn resolve_hf_source(
+    src: &HfSource,
+    pinned: Option<&str>,
+    token: Option<&str>,
+) -> Result<HfResolved, Error> {
+    let resolved = resolve_hf_sha256_rev(&src.repo, &src.file, &src.revision, token)?;
+    check_pinned(&src.file, &resolved.sha256, pinned)?;
+    Ok(resolved)
+}
+
+/// Return a copy of `spec` with every [`Artifact::hf`]-sourced checksum resolved
+/// from the hub and cross-checked against its pin.
+///
+/// For each artifact carrying an [`HfSource`]: resolve its sha256 (and size, and
+/// url if missing), verify it against the artifact's existing `sha256` when that
+/// is a non-empty pin, and write the resolved value in. Artifacts with no
+/// [`HfSource`] are passed through untouched. The result is a plain [`ModelSpec`]
+/// with concrete checksums, ready for [`crate::ensure_available`].
+///
+/// This is the bridge that lets [`crate::ensure_available_resolving`] (and thus
+/// the CLI's `models pull` / `list`) get auto-SHA for free.
+///
+/// # Errors
+///
+/// Everything [`resolve_hf_source`] can return, including
+/// [`Error::ChecksumMismatch`] on a pin disagreement.
+#[cfg(feature = "net")]
+pub fn resolve_spec(spec: &ModelSpec, token: Option<&str>) -> Result<ModelSpec, Error> {
+    let mut out = spec.clone();
+    for a in &mut out.artifacts {
+        let Some(src) = a.hf.clone() else { continue };
+        let pinned = if a.sha256.is_empty() {
+            None
+        } else {
+            Some(a.sha256.as_str())
+        };
+        let resolved = resolve_hf_source(&src, pinned, token)?;
+        a.sha256 = resolved.sha256;
+        if a.size_bytes == 0 {
+            a.size_bytes = resolved.size_bytes;
+        }
+        if a.url.is_empty() {
+            a.url = resolved.url;
+        }
+    }
+    Ok(out)
+}
+
+/// Query the tree API and parse it. `Ok(..)` on a well-formed reply (including
+/// [`HfTreeLookup::NotFound`]); `Err` only on transport / shape failure.
+#[cfg(feature = "net")]
+fn try_resolve_via_tree(
+    repo: &str,
+    file: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<HfTreeLookup, Error> {
+    let url = hf_tree_url(repo, revision);
+    let bytes = hf_get_bytes(&url, token)?;
+    let json = String::from_utf8_lossy(&bytes);
+    parse_hf_tree(&json, file)
+}
+
+/// Resolve via the `/raw/` endpoint: parse an LFS pointer, or hash the bytes of
+/// a non-LFS file.
+#[cfg(feature = "net")]
+fn resolve_via_raw(
+    repo: &str,
+    file: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<HfResolved, Error> {
+    let raw_url = hf_raw_url(repo, revision, file);
+    let bytes = hf_get_bytes(&raw_url, token)?;
+    let url = hf_resolve_url(repo, revision, file);
+
+    // An LFS file's /raw/ body is the pointer text; a non-LFS file's is the
+    // real bytes. Try the pointer first, else hash the bytes we got.
+    if let Some((sha256, size_bytes)) = std::str::from_utf8(&bytes).ok().and_then(parse_lfs_pointer)
+    {
+        return Ok(HfResolved {
+            sha256,
+            size_bytes,
+            url,
+        });
+    }
+    Ok(HfResolved {
+        sha256: sha256_hex(&bytes),
+        size_bytes: bytes.len() as u64,
+        url,
+    })
+}
+
+/// One small GET, whole body into memory. Only used for tree JSON and LFS
+/// pointers / small non-LFS files -- all small, so buffering is fine (the big
+/// GGUF bytes go through the streaming [`crate::Fetcher`], never here).
+///
+/// Follows redirects with the same same-host bearer policy as [`HfFetcher`], so
+/// a token never leaks to the CDN. Never interpolates the token into an error.
+#[cfg(feature = "net")]
+fn hf_get_bytes(url: &str, token: Option<&str>) -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+
+    use ureq::config::RedirectAuthHeaders;
+
+    let agent = ureq::Agent::config_builder()
+        .redirect_auth_headers(RedirectAuthHeaders::SameHost)
+        .build()
+        .new_agent();
+
+    let mut request = agent.get(url);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let response = request
+        .call()
+        .map_err(|e| Error::Http(format!("GET {url} failed: {e}")))?;
+
+    let mut buf = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::Http(format!("reading body of {url}: {e}")))?;
+    Ok(buf)
+}
+
+/// sha256 of a byte slice as lowercase hex. Local to the resolver (the store's
+/// streaming `sha256_file` is for on-disk artifacts); these buffers are small.
+#[cfg(feature = "net")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Process-wide memo of resolved shas, so `list` then `pull` (or repeated
+/// pulls) don't re-hit the hub. Trivial and stdlib-only: a `Mutex<HashMap>`
+/// behind a `OnceLock`. Keyed by `repo@revision/file`.
+#[cfg(feature = "net")]
+fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, HfResolved>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, HfResolved>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(feature = "net")]
+fn resolve_cache_get(key: &str) -> Option<HfResolved> {
+    resolve_cache()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(key).cloned())
+}
+
+#[cfg(feature = "net")]
+fn resolve_cache_put(key: String, value: HfResolved) {
+    if let Ok(mut m) = resolve_cache().lock() {
+        m.insert(key, value);
+    }
 }
 
 // ---------------------------------------------------------------------------
