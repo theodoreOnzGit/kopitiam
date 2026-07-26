@@ -70,7 +70,7 @@ pub(crate) fn main() {
             let version = if invoked_as_tmux(&args) {
                 "tmux 3.4".to_owned()
             } else {
-                format!("rmux {}", env!("CARGO_PKG_VERSION"))
+                format!("kmux {}", env!("CARGO_PKG_VERSION"))
             };
             write_stdout(format!("{version}\n").as_bytes())
                 .map(|()| 0)

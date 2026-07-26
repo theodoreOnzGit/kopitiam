@@ -73,7 +73,7 @@ pub(super) fn top_level_version_output(invoked_as_tmux: bool) -> String {
         // and version. The shim keeps the rest of the CLI on the normal rmux path.
         return format!("tmux {}", tmux_compatible_version());
     }
-    format!("rmux {}", env!("CARGO_PKG_VERSION"))
+    format!("kmux {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn tmux_compatible_version() -> &'static str {
