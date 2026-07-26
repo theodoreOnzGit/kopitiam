@@ -1,0 +1,63 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 1634 >>
+stream
+BT /F1 10.0 Tf 72.0 120.0 Td (Figure 1. System architecture of the synthetic digital twin, showing the data ingestion, model, and visualisation tiers described in the text.) Tj ET
+BT /F1 8.0 Tf 84.0 680.0 Td (Sensor Gateway) Tj ET
+BT /F1 8.0 Tf 171.0 680.0 Td (Message Bus) Tj ET
+BT /F1 8.0 Tf 245.0 680.0 Td (Stream Ingest) Tj ET
+BT /F1 8.0 Tf 332.0 680.0 Td (Feature Store) Tj ET
+BT /F1 8.0 Tf 406.0 680.0 Td (Model Runner) Tj ET
+BT /F1 8.0 Tf 493.0 680.0 Td (State Cache) Tj ET
+BT /F1 8.0 Tf 87.0 636.0 Td (Twin Core) Tj ET
+BT /F1 8.0 Tf 174.0 636.0 Td (Sync Engine) Tj ET
+BT /F1 8.0 Tf 248.0 636.0 Td (Geometry Store) Tj ET
+BT /F1 8.0 Tf 335.0 636.0 Td (Mesh Loader) Tj ET
+BT /F1 8.0 Tf 409.0 636.0 Td (Render Tier) Tj ET
+BT /F1 8.0 Tf 496.0 636.0 Td (View Cache) Tj ET
+BT /F1 8.0 Tf 90.0 592.0 Td (Alert Rules) Tj ET
+BT /F1 8.0 Tf 164.0 592.0 Td (Anomaly Flag) Tj ET
+BT /F1 8.0 Tf 251.0 592.0 Td (Ops Console) Tj ET
+BT /F1 8.0 Tf 325.0 592.0 Td (Audit Log) Tj ET
+BT /F1 8.0 Tf 412.0 592.0 Td (Edge Node) Tj ET
+BT /F1 8.0 Tf 486.0 592.0 Td (Field Bus) Tj ET
+BT /F1 8.0 Tf 93.0 548.0 Td (PLC Bridge) Tj ET
+BT /F1 8.0 Tf 167.0 548.0 Td (Historian) Tj ET
+BT /F1 8.0 Tf 254.0 548.0 Td (Batch Job) Tj ET
+BT /F1 8.0 Tf 328.0 548.0 Td (Replay Buf) Tj ET
+BT /F1 8.0 Tf 415.0 548.0 Td (Schema Reg) Tj ET
+BT /F1 8.0 Tf 489.0 548.0 Td (Type Map) Tj ET
+BT /F1 8.0 Tf 96.0 504.0 Td (Auth Guard) Tj ET
+BT /F1 8.0 Tf 170.0 504.0 Td (Token Vault) Tj ET
+BT /F1 8.0 Tf 244.0 504.0 Td (Rate Limit) Tj ET
+BT /F1 8.0 Tf 331.0 504.0 Td (Trace Span) Tj ET
+BT /F1 8.0 Tf 405.0 504.0 Td (Health Ping) Tj ET
+BT /F1 8.0 Tf 492.0 504.0 Td (Cold Store) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+2029
+%%EOF

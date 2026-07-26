@@ -1,0 +1,47 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 1619 >>
+stream
+BT /F1 11.0 Tf 72.0 720.0 Td (A digital twin is a synchronised virtual model of a physical system,) Tj ET
+BT /F1 11.0 Tf 72.0 704.0 Td (kept current by a stream of measurements from that system and used to) Tj ET
+BT /F1 11.0 Tf 72.0 688.0 Td (reason about states the physical system has not yet reached. The value) Tj ET
+BT /F1 11.0 Tf 72.0 672.0 Td (of such a model rises with the fidelity of its synchronisation and with) Tj ET
+BT /F1 11.0 Tf 72.0 656.0 Td (the breadth of the questions an operator can pose against it cheaply.) Tj ET
+BT /F1 11.0 Tf 72.0 628.0 Td (This control fixture contains only ordinary prose in a single column.) Tj ET
+BT /F1 11.0 Tf 72.0 612.0 Td (It carries no running head, no footer page number, no figure labels,) Tj ET
+BT /F1 11.0 Tf 72.0 596.0 Td (and no tabular material, so every structural stripper in the pipeline) Tj ET
+BT /F1 11.0 Tf 72.0 580.0 Td (should leave it essentially untouched. Its recovery ratio is therefore) Tj ET
+BT /F1 11.0 Tf 72.0 564.0 Td (the cleanest signal in the corpus for spotting an accidental regression.) Tj ET
+BT /F1 11.0 Tf 72.0 536.0 Td (Because the text reads as continuous sentences with terminal punctuation,) Tj ET
+BT /F1 11.0 Tf 72.0 520.0 Td (no run of short unpunctuated lines exists for a figure heuristic to catch,) Tj ET
+BT /F1 11.0 Tf 72.0 504.0 Td (and no digit-only line exists for a page-number rule to strip. A change) Tj ET
+BT /F1 11.0 Tf 72.0 488.0 Td (that alters this fixture's numbers points at a bug in general prose) Tj ET
+BT /F1 11.0 Tf 72.0 472.0 Td (handling rather than in any of the targeted structural special cases.) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+2014
+%%EOF

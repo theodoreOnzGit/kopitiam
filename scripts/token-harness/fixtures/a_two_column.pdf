@@ -1,0 +1,190 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R 12 0 R 14 0 R] /Count 6 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 1740 >>
+stream
+BT /F1 9.0 Tf 72.0 760.0 Td (Proceedings of the Synthetic Symposium on Nothing in Particular) Tj ET
+BT /F1 9.0 Tf 300.0 36.0 Td (1) Tj ET
+BT /F1 10.0 Tf 72.0 700.0 Td (The reconstruction pipeline linearises columns into a single) Tj ET
+BT /F1 10.0 Tf 72.0 684.0 Td (reading order before any block classification runs. Each span) Tj ET
+BT /F1 10.0 Tf 72.0 668.0 Td (carries a baseline and an x position, and the paragraph builder) Tj ET
+BT /F1 10.0 Tf 72.0 652.0 Td (walks them top to bottom within a detected column boundary.) Tj ET
+BT /F1 10.0 Tf 72.0 636.0 Td (A running head repeated on every page carries no information for) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (an agent that greps the output, yet it is emitted verbatim once) Tj ET
+BT /F1 10.0 Tf 72.0 604.0 Td (per page unless a header zone strips it before rendering.) Tj ET
+BT /F1 10.0 Tf 72.0 588.0 Td (This paragraph is ordinary prose and must survive conversion.) Tj ET
+BT /F1 10.0 Tf 320.0 700.0 Td (Footers and bare page numbers behave the same way: they recur) Tj ET
+BT /F1 10.0 Tf 320.0 684.0 Td (in a fixed page zone with a digit-normalised signature, and a) Tj ET
+BT /F1 10.0 Tf 320.0 668.0 Td (conservative stripper drops them only when they recur across a) Tj ET
+BT /F1 10.0 Tf 320.0 652.0 Td (minimum number of pages so a short document is left untouched.) Tj ET
+BT /F1 10.0 Tf 320.0 636.0 Td (The two-column archetype exercises exactly that machinery while) Tj ET
+BT /F1 10.0 Tf 320.0 620.0 Td (keeping the body text long enough that the recovery ratio stays) Tj ET
+BT /F1 10.0 Tf 320.0 604.0 Td (honest and well inside the accepted band for a clean document.) Tj ET
+BT /F1 10.0 Tf 320.0 588.0 Td (None of this text is drawn from any real publication whatsoever.) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 1740 >>
+stream
+BT /F1 9.0 Tf 72.0 760.0 Td (Proceedings of the Synthetic Symposium on Nothing in Particular) Tj ET
+BT /F1 9.0 Tf 300.0 36.0 Td (2) Tj ET
+BT /F1 10.0 Tf 72.0 700.0 Td (The reconstruction pipeline linearises columns into a single) Tj ET
+BT /F1 10.0 Tf 72.0 684.0 Td (reading order before any block classification runs. Each span) Tj ET
+BT /F1 10.0 Tf 72.0 668.0 Td (carries a baseline and an x position, and the paragraph builder) Tj ET
+BT /F1 10.0 Tf 72.0 652.0 Td (walks them top to bottom within a detected column boundary.) Tj ET
+BT /F1 10.0 Tf 72.0 636.0 Td (A running head repeated on every page carries no information for) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (an agent that greps the output, yet it is emitted verbatim once) Tj ET
+BT /F1 10.0 Tf 72.0 604.0 Td (per page unless a header zone strips it before rendering.) Tj ET
+BT /F1 10.0 Tf 72.0 588.0 Td (This paragraph is ordinary prose and must survive conversion.) Tj ET
+BT /F1 10.0 Tf 320.0 700.0 Td (Footers and bare page numbers behave the same way: they recur) Tj ET
+BT /F1 10.0 Tf 320.0 684.0 Td (in a fixed page zone with a digit-normalised signature, and a) Tj ET
+BT /F1 10.0 Tf 320.0 668.0 Td (conservative stripper drops them only when they recur across a) Tj ET
+BT /F1 10.0 Tf 320.0 652.0 Td (minimum number of pages so a short document is left untouched.) Tj ET
+BT /F1 10.0 Tf 320.0 636.0 Td (The two-column archetype exercises exactly that machinery while) Tj ET
+BT /F1 10.0 Tf 320.0 620.0 Td (keeping the body text long enough that the recovery ratio stays) Tj ET
+BT /F1 10.0 Tf 320.0 604.0 Td (honest and well inside the accepted band for a clean document.) Tj ET
+BT /F1 10.0 Tf 320.0 588.0 Td (None of this text is drawn from any real publication whatsoever.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 1740 >>
+stream
+BT /F1 9.0 Tf 72.0 760.0 Td (Proceedings of the Synthetic Symposium on Nothing in Particular) Tj ET
+BT /F1 9.0 Tf 300.0 36.0 Td (3) Tj ET
+BT /F1 10.0 Tf 72.0 700.0 Td (The reconstruction pipeline linearises columns into a single) Tj ET
+BT /F1 10.0 Tf 72.0 684.0 Td (reading order before any block classification runs. Each span) Tj ET
+BT /F1 10.0 Tf 72.0 668.0 Td (carries a baseline and an x position, and the paragraph builder) Tj ET
+BT /F1 10.0 Tf 72.0 652.0 Td (walks them top to bottom within a detected column boundary.) Tj ET
+BT /F1 10.0 Tf 72.0 636.0 Td (A running head repeated on every page carries no information for) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (an agent that greps the output, yet it is emitted verbatim once) Tj ET
+BT /F1 10.0 Tf 72.0 604.0 Td (per page unless a header zone strips it before rendering.) Tj ET
+BT /F1 10.0 Tf 72.0 588.0 Td (This paragraph is ordinary prose and must survive conversion.) Tj ET
+BT /F1 10.0 Tf 320.0 700.0 Td (Footers and bare page numbers behave the same way: they recur) Tj ET
+BT /F1 10.0 Tf 320.0 684.0 Td (in a fixed page zone with a digit-normalised signature, and a) Tj ET
+BT /F1 10.0 Tf 320.0 668.0 Td (conservative stripper drops them only when they recur across a) Tj ET
+BT /F1 10.0 Tf 320.0 652.0 Td (minimum number of pages so a short document is left untouched.) Tj ET
+BT /F1 10.0 Tf 320.0 636.0 Td (The two-column archetype exercises exactly that machinery while) Tj ET
+BT /F1 10.0 Tf 320.0 620.0 Td (keeping the body text long enough that the recovery ratio stays) Tj ET
+BT /F1 10.0 Tf 320.0 604.0 Td (honest and well inside the accepted band for a clean document.) Tj ET
+BT /F1 10.0 Tf 320.0 588.0 Td (None of this text is drawn from any real publication whatsoever.) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<< /Length 1740 >>
+stream
+BT /F1 9.0 Tf 72.0 760.0 Td (Proceedings of the Synthetic Symposium on Nothing in Particular) Tj ET
+BT /F1 9.0 Tf 300.0 36.0 Td (4) Tj ET
+BT /F1 10.0 Tf 72.0 700.0 Td (The reconstruction pipeline linearises columns into a single) Tj ET
+BT /F1 10.0 Tf 72.0 684.0 Td (reading order before any block classification runs. Each span) Tj ET
+BT /F1 10.0 Tf 72.0 668.0 Td (carries a baseline and an x position, and the paragraph builder) Tj ET
+BT /F1 10.0 Tf 72.0 652.0 Td (walks them top to bottom within a detected column boundary.) Tj ET
+BT /F1 10.0 Tf 72.0 636.0 Td (A running head repeated on every page carries no information for) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (an agent that greps the output, yet it is emitted verbatim once) Tj ET
+BT /F1 10.0 Tf 72.0 604.0 Td (per page unless a header zone strips it before rendering.) Tj ET
+BT /F1 10.0 Tf 72.0 588.0 Td (This paragraph is ordinary prose and must survive conversion.) Tj ET
+BT /F1 10.0 Tf 320.0 700.0 Td (Footers and bare page numbers behave the same way: they recur) Tj ET
+BT /F1 10.0 Tf 320.0 684.0 Td (in a fixed page zone with a digit-normalised signature, and a) Tj ET
+BT /F1 10.0 Tf 320.0 668.0 Td (conservative stripper drops them only when they recur across a) Tj ET
+BT /F1 10.0 Tf 320.0 652.0 Td (minimum number of pages so a short document is left untouched.) Tj ET
+BT /F1 10.0 Tf 320.0 636.0 Td (The two-column archetype exercises exactly that machinery while) Tj ET
+BT /F1 10.0 Tf 320.0 620.0 Td (keeping the body text long enough that the recovery ratio stays) Tj ET
+BT /F1 10.0 Tf 320.0 604.0 Td (honest and well inside the accepted band for a clean document.) Tj ET
+BT /F1 10.0 Tf 320.0 588.0 Td (None of this text is drawn from any real publication whatsoever.) Tj ET
+endstream
+endobj
+12 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 13 0 R >>
+endobj
+13 0 obj
+<< /Length 1740 >>
+stream
+BT /F1 9.0 Tf 72.0 760.0 Td (Proceedings of the Synthetic Symposium on Nothing in Particular) Tj ET
+BT /F1 9.0 Tf 300.0 36.0 Td (5) Tj ET
+BT /F1 10.0 Tf 72.0 700.0 Td (The reconstruction pipeline linearises columns into a single) Tj ET
+BT /F1 10.0 Tf 72.0 684.0 Td (reading order before any block classification runs. Each span) Tj ET
+BT /F1 10.0 Tf 72.0 668.0 Td (carries a baseline and an x position, and the paragraph builder) Tj ET
+BT /F1 10.0 Tf 72.0 652.0 Td (walks them top to bottom within a detected column boundary.) Tj ET
+BT /F1 10.0 Tf 72.0 636.0 Td (A running head repeated on every page carries no information for) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (an agent that greps the output, yet it is emitted verbatim once) Tj ET
+BT /F1 10.0 Tf 72.0 604.0 Td (per page unless a header zone strips it before rendering.) Tj ET
+BT /F1 10.0 Tf 72.0 588.0 Td (This paragraph is ordinary prose and must survive conversion.) Tj ET
+BT /F1 10.0 Tf 320.0 700.0 Td (Footers and bare page numbers behave the same way: they recur) Tj ET
+BT /F1 10.0 Tf 320.0 684.0 Td (in a fixed page zone with a digit-normalised signature, and a) Tj ET
+BT /F1 10.0 Tf 320.0 668.0 Td (conservative stripper drops them only when they recur across a) Tj ET
+BT /F1 10.0 Tf 320.0 652.0 Td (minimum number of pages so a short document is left untouched.) Tj ET
+BT /F1 10.0 Tf 320.0 636.0 Td (The two-column archetype exercises exactly that machinery while) Tj ET
+BT /F1 10.0 Tf 320.0 620.0 Td (keeping the body text long enough that the recovery ratio stays) Tj ET
+BT /F1 10.0 Tf 320.0 604.0 Td (honest and well inside the accepted band for a clean document.) Tj ET
+BT /F1 10.0 Tf 320.0 588.0 Td (None of this text is drawn from any real publication whatsoever.) Tj ET
+endstream
+endobj
+14 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 15 0 R >>
+endobj
+15 0 obj
+<< /Length 1740 >>
+stream
+BT /F1 9.0 Tf 72.0 760.0 Td (Proceedings of the Synthetic Symposium on Nothing in Particular) Tj ET
+BT /F1 9.0 Tf 300.0 36.0 Td (6) Tj ET
+BT /F1 10.0 Tf 72.0 700.0 Td (The reconstruction pipeline linearises columns into a single) Tj ET
+BT /F1 10.0 Tf 72.0 684.0 Td (reading order before any block classification runs. Each span) Tj ET
+BT /F1 10.0 Tf 72.0 668.0 Td (carries a baseline and an x position, and the paragraph builder) Tj ET
+BT /F1 10.0 Tf 72.0 652.0 Td (walks them top to bottom within a detected column boundary.) Tj ET
+BT /F1 10.0 Tf 72.0 636.0 Td (A running head repeated on every page carries no information for) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (an agent that greps the output, yet it is emitted verbatim once) Tj ET
+BT /F1 10.0 Tf 72.0 604.0 Td (per page unless a header zone strips it before rendering.) Tj ET
+BT /F1 10.0 Tf 72.0 588.0 Td (This paragraph is ordinary prose and must survive conversion.) Tj ET
+BT /F1 10.0 Tf 320.0 700.0 Td (Footers and bare page numbers behave the same way: they recur) Tj ET
+BT /F1 10.0 Tf 320.0 684.0 Td (in a fixed page zone with a digit-normalised signature, and a) Tj ET
+BT /F1 10.0 Tf 320.0 668.0 Td (conservative stripper drops them only when they recur across a) Tj ET
+BT /F1 10.0 Tf 320.0 652.0 Td (minimum number of pages so a short document is left untouched.) Tj ET
+BT /F1 10.0 Tf 320.0 636.0 Td (The two-column archetype exercises exactly that machinery while) Tj ET
+BT /F1 10.0 Tf 320.0 620.0 Td (keeping the body text long enough that the recovery ratio stays) Tj ET
+BT /F1 10.0 Tf 320.0 604.0 Td (honest and well inside the accepted band for a clean document.) Tj ET
+BT /F1 10.0 Tf 320.0 588.0 Td (None of this text is drawn from any real publication whatsoever.) Tj ET
+endstream
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000154 00000 n 
+0000000251 00000 n 
+0000000377 00000 n 
+0000002168 00000 n 
+0000002294 00000 n 
+0000004085 00000 n 
+0000004211 00000 n 
+0000006002 00000 n 
+0000006130 00000 n 
+0000007922 00000 n 
+0000008050 00000 n 
+0000009842 00000 n 
+0000009970 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R >>
+startxref
+11762
+%%EOF

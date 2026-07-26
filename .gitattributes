@@ -1,0 +1,4 @@
+# PDFs are binary: never apply EOL conversion. The token-harness synthetic
+# fixtures encode exact byte offsets in their xref tables, so a LF->CRLF
+# rewrite on checkout would shift those offsets and corrupt the PDF.
+*.pdf binary

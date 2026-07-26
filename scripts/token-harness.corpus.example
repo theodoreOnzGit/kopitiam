@@ -1,0 +1,18 @@
+# token-harness local corpus (BY PATH ONLY -- never copy PDFs into the repo).
+#
+# Copy this file to `scripts/token-harness.corpus` (which is gitignored) and
+# list one absolute-or-relative PATH to a local PDF per line. The harness reads
+# these paths, converts them, and reports the same metrics as for the synthetic
+# fixtures. Paths that do not exist are skipped silently, so it is safe to keep
+# machine-specific entries here.
+#
+# Per kopitiam_token_max.md §2.4, these copyrighted papers live OUTSIDE the
+# repo. Only their measurements (numbers) ever appear in harness output, never
+# their content, and output uses the basename only -- no absolute paths leak.
+#
+# You can also pass paths at runtime without a file:
+#   KOPITIAM_TOKEN_CORPUS="/papers/a.pdf;/papers/b.pdf" scripts/token-harness.sh
+#
+# Example entries (delete these; they are illustrative):
+# C:/Users/me/papers/proceedings-volume.pdf
+# /home/me/papers/diagram-heavy-chapter.pdf

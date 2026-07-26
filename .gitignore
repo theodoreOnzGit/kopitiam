@@ -16,6 +16,10 @@ Cargo.lock.bak
 # KOPITIAM Semantic Runtime per-project state (local session memory)
 .kopitiam/
 
+# token-harness local corpus: machine-specific list of local PDF paths
+# (by path only, never copied in -- see scripts/token-harness.corpus.example).
+scripts/token-harness.corpus
+
 # Vendored reference sources for translation (not part of the Pure Rust Core;
 # local-only, never committed — see README.md's "Scientific Translation" plan)
 crates/*/vendor/

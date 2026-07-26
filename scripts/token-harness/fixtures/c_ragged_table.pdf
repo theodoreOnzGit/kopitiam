@@ -1,0 +1,51 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 999 >>
+stream
+BT /F1 10.0 Tf 72.0 720.0 Td (The measured tiers of the synthetic pipeline are summarised below.) Tj ET
+BT /F1 10.0 Tf 72.0 680.0 Td (Component) Tj ET
+BT /F1 10.0 Tf 200.0 680.0 Td (Latency ms) Tj ET
+BT /F1 10.0 Tf 330.0 680.0 Td (Throughput) Tj ET
+BT /F1 10.0 Tf 460.0 680.0 Td (Status) Tj ET
+BT /F1 10.0 Tf 72.0 660.0 Td (Gateway) Tj ET
+BT /F1 10.0 Tf 200.0 660.0 Td (12) Tj ET
+BT /F1 10.0 Tf 330.0 660.0 Td (8400) Tj ET
+BT /F1 10.0 Tf 460.0 660.0 Td (OK) Tj ET
+BT /F1 10.0 Tf 72.0 640.0 Td (Ingest) Tj ET
+BT /F1 10.0 Tf 200.0 640.0 Td (31) Tj ET
+BT /F1 10.0 Tf 330.0 640.0 Td (6200) Tj ET
+BT /F1 10.0 Tf 460.0 640.0 Td (OK) Tj ET
+BT /F1 10.0 Tf 72.0 620.0 Td (Model) Tj ET
+BT /F1 10.0 Tf 200.0 620.0 Td (58) Tj ET
+BT /F1 10.0 Tf 330.0 620.0 Td (1100) Tj ET
+BT /F1 10.0 Tf 460.0 620.0 Td (Degraded) Tj ET
+BT /F1 10.0 Tf 72.0 600.0 Td (Total across all tiers: 15700 requests per second) Tj ET
+BT /F1 10.0 Tf 72.0 570.0 Td (Values above are synthetic and illustrate the ragged-row case only.) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000344 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1393
+%%EOF
