@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-ai"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-loader",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-bibliography"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-document",
  "kopitiam-ontology",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -1747,7 +1747,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-document"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-pdf",
  "regex",
@@ -1763,7 +1763,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-finance"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-document",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-health"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-document",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-index"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "redb",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-insurance"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-document",
  "kopitiam-ontology",
@@ -1825,11 +1825,11 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-internet-research"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "kopitiam-knowledge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-ontology",
  "serde",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-legal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-document",
@@ -1857,7 +1857,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-loader"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "indexmap",
  "kopitiam-core",
@@ -1873,7 +1873,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-lua"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "indexmap",
 ]
@@ -1884,14 +1884,14 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-markdown"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-document",
 ]
 
 [[package]]
 name = "kopitiam-models"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-neovim"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crossterm 0.29.0",
@@ -1934,7 +1934,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-ontology"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-pdf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lopdf",
  "miniz_oxide",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-plot"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-ontology",
  "kopitiam-pdf",
@@ -1973,7 +1973,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-resource"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cargo_metadata",
  "ignore",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-core",
  "kopitiam-loader",
@@ -1998,7 +1998,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-search"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-ontology",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-semantic"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -2026,22 +2026,22 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-snippet"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "kopitiam-syntax"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "kopitiam-tensor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-core",
 ]
 
 [[package]]
 name = "kopitiam-tokenizer"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kopitiam-core",
  "regex",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ignore",
  "kopitiam-resource",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-translation"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -2083,7 +2083,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kopitiam-web"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-workflow"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-ai",
@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-workspace"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "kopitiam-index",

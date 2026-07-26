@@ -56,6 +56,10 @@ CRATES=(
     kopitiam-index       # leaf
     kopitiam-pdf         # leaf
     kopitiam-models      # leaf (net feature -> ureq)
+    kopitiam-config      # leaf (editor/kvim)
+    kopitiam-lua         # leaf (editor/kvim: pure-Rust Lua interpreter)
+    kopitiam-syntax      # leaf (editor/kvim)
+    kopitiam-snippet     # leaf (editor/kvim)
     kopitiam-tensor      # depends on: kopitiam-core
     kopitiam-loader      # depends on: kopitiam-core
     kopitiam-tokenizer   # depends on: kopitiam-core
@@ -67,7 +71,8 @@ CRATES=(
     kopitiam-runtime     # depends on: kopitiam-{core,loader,tensor,tokenizer}
     kopitiam-ai          # depends on: kopitiam-{loader,runtime,tokenizer}
     kopitiam-workflow    # depends on: kopitiam-{ai,knowledge,ontology,workspace}
-    kopitiam             # depends on: all of the above
+    kopitiam-neovim      # editor (kvim); depends on config/lua/syntax/snippet/semantic
+    kopitiam             # depends on: all of the above (incl. kopitiam-neovim, via the TUI)
 )
 
 # Resolves a crate's OWN published version straight from Cargo's own view of
