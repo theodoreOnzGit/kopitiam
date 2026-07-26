@@ -25,7 +25,8 @@ struct MenuEntry {
 const MENU: &[MenuEntry] = &[
     MenuEntry { label: "Convert PDF", blurb: "fuzzy-find one PDF and convert it to Markdown", route: Some(Route::ConvertPdf) },
     MenuEntry { label: "Convert Folder", blurb: "recursively batch-convert a folder of PDFs", route: Some(Route::ConvertFolder) },
-    MenuEntry { label: "File Explorer", blurb: "browse directories; open a PDF into the converter", route: Some(Route::Explorer) },
+    MenuEntry { label: "File Explorer", blurb: "browse directories; open a PDF into the viewer", route: Some(Route::Explorer) },
+    MenuEntry { label: "View PDF", blurb: "fuzzy-find a PDF and read it (reflow / image modes)", route: Some(Route::Viewer) },
     MenuEntry { label: "AI Chat", blurb: "chat with the local kopi-o model", route: Some(Route::Chat) },
     MenuEntry { label: "kvim (Editor)", blurb: "open the kvim modal editor; returns here on exit", route: Some(Route::Editor) },
     MenuEntry { label: "Scan", blurb: "scan a Rust project's real tooling", route: Some(Route::Scan) },

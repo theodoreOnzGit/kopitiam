@@ -44,6 +44,7 @@ mod explorer;
 mod home;
 mod logic;
 mod theme;
+mod viewer;
 
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
@@ -70,6 +71,7 @@ use commands::{CommandPane, PlanPrompt};
 use convert::{ConvertFolderState, ConvertPdfState};
 use explorer::ExplorerState;
 use home::HomeState;
+use viewer::ViewerState;
 
 /// Options for `kopitiam tui`. Mirrors [`crate::ai::ChatConfig`] so the chat
 /// view seeds the model identically to `kopitiam ai chat`.
@@ -97,6 +99,7 @@ pub enum Route {
     ConvertPdf,
     ConvertFolder,
     Explorer,
+    Viewer,
     Chat,
     Editor,
     Scan,
@@ -118,6 +121,8 @@ pub enum Transition {
     Open(Route),
     /// Open the Convert PDF flow pre-selected on this file (from the explorer).
     OpenConvertFile(PathBuf),
+    /// Open the PDF Viewer straight on this file (from the explorer).
+    OpenViewFile(PathBuf),
     /// Run the plan workflow with this task (from the Plan prompt).
     RunPlan(String),
 }
@@ -138,6 +143,10 @@ enum View {
     ConvertPdf(ConvertPdfState),
     ConvertFolder(ConvertFolderState),
     Explorer(ExplorerState),
+    /// Boxed because [`ViewerState`] (which owns an optional open document with
+    /// its rasteriser and graphics-protocol picker) is much larger than the
+    /// other variants; boxing keeps `View` small.
+    Viewer(Box<ViewerState>),
     Chat,
     Command(CommandPane),
     Plan(PlanPrompt),
@@ -229,6 +238,14 @@ impl App {
             {
                 folder.step();
             }
+            // Run the viewer's (possibly slow) reflow render one frame after its
+            // "rendering…" notice has painted, so the app never freezes on a
+            // black screen.
+            if let View::Viewer(viewer) = &mut self.view
+                && viewer.needs_render()
+            {
+                viewer.render_now();
+            }
 
             if event::poll(Duration::from_millis(30))?
                 && let Event::Key(key) = event::read()?
@@ -251,6 +268,7 @@ impl App {
             View::ConvertPdf(state) => state.on_key(key),
             View::ConvertFolder(state) => state.on_key(key),
             View::Explorer(state) => state.on_key(key),
+            View::Viewer(state) => state.on_key(key),
             View::Command(state) => state.on_key(key),
             View::Plan(state) => state.on_key(key),
             View::Chat => {
@@ -275,6 +293,9 @@ impl App {
             Transition::OpenConvertFile(pdf) => {
                 self.view = View::ConvertPdf(ConvertPdfState::with_file(pdf));
             }
+            Transition::OpenViewFile(pdf) => {
+                self.view = View::Viewer(Box::new(ViewerState::with_file(pdf)));
+            }
             Transition::RunPlan(task) => {
                 self.pending = Some(Pending::Plan(task));
                 self.view = View::Home;
@@ -288,6 +309,7 @@ impl App {
             Route::ConvertPdf => View::ConvertPdf(ConvertPdfState::new(self.cwd.clone())),
             Route::ConvertFolder => View::ConvertFolder(ConvertFolderState::new(self.cwd.clone())),
             Route::Explorer => View::Explorer(ExplorerState::new(self.cwd.clone())),
+            Route::Viewer => View::Viewer(Box::new(ViewerState::new(self.cwd.clone()))),
             Route::Chat => {
                 self.ensure_chat();
                 View::Chat
@@ -382,6 +404,7 @@ impl App {
             View::ConvertPdf(state) => state.footer_hints(),
             View::ConvertFolder(state) => state.footer_hints(),
             View::Explorer(state) => state.footer_hints(),
+            View::Viewer(state) => state.footer_hints(),
             View::Command(state) => state.footer_hints(),
             View::Plan(state) => state.footer_hints(),
             View::Chat => self.chat.as_ref().map(ChatView::footer_hints).unwrap_or_default(),
@@ -392,6 +415,7 @@ impl App {
             View::ConvertPdf(state) => state.render(frame, body),
             View::ConvertFolder(state) => state.render(frame, body),
             View::Explorer(state) => state.render(frame, body),
+            View::Viewer(state) => state.render(frame, body),
             View::Command(state) => state.render(frame, body),
             View::Plan(state) => state.render(frame, body),
             View::Chat => {
@@ -486,9 +510,9 @@ mod tests {
     #[test]
     fn selecting_editor_arms_pending_and_stays_home() {
         let mut app = app();
-        // Editor is the 5th entry (index 4): Convert PDF, Convert Folder,
-        // File Explorer, AI Chat, kvim (Editor).
-        for _ in 0..4 {
+        // Editor is index 5: Convert PDF, Convert Folder, File Explorer,
+        // View PDF, AI Chat, kvim (Editor).
+        for _ in 0..5 {
             app.handle_key(key(KeyCode::Char('j')));
         }
         app.handle_key(key(KeyCode::Enter));
@@ -501,8 +525,9 @@ mod tests {
     #[test]
     fn plan_prompt_arms_pending_plan_on_enter() {
         let mut app = app();
-        // Plan is index 7: ...Chat(3), Editor(4), Scan(5), Status(6), Plan(7).
-        for _ in 0..7 {
+        // Plan is index 8: ...View PDF(3), Chat(4), Editor(5), Scan(6),
+        // Status(7), Plan(8).
+        for _ in 0..8 {
             app.handle_key(key(KeyCode::Char('j')));
         }
         app.handle_key(key(KeyCode::Enter)); // -> Plan prompt
@@ -518,6 +543,28 @@ mod tests {
         let mut app = app();
         app.apply(Transition::OpenConvertFile(PathBuf::from("/x/y/paper.pdf")));
         assert!(matches!(app.view, View::ConvertPdf(_)));
+    }
+
+    #[test]
+    fn home_to_viewer_and_back_home() {
+        let mut app = app();
+        // "View PDF" is index 3: Convert PDF, Convert Folder, File Explorer,
+        // View PDF.
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char('j')));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.view, View::Viewer(_)));
+        // Esc on the viewer's picker returns to the home menu.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.view, View::Home));
+    }
+
+    #[test]
+    fn opening_a_pdf_from_the_explorer_enters_the_viewer() {
+        let mut app = app();
+        app.apply(Transition::OpenViewFile(PathBuf::from("/x/y/paper.pdf")));
+        assert!(matches!(app.view, View::Viewer(_)));
     }
 
     #[test]

@@ -44,6 +44,24 @@ nucleo-matcher = "0.3"
 # not in [workspace.dependencies]); the crate itself targets aarch64-linux-android,
 # so it does not compromise the Android build. Pinned to the workspace version.
 kopitiam-neovim = { path = "../../crates/kopitiam-neovim", version = "0.2.1" }
+# The PDF **viewer** View's image mode. `ratatui-image` auto-detects the
+# terminal's graphics protocol (kitty / sixel / iTerm2) and falls back to
+# Unicode half-blocks on terminals that support none of them -- which is what
+# keeps the viewer Termux-safe (Termux's terminal has no graphics protocol, so
+# it lands on the half-block path). Pure Rust: we take ONLY the `crossterm`
+# feature (matching the app's crossterm backend) and deliberately leave
+# `chafa-dyn`/`chafa-static` OFF -- those are the sole features that would link
+# the `chafa` C library. `default-features = false` also drops `image-defaults`
+# so no image codec (some of which want C) is pulled in; the viewer never
+# decodes an image file, it rasterises pages straight to an in-memory
+# `RgbaImage`. No C, no `cc`/CMake in the build.
+ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+# The in-memory pixel buffer type (`image::RgbaImage` / `DynamicImage`) the
+# `PageRasterizer` seam produces and `ratatui-image` consumes. Pure Rust.
+# `default-features = false` drops every codec (PNG/JPEG/... , some of which
+# reach for C) -- unneeded because pages are rasterised to raw RGBA in memory,
+# never encoded to or decoded from a file format here.
+image = { version = "0.25", default-features = false }
 
 [dev-dependencies]
 # Used by adapter-selection tests to build throwaway model stores in a

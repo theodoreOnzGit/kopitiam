@@ -42,6 +42,27 @@ pub fn discover_pdfs(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Recursively find every directory under `root` (including `root` itself),
+/// returned sorted by path for a stable listing.
+///
+/// The companion of [`discover_pdfs`] for the fuzzy **input-folder** picker: it
+/// lets the user fuzzy-find a target directory the same way they fuzzy-find a
+/// PDF. Same pure-Rust `walkdir` walk (Android/Termux-safe), same silent-skip of
+/// unreadable entries. `root` is included first so the search root itself is
+/// always a selectable candidate (the typed-path fallback: type a path in the
+/// root box and it is the first entry).
+pub fn discover_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_dir())
+        .map(|entry| entry.into_path())
+        .collect();
+    out.sort();
+    out
+}
+
 /// True when `path` has a `.pdf` extension, compared case-insensitively so
 /// `Paper.PDF` and `paper.pdf` both count.
 pub fn is_pdf(path: &Path) -> bool {
@@ -212,6 +233,37 @@ mod tests {
         // the second, so the first must rank and the second must be excluded.
         let ranked = fuzzy_rank("amn", &candidates);
         assert_eq!(ranked, vec![0]);
+    }
+
+    #[test]
+    fn discover_dirs_includes_root_and_nested_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("reports/2024")).unwrap();
+        std::fs::create_dir_all(root.join("invoices")).unwrap();
+        std::fs::write(root.join("reports/note.pdf"), b"x").unwrap();
+
+        let dirs = discover_dirs(root);
+        // root, reports, reports/2024, invoices → 4 directories, no files.
+        assert_eq!(dirs.len(), 4, "dirs = {dirs:?}");
+        assert!(dirs.iter().any(|d| d == root));
+        assert!(dirs.iter().any(|d| d.ends_with("reports/2024") || d.ends_with("reports\\2024")));
+        assert!(dirs.iter().all(|d| d.is_dir()));
+    }
+
+    #[test]
+    fn fuzzy_rank_over_a_dir_listing_picks_expected_and_drops_non_matches() {
+        // A synthetic directory listing (the shape both new pickers filter).
+        let names = vec![
+            "annual_reports".to_string(),
+            "invoices".to_string(),
+            "receipts".to_string(),
+        ];
+        // "rep" targets annual_reports.
+        let ranked = fuzzy_rank("rep", &names);
+        assert_eq!(ranked.first().copied(), Some(0), "ranked = {ranked:?}");
+        // A query that matches nothing drops every candidate.
+        assert!(fuzzy_rank("zzzzz", &names).is_empty());
     }
 
     #[test]

@@ -20,7 +20,8 @@ use ratatui::{
 };
 
 use super::logic::{
-    default_batch_output, derive_md_name, discover_pdfs, fuzzy_rank, mirror_output_path,
+    default_batch_output, derive_md_name, discover_dirs, discover_pdfs, fuzzy_rank,
+    mirror_output_path,
 };
 use super::theme::{CHILLI, DIM, GOLD, PALM, STEAM, TAN, USER};
 use super::Transition;
@@ -466,7 +467,22 @@ struct BatchItem {
 /// State for the recursive Convert Folder flow.
 pub struct ConvertFolderState {
     stage: FolderStage,
-    input_text: String,
+    // ---- input-folder fuzzy picker (FolderStage::Input) ----
+    /// Where directory discovery is rooted.
+    search_root: PathBuf,
+    /// The editable search-root text (also the typed-path fallback).
+    root_input: String,
+    /// Every directory discovered under `search_root` (root included first).
+    dir_candidates: Vec<PathBuf>,
+    /// Display strings (relative to `search_root`), parallel to `dir_candidates`.
+    dir_display: Vec<String>,
+    query: String,
+    /// Indices into `dir_candidates`, ranked best-first for the current query.
+    ranked: Vec<usize>,
+    /// Position within `ranked` of the highlighted row.
+    selected: usize,
+    focus: Focus,
+    // ---- output + run ----
     output_text: String,
     input_root: PathBuf,
     output_root: PathBuf,
@@ -477,23 +493,72 @@ pub struct ConvertFolderState {
 }
 
 impl ConvertFolderState {
-    /// Open the batch flow with the input prefilled to `cwd`.
+    /// Open the batch flow with the fuzzy input-folder picker rooted at `cwd`.
     pub fn new(cwd: PathBuf) -> Self {
-        Self {
+        let mut state = Self {
             stage: FolderStage::Input,
-            input_text: cwd.display().to_string(),
+            root_input: cwd.display().to_string(),
+            search_root: cwd.clone(),
+            dir_candidates: Vec::new(),
+            dir_display: Vec::new(),
+            query: String::new(),
+            ranked: Vec::new(),
+            selected: 0,
+            focus: Focus::Query,
             output_text: String::new(),
+            // Prefilled to `cwd` so a direct `start()` (used in tests / headless
+            // flows) has a sensible input root even without going through the
+            // picker.
             input_root: cwd,
             output_root: PathBuf::new(),
             items: Vec::new(),
             cursor: 0,
             scroll: 0,
+        };
+        state.rescan_dirs();
+        state
+    }
+
+    /// Re-walk `search_root` for directories and rebuild the display + ranking.
+    fn rescan_dirs(&mut self) {
+        self.dir_candidates = discover_dirs(&self.search_root);
+        self.dir_display = self
+            .dir_candidates
+            .iter()
+            .map(|p| {
+                let rel = p.strip_prefix(&self.search_root).unwrap_or(p).display().to_string();
+                // The root itself strips to an empty string; show it as ".".
+                if rel.is_empty() { ".".to_string() } else { rel }
+            })
+            .collect();
+        self.refilter_dirs();
+    }
+
+    /// Recompute the ranked directory list for the current query.
+    fn refilter_dirs(&mut self) {
+        self.ranked = fuzzy_rank(&self.query, &self.dir_display);
+        if self.selected >= self.ranked.len() {
+            self.selected = self.ranked.len().saturating_sub(1);
         }
+    }
+
+    fn move_sel(&mut self, delta: i32) {
+        if self.ranked.is_empty() {
+            return;
+        }
+        let len = self.ranked.len() as i32;
+        self.selected = (self.selected as i32 + delta).rem_euclid(len) as usize;
     }
 
     pub fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.stage {
-            FolderStage::Input => vec![("type", "input folder"), ("Enter", "next"), ("Esc", "home")],
+            FolderStage::Input => vec![
+                ("type", "filter"),
+                ("↑/↓", "move"),
+                ("Tab", "root/search"),
+                ("Enter", "pick folder"),
+                ("Esc", "home"),
+            ],
             FolderStage::Output => vec![("type", "output folder"), ("Enter", "start"), ("Esc", "back")],
             FolderStage::Running => {
                 if self.is_done() {
@@ -541,19 +606,7 @@ impl ConvertFolderState {
             return Transition::Quit;
         }
         match self.stage {
-            FolderStage::Input => match key.code {
-                KeyCode::Esc => return Transition::Home,
-                KeyCode::Enter => {
-                    self.input_root = PathBuf::from(self.input_text.trim());
-                    self.output_text = default_batch_output(&self.input_root).display().to_string();
-                    self.stage = FolderStage::Output;
-                }
-                KeyCode::Backspace => {
-                    self.input_text.pop();
-                }
-                KeyCode::Char(c) => self.input_text.push(c),
-                _ => {}
-            },
+            FolderStage::Input => return self.on_key_input(key, ctrl),
             FolderStage::Output => match key.code {
                 KeyCode::Esc => self.stage = FolderStage::Input,
                 KeyCode::Enter => self.start(),
@@ -571,6 +624,65 @@ impl ConvertFolderState {
             },
         }
         Transition::Stay
+    }
+
+    /// Handle a key on the fuzzy input-folder picker. Mirrors the single-PDF
+    /// picker: type to fuzzy-filter, ↑/↓ (or Ctrl-p/n) to move, Tab to swap
+    /// between the search-root box and the query, Enter to pick.
+    fn on_key_input(&mut self, key: KeyEvent, ctrl: bool) -> Transition {
+        match key.code {
+            KeyCode::Esc => return Transition::Home,
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Query => Focus::Root,
+                    Focus::Root => Focus::Query,
+                };
+            }
+            KeyCode::Up => self.move_sel(-1),
+            KeyCode::Down => self.move_sel(1),
+            KeyCode::Char('p') if ctrl => self.move_sel(-1),
+            KeyCode::Char('n') if ctrl => self.move_sel(1),
+            KeyCode::Enter => match self.focus {
+                Focus::Root => {
+                    // Re-root discovery at the typed path (the typed-path fallback).
+                    self.search_root = PathBuf::from(self.root_input.trim());
+                    self.selected = 0;
+                    self.rescan_dirs();
+                    self.focus = Focus::Query;
+                }
+                Focus::Query => {
+                    if let Some(&cand_idx) = self.ranked.get(self.selected) {
+                        self.select_input_dir(self.dir_candidates[cand_idx].clone());
+                    }
+                }
+            },
+            KeyCode::Backspace => match self.focus {
+                Focus::Query => {
+                    self.query.pop();
+                    self.refilter_dirs();
+                }
+                Focus::Root => {
+                    self.root_input.pop();
+                }
+            },
+            KeyCode::Char(c) if !ctrl => match self.focus {
+                Focus::Query => {
+                    self.query.push(c);
+                    self.refilter_dirs();
+                }
+                Focus::Root => self.root_input.push(c),
+            },
+            _ => {}
+        }
+        Transition::Stay
+    }
+
+    /// Commit `dir` as the input root, prefill the default output, and advance to
+    /// the output-folder stage.
+    fn select_input_dir(&mut self, dir: PathBuf) {
+        self.input_root = dir;
+        self.output_text = default_batch_output(&self.input_root).display().to_string();
+        self.stage = FolderStage::Output;
     }
 
     /// Discover the PDFs, build the mirrored output queue, and enter Running.
@@ -595,19 +707,7 @@ impl ConvertFolderState {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         match self.stage {
-            FolderStage::Input => {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Min(0)])
-                    .split(area);
-                frame.render_widget(
-                    Paragraph::new("Recursively convert every PDF under a folder, mirroring its subdirectories.")
-                        .style(Style::default().fg(STEAM))
-                        .wrap(Wrap { trim: false }),
-                    chunks[0],
-                );
-                frame.render_widget(input_box(" input folder ", &self.input_text, true), chunks[1]);
-            }
+            FolderStage::Input => self.render_input_picker(frame, area),
             FolderStage::Output => {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -623,6 +723,48 @@ impl ConvertFolderState {
                 frame.render_widget(input_box(" output folder ", &self.output_text, true), chunks[1]);
             }
             FolderStage::Running => self.render_running(frame, area),
+        }
+    }
+
+    /// Render the fuzzy input-folder picker (the same shape as the single-PDF
+    /// picker): a search-root box, a fuzzy-query box, and the ranked directory
+    /// list.
+    fn render_input_picker(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(3)])
+            .split(area);
+
+        frame.render_widget(input_box(" search root ", &self.root_input, self.focus == Focus::Root), chunks[0]);
+        frame.render_widget(input_box(" fuzzy folder ", &self.query, self.focus == Focus::Query), chunks[1]);
+
+        let items: Vec<ListItem> = self
+            .ranked
+            .iter()
+            .map(|&idx| ListItem::new(Line::from(Span::styled(self.dir_display[idx].clone(), Style::default().fg(TAN)))))
+            .collect();
+
+        let title = format!(" {} folder(s) · {} match ", self.dir_candidates.len(), self.ranked.len());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(DIM))
+            .title(Span::styled(title, Style::default().fg(GOLD).add_modifier(Modifier::BOLD)));
+
+        if self.ranked.is_empty() {
+            let msg = if self.dir_candidates.is_empty() {
+                "No folders found under this root. Tab to the search-root box to change it."
+            } else {
+                "No matches for this query."
+            };
+            frame.render_widget(Paragraph::new(msg).style(Style::default().fg(STEAM)).block(block), chunks[2]);
+        } else {
+            let list = List::new(items).block(block).highlight_symbol("▍ ").highlight_style(
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            );
+            let mut state = ListState::default();
+            state.select(Some(self.selected.min(self.ranked.len().saturating_sub(1))));
+            frame.render_stateful_widget(list, chunks[2], &mut state);
         }
     }
 
@@ -724,6 +866,46 @@ mod tests {
         };
         let lines = success_lines(&outcome);
         assert!(!lines.iter().any(|l| l.contains("skipped")));
+    }
+
+    #[test]
+    fn folder_input_picker_fuzzy_filters_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("annual_reports/2024")).unwrap();
+        std::fs::create_dir_all(root.join("invoices")).unwrap();
+
+        let mut state = ConvertFolderState::new(root.to_path_buf());
+        // The root plus three nested dirs are discovered.
+        assert!(state.dir_candidates.len() >= 4, "candidates = {:?}", state.dir_display);
+
+        // Fuzzy-filtering to "report" keeps the reports subtree and drops invoices.
+        state.query = "report".to_string();
+        state.refilter_dirs();
+        assert!(!state.ranked.is_empty());
+        let ranked_names: Vec<&String> = state.ranked.iter().map(|&i| &state.dir_display[i]).collect();
+        // The reports subtree ranks; the unrelated "invoices" dir is dropped.
+        assert!(ranked_names.iter().any(|n| n.contains("annual_reports")));
+        assert!(!ranked_names.iter().any(|n| n.as_str() == "invoices"));
+
+        // A non-matching query drops everything.
+        state.query = "zzzzz".to_string();
+        state.refilter_dirs();
+        assert!(state.ranked.is_empty());
+    }
+
+    #[test]
+    fn folder_input_picker_selects_dir_and_advances_to_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("papers")).unwrap();
+
+        let mut state = ConvertFolderState::new(root.to_path_buf());
+        state.select_input_dir(root.join("papers"));
+        assert!(matches!(state.stage, FolderStage::Output));
+        assert_eq!(state.input_root, root.join("papers"));
+        // Default output is the `markdown` subdir of the chosen input.
+        assert_eq!(state.output_text, root.join("papers").join("markdown").display().to_string());
     }
 
     #[test]
