@@ -72,7 +72,8 @@ CRATES=(
     kopitiam-ai          # depends on: kopitiam-{loader,runtime,tokenizer}
     kopitiam-workflow    # depends on: kopitiam-{ai,knowledge,ontology,workspace}
     kopitiam-neovim      # editor (kvim); depends on config/lua/syntax/snippet/semantic
-    kopitiam             # depends on: all of the above (incl. kopitiam-neovim, via the TUI)
+    kopitiam-ocr         # NEW 0.1.0: Tesseract LSTM OCR port; depends on kopitiam-tensor
+    kopitiam             # depends on: all of the above (incl. kopitiam-neovim + kopitiam-ocr)
 )
 
 # Resolves a crate's OWN published version straight from Cargo's own view of
