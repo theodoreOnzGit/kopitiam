@@ -88,12 +88,51 @@ combine one-way into AGPLv3 as usual, with their notices retained.
 | [pypdf](https://github.com/py-pdf/pypdf) | BSD-3-Clause | `0a87f78` | Layout-mode text reconstruction cross-check |
 | [pdf-to-markdown](https://github.com/iamarunbrahma/pdf-to-markdown) | MIT | `54baa2e` | PDF→Markdown pipeline: multi-column reading order, header / footer stripping, heading / table reconstruction |
 | [marker](https://github.com/datalab-to/marker) | Apache-2.0 | — | **Clean-room study only — no code copied.** The running-head / running-foot detection *guard rails* in `kopitiam-document`'s `reconstruction/headers.rs` (the margin-zone constraint and the "be conservative on short documents" minimum-page rule) were informed by reading marker's `processors/marginalia.py` and `processors/ignoretext.py`. The signature-recurrence algorithm itself is adapted from pdf-to-markdown (above); marker was studied for the safety conditions wrapped around it. Original Rust throughout. |
-| [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | AGPL-3.0 | — | High-capability text extraction (blocks / lines / spans with bounding boxes); now license-compatible under the AGPLv3 relicense |
-| [MuPDF](https://github.com/ArtifexSoftware/mupdf) | AGPL-3.0 | — | The C extraction engine PyMuPDF binds |
+| [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | AGPL-3.0 | — | High-capability text extraction (blocks / lines / spans with bounding boxes); kept purely as an **API-shape** reference (what `get_text` yields). The algorithm KOPITIAM ports is always the underlying C, never the Python binding (AID-0051). Now license-compatible under the AGPLv3 relicense |
+| [MuPDF](https://github.com/ArtifexSoftware/mupdf) | AGPL-3.0 | `19f1284` | The C engine PyMuPDF binds — the **primary translation source** for `kopitiam-pdf/src/mupdf/`. The port has grown from text extraction into a near-complete PDF **rendering vertical**: the `fitz` geometry / stream / filter primitives, the PDF object / lexer / parser / xref layer, CMap / font / ToUnicode / AGL, the `stext` structured-text device, **the content interpreter wired to a draw device** (`op_run.rs` / `page_run.rs` / `resources.rs`, from `pdf-op-run.c`), **a pure-Rust rasterizer** (`pixmap.rs` / `draw_edge.rs` / `draw_path.rs` / `draw_device.rs`, from `pixmap.c` / `path.c` / `draw-*.c`), **embedded-font glyph-outline decoding** (`glyph*.rs`), and **embedded-image decode** (`page_image.rs`, from `pdf-image.c` / `image.c` / `load-jpeg.c`). Every ported unit carries a point-of-use provenance header naming the source file and pinned commit; `docs/port-ledger.md` enumerates all 81 MuPDF source→target units, each at `19f1284`. See AID-0051 (port conventions) and AID-0052 (the C-delegation substitutions below) |
+| [tdf](https://github.com/itsjunetime/tdf) | AGPL-3.0 | — | Terminal PDF **viewer** studied for the "tdf-parity" target: how a Rust TUI presents rasterized pages (responsive layout, graphics-protocol detection, half-block fallback) that the new draw-device / `ratatui-image` viewer path matches. Clean-room study of the UX only; the rasterizer itself is the MuPDF translation above |
 
 As with every other reference here, these are credited up front, their upstream
 licenses are recorded and honored, and any close translation records its
 provenance at the point of use — they are studied, not shipped.
+
+### Pure-Rust substitutions for the C libraries MuPDF delegates to
+
+MuPDF is not self-contained: for three jobs it hands off to a bundled C library
+(`<zlib.h>` for FlateDecode, `<jpeglib.h>` for DCTDecode, **FreeType** for
+embedded-font outlines). KOPITIAM's Pure Rust Core forbids a mandatory C
+toolchain, so the port does **not** translate those C libraries. Instead, where
+MuPDF would call one, the port either **substitutes a pure-Rust crate** that is
+linked and shipped, or **re-implements the format from its public specification**
+(clean-room). This is a distinct provenance relationship from the MuPDF
+translation above, and is recorded here and in **AID-0052**:
+
+* **FlateDecode / zlib → `miniz_oxide`.** `filter_flate.rs` wires miniz_oxide's
+  streaming inflate into an `fz_stream`-style filter in place of MuPDF's zlib
+  call. The filter *plumbing* is translated from MuPDF; the DEFLATE codec is the
+  pure-Rust crate.
+* **DCTDecode / libjpeg → `zune-jpeg`.** `page_image.rs` translates MuPDF's
+  `/Width /Height /ColorSpace /Decode /Filter` reading and sample unpacking
+  (`pdf-image.c` / `image.c`), but the JPEG bitstream itself is decoded by the
+  pure-Rust `zune-jpeg` (with `zune-core`) rather than by `load-jpeg.c`'s
+  libjpeg. `MIT OR Apache-2.0 OR Zlib`; no C in the build.
+* **Embedded-font outlines / FreeType → spec re-implementation (no crate).**
+  MuPDF reads `/FontFile2` / `/FontFile3` programs through FreeType. This port
+  **avoids FreeType entirely**: `glyph.rs` keeps MuPDF's outline→`Path`
+  *callback shape* (the `move_to` / `line_to` / `conic_to` / `cubic_to`
+  decompose of `font.c`), but the actual font-program parsing is written
+  **clean-room from the format specifications** — the OpenType `glyf`/`loca`
+  tables (`glyph_truetype.rs`) and the Adobe CFF / Type2 Charstring format,
+  Technical Note #5177 (`glyph_cff.rs`). One narrow exception is recorded at the
+  point of use: the CFF *container* parse (`INDEX` / `DICT` / charset / FDSelect
+  / `subr_bias`) is a close adaptation of MuPDF's own non-FreeType CFF reader in
+  `source/fitz/subset-cff.c` (still MuPDF, still `19f1284`), not of FreeType.
+
+The consequence for provenance is that these subsystems are **not** derivative
+of FreeType or libjpeg: the glyph decoders are spec-based original Rust (plus one
+MuPDF-`subset-cff.c` adaptation), and the JPEG/zlib paths are permissive shipped
+crates whose notices travel with the binary. See "Notable shipped Rust
+dependencies" below.
 
 ## OCR references (translation / close adaptation)
 
@@ -119,9 +158,10 @@ vendored or committed.
 Unlike everything above, these are **forks**. Their code is reused directly,
 their copyright notices are retained, and the crate's rustdoc says so.
 
-| Project | License | KOPITIAM crate | Why forked |
-| --- | --- | --- | --- |
-| [rmux](https://github.com/helvesec/rmux) | MIT OR Apache-2.0 | `kmux` | Terminal multiplexer, already Rust, but it does not run on Android. Forked to add Android/Termux support alongside Linux, macOS and Windows. Upstream copyright: **"The RMUX Authors"**. |
+| Project | License | Fork commit | KOPITIAM crate | Why forked |
+| --- | --- | --- | --- | --- |
+| [rmux](https://github.com/helvesec/rmux) | MIT OR Apache-2.0 | — | `kmux` | Terminal multiplexer, already Rust, but it does not run on Android. Forked to add Android/Termux support alongside Linux, macOS and Windows. Upstream copyright: **"The RMUX Authors"**. |
+| [beads-rs](https://github.com/delightful-ai/beads-rs) | MIT | `d98da23` | `kopitiam-bds` | The `bd` issue tracker KOPITIAM uses for its own work items (every AID is filed as a `bd` issue), already Rust, but upstream v0.1.26 / 0.2.0-alpha does not build on Windows (~19 errors: Unix-only deps and a Unix-domain-socket-only daemon IPC layer). Forked to add Windows and Android/Termux support. Upstream copyright: **© 2025 Darin Kishore**. |
 
 ### What the rmux fork actually consists of
 
@@ -151,6 +191,60 @@ Android/Termux port (`cfg` widening, the `rmux_os::runtime_dir` resolver, the
 Bionic-specific PTY/signal/locale paths) and the `kmux` binary rename. See
 `docs/ai-decisions/AID-0006`.
 
+### What the beads-rs fork actually consists of
+
+The same "fork" caveats apply to `kopitiam-bds`, and are recorded in full in
+`crates/kopitiam-bds/NOTICE`.
+
+**The whole of beads-rs was taken**, not a subset: the top package plus every
+nested crate under `crates/kopitiam-bds/crates/` (beads-core, beads-api,
+beads-bootstrap, beads-surface, beads-macros, beads-cli, beads-git, beads-daemon,
+beads-daemon-core, beads-http), forked from upstream `main` at commit
+`d98da231` (post-dates the tagged v0.1.26; reports itself as `0.2.0-alpha`).
+**The overwhelming majority of this code was written by the beads-rs author,
+Darin Kishore, not by KOPITIAM.**
+
+* Upstream's `LICENSE-MIT` ships unmodified in `crates/kopitiam-bds/`, and
+  `crates/kopitiam-bds/NOTICE` records the fork, the commit, and every change.
+* The top package is renamed `beads-rs` → `kopitiam-bds` (`publish = false`);
+  the library keeps the upstream crate name `beads_rs` and every sub-crate keeps
+  its upstream name (with a `-kopitiam.1` suffix) so diffs and future merges
+  against upstream stay readable — mirroring `kmux`.
+* The fork is distributed under **AGPL-3.0-only** as part of KOPITIAM, which the
+  permissive upstream MIT license allows so long as its notice travels with the
+  code. **This does not relicense beads-rs**, which remains available from its
+  author under MIT.
+* KOPITIAM's contributions are concentrated in **Windows support** (the reason
+  for the fork: a cross-platform Unix-domain-socket alias, Win32 process
+  liveness / `LockFileEx` store locking / `CreateProcessW` daemon spawn, `cfg`
+  gating of POSIX signals and `nix`/`libc`/`signal-hook`) and the Android/Termux
+  code path (`cfg(unix)` covers `target_os = "android"`). Upstream's
+  release/packaging/CI scripts, the `fuzz` crate, and the `stateright`
+  model-checking harness were not carried into the fork's build.
+
+---
+
+## Notable shipped Rust dependencies (linked, notices retained)
+
+Everything above is either studied (never linked), or a whole-project fork. This
+section names the smaller set of **ordinary crates.io dependencies** that KOPITIAM
+links and ships and that are worth crediting individually — because they either
+**substitute for a C library** an upstream used (keeping the Pure Rust Core), or
+are load-bearing enough to name. These are used **as published**, unmodified;
+Cargo carries their license text, and their permissive licenses combine one-way
+into AGPLv3. (Routine crates — serde, tokio, ratatui, clap, … — are not
+enumerated here; their provenance is the Cargo lockfile.)
+
+| Crate | License | Role |
+| --- | --- | --- |
+| [pdf-extract](https://crates.io/crates/pdf-extract) | MIT | The pre-MuPDF-port PDF text-extraction path (wraps `lopdf`); still the `pdf-extract` engine option in `pdf2md` |
+| [lopdf](https://crates.io/crates/lopdf) | MIT | Low-level PDF object / content-stream walking for font-style recovery (`kopitiam-pdf`), `kopitiam-plot` vector paths |
+| [zune-jpeg](https://crates.io/crates/zune-jpeg) (+ `zune-core`) | MIT OR Apache-2.0 OR Zlib | Pure-Rust JPEG decoder substituting for MuPDF's libjpeg on the DCTDecode image path (see "Pure-Rust substitutions" above, AID-0052) |
+| [miniz_oxide](https://crates.io/crates/miniz_oxide) | MIT OR Zlib OR Apache-2.0 | Pure-Rust DEFLATE/zlib behind PDF FlateDecode, substituting for MuPDF's zlib |
+| [nucleo](https://crates.io/crates/nucleo) / [nucleo-matcher](https://crates.io/crates/nucleo-matcher) | MPL-2.0 | Fuzzy matching/ranking by the Helix authors — kvim's telescope-replacement pickers and the CLI/TUI PDF finder. MPL-2.0 is file-level copyleft, one-way compatible with AGPLv3; used unmodified as a dependency, so its files stay under MPL-2.0 |
+| [ratatui-image](https://crates.io/crates/ratatui-image) | MIT | The PDF viewer's image mode: graphics-protocol detection (kitty / sixel / iTerm2) with a Unicode half-block fallback for Termux. Taken with only the `crossterm` feature — the `chafa` C-linking features are deliberately left off |
+| [portable-pty](https://crates.io/crates/portable-pty) / [vt100](https://crates.io/crates/vt100) | MIT | kvim's `:term` emulator — pty spawn + ANSI/VT parsing, both pure Rust (see AID-0049) |
+
 ---
 
 ## Bundled assets
@@ -165,10 +259,15 @@ Bionic-specific PTY/signal/locale paths) and the `kmux` binary rename. See
 
 KOPITIAM is licensed AGPL-3.0-only (see README.md's "Why AGPLv3,
 specifically?"). Every permissively-licensed project above (MIT,
-Apache-2.0, BSD-3-Clause) is one-way compatible with AGPLv3: permissive
+Apache-2.0, BSD-2/3-Clause, Zlib) is one-way compatible with AGPLv3: permissive
 code can be incorporated into an AGPLv3 work, provided its copyright
 notices and license text are retained, and the combined work is then
-distributed under AGPLv3 as a whole.
+distributed under AGPLv3 as a whole. The **copyleft** upstreams combine too:
+the AGPL-3.0 ones (MuPDF, PyMuPDF, tdf) are the very reason the relicense to
+AGPL-3.0-only was made, GPL-3.0 (OpenFOAM) is upgrade-compatible with AGPLv3,
+and MPL-2.0 (nucleo) is file-level copyleft that co-exists with an AGPLv3 work
+so long as the MPL files keep their license — which, used unmodified as a
+dependency, they do.
 
 None of this is a license to copy code wholesale. See "Clean-room
 implementation" below.
