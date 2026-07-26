@@ -1,10 +1,41 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-25 (kvim nucleo-panic fix + 0.1.8 crates.io publish)
+**Last updated:** 2026-07-27 (NUS working-hours rule removed — KOPITIAM is SNRSI work now)
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
 
-> ## ✅ LATEST — 2026-07-25 (Sat, ~10:45 SGT, outside NUS hours)
+> ## ✅ LATEST — 2026-07-27 (Mon, ~07:30 SGT)
+>
+> **Governance change: the NUS working-hours restriction is GONE.** KOPITIAM is
+> SNRSI work now, so the personal-time/work split that rule protected no longer
+> exists. Removed from both `CLAUDE.md` and `AGENTS.md`: the Mon–Fri
+> 08:30–18:00 ban, the "on leave or public holiday?" ask, the
+> halt-at-the-08:30-boundary rule for in-flight agents, and the
+> `Worked during NUS hours — ...` commit trailer. **Any older note in this file
+> citing the NUS window (e.g. the 2026-07-16 block below) is superseded** —
+> agents run whenever now, no ask.
+>
+> **Still hard, unchanged:** the sleep-hours rule (23:30–06:00 SGT — agents may
+> run, maintainer's prompts get banked as beads, not worked live). It guards
+> rest, not the work/personal split, so the SNRSI move doesn't touch it.
+>
+> **Licence clarification worth banking (was stated loosely, now precise):**
+> KOPITIAM is AGPL-3.0-only **because `crates/kopitiam-pdf/src/mupdf/` is a port
+> of MuPDF's C into Rust** — a translation is a derivative work, and MuPDF is
+> AGPL-3.0 (Artifex). It is *not* merely the vendored reference sources under
+> `vendor/` that bind us; reading inert reference material would not. Practical
+> consequence: **KOPITIAM cannot be relicensed non-AGPL** while that port is in
+> the tree. A closed-source SNRSI distribution would need a commercial MuPDF
+> licence from Artifex, or the port ripped out. Becoming institute work does not
+> change this.
+>
+> **Environment note:** fresh container this session — no `target/` (release
+> build from cold), and **`bd` is NOT on PATH**, so beads could not be consulted
+> or filed. Anything needing a bead this session is recorded here instead.
+>
+> Everything below is older — read it for background, not for current state.
+
+> ## 2026-07-25 (Sat, ~10:45 SGT)
 >
 > Short session, nothing in-flight, no agents running, tree clean and pushed.
 >
