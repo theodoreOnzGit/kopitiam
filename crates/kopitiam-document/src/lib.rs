@@ -22,4 +22,4 @@ pub use list::List;
 pub use paragraph::Paragraph;
 pub use reconstruction::{reconstruct, reconstruct_preordered};
 pub use table::Table;
-pub use validation::{ConversionReport, validate};
+pub use validation::{ConversionReport, PageRecovery, validate};

@@ -32,6 +32,7 @@ const MIN_RECOVERY_RATIO: f64 = 0.98;
 /// [`ConversionReport::rendered_chars`]), because the same normalization is
 /// applied and the anchor lines themselves contribute zero content.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PageRecovery {
     /// 1-based page number, matching the block's `Document::block_pages` value
     /// and the `<!-- page N -->` anchor.
@@ -58,6 +59,7 @@ impl PageRecovery {
 /// blocks found, so every conversion is auditable rather than a silent
 /// best-effort guess.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ConversionReport {
     pub pages: usize,
 
@@ -143,6 +145,52 @@ impl ConversionReport {
     pub fn passes(&self) -> bool {
         self.recovery_ratio() >= MIN_RECOVERY_RATIO
     }
+
+    /// A machine-readable JSON view of this report (`kopitiam pdf2md
+    /// --report-json`, card I-F).
+    ///
+    /// # Why a bespoke view rather than the bare `#[derive(Serialize)]`
+    ///
+    /// The point of `--report-json` is that a caller gates on the recovery
+    /// ratio *without parsing prose* (`kopitiam_token_max.md` §0.2). But the
+    /// headline signals a caller actually gates on — [`recovery_ratio`], whether
+    /// it [`passes`], and the **per-page** ratios from card I-B — are computed
+    /// methods, not stored fields, so the raw field derive omits exactly them.
+    /// This view emits the stored fields *and* those computed signals, so
+    /// `recovery_ratio`, `passes`, and each page's `recovery_ratio` are present
+    /// as first-class numbers a script can test directly.
+    ///
+    /// [`recovery_ratio`]: Self::recovery_ratio
+    /// [`passes`]: Self::passes
+    #[cfg(feature = "serde")]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pages": self.pages,
+            "recovery_ratio": self.recovery_ratio(),
+            "passes": self.passes(),
+            "extracted_chars": self.extracted_chars,
+            "rendered_chars": self.rendered_chars,
+            "word_recovery_ratio": self.word_recovery_ratio(),
+            "extracted_words": self.extracted_words,
+            "rendered_words": self.rendered_words,
+            "headings_found": self.headings_found,
+            "lists_found": self.lists_found,
+            "tables_found": self.tables_found,
+            "citations_found": self.citations_found,
+            "per_page": self
+                .per_page
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "page": p.page,
+                        "extracted_chars": p.extracted_chars,
+                        "rendered_chars": p.rendered_chars,
+                        "recovery_ratio": p.recovery_ratio(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+    }
 }
 
 impl std::fmt::Display for ConversionReport {
@@ -178,5 +226,56 @@ impl std::fmt::Display for ConversionReport {
         writeln!(f, "Citations: {}", self.citations_found)?;
         writeln!(f)?;
         write!(f, "Status: {}", if self.passes() { "PASS" } else { "FAIL" })
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod json_tests {
+    use super::*;
+
+    fn sample() -> ConversionReport {
+        ConversionReport {
+            pages: 2,
+            extracted_words: 10,
+            rendered_words: 10,
+            extracted_chars: 100,
+            rendered_chars: 98,
+            headings_found: 3,
+            lists_found: 1,
+            tables_found: 2,
+            citations_found: 4,
+            per_page: vec![
+                PageRecovery { page: 1, extracted_chars: 60, rendered_chars: 60 },
+                PageRecovery { page: 2, extracted_chars: 40, rendered_chars: 38 },
+            ],
+        }
+    }
+
+    #[test]
+    fn to_json_carries_the_computed_signals_a_caller_gates_on() {
+        // Card I-F / §0.2: the computed recovery_ratio + passes must be present
+        // as first-class numbers, not left for the caller to re-derive.
+        let json = sample().to_json();
+        assert_eq!(json["pages"], 2);
+        // 98 / 100 = 0.98 -> exactly the PASS threshold.
+        assert!((json["recovery_ratio"].as_f64().unwrap() - 0.98).abs() < 1e-9);
+        assert_eq!(json["passes"], true);
+        assert_eq!(json["extracted_chars"], 100);
+        assert_eq!(json["rendered_chars"], 98);
+        assert_eq!(json["headings_found"], 3);
+        assert_eq!(json["tables_found"], 2);
+        assert_eq!(json["citations_found"], 4);
+    }
+
+    #[test]
+    fn to_json_includes_per_page_ratios_from_card_i_b() {
+        let json = sample().to_json();
+        let per_page = json["per_page"].as_array().unwrap();
+        assert_eq!(per_page.len(), 2);
+        assert_eq!(per_page[0]["page"], 1);
+        assert!((per_page[0]["recovery_ratio"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(per_page[1]["page"], 2);
+        // 38 / 40 = 0.95: the per-page view localizes the shortfall to page 2.
+        assert!((per_page[1]["recovery_ratio"].as_f64().unwrap() - 0.95).abs() < 1e-9);
     }
 }

@@ -14,3 +14,15 @@ exclude = ["vendor/"]
 [dependencies]
 kopitiam-pdf = { workspace = true }
 regex = { workspace = true }
+# Optional, feature-gated: lets `ConversionReport` serialize to JSON so a
+# machine consumer can gate on the recovery ratio without parsing the Display
+# prose (`kopitiam_token_max.md` §0.2, card I-F). `serde_json` backs the
+# `ConversionReport::to_json` view, which includes the *computed* signals
+# (recovery_ratio, passes, per-page ratios) a bare field derive would omit.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# Off by default so the library stays dependency-light for consumers that only
+# reconstruct/validate; `apps/cli` enables it for `pdf2md --report-json`.
+serde = ["dep:serde", "dep:serde_json"]

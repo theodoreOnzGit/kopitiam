@@ -13,7 +13,10 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 kopitiam-pdf = { workspace = true }
-kopitiam-document = { workspace = true }
+# `serde` feature on: `pdf2md --report-json` serializes the `ConversionReport`
+# (recovery ratio + per-page ratios) to JSON so callers gate on it without
+# parsing prose (`kopitiam_token_max.md` card I-F).
+kopitiam-document = { workspace = true, features = ["serde"] }
 kopitiam-markdown = { workspace = true }
 kopitiam-ontology = { workspace = true }
 kopitiam-semantic = { workspace = true }
@@ -25,6 +28,10 @@ kopitiam-ai = { workspace = true }
 kopitiam-models = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# `pdf2md --report-json` (card I-F) and the `<output>.index.json` sidecar
+# (card I-G): serialize small local structs and the report's JSON view.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # The `kopitiam tui` chat surface. Pinned to the same ratatui the `kvim`
 # editor uses (crates/kopitiam-neovim) so the workspace resolves one ratatui +
 # crossterm. crossterm is used via `ratatui::crossterm` (ratatui's default

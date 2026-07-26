@@ -2236,6 +2236,8 @@ dependencies = [
  "nucleo-matcher",
  "ratatui",
  "ratatui-image",
+ "serde",
+ "serde_json",
  "tempfile",
  "walkdir",
 ]
@@ -2342,6 +2344,8 @@ version = "0.2.1"
 dependencies = [
  "kopitiam-pdf",
  "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
