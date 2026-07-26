@@ -193,7 +193,26 @@ fn main() -> anyhow::Result<ExitCode> {
 /// Implements [`Command::Pdf2md`]: PDF in, semantic Markdown out, plus a
 /// validation report printed to stdout.
 fn pdf2md(input: &Path, output: Option<PathBuf>) -> anyhow::Result<()> {
-    let pages = kopitiam_pdf::extract(input)?;
+    // `kopitiam_pdf::extract` is panic-safe: even PDFs whose fonts make the
+    // underlying `pdf-extract` crate `panic!` come back as a normal `Err`
+    // (`ExtractError::UnsupportedFont`) instead of aborting the process. Turn
+    // that into a clear, actionable message so that a user batch-converting
+    // many PDFs sees this file fail cleanly and can move on, rather than the
+    // whole run dying on one bad document.
+    let pages = match kopitiam_pdf::extract(input) {
+        Ok(pages) => pages,
+        Err(err @ kopitiam_pdf::ExtractError::UnsupportedFont(_)) => {
+            anyhow::bail!(
+                "could not extract text from {}: {err} \
+                 (the PDF uses fonts with no unicode mapping)",
+                input.display()
+            );
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("could not extract text from {}", input.display())));
+        }
+    };
     let document = kopitiam_document::reconstruct(&pages);
     let markdown = kopitiam_markdown::render_document(&document);
     let report = kopitiam_document::validate(&pages, &document, &markdown);

@@ -1,10 +1,12 @@
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::path::Path as FsPath;
 use std::rc::Rc;
 
 use pdf_extract::{
     Document as PdfDocument, Error as PdfLoadError, MediaBox, OutputDev, OutputError, Transform,
-    output_doc,
+    output_doc_page,
 };
 
 use crate::font::FontStyle;
@@ -17,6 +19,19 @@ pub enum ExtractError {
     Load(#[from] PdfLoadError),
     #[error("failed to parse PDF content streams: {0}")]
     Parse(#[from] OutputError),
+    /// `pdf-extract` `panic!`ed while decoding a page's content stream, and
+    /// *every* page failed the same way so there was nothing left to salvage.
+    ///
+    /// The classic trigger is a font whose `/ToUnicode` CMap does not cover
+    /// the character codes the page actually uses and which also has no
+    /// `/Encoding` to fall back on: deep inside `pdf-extract`'s `decode_char`
+    /// this hits `expect("missing unicode map and encoding")` and unwinds. That
+    /// panic blows straight past every `Result`/`?`/`thiserror`/`anyhow` on the
+    /// way out, so the only way to keep it from aborting the whole process is
+    /// to guard the extraction with `catch_unwind` (see `run`). This variant
+    /// carries the recovered panic message.
+    #[error("could not decode PDF text: {0}")]
+    UnsupportedFont(String),
 }
 
 /// Extract physical layout (pages + text spans) from a PDF file on disk.
@@ -42,8 +57,96 @@ fn run(doc: &PdfDocument) -> Result<Vec<Page>, ExtractError> {
         word_fonts,
         ..PageCollector::default()
     };
-    output_doc(doc, &mut collector)?;
+
+    // `pdf-extract` 0.12.0 can `panic!` outright deep inside content-stream
+    // decoding (e.g. `expect("missing unicode map and encoding")` for a font
+    // whose `/ToUnicode` map doesn't cover a code it uses and which has no
+    // `/Encoding`). Such a panic unwinds past every `Result`/`?` here, so a
+    // plain `output_doc(doc, &mut collector)?` cannot contain it -- it would
+    // abort the whole process (and, for the CLI, a whole batch of PDFs).
+    //
+    // pdf-extract exposes a per-page entry point, `output_doc_page`, so we
+    // drive extraction one page at a time and wrap each page in
+    // `catch_unwind`. That isolates the blast radius to a single page: a good
+    // page still lands in `collector.pages`, and a page that makes
+    // pdf-extract panic is simply skipped (and counted) instead of discarding
+    // the entire document. `AssertUnwindSafe` is required because `&mut
+    // collector` (and `doc`) cross the unwind boundary; that is sound here
+    // because we explicitly reset the collector's transient per-page state
+    // after any failure (`reset_transient`), so no half-built page or word
+    // leaks into the next page.
+    let page_nums: Vec<u32> = doc.get_pages().into_keys().collect();
+
+    // Install a no-op panic hook for the duration of the guarded calls so the
+    // *expected, handled* panic doesn't dump a full backtrace to stderr for
+    // every malformed page. The panic message itself is still recovered from
+    // the payload below; only the noisy default hook is suppressed. The
+    // previous hook is restored before we return.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let mut skipped = 0usize;
+    let mut last_failure: Option<String> = None;
+
+    for page_num in page_nums {
+        let result =
+            std::panic::catch_unwind(AssertUnwindSafe(|| output_doc_page(doc, &mut collector, page_num)));
+        match result {
+            // Page decoded cleanly; its `Page` is already in `collector.pages`
+            // (pushed by `PageCollector::end_page`).
+            Ok(Ok(())) => {}
+            // A structured `OutputError` for this page. Rare, but treat it the
+            // same as a panic: skip the page, remember why, and keep going so
+            // one broken page doesn't sink the rest of the document.
+            Ok(Err(err)) => {
+                skipped += 1;
+                last_failure = Some(err.to_string());
+                collector.reset_transient();
+            }
+            // pdf-extract panicked while decoding this page. Recover the
+            // message from the payload, skip the page, carry on.
+            Err(payload) => {
+                skipped += 1;
+                last_failure = Some(panic_message(payload.as_ref()));
+                collector.reset_transient();
+            }
+        }
+    }
+
+    std::panic::set_hook(previous_hook);
+
+    // If we salvaged nothing at all yet something did go wrong, surface the
+    // failure instead of pretending we extracted an empty document. (A
+    // genuinely empty/zero-page PDF has no failures and returns `Ok(vec![])`,
+    // exactly as before.)
+    if collector.pages.is_empty()
+        && let Some(reason) = last_failure
+    {
+        return Err(ExtractError::UnsupportedFont(reason));
+    }
+
+    if skipped > 0 {
+        eprintln!(
+            "warning: skipped {skipped} unreadable page(s) while extracting text \
+             (fonts with no usable unicode mapping); continued with the remaining pages"
+        );
+    }
+
     Ok(collector.pages)
+}
+
+/// Recover a human-readable message from a `catch_unwind` panic payload.
+/// Panic payloads are almost always a `&'static str` (plain `panic!("lit")`)
+/// or a `String` (formatted panics, which is what `Option::expect` produces);
+/// anything else we can only describe generically.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "pdf-extract panicked while decoding the page".to_string()
+    }
 }
 
 #[derive(Default)]
@@ -60,6 +163,19 @@ struct PageCollector {
 }
 
 impl PageCollector {
+    /// Drop any half-built per-page state left behind when a page's
+    /// extraction was aborted mid-stream (by a panic or an `OutputError`), so
+    /// the *next* page starts from a clean slate instead of inheriting a
+    /// partially built `Page`, a dangling in-progress word, or a stale
+    /// word-font queue. `pages` (the salvaged output) is deliberately left
+    /// untouched. Without this, a `begin_word` on the next page would flush a
+    /// leftover word from the aborted page into the wrong `Page`.
+    fn reset_transient(&mut self) {
+        self.current = None;
+        self.word = WordBuilder::default();
+        self.current_page_fonts = WordFontQueue::default();
+    }
+
     fn flush_word(&mut self) {
         if let Some(span) = self.word.take()
             && let Some(page) = self.current.as_mut()
