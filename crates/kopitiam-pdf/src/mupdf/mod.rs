@@ -86,7 +86,11 @@ pub mod page_run;
 pub mod parse;
 pub mod pool;
 pub mod resources;
+pub mod stext_boxer;
+pub mod stext_classify;
 pub mod stext_device;
+pub mod stext_iterator;
+pub mod stext_para;
 pub mod stream;
 pub mod string_util;
 pub mod structured_text;
@@ -108,7 +112,10 @@ pub use object::Object;
 pub use page_run::{run_page, run_page_dict};
 pub use parse::{parse_array, parse_dict, parse_ind_obj, IndirectObject, StreamRange};
 pub use pool::{Handle, Pool};
+pub use stext_boxer::{page_to_stext_segmented, segment_stext_page};
 pub use stext_device::{page_to_stext, StextDevice};
+pub use stext_iterator::{block_bbox, blocks_dfs, line_bbox};
+pub use stext_para::paragraph_break;
 pub use stream::{Stream, StreamSource, Whence};
 pub use structured_text::{
     StextBlock, StextChar, StextImageBlock, StextLine, StextOptions, StextPage, StextTextBlock,
