@@ -251,9 +251,15 @@ fn builtin_catalog_has_at_least_two_families() {
 
 #[test]
 fn builtin_checksums_are_placeholders() {
-    // Documents the intentional placeholder state: every shipped checksum is
-    // 64 zeros until a real pull records the true value.
+    // Documents the intentional placeholder state: every shipped GGUF LLM
+    // checksum is 64 zeros until a real pull records the true value. The
+    // Tesseract `tessdata-*` entries are exempt -- their `.traineddata`
+    // hashes are REAL (computed from an actual pull), so they carry a genuine
+    // digest, not the sentinel.
     for s in Catalog::builtin() {
+        if s.id.starts_with("tessdata-") {
+            continue;
+        }
         for a in &s.artifacts {
             assert_eq!(a.sha256, "0".repeat(64), "{} still placeholder", a.filename);
         }

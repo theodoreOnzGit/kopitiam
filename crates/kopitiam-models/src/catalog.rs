@@ -94,11 +94,15 @@ impl Catalog {
     ///
     /// # WARNING -- the checksums here are placeholders, on purpose
     ///
-    /// Every [`Artifact::sha256`] below is the sentinel value
+    /// Every GGUF LLM [`Artifact::sha256`] below is the sentinel value
     /// `"0000...0000"` (64 zeros), NOT a real hash. Reason: a real sha256 can
     /// only be gotten by actually downloading the hundreds-of-MB weights file
     /// and hashing it, which cannot be done at authoring time. Better to be
     /// honest than to ship a catalog that lies about hashes it never checked.
+    ///
+    /// The small Tesseract `tessdata-*` OCR entries are the exception -- their
+    /// `.traineddata` files are small enough to have been pulled and hashed for
+    /// real, so those carry genuine sha256/size values and verify clean.
     ///
     /// The direct consequence, and this is by design: any [`crate::verify`]
     /// (via [`crate::ModelStore::verify`]) or [`crate::ensure_available`] on a
@@ -161,6 +165,54 @@ impl Catalog {
                     // TODO: record real sha256 after first successful pull.
                     sha256: PLACEHOLDER_SHA256.to_string(),
                     size_bytes: 771_000_000,
+                }],
+            },
+            // ---- Tesseract LSTM OCR models -------------------------------
+            // These are NOT GGUF LLM weights -- they are Tesseract's float
+            // LSTM `.traineddata` files from the `tessdata_best` repo (the
+            // most accurate, correct for technical + CJK papers). The store
+            // treats a `.traineddata` as just another verified Artifact, so
+            // the OCR engine fetches them through the same ModelStore. Family
+            // is carried as `Other("tesseract-lstm")` rather than a dedicated
+            // enum variant, so every existing exhaustive `match` on
+            // `Architecture` (including the CLI's) stays exhaustive. Unlike
+            // the two GGUF entries above, these sha256/size values are REAL --
+            // computed from an actual pull of the pinned `main` blobs -- so
+            // these entries acquire and verify clean.
+            ModelSpec {
+                id: "tessdata-eng".to_string(),
+                display_name: "Tesseract English (LSTM, best)".to_string(),
+                architecture: Architecture::Other("tesseract-lstm".to_string()),
+                license: "Apache-2.0".to_string(),
+                artifacts: vec![Artifact {
+                    filename: "eng.traineddata".to_string(),
+                    url: "https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata".to_string(),
+                    sha256: "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba".to_string(),
+                    size_bytes: 15_400_601,
+                }],
+            },
+            ModelSpec {
+                id: "tessdata-chi_sim".to_string(),
+                display_name: "Tesseract Simplified Chinese (LSTM, best)".to_string(),
+                architecture: Architecture::Other("tesseract-lstm".to_string()),
+                license: "Apache-2.0".to_string(),
+                artifacts: vec![Artifact {
+                    filename: "chi_sim.traineddata".to_string(),
+                    url: "https://github.com/tesseract-ocr/tessdata_best/raw/main/chi_sim.traineddata".to_string(),
+                    sha256: "4fef2d1306c8e87616d4d3e4c6c67faf5d44be3342290cf8f2f0f6e3aa7e735b".to_string(),
+                    size_bytes: 13_077_423,
+                }],
+            },
+            ModelSpec {
+                id: "tessdata-jpn".to_string(),
+                display_name: "Tesseract Japanese (LSTM, best)".to_string(),
+                architecture: Architecture::Other("tesseract-lstm".to_string()),
+                license: "Apache-2.0".to_string(),
+                artifacts: vec![Artifact {
+                    filename: "jpn.traineddata".to_string(),
+                    url: "https://github.com/tesseract-ocr/tessdata_best/raw/main/jpn.traineddata".to_string(),
+                    sha256: "36bdf9ac823f5911e624c30d0553e890b8abc7c31a65b3ef14da943658c40b79".to_string(),
+                    size_bytes: 14_330_109,
                 }],
             },
         ]
