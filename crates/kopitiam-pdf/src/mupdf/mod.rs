@@ -64,7 +64,10 @@
 //! device + layout analysis (`boxer`/`para`) -- the parts that actually fix the
 //! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.
 
+pub mod agl;
+pub mod agl_data;
 pub mod buffer;
+pub mod cmap;
 pub mod doc_stream;
 pub mod encodings;
 pub mod error;
@@ -72,6 +75,7 @@ pub mod filter_basic;
 pub mod filter_flate;
 pub mod filter_lzw;
 pub mod filter_predict;
+pub mod font;
 pub mod geometry;
 pub mod hash;
 pub mod lex;
@@ -82,10 +86,13 @@ pub mod stream;
 pub mod string_util;
 pub mod xref;
 
+pub use agl::{unicode_from_glyph_name, unicode_from_glyph_name_strict};
 pub use buffer::Buffer;
+pub use cmap::CMap;
 pub use doc_stream::decode_stream;
 pub use encodings::BaseEncoding;
 pub use error::{Error, ErrorKind, Result};
+pub use font::{Decoded, Font};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
 pub use hash::HashTable;
 pub use lex::{lex, Token};
