@@ -36,10 +36,32 @@
 //!
 //! ## What's here now
 //!
-//! Only the FOUNDATION geometry module -- `Point`, `Rect`, `IRect`, `Matrix`,
-//! `Quad` and their transforms. It is the pattern-setter; no other MuPDF module
-//! is ported yet, hor. Don't reach for `stext` here -- not built.
+//! The FOUNDATION layer (`fitz` primitives everything else builds on):
+//! * `geometry` -- `Point`, `Rect`, `IRect`, `Matrix`, `Quad` and their transforms.
+//! * `error` -- MuPDF's `fz_error_type` taxonomy as `Error` / `ErrorKind` /
+//!   `Result`; the setjmp/longjmp exception machinery is mapped to Rust `Result`,
+//!   and this is the port-wide error type later modules return.
+//! * `string_util` -- the UTF-8 rune codec (`chartorune`/`runetochar`) and the
+//!   bounded string helpers, preserving MuPDF's exact invalid-sequence handling.
+//! * `encodings` -- the static base-encoding tables (Standard / WinAnsi /
+//!   MacRoman / MacExpert / PdfDoc), entry-for-entry from `encodings.h`.
+//! * `hash` -- MuPDF's fixed-key open-addressing hash table (exact hash fn).
+//! * `pool` -- the block-chained bump arena (the `stext` page lives in one).
+//!
+//! Still ahead: buffers/streams, the `filter-*` decoders, the PDF object model /
+//! parser / xref, the content interpreter, fonts/CMaps/ToUnicode, and the `stext`
+//! device + layout analysis (`boxer`/`para`) -- the parts that actually fix the
+//! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.
 
+pub mod encodings;
+pub mod error;
 pub mod geometry;
+pub mod hash;
+pub mod pool;
+pub mod string_util;
 
+pub use encodings::BaseEncoding;
+pub use error::{Error, ErrorKind, Result};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
+pub use hash::HashTable;
+pub use pool::{Handle, Pool};
