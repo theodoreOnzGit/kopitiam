@@ -1,0 +1,5 @@
+# Golden snapshots are byte-exact oracles of pdf2md output (LF only). This host
+# has core.autocrlf=true; pin these as -text so git never rewrites LF<->CRLF and
+# desyncs them from pdf2md, which always emits LF. See scripts/diff-harness.sh.
+*.md -text
+*.report.json -text

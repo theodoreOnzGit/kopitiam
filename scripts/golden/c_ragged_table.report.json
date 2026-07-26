@@ -1,0 +1,22 @@
+{
+  "citations_found": 0,
+  "extracted_chars": 239,
+  "extracted_words": 45,
+  "headings_found": 0,
+  "lists_found": 0,
+  "pages": 1,
+  "passes": true,
+  "per_page": [
+    {
+      "extracted_chars": 239,
+      "page": 1,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 239
+    }
+  ],
+  "recovery_ratio": 1.0,
+  "rendered_chars": 239,
+  "rendered_words": 45,
+  "tables_found": 0,
+  "word_recovery_ratio": 1.0
+}

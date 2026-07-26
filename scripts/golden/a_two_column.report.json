@@ -1,0 +1,52 @@
+{
+  "citations_found": 0,
+  "extracted_chars": 5028,
+  "extracted_words": 984,
+  "headings_found": 0,
+  "lists_found": 0,
+  "pages": 6,
+  "passes": true,
+  "per_page": [
+    {
+      "extracted_chars": 838,
+      "page": 1,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 838
+    },
+    {
+      "extracted_chars": 838,
+      "page": 2,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 838
+    },
+    {
+      "extracted_chars": 838,
+      "page": 3,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 838
+    },
+    {
+      "extracted_chars": 838,
+      "page": 4,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 838
+    },
+    {
+      "extracted_chars": 838,
+      "page": 5,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 838
+    },
+    {
+      "extracted_chars": 838,
+      "page": 6,
+      "recovery_ratio": 1.0,
+      "rendered_chars": 838
+    }
+  ],
+  "recovery_ratio": 1.0,
+  "rendered_chars": 5028,
+  "rendered_words": 1004,
+  "tables_found": 0,
+  "word_recovery_ratio": 1.0203252032520325
+}
