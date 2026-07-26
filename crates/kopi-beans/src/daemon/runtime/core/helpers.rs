@@ -174,7 +174,7 @@ pub(super) fn checkpoint_head_status(
 pub(super) fn checkpoint_ref_oid(
     repo: &Repository,
     git_ref: &str,
-) -> Result<Option<Oid>, git2::Error> {
+) -> Result<Option<Oid>, crate::git::gix_compat::Error> {
     if let Some(oid) = refname_to_id_optional(repo, git_ref)? {
         return Ok(Some(oid));
     }
@@ -192,7 +192,7 @@ pub(super) fn checkpoint_remote_tracking_ref(git_ref: &str) -> Option<String> {
 pub(super) fn refname_to_id_optional(
     repo: &Repository,
     name: &str,
-) -> Result<Option<Oid>, git2::Error> {
+) -> Result<Option<Oid>, crate::git::gix_compat::Error> {
     match repo.refname_to_id(name) {
         Ok(oid) => Ok(Some(oid)),
         Err(err) if err.code() == GitErrorCode::NotFound => Ok(None),
@@ -202,7 +202,7 @@ pub(super) fn refname_to_id_optional(
 
 pub(super) fn write_checkpoint_tree(
     repo: &Repository,
-    tree: &git2::Tree,
+    tree: &crate::git::gix_compat::Tree,
     dir: &Path,
 ) -> Result<(), CheckpointTreeError> {
     let mut outcome: Result<(), CheckpointTreeError> = Ok(());

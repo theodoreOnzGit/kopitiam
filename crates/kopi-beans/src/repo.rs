@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use git2::Repository;
+use crate::git::gix_compat::Repository;
 
 use crate::Error;
 use crate::bootstrap::repo as bootstrap_repo;

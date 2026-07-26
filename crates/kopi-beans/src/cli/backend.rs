@@ -11,7 +11,7 @@ use crate::surface::store_admin::{
     StoreAdminCall, StoreAdminCallError, call_store_fsck_no_autostart,
     call_store_unlock_no_autostart, daemon_pid_no_autostart,
 };
-use git2::{ErrorCode, ObjectType, Oid, Repository};
+use crate::git::gix_compat::{ErrorCode, ObjectType, Oid, Repository, Tree};
 
 use crate::config::load_or_init;
 use crate::upgrade::{UpgradeMethod as HostUpgradeMethod, run_upgrade};
@@ -427,7 +427,7 @@ fn deps_format_rank(format: DepsFormat) -> u8 {
     }
 }
 
-fn read_meta_probe(repo: &Repository, tree: &git2::Tree<'_>) -> Result<Option<(u32, bool)>> {
+fn read_meta_probe(repo: &Repository, tree: &Tree<'_>) -> Result<Option<(u32, bool)>> {
     let Some(bytes) = read_blob_from_tree(repo, tree, "meta.json")? else {
         return Ok(None);
     };
@@ -441,7 +441,7 @@ fn read_meta_probe(repo: &Repository, tree: &git2::Tree<'_>) -> Result<Option<(u
 
 fn read_blob_from_tree(
     repo: &Repository,
-    tree: &git2::Tree<'_>,
+    tree: &Tree<'_>,
     name: &'static str,
 ) -> Result<Option<Vec<u8>>> {
     let Some(entry) = tree.get_name(name) else {

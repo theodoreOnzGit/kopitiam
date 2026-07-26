@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use git2::Repository;
+use crate::git::gix_compat::Repository;
 
 use super::{
     CheckpointCache, CheckpointImport, ContentHash, Daemon, StoreId, checkpoint_ref_oid,

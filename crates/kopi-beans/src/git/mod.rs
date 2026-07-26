@@ -9,6 +9,7 @@ pub use crate::core as core;
 
 pub mod checkpoint;
 pub mod error;
+pub mod gix_compat;
 pub mod observe;
 mod paths;
 pub mod sync;

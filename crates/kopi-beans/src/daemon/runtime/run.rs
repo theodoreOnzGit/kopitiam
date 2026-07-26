@@ -127,7 +127,10 @@ pub fn run_daemon(
     // Create daemon core and git worker.
     let mut daemon = Daemon::new_with_runtime_config(actor, layout, runtime_config);
     daemon.set_started_at_ms(started_at_ms);
-    let git_worker = GitWorker::new(git_result_tx, (*limits).clone());
+    // The git worker owns `gix` repository handles, which are `!Send` (unlike
+    // libgit-2's `git-2::Repository`). It is therefore CONSTRUCTED INSIDE the git
+    // thread below; only the (Send) `git_result_tx` + limits cross the boundary.
+    let git_worker_limits = (*limits).clone();
 
     // Spawn state thread.
     let (state_exit_tx, state_exit_rx) = crossbeam::channel::bounded(1);
@@ -142,6 +145,7 @@ pub fn run_daemon(
     // Spawn git thread.
     let git_span = tracing::Span::current();
     let git_handle = std::thread::spawn(move || {
+        let git_worker = GitWorker::new(git_result_tx, git_worker_limits);
         git_span.in_scope(|| {
             run_git_loop(git_worker, git_rx);
         });

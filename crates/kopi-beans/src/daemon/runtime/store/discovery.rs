@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::bootstrap::repo as bootstrap_repo;
-use git2::{ErrorCode as GitErrorCode, Repository};
+use crate::git::gix_compat::{Error as GitError, ErrorCode as GitErrorCode, Repository};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -239,7 +239,7 @@ impl ResolvedStore {
 #[derive(Debug, Error)]
 enum StoreDiscoveryError {
     #[error("failed to read meta ref: {source}")]
-    MetaRef { source: git2::Error },
+    MetaRef { source: GitError },
     #[error("store_meta.json missing from meta ref")]
     MetaMissing,
     #[error("failed to parse store_meta.json: {source}")]
@@ -248,7 +248,7 @@ enum StoreDiscoveryError {
         source: serde_json::Error,
     },
     #[error("failed to list refs: {source}")]
-    RefList { source: git2::Error },
+    RefList { source: GitError },
     #[error("multiple store ids found in refs: {ids:?}")]
     MultipleStoreIds { ids: Vec<StoreId> },
 }
@@ -342,7 +342,7 @@ fn write_store_path_map(path: &Path, map: &StorePathMap) -> io::Result<()> {
 }
 
 fn read_store_id_from_git_meta(repo: &Repository) -> Result<Option<StoreId>, StoreDiscoveryError> {
-    let reference = match repo.find_reference("refs/beads/meta") {
+    let mut reference = match repo.find_reference("refs/beads/meta") {
         Ok(reference) => reference,
         Err(err) if err.code() == GitErrorCode::NotFound => return Ok(None),
         Err(err) => return Err(StoreDiscoveryError::MetaRef { source: err }),
@@ -456,7 +456,7 @@ mod tests {
 
     use super::*;
     use crate::daemon::core::StoreEpoch;
-    use git2::{Repository, Signature};
+    use crate::git::gix_compat::{Repository, Signature};
     use tempfile::TempDir;
 
     fn init_repo() -> (TempDir, Repository) {

@@ -12,11 +12,10 @@ members = [
     # would sit on disk in no build graph at all, never compiled, never tested,
     # silently rotting. Membership is what keeps `--workspace` honest.
     "crates/kmux/crates/*",
-    # kopi-beans (the `bn` work-item tracker) is a single-crate collapse of the
-    # former multi-crate kopitiam-bds fork of beads-rs. It is a normal member
-    # picked up by the `crates/*` glob above; it no longer nests sub-crates, so
-    # (unlike kmux) it needs no extra member line or exclude block here.
 ]
+# kopi-beans (the `bn` work-item tracker) is a single-crate collapse of the
+# former multi-crate kopitiam-bds fork of beads-rs. It is a normal member
+# picked up by the `crates/*` glob above; it no longer nests sub-crates.
 
 [workspace.package]
 version = "0.2.2"
@@ -219,3 +218,51 @@ kopitiam-models = { path = "crates/kopitiam-models", version = "0.2.2" }
 kopitiam-loader = { path = "crates/kopitiam-loader", version = "0.2.2" }
 kopitiam-tokenizer = { path = "crates/kopitiam-tokenizer", version = "0.2.2" }
 kopitiam-runtime = { path = "crates/kopitiam-runtime", version = "0.2.2" }
+
+# gitoxide (`gix`): pure-Rust Git. This is the pure-Rust-core replacement for
+# kopi-beans's `git2` (vendored libgit2 + OpenSSL = a C toolchain), so `bn`
+# cross-compiles to Termux/Android with NO NDK. gitoxide is pure Rust and builds
+# for aarch64-linux-android.
+#
+# Feature choice = no C for the acceptance targets. Verified empirically (isolated
+# `cargo generate-lockfile` probe against gix 0.86): the tree contains NONE of
+# `git2` / `libgit2-sys` / `openssl-sys` / `libz-sys` (gix's zlib is the pure-Rust
+# `flate2`/`miniz_oxide` path, matching this workspace's existing FlateDecode note).
+#
+# TLS nuance (documented on purpose): `blocking-network-client` ALONE is fully
+# C-free (132 crates; no `ring`, no `aws-lc-sys`, no `cc`) and already covers the
+# `file://` bare-remote round-trip plus `git://`/`ssh` (gix drives `ssh` as an
+# external process, nothing C is linked). HTTPS to GitHub needs an HTTP transport;
+# the only pure-Rust-TLS option gix exposes is
+# `blocking-http-transport-reqwest-rust-tls` (reqwest + rustls). rustls in turn
+# pulls `ring` + `aws-lc-sys`, which ship a little C/asm built via `cc` -- still
+# NO libgit2/OpenSSL/libz, so it clears every acceptance target, but it is not
+# literally zero-C. For a strictly-NDK-free Termux build prefer `ssh` remotes and
+# drop the http feature; enable the reqwest-rustls feature only when HTTPS remotes
+# are required. NOTE: gix 0.86 has NO high-level push (no `prepare_push`/
+# `send_pack`/`push` on `Remote`; upstream issue #306 is still open) -- push must
+# be built on `gix-protocol`/`gix-transport` send-pack, which is the shim the
+# kopi-beans port carries. See NOTICE / kopi-beans for the migration.
+gix = { version = "0.86", default-features = false, features = [
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+    "revision",
+    "sha1",
+] }
+# WHY `sha1` and NOT `worktree-mutation`: gix gates SHA-1 object-hash support at
+# RUNTIME on its OWN `sha1` feature (`config::cache::incubate::legacy_object_hash`
+# is `#[cfg(feature = "sha1")]`) -- NOT on `gix-hash/sha1`. Without gix's `sha1`
+# feature, opening any ordinary SHA-1 repo fails with
+# "Cannot handle objects formatted as sha1". gix's `sha1` feature also flips on
+# `gix-worktree-stream?/sha1`, but that is an *optional* dep only pulled in by
+# `worktree-mutation` -- which kopi-beans does not use (it is a bare object/ref
+# workflow, never checking out a worktree). Dropping `worktree-mutation` keeps
+# `gix-worktree-stream` out of the tree entirely, so its `^0.35` pin can't bite,
+# and `sha1` resolves cleanly. Still C-free: no libgit2 / OpenSSL / libz.
+
+# NOTE: gix 0.86's `sha1` feature carries a weak `gix-worktree-stream?/sha1`
+# reference cargo version-resolves. gix-worktree-stream 0.35.0 is now published
+# on crates.io, so the `^0.35` pin resolves cleanly from the registry -- no
+# `[patch.crates-io]` stub is needed (removing it is what makes kopi-beans
+# publishable: patches don't survive `cargo publish`). The optional dep is
+# still never compiled (worktree-mutation is off).

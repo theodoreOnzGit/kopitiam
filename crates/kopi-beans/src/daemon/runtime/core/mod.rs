@@ -37,7 +37,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::Sender;
-use git2::{ErrorCode as GitErrorCode, ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
+use crate::git::gix_compat::{
+    Error as GitError, ErrorCode as GitErrorCode, ObjectType, Oid, Repository, TreeWalkMode,
+    TreeWalkResult,
+};
 use thiserror::Error;
 
 use super::Clock;
@@ -80,7 +83,7 @@ use crate::daemon::core::error::details as error_details;
 #[derive(Debug, Error)]
 enum CheckpointTreeError {
     #[error("checkpoint tree git error: {0}")]
-    Git(#[from] git2::Error),
+    Git(#[from] GitError),
     #[error("checkpoint tree io error at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -450,7 +453,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::daemon_core::repl::proto::{Capabilities, Hello, PROTOCOL_VERSION_V1};
-    use git2::{Oid, Repository, Signature};
+    use crate::git::gix_compat::{Oid, Repository, Signature};
     use uuid::Uuid;
 
     use crate::daemon::core::{

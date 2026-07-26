@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use git2::{ErrorCode, Oid, Repository};
+use crate::git::gix_compat::{ErrorCode, Oid, Repository};
 
 use crate::daemon::core::{BeadSlug, CanonicalState, WriteStamp};
 use crate::daemon::git::checkpoint::{

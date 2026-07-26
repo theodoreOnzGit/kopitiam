@@ -1,6 +1,6 @@
 //! Git worker for background sync operations.
 //!
-//! Owns git2::Repository handles (which are !Send !Sync) and runs on a dedicated thread.
+//! Owns git-2::Repository handles (which are !Send !Sync) and runs on a dedicated thread.
 //! Receives GitOp messages from state thread, sends results back.
 
 use std::collections::{BTreeMap, HashMap, hash_map::Entry};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam::channel::{Receiver, Sender};
-use git2::{ErrorCode, Oid, Repository};
+use crate::git::gix_compat::{ErrorCode, Oid, Repository};
 
 use crate::daemon::core::{ActorId, BeadSlug, CanonicalState, StoreId, WriteStamp};
 use crate::daemon::git::checkpoint::{

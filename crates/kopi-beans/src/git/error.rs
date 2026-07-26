@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::git::gix_compat::Error as GitError;
 use crate::git::core::error::details as error_details;
 use crate::git::core::{
     CliErrorCode, Effect, ErrorCode, ErrorPayload, IntoErrorPayload, ProtocolErrorCode,
@@ -15,10 +16,10 @@ use crate::git::core::{
 #[non_exhaustive]
 pub enum SyncError {
     #[error("failed to open repository at {0}: {1}")]
-    OpenRepo(PathBuf, #[source] git2::Error),
+    OpenRepo(PathBuf, #[source] GitError),
 
     #[error("failed to fetch from remote: {0}")]
-    Fetch(#[source] git2::Error),
+    Fetch(#[source] GitError),
 
     #[error("local ref not found: {0}")]
     NoLocalRef(String),
@@ -27,7 +28,7 @@ pub enum SyncError {
     NoRemoteRef(String),
 
     #[error("failed to find merge base: {0}")]
-    MergeBase(#[source] git2::Error),
+    MergeBase(#[source] GitError),
 
     #[error("missing file in tree: {0}")]
     MissingFile(String),
@@ -36,19 +37,19 @@ pub enum SyncError {
     NotABlob(&'static str),
 
     #[error("failed to write blob: {0}")]
-    WriteBlob(#[source] git2::Error),
+    WriteBlob(#[source] GitError),
 
     #[error("failed to build tree: {0}")]
-    BuildTree(#[source] git2::Error),
+    BuildTree(#[source] GitError),
 
     #[error("failed to create commit: {0}")]
-    Commit(#[source] git2::Error),
+    Commit(#[source] GitError),
 
     #[error("push rejected (non-fast-forward)")]
     NonFastForward,
 
     #[error("failed to push: {0}")]
-    Push(#[source] git2::Error),
+    Push(#[source] GitError),
 
     #[error("I/O error: {0}")]
     Io(#[source] std::io::Error),
@@ -69,10 +70,10 @@ pub enum SyncError {
     PushRejected(#[from] PushRejected),
 
     #[error("init failed: {0}")]
-    InitFailed(#[source] git2::Error),
+    InitFailed(#[source] GitError),
 
     #[error("git operation failed: {0}")]
-    Git(#[from] git2::Error),
+    Git(#[from] GitError),
 }
 
 impl SyncError {

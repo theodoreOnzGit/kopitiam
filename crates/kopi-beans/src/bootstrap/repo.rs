@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use git2::Repository;
+use crate::git::gix_compat::{Error as GitError, Repository};
 
-pub fn discover(start: impl AsRef<Path>) -> Result<(Repository, PathBuf), git2::Error> {
+pub fn discover(start: impl AsRef<Path>) -> Result<(Repository, PathBuf), GitError> {
     discover_inner(start.as_ref())
 }
 
-pub fn discover_root(start: impl AsRef<Path>) -> Result<PathBuf, git2::Error> {
+pub fn discover_root(start: impl AsRef<Path>) -> Result<PathBuf, GitError> {
     discover_inner(start.as_ref()).map(|(_, root)| root)
 }
 
@@ -15,7 +15,7 @@ pub fn discover_root_optional(start: impl AsRef<Path>) -> Option<PathBuf> {
     discover_inner(start.as_ref()).ok().map(|(_, root)| root)
 }
 
-fn discover_inner(start: &Path) -> Result<(Repository, PathBuf), git2::Error> {
+fn discover_inner(start: &Path) -> Result<(Repository, PathBuf), GitError> {
     if should_fast_discover()
         && let Some((repo, root)) = fast_repo_discovery(start)
     {
@@ -29,7 +29,7 @@ fn discover_inner(start: &Path) -> Result<(Repository, PathBuf), git2::Error> {
     let root = repo
         .workdir()
         .map(|path| path.to_owned())
-        .ok_or_else(|| git2::Error::from_str("bare repository not supported"))?;
+        .ok_or_else(|| GitError::from_str("bare repository not supported"))?;
     Ok((repo, root))
 }
 
