@@ -44,7 +44,10 @@ mod explorer;
 mod home;
 mod logic;
 mod theme;
-mod viewer;
+/// `pub(crate)` so the standalone `kopitiam view` command ([`crate::view`]) can
+/// reuse the exact same [`viewer::ViewDoc`] rendering/navigation path the TUI
+/// drives — one shared viewer, no forked logic.
+pub(crate) mod viewer;
 
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;

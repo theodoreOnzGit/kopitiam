@@ -38,6 +38,7 @@ mod status;
 mod tokens;
 mod translate;
 mod tui;
+mod view;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -189,6 +190,19 @@ enum Command {
     /// runnable slice of `temp_ai_design.md`'s "full ratatui" phase.
     Tui(tui::TuiArgs),
 
+    /// Open a PDF in an on-screen terminal viewer, rendering pages as images.
+    ///
+    /// A standalone, interactive image viewer over the ported MuPDF rasteriser
+    /// (`kopitiam_pdf::mupdf::rasterize_page` — real glyph outlines, vector,
+    /// colour and images) displayed through `ratatui-image`, which auto-detects
+    /// the terminal's graphics protocol (kitty / sixel / iTerm2) and falls back
+    /// to Unicode half-blocks under Termux. Keys: j/k or arrows or PgUp/PgDn to
+    /// page, `g` to go to a page, `+`/`-` to zoom, `r`/`i` to toggle the reflow
+    /// (Markdown) view, `q` to quit. This is what `kmux latex` shells out to for
+    /// its live preview. See `apps/cli/src/view.rs`; the page-rendering path is
+    /// shared with `kopitiam tui`'s image mode (no forked viewer logic).
+    View(view::ViewArgs),
+
     /// Go and get, then check, the local model weights the AI layer runs on.
     ///
     /// Group of four actions — `list`, `pull`, `path`, `verify` — over the
@@ -336,6 +350,10 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Tui(args) => {
             tui::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::View(args) => {
+            view::run(args)?;
             ExitCode::SUCCESS
         }
         Command::Models(args) => models::run(args)?,

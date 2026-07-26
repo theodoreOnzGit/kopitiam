@@ -13,9 +13,11 @@
 //!   auto-detects the terminal's graphics protocol (kitty / sixel / iTerm2) and
 //!   **falls back to Unicode half-blocks** where none is available — the reason
 //!   the viewer stays Android/Termux-safe. The pixels come from a
-//!   [`PageRasterizer`], the seam a future MuPDF wave slots into without the UI
-//!   changing. Until then the shipped [`UnavailableRasterizer`] returns a clear
-//!   error and the pane shows a friendly notice instead of crashing.
+//!   [`PageRasterizer`]; the shipped [`MupdfRasterizer`] renders real pages
+//!   through the ported MuPDF draw device (glyph outlines, vector, colour,
+//!   images). A rasterise error (e.g. an unopenable PDF, or `Error::limit` on a
+//!   pathological page) is caught and the pane shows a friendly notice instead
+//!   of crashing.
 //!
 //! # Selecting a PDF
 //!
@@ -23,10 +25,12 @@
 //! `discover_pdfs` + `fuzzy_rank` picker pattern as `convert`); opened from the
 //! File Explorer on a `.pdf` it lands straight on the document.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::{DynamicImage, RgbaImage};
+use kopitiam_pdf::mupdf::{PdfDocument, Pixmap, rasterize_page};
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -56,10 +60,13 @@ pub trait PageRasterizer {
     fn rasterize(&self, pdf: &Path, page: usize, dpi: f32) -> Result<RgbaImage>;
 }
 
-/// The stub rasteriser shipped today: every call returns a clear error. It keeps
-/// the image-mode plumbing exercised end-to-end (the pane calls it, catches the
-/// error, and shows the friendly notice) while the real page renderer is still
-/// to come.
+/// A rasteriser whose every call returns a clear error. Image mode now defaults
+/// to the real [`MupdfRasterizer`], so this is retained as the graceful
+/// "rendering unavailable" fallback and as the erroring test double that
+/// exercises the pane's friendly-notice path (it reports no page count and never
+/// produces pixels). Constructed only from tests today, hence the `dead_code`
+/// allowance on non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct UnavailableRasterizer;
 
 /// The one message both stub methods carry, so the notice and any log read the
@@ -75,6 +82,101 @@ impl PageRasterizer for UnavailableRasterizer {
     fn rasterize(&self, _pdf: &Path, _page: usize, _dpi: f32) -> Result<RgbaImage> {
         anyhow::bail!(RASTERIZER_UNAVAILABLE)
     }
+}
+
+/// The real page rasteriser: it opens the PDF once (cached), renders a page to a
+/// [`Pixmap`] through the ported MuPDF draw device
+/// ([`kopitiam_pdf::mupdf::rasterize_page`] — real glyph outlines, vector fills,
+/// colour and images), and converts that to the [`RgbaImage`] `ratatui-image`
+/// encodes for the terminal. This is the **single** rendering path both the
+/// standalone `kopitiam view` command and the TUI's image mode drive.
+#[derive(Default)]
+pub struct MupdfRasterizer {
+    /// The most-recently-opened document, keyed by its path, so paging and
+    /// zooming do not reparse the whole PDF every frame. `RefCell` keeps the
+    /// `&self`-only [`PageRasterizer`] seam while still caching.
+    cached: RefCell<Option<(PathBuf, PdfDocument)>>,
+}
+
+impl MupdfRasterizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run `f` against the opened document for `pdf`, (re)opening it from disk
+    /// only on a cache miss. The closure runs while the cache is borrowed, so the
+    /// parsed [`PdfDocument`] never has to be cloned.
+    fn with_doc<T>(&self, pdf: &Path, f: impl FnOnce(&PdfDocument) -> Result<T>) -> Result<T> {
+        {
+            let mut slot = self.cached.borrow_mut();
+            let hit = matches!(slot.as_ref(), Some((p, _)) if p == pdf);
+            if !hit {
+                let bytes = std::fs::read(pdf)
+                    .with_context(|| format!("could not read {}", pdf.display()))?;
+                let doc = PdfDocument::open(bytes)
+                    .map_err(|e| anyhow::anyhow!("could not open {} as a PDF: {e}", pdf.display()))?;
+                *slot = Some((pdf.to_path_buf(), doc));
+            }
+        }
+        let slot = self.cached.borrow();
+        let (_, doc) = slot.as_ref().expect("cache just populated above");
+        f(doc)
+    }
+}
+
+impl PageRasterizer for MupdfRasterizer {
+    fn page_count(&self, pdf: &Path) -> Result<usize> {
+        self.with_doc(pdf, |doc| Ok(doc.page_count()))
+    }
+
+    fn rasterize(&self, pdf: &Path, page: usize, dpi: f32) -> Result<RgbaImage> {
+        // `rasterize_page` returns `Error::limit` for a pathological page (a huge
+        // MediaBox and/or dpi); surface it as a normal `Err` so the viewer shows
+        // a notice instead of the process aborting on a multi-GB allocation.
+        self.with_doc(pdf, |doc| {
+            let pixmap = rasterize_page(doc, page, dpi).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(pixmap_to_rgba(&pixmap))
+        })
+    }
+}
+
+/// Convert a rasterised [`Pixmap`] into the [`RgbaImage`] `ratatui-image`
+/// consumes. Handles the draw device's three component layouts — DeviceGray
+/// (`n = 1`), DeviceRGB (`n = 3`, the default target) and RGBA (`n = 4`) — and
+/// copies **row by row honouring `stride`**, so a pixmap whose `stride` exceeds
+/// `w * n` (row padding) is laid out correctly rather than sheared. An undersized
+/// `samples` buffer yields a blank image instead of an out-of-bounds panic.
+fn pixmap_to_rgba(pm: &Pixmap) -> RgbaImage {
+    let (w, h, n, stride) = (pm.w, pm.h, pm.n as usize, pm.stride);
+    let mut img = RgbaImage::new(w, h);
+    if n == 0 || pm.samples.len() < stride.saturating_mul(h as usize) {
+        return img; // malformed: transparent-black rather than indexing OOB
+    }
+    for y in 0..h as usize {
+        let row = y * stride;
+        for x in 0..w as usize {
+            let i = row + x * n;
+            let rgba = match n {
+                1 => {
+                    let v = pm.samples[i];
+                    image::Rgba([v, v, v, 255])
+                }
+                2 => {
+                    let v = pm.samples[i];
+                    image::Rgba([v, v, v, pm.samples[i + 1]])
+                }
+                3 => image::Rgba([pm.samples[i], pm.samples[i + 1], pm.samples[i + 2], 255]),
+                _ => image::Rgba([
+                    pm.samples[i],
+                    pm.samples[i + 1],
+                    pm.samples[i + 2],
+                    pm.samples[i + 3],
+                ]),
+            };
+            img.put_pixel(x as u32, y as u32, rgba);
+        }
+    }
+    img
 }
 
 // ---- reflow pipeline (pure, UI-free) ------------------------------------
@@ -147,6 +249,10 @@ struct Raster {
 }
 
 /// The opened document: everything the actual viewer (post-pick) owns.
+///
+/// `pub(crate)` because the standalone `kopitiam view` command
+/// ([`crate::view`]) drives one directly — the same navigation, zoom and
+/// image-rendering path the TUI uses, so there is no forked viewer logic.
 pub struct ViewDoc {
     pdf: PathBuf,
     mode: ViewerMode,
@@ -167,6 +273,9 @@ pub struct ViewDoc {
     image_error: Option<String>,
     /// Cached rasterised page (see [`Raster`]).
     raster: Option<Raster>,
+    /// `Some(buffer)` while a "go to page" number is being typed in image mode;
+    /// digits feed the buffer, Enter commits, Esc cancels.
+    goto: Option<String>,
     /// The graphics-protocol picker, built lazily the first time a real image is
     /// actually available (never with the stub), so terminal-querying I/O only
     /// happens when it can pay off.
@@ -194,8 +303,30 @@ impl ViewDoc {
             dpi: DPI_DEFAULT,
             image_error: None,
             raster: None,
+            goto: None,
             picker: None,
         }
+    }
+
+    /// Open `pdf` straight into **image** mode at an optional initial 1-based
+    /// `page` and `dpi`, backed by `rasterizer`. This is the entry the standalone
+    /// `kopitiam view` command uses; the reflow pane stays lazily `Pending` and is
+    /// only ever rendered if the user toggles to it.
+    pub(crate) fn open_image(
+        pdf: PathBuf,
+        rasterizer: Box<dyn PageRasterizer>,
+        page: Option<usize>,
+        dpi: Option<f32>,
+    ) -> Self {
+        let mut doc = Self::new(pdf, rasterizer);
+        doc.mode = ViewerMode::Image;
+        if let Some(dpi) = dpi {
+            doc.dpi = dpi.clamp(DPI_MIN, DPI_MAX);
+        }
+        if let Some(page) = page {
+            doc.goto_page_1based(page);
+        }
+        doc
     }
 
     /// The reflow pane is waiting for its first render.
@@ -203,9 +334,35 @@ impl ViewDoc {
         matches!(self.content, Reflow::Pending)
     }
 
+    /// True while a text sub-mode (search box or goto-page box) is capturing
+    /// keys, so a host loop knows not to treat `q`/`Esc` as "quit".
+    pub(crate) fn is_capturing_text(&self) -> bool {
+        self.search.typing || self.goto.is_some()
+    }
+
+    /// The standalone viewer only needs to run the (slow) reflow pipeline if the
+    /// user has actually switched to reflow mode and it has not rendered yet.
+    pub(crate) fn needs_reflow_render(&self) -> bool {
+        self.mode == ViewerMode::Reflow && self.is_pending()
+    }
+
+    /// Jump to a 1-based page number, clamped into range (floored at page 1, and
+    /// capped at the last page when the count is known).
+    fn goto_page_1based(&mut self, page_1based: usize) {
+        let target = page_1based.saturating_sub(1);
+        let clamped = match self.page_count {
+            Some(count) if count > 0 => target.min(count - 1),
+            _ => target,
+        };
+        if clamped != self.page {
+            self.page = clamped;
+            self.invalidate_raster();
+        }
+    }
+
     /// Run the reflow pipeline now (called by the router once, after the
     /// `Pending` notice has painted).
-    fn render_now(&mut self) {
+    pub(crate) fn render_now(&mut self) {
         self.content = match reflow_to_markdown(&self.pdf) {
             Ok(md) => Reflow::Ready(md.lines().map(str::to_string).collect()),
             Err(err) => Reflow::Failed(err),
@@ -296,7 +453,10 @@ impl ViewDoc {
         self.raster = None;
     }
 
-    fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
+    pub(crate) fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.goto.is_some() {
+            return vec![("digits", "page"), ("Enter", "go"), ("Esc", "cancel")];
+        }
         if self.search.typing {
             return vec![("type", "search"), ("Enter", "jump"), ("Esc", "cancel")];
         }
@@ -311,6 +471,7 @@ impl ViewDoc {
             ],
             ViewerMode::Image => vec![
                 ("←/→ n/p", "page"),
+                ("g", "goto"),
                 ("+/-", "zoom"),
                 ("r", "reflow"),
                 ("Esc", "home"),
@@ -319,7 +480,34 @@ impl ViewDoc {
     }
 
     /// Handle one key while a document is open. Returns the router transition.
-    fn on_key(&mut self, key: KeyEvent, ctrl: bool) -> Transition {
+    pub(crate) fn on_key(&mut self, key: KeyEvent, ctrl: bool) -> Transition {
+        // While typing a goto-page number (image mode), keys feed that box.
+        if self.goto.is_some() {
+            match key.code {
+                KeyCode::Esc => self.goto = None,
+                KeyCode::Enter => {
+                    let buf = self.goto.take().unwrap_or_default();
+                    if let Ok(n) = buf.trim().parse::<usize>()
+                        && n >= 1
+                    {
+                        self.goto_page_1based(n);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(buf) = self.goto.as_mut() {
+                        buf.pop();
+                    }
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(buf) = self.goto.as_mut() {
+                        buf.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return Transition::Stay;
+        }
+
         // While typing a search query, keys feed the box.
         if self.search.typing {
             match key.code {
@@ -391,17 +579,19 @@ impl ViewDoc {
     fn on_key_image(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('r') => self.mode = ViewerMode::Reflow,
-            KeyCode::Char('n') | KeyCode::Right => self.next_page(),
-            KeyCode::Char('p') | KeyCode::Left => self.prev_page(),
+            KeyCode::Char('n') | KeyCode::Right | KeyCode::PageDown => self.next_page(),
+            KeyCode::Char('p') | KeyCode::Left | KeyCode::PageUp => self.prev_page(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(),
             KeyCode::Char('-') | KeyCode::Char('_') => self.zoom_out(),
+            // Start typing a "go to page" number; digits/Enter handled in `on_key`.
+            KeyCode::Char('g') => self.goto = Some(String::new()),
             _ => {}
         }
     }
 
     // ---- rendering ------------------------------------------------------
 
-    fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
         match self.mode {
             ViewerMode::Reflow => self.render_reflow(frame, area),
             ViewerMode::Image => self.render_image(frame, area),
@@ -485,16 +675,18 @@ impl ViewDoc {
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(area);
 
-        // Page / zoom indicator.
+        // Page / zoom indicator, plus the goto-page box when one is being typed.
         let total = self.page_count.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" page ", Style::default().fg(DIM)),
-                Span::styled(format!("{}/{total}", self.page + 1), Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("   ·   {:.0} dpi", self.dpi), Style::default().fg(STEAM)),
-            ])),
-            chunks[0],
-        );
+        let mut spans = vec![
+            Span::styled(" page ", Style::default().fg(DIM)),
+            Span::styled(format!("{}/{total}", self.page + 1), Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("   ·   {:.0} dpi", self.dpi), Style::default().fg(STEAM)),
+        ];
+        if let Some(buf) = &self.goto {
+            spans.push(Span::styled(format!("   ·   goto: {buf}"), Style::default().fg(GOLD)));
+            spans.push(Span::styled("▌", Style::default().fg(GOLD)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
 
         let pane = chunks[1];
         let block = Block::default()
@@ -663,9 +855,11 @@ impl ViewerState {
         state
     }
 
-    /// Open `pdf` into the `View` stage, backed by the shipped stub rasteriser.
+    /// Open `pdf` into the `View` stage, backed by the real MuPDF rasteriser —
+    /// the same [`MupdfRasterizer`] the standalone `kopitiam view` command uses,
+    /// so image mode shows real glyphs / vector / colour here too.
     fn open(&mut self, pdf: PathBuf) {
-        self.doc = Some(ViewDoc::new(pdf, Box::new(UnavailableRasterizer)));
+        self.doc = Some(ViewDoc::new(pdf, Box::new(MupdfRasterizer::new())));
         self.stage = Stage::View;
     }
 
@@ -1072,5 +1266,126 @@ mod tests {
         let mut state = ViewerState::new(PathBuf::from("."));
         let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(state.on_key(ev), Transition::Quit));
+    }
+
+    // ---- Pixmap -> RgbaImage conversion (the shared render seam's core) ----
+
+    #[test]
+    fn pixmap_to_rgba_maps_dimensions_and_rgb_pixels() {
+        // 2x1 DeviceRGB, tightly packed (stride == w*n).
+        let pm = Pixmap {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 1,
+            n: 3,
+            alpha: false,
+            stride: 6,
+            samples: vec![10, 20, 30, 40, 50, 60],
+        };
+        let img = pixmap_to_rgba(&pm);
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(img.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn pixmap_to_rgba_honors_row_stride_padding() {
+        // 2x2 DeviceRGB with 2 padding bytes per row (stride 8 != w*n 6). If the
+        // conversion ignored stride, row 1 would read the padding and shear.
+        let pm = Pixmap {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+            n: 3,
+            alpha: false,
+            stride: 8,
+            samples: vec![
+                1, 2, 3, 4, 5, 6, 0, 0, // row 0 (last 2 bytes are padding)
+                7, 8, 9, 10, 11, 12, 0, 0, // row 1
+            ],
+        };
+        let img = pixmap_to_rgba(&pm);
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [1, 2, 3, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [4, 5, 6, 255]);
+        // Row 1 must start at byte offset `stride` (8), not `w*n` (6).
+        assert_eq!(img.get_pixel(0, 1).0, [7, 8, 9, 255]);
+        assert_eq!(img.get_pixel(1, 1).0, [10, 11, 12, 255]);
+    }
+
+    #[test]
+    fn pixmap_to_rgba_expands_gray_and_survives_a_short_buffer() {
+        // DeviceGray (n=1) -> replicated across RGB, opaque alpha.
+        let gray = Pixmap { x: 0, y: 0, w: 2, h: 1, n: 1, alpha: false, stride: 2, samples: vec![77, 200] };
+        let img = pixmap_to_rgba(&gray);
+        assert_eq!(img.get_pixel(0, 0).0, [77, 77, 77, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [200, 200, 200, 255]);
+
+        // A malformed pixmap (samples too short) yields a blank image, not a panic.
+        let bad = Pixmap { x: 0, y: 0, w: 4, h: 4, n: 3, alpha: false, stride: 12, samples: vec![1, 2, 3] };
+        let img = pixmap_to_rgba(&bad);
+        assert_eq!(img.dimensions(), (4, 4));
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 0]);
+    }
+
+    // ---- goto-page navigation + image-first constructor ----
+
+    #[test]
+    fn goto_page_clamps_into_range() {
+        let mut doc = doc_with(Box::new(FakeRasterizer { pages: 5 }));
+        doc.on_key(key(KeyCode::Char('i')), false); // image mode
+        // g, 3, Enter -> page index 2 (1-based 3).
+        doc.on_key(key(KeyCode::Char('g')), false);
+        assert!(doc.goto.is_some());
+        doc.on_key(key(KeyCode::Char('3')), false);
+        doc.on_key(key(KeyCode::Enter), false);
+        assert_eq!(doc.page, 2);
+        assert!(doc.goto.is_none());
+        // An out-of-range page clamps to the last (index 4 of 5).
+        doc.on_key(key(KeyCode::Char('g')), false);
+        for c in "99".chars() {
+            doc.on_key(key(KeyCode::Char(c)), false);
+        }
+        doc.on_key(key(KeyCode::Enter), false);
+        assert_eq!(doc.page, 4);
+        // Esc cancels goto and leaves the page unchanged.
+        doc.on_key(key(KeyCode::Char('g')), false);
+        doc.on_key(key(KeyCode::Char('1')), false);
+        doc.on_key(key(KeyCode::Esc), false);
+        assert!(doc.goto.is_none());
+        assert_eq!(doc.page, 4);
+    }
+
+    #[test]
+    fn open_image_starts_in_image_mode_and_clamps_page_and_dpi() {
+        let doc = ViewDoc::open_image(
+            PathBuf::from("/x/p.pdf"),
+            Box::new(FakeRasterizer { pages: 10 }),
+            Some(4),      // 1-based initial page -> index 3
+            Some(9999.0), // absurd dpi -> clamped to DPI_MAX
+        );
+        assert_eq!(doc.mode, ViewerMode::Image);
+        assert_eq!(doc.page, 3);
+        assert_eq!(doc.dpi, DPI_MAX);
+        assert!(!doc.is_capturing_text());
+        // A page past the end clamps to the last.
+        let doc = ViewDoc::open_image(
+            PathBuf::from("/x/p.pdf"),
+            Box::new(FakeRasterizer { pages: 10 }),
+            Some(100),
+            None,
+        );
+        assert_eq!(doc.page, 9);
+    }
+
+    #[test]
+    fn mupdf_rasterizer_errors_cleanly_on_a_missing_file() {
+        // The real rasteriser must return an Err (never panic) when the PDF is not
+        // openable, so the viewer shows a notice instead of crashing.
+        let r = MupdfRasterizer::new();
+        assert!(r.page_count(Path::new("/no/such/file.pdf")).is_err());
+        assert!(r.rasterize(Path::new("/no/such/file.pdf"), 0, 150.0).is_err());
     }
 }

@@ -70,11 +70,14 @@ list_subcommands() {
 	'
 }
 
-# Static, curated classification: the two INTERACTIVE commands an agent must
-# never spawn. Everything else is non-interactive and agent-safe.
+# Static, curated classification: the INTERACTIVE commands an agent must never
+# spawn. Everything else is non-interactive and agent-safe. `view` is a
+# full-screen, on-screen PDF viewer that owns the terminal and runs its own
+# blocking event loop (it is what `kmux latex` shells out to for a human's live
+# preview), so — like `tui` and `ai chat` — it will HANG a non-interactive agent.
 is_interactive() {
 	case "$1" in
-	"tui" | "ai chat") return 0 ;;
+	"tui" | "ai chat" | "view") return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -141,11 +144,13 @@ chat/TUI front end that runs even with no weights present).
 
 - **Use the non-interactive subcommands.** They accept flags, read/write
   files, and return meaningful exit codes — exactly what an agent needs.
-- **NEVER run `kopitiam tui` or `kopitiam ai chat` from an agent.** Both are
-  INTERACTIVE programs: `tui` is a full-screen terminal UI and `ai chat`
-  streams tokens while blocking on stdin. From a non-interactive agent they do
-  not return — they will **HANG the session**. They exist for humans at a real
-  terminal, not for automation.
+- **NEVER run `kopitiam tui`, `kopitiam ai chat`, or `kopitiam view` from an
+  agent.** All three are INTERACTIVE programs: `tui` is a full-screen terminal
+  UI, `ai chat` streams tokens while blocking on stdin, and `view` is a
+  full-screen, on-screen PDF viewer that owns the terminal and runs its own
+  blocking event loop (it is what `kmux latex` shells out to for a human's live
+  preview). From a non-interactive agent they do not return — they will **HANG
+  the session**. They exist for humans at a real terminal, not for automation.
 - **The primary agent workflow is `pdf2md`.** Convert one file, or loop over a
   folder, then read the printed validation report to confirm nothing dropped.
 - Everything else in the Command reference below is marked **Agent-safe** or
@@ -223,8 +228,9 @@ EOF
 - **Do not rely on OCR yet.** An automatic OCR fallback for image-only or
   scanned pages is *planned* but not something to depend on today. If a PDF is
   scanned images, `pdf2md` may produce little or no text.
-- **`tui` and `ai chat` are interactive** and must never be launched by an
-  agent (see CRITICAL agent guidance above).
+- **`tui`, `ai chat`, and `view` are interactive** and must never be launched by
+  an agent (see CRITICAL agent guidance above). `view` in particular is the
+  on-screen page viewer `kmux latex` opens for a human's live preview.
 EOF
 }
 

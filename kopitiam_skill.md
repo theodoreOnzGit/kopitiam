@@ -17,11 +17,13 @@ chat/TUI front end that runs even with no weights present).
 
 - **Use the non-interactive subcommands.** They accept flags, read/write
   files, and return meaningful exit codes — exactly what an agent needs.
-- **NEVER run `kopitiam tui` or `kopitiam ai chat` from an agent.** Both are
-  INTERACTIVE programs: `tui` is a full-screen terminal UI and `ai chat`
-  streams tokens while blocking on stdin. From a non-interactive agent they do
-  not return — they will **HANG the session**. They exist for humans at a real
-  terminal, not for automation.
+- **NEVER run `kopitiam tui`, `kopitiam ai chat`, or `kopitiam view` from an
+  agent.** All three are INTERACTIVE programs: `tui` is a full-screen terminal
+  UI, `ai chat` streams tokens while blocking on stdin, and `view` is a
+  full-screen, on-screen PDF viewer that owns the terminal and runs its own
+  blocking event loop (it is what `kmux latex` shells out to for a human's live
+  preview). From a non-interactive agent they do not return — they will **HANG
+  the session**. They exist for humans at a real terminal, not for automation.
 - **The primary agent workflow is `pdf2md`.** Convert one file, or loop over a
   folder, then read the printed validation report to confirm nothing dropped.
 - Everything else in the Command reference below is marked **Agent-safe** or
@@ -331,6 +333,36 @@ Options:
 
       --max-tokens <MAX_TOKENS>
           Cap on tokens generated per reply. Left to the adapter default when omitted
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `kopitiam view`
+
+**INTERACTIVE — DO NOT RUN from an agent.** Full-screen / token-streamed; it blocks on stdin and will HANG a non-interactive session.
+
+```text
+Open a PDF in an on-screen terminal viewer, rendering pages as images.
+
+A standalone, interactive image viewer over the ported MuPDF rasteriser (`kopitiam_pdf::mupdf::rasterize_page` — real glyph outlines, vector, colour and images) displayed through `ratatui-image`, which auto-detects the terminal's graphics protocol (kitty / sixel / iTerm2) and falls back to Unicode half-blocks under Termux. Keys: j/k or arrows or PgUp/PgDn to page, `g` to go to a page, `+`/`-` to zoom, `r`/`i` to toggle the reflow (Markdown) view, `q` to quit. This is what `kmux latex` shells out to for its live preview. See `apps/cli/src/view.rs`; the page-rendering path is shared with `kopitiam tui`'s image mode (no forked viewer logic).
+
+Usage: kopitiam.exe view [OPTIONS] <PDF>
+
+Arguments:
+  <PDF>
+          The PDF file to open
+
+Options:
+      --page <PAGE>
+          Initial 1-based page to open on. Clamped into range if out of bounds
+          
+          [default: 1]
+
+      --dpi <DPI>
+          Initial render resolution in DPI. Higher is sharper but slower to render; adjust live with `+` / `-` once open
+          
+          [default: 150]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -850,5 +882,6 @@ Options:
 - **Do not rely on OCR yet.** An automatic OCR fallback for image-only or
   scanned pages is *planned* but not something to depend on today. If a PDF is
   scanned images, `pdf2md` may produce little or no text.
-- **`tui` and `ai chat` are interactive** and must never be launched by an
-  agent (see CRITICAL agent guidance above).
+- **`tui`, `ai chat`, and `view` are interactive** and must never be launched by
+  an agent (see CRITICAL agent guidance above). `view` in particular is the
+  on-screen page viewer `kmux latex` opens for a human's live preview.
