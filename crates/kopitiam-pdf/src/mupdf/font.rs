@@ -359,6 +359,27 @@ impl Font {
         self.wmode
     }
 
+    // MuPDF: fz_font_ascender (font.c:281) -- FZ_ASCDESC_DEFAULT path.
+    /// The font's ascender in em units (glyph box top). Because this port
+    /// avoids FreeType, per-font face metrics are unavailable, so this returns
+    /// MuPDF's default ascender `0.8` -- exactly the value MuPDF itself falls
+    /// back to (`FZ_ASCDESC_DEFAULT`) whenever a face reports no trustworthy
+    /// ascent (`fz_new_font_from_buffer`, font.c:785). The `stext` device uses
+    /// it to build the scalar (non-accurate) glyph quad. Reading `/Ascent` from
+    /// the PDF `FontDescriptor` is deliberately *not* done here: MuPDF's
+    /// `fz_font_ascender` never consults it either.
+    pub fn ascender(&self) -> f32 {
+        0.8
+    }
+
+    // MuPDF: fz_font_descender (font.c:286) -- FZ_ASCDESC_DEFAULT path.
+    /// The font's descender in em units (glyph box bottom, negative). Returns
+    /// MuPDF's default `-0.2` for the same no-FreeType reason as
+    /// [`Font::ascender`].
+    pub fn descender(&self) -> f32 {
+        -0.2
+    }
+
     // MuPDF: pdf_decode_cmap over fontdesc->encoding (pdf-op-run.c:1577).
     /// Split the front of `buf` into one character code, returning
     /// `(code, bytes_consumed)`. Use this to iterate a PDF string's codes (1- or

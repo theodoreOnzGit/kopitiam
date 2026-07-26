@@ -86,8 +86,10 @@ pub mod page_run;
 pub mod parse;
 pub mod pool;
 pub mod resources;
+pub mod stext_device;
 pub mod stream;
 pub mod string_util;
+pub mod structured_text;
 pub mod text_device;
 pub mod xref;
 
@@ -106,6 +108,10 @@ pub use object::Object;
 pub use page_run::{run_page, run_page_dict};
 pub use parse::{parse_array, parse_dict, parse_ind_obj, IndirectObject, StreamRange};
 pub use pool::{Handle, Pool};
+pub use stext_device::{page_to_stext, StextDevice};
 pub use stream::{Stream, StreamSource, Whence};
+pub use structured_text::{
+    StextBlock, StextChar, StextImageBlock, StextLine, StextOptions, StextPage, StextTextBlock,
+};
 pub use text_device::TextDevice;
 pub use xref::PdfDocument;
