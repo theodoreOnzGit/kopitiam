@@ -96,11 +96,27 @@ fn escape_cell(cell: &str) -> String {
     cell.replace('|', "\\|")
 }
 
+/// Single-token marker for a figure that has no caption. The image itself is
+/// never extracted (the extraction layer recovers text spans only), so a
+/// caption-less figure would otherwise vanish entirely; this keeps a minimal,
+/// grep-able "a figure was here" signal at essentially zero token cost.
+///
+/// Must stay identical to `FIGURE_PLACEHOLDER` in
+/// `kopitiam-document`'s `validation/mod.rs` (`kopitiam_token_max.md` §2.3):
+/// validation strips exactly this string before counting rendered characters,
+/// so if one changes the other must change with it.
+const FIGURE_PLACEHOLDER: &str = "[figure]";
+
 impl RenderMarkdown for Figure {
     fn render(&self) -> String {
+        // A captioned figure renders the caption *alone*. The old
+        // `{caption}\n\n[Figure omitted from Markdown output]` emission spent a
+        // 37-char placeholder plus a blank line per figure carrying no
+        // information (`kopitiam_token_max.md` §7 card I-D); the caption is the
+        // only recovered content, so it is all we emit.
         match &self.caption {
-            Some(caption) => format!("{caption}\n\n[Figure omitted from Markdown output]"),
-            None => "[Figure omitted from Markdown output]".to_string(),
+            Some(caption) => caption.clone(),
+            None => FIGURE_PLACEHOLDER.to_string(),
         }
     }
 }
@@ -169,11 +185,30 @@ mod tests {
 
     #[test]
     fn figure_without_caption_still_renders_placeholder() {
+        // Updated deliberately for I-D (`kopitiam_token_max.md` §7, §2.5): the
+        // placeholder was shortened from the 37-char
+        // "[Figure omitted from Markdown output]" to the single-token "[figure]"
+        // to stop spending tokens on a per-figure boilerplate line. A
+        // caption-less figure still emits *a* marker (the image is never
+        // extracted, so without it the figure would vanish silently); it is just
+        // as short as possible now. Must match `FIGURE_PLACEHOLDER` in
+        // kopitiam-document's validation/mod.rs (§2.3).
         let figure = Figure {
             caption: None,
             image_path: None,
         };
-        assert_eq!(figure.render(), "[Figure omitted from Markdown output]");
+        assert_eq!(figure.render(), "[figure]");
+    }
+
+    #[test]
+    fn captioned_figure_renders_the_caption_alone_with_no_placeholder() {
+        // The I-D win: a captioned figure is now just its caption -- no
+        // "[Figure omitted ...]" line, no extra blank line.
+        let figure = Figure {
+            caption: Some("Fig. 1 System overview".to_string()),
+            image_path: None,
+        };
+        assert_eq!(figure.render(), "Fig. 1 System overview");
     }
 
     #[test]

@@ -17,6 +17,12 @@ use crate::{Block, Document, Heading, Metadata, Paragraph};
 /// `kopitiam_token_max.md` §2.1.
 pub(crate) use headers::strip_marginalia;
 
+/// Re-exported for `validation` for the same reason: the figure-label collapse
+/// deletes spans, so validation must rerun the *identical* pure pass over the
+/// same pages to discount those labels from the extracted side too (see
+/// `figures.rs` and `kopitiam_token_max.md` §2.1).
+pub(crate) use figures::collapse_figure_regions;
+
 /// One visual line of text on a page: spans grouped by shared baseline and
 /// sorted left to right.
 struct Line {
@@ -52,6 +58,11 @@ pub fn reconstruct(pages: &[Page]) -> Document {
     // so they never become spurious paragraphs. `validation::validate` reruns
     // this same pass so the recovery ratio is not distorted (see `headers.rs`).
     let pages = strip_marginalia(pages);
+    // Then collapse figure regions -- scattered diagram-label soup anchored to a
+    // `Fig. N` caption -- down to the caption alone, before those labels can
+    // each become a spurious `Paragraph`. `validation::validate` reruns this
+    // same pass too, for the same recovery-ratio reason (see `figures.rs`).
+    let pages = collapse_figure_regions(&pages);
     let pages = pages.as_slice();
 
     let body_font_size = estimate_body_font_size(pages);
@@ -119,6 +130,9 @@ pub fn reconstruct_preordered(pages: &[Page]) -> Document {
     // trusts is not disturbed -- only header/footer/page-number spans are
     // removed. `validation::validate` reruns it to keep the ratio honest.
     let pages = strip_marginalia(pages);
+    // Figure-region collapse likewise preserves the surviving spans' order
+    // (it only removes label spans), so the pre-ordered reading order is kept.
+    let pages = collapse_figure_regions(&pages);
     let pages = pages.as_slice();
 
     let body_font_size = estimate_body_font_size(pages);

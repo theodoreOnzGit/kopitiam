@@ -4,17 +4,19 @@ pub use report::ConversionReport;
 
 use kopitiam_pdf::{Page, TextSpan};
 
-use crate::reconstruction::strip_marginalia;
+use crate::reconstruction::{collapse_figure_regions, strip_marginalia};
 use crate::{Block, Document};
 
-/// Markdown text `Figure::render` emits in place of an image (see
+/// Marker text `Figure::render` emits for a figure that has **no** caption (see
 /// `kopitiam-markdown`'s `renderer.rs`). It is renderer boilerplate, not
 /// content recovered from the source PDF, so [`strip_rendered_markdown_syntax`]
 /// removes it before counting. Kept as a literal here rather than a shared
 /// constant because `kopitiam-document` does not depend on `kopitiam-markdown`
 /// (dependencies flow the other way); if the renderer's wording changes this
-/// constant must be updated too, which is a known, cheap-to-miss coupling.
-const FIGURE_PLACEHOLDER: &str = "[Figure omitted from Markdown output]";
+/// constant must be updated too, which is a known, cheap-to-miss coupling
+/// (`kopitiam_token_max.md` §2.3). A *captioned* figure now renders only its
+/// caption (real extracted content), so no placeholder is emitted for it.
+const FIGURE_PLACEHOLDER: &str = "[figure]";
 
 /// Compares what was extracted against what was rendered, and tallies the
 /// block types found, so every conversion produces an auditable report
@@ -36,7 +38,17 @@ pub fn validate(pages: &[Page], document: &Document, rendered_markdown: &str) ->
     // same spans. The removed header/footer text is then absent from *both*
     // `extracted_chars` and `rendered_chars`, and the ratio measures only body
     // recovery, staying honestly inside [0.98, 1.0].
+    //
+    // The identical reasoning applies to figure-region collapsing: reconstruction
+    // drops scattered diagram-label spans (keeping only the caption), so those
+    // labels are legitimately absent from `rendered_markdown`. `collapse_figure_regions`
+    // is likewise pure and deterministic in its input pages, and reconstruction
+    // ran it over exactly these same (already marginalia-stripped) pages in the
+    // same order, so rerunning the same composition here drops byte-for-byte the
+    // same label spans -- discounting them from `extracted_chars` too, exactly
+    // as I-C does for running heads.
     let stripped = strip_marginalia(pages);
+    let stripped = collapse_figure_regions(&stripped);
 
     let extracted_words = stripped
         .iter()
@@ -466,6 +478,63 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_figure_labels_keep_recovery_ratio_honest() {
+        // The recovery-ratio trap (kopitiam_token_max.md §2.1) for I-D. A page
+        // with a scattered cloud of short diagram labels anchored to a `Fig. 1`
+        // caption. Reconstruction drops the labels and keeps only the caption,
+        // so the rendered Markdown is the caption alone. If `validate` still
+        // counted the dropped labels on the extracted side, the ratio would
+        // crater far below 0.98 and the doc would FAIL purely for containing a
+        // diagram. Because `validate` reruns the same `collapse_figure_regions`
+        // (after the same `strip_marginalia`), the labels are discounted on both
+        // sides and the ratio stays honestly in [0.98, 1.0].
+        let caption = "Fig. 1 System architecture of the platform";
+        let labels = [
+            "Sensor Array", "Data Ingestion", "Message Queue", "Stream Processor",
+            "Control Unit", "PID Controller", "Actuator Bank", "Feedback Loop",
+            "State Store", "Cache Layer", "Load Balancer", "API Gateway",
+        ];
+        let mut spans = Vec::new();
+        for (i, label) in labels.iter().enumerate() {
+            let x = 50.0 + ((i * 97) % 450) as f32;
+            let y = 720.0 - (i as f32) * 12.0;
+            spans.push(span(label, x, y, 80.0, 10.0));
+        }
+        spans.push(span(caption, 50.0, 340.0, 400.0, 10.0));
+        let pages = vec![page(spans)];
+
+        // Rendered output is the caption only (labels were collapsed away, and a
+        // captioned figure now renders just its caption).
+        let rendered = format!("{caption}\n");
+        let document = empty_document(vec![Block::Figure(crate::Figure {
+            caption: Some(caption.to_string()),
+            image_path: None,
+        })]);
+        let report = validate(&pages, &document, &rendered);
+
+        assert!(
+            report.recovery_ratio() <= 1.0 + 1e-9,
+            "ratio must not exceed 1.0, got {}",
+            report.recovery_ratio()
+        );
+        assert!(
+            report.recovery_ratio() >= 0.98,
+            "discounting collapsed labels on the extracted side must keep the \
+             ratio in PASS range, got {}",
+            report.recovery_ratio()
+        );
+        assert!(report.passes(), "a doc whose only loss is diagram labels must PASS");
+
+        // Sanity: the labels really were removed from the extracted count -- only
+        // the caption's characters remain.
+        assert_eq!(
+            report.extracted_chars,
+            content_char_count(caption),
+            "extracted side must count the caption only, not the collapsed labels"
+        );
+    }
+
+    #[test]
     fn strip_rendered_markdown_syntax_removes_all_known_scaffolding() {
         let markdown = "# Title\n\n\
              Body paragraph.\n\n\
@@ -479,14 +548,16 @@ mod tests {
              fn main() {}\n\
              ```\n\n\
              Caption text.\n\n\
-             [Figure omitted from Markdown output]\n";
+             [figure]\n";
         let stripped = strip_rendered_markdown_syntax(markdown);
 
         assert!(!stripped.contains('#'));
         assert!(!stripped.contains('|'));
         assert!(!stripped.contains('>'));
         assert!(!stripped.contains("```"));
-        assert!(!stripped.contains("[Figure omitted"));
+        // The caption-less figure marker (I-D shortened it to "[figure]", §2.3)
+        // is renderer boilerplate and must be stripped before counting.
+        assert!(!stripped.contains("[figure]"));
         assert!(stripped.contains("Title"));
         assert!(stripped.contains("Body paragraph."));
         assert!(stripped.contains("First item"));
