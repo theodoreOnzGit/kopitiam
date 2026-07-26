@@ -101,9 +101,39 @@
 //! The image side that *produces* the [`GrayLine`] — the page rasterizer,
 //! Leptonica preprocessing, and line-finding — is a later phase; `pixScale` is
 //! approximated with bilinear resampling for now (see the module docs).
+//!
+//! ## Phase 7: the Leptonica image-preprocessing subset
+//!
+//! This phase ports the **Leptonica** (not Tesseract) image operations between
+//! a rendered page raster and line-finding: grayscale conversion, binarization,
+//! and scaling. Leptonica is BSD-2-Clause (© 2001-2020 Leptonica, Dan
+//! Bloomberg), one-way compatible with AGPLv3; sources are vendored read-only
+//! at `crates/kopitiam-ocr/vendor/leptonica` (commit `10bdea2`). Same raw
+//! 8-bit-buffer style as [`GrayLine`] — no `image`-crate dependency.
+//!
+//! * [`image`] — the page-image types ([`GrayImage`], [`RgbImage`],
+//!   [`RgbaImage`], the [`BinaryImage`] alias) and [`to_gray`], RGB(A)→gray with
+//!   Leptonica's perceptual luma weights (`pixConvertRGBToGray`).
+//! * [`binarize`] — [`otsu_binarize`] (global Otsu histogram split,
+//!   `numaSplitDistribution`) and [`sauvola_binarize`] (adaptive local-mean/std
+//!   threshold via summed-area tables, `pixSauvolaBinarize`).
+//! * [`scale`] — [`scale_gray`]/[`scale_gray_li`], Leptonica's fixed-point
+//!   grayscale linear-interpolation resampler (`pixScaleGrayLI`), the faithful
+//!   form of the bilinear approximation Phase 6 uses to normalize line height.
+//!
+//! Only the minimal LSTM-path subset is ported; deskew/rotate, morphology,
+//! color, the packed 1-bpp `Pix` API, tiled/adaptive thresholding, and image
+//! I/O are deferred (each module documents what and why).
 
 pub mod error;
 pub mod serialis;
+
+// Phase 7: the Leptonica image-preprocessing subset — grayscale conversion,
+// binarization, and scaling (the steps between a rendered page raster and
+// line-finding). Ported from Leptonica (BSD-2-Clause), not Tesseract.
+pub mod binarize;
+pub mod image;
+pub mod scale;
 pub mod tessdata;
 pub mod unichar;
 pub mod unicharcompress;
@@ -133,8 +163,13 @@ mod network_tests;
 #[cfg(test)]
 mod test_support;
 
+pub use binarize::{otsu_binarize, otsu_threshold, sauvola_binarize};
 pub use error::{Error, ErrorKind, Result};
+pub use image::{
+    BINARY_BG, BINARY_FG, BinaryImage, GrayImage, RgbImage, RgbSource, RgbaImage, to_gray,
+};
 pub use lstmrecognizer::{GrayLine, LstmRecognizer};
+pub use scale::{scale_gray, scale_gray_li};
 pub use network::{Network, NetworkHeader, NetworkNode, NetworkType, TYPE_NAMES, create_from_file};
 pub use networkio::NetworkIO;
 pub use recodebeam::{
