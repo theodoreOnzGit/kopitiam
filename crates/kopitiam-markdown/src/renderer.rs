@@ -6,17 +6,96 @@ pub trait RenderMarkdown {
     fn render(&self) -> String;
 }
 
-/// Renders a full document. Blocks are joined by a single blank line and the
-/// output always ends in exactly one trailing newline, so re-rendering an
-/// unchanged `Document` byte-for-byte reproduces the same file (deterministic
-/// output, stable diffs).
+/// Options controlling [`render_document_with`].
+///
+/// A struct (rather than a bare `bool` parameter) so future rendering knobs
+/// can be added without breaking every call site again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Emit a `<!-- page N -->` HTML comment at each page boundary (see
+    /// [`render_document_with`]). Defaults to **on**.
+    ///
+    /// # Why on by default
+    ///
+    /// KOPITIAM's primary consumer of `pdf2md` output is an agent that must
+    /// *cite what it reads* — jump straight to a source page to verify a
+    /// claim (`kopitiam_token_max.md` §8 card I-B). A page anchor is the
+    /// cheapest possible affordance for that: an HTML comment renders to
+    /// nothing in a Markdown viewer, costs a handful of tokens per page, and
+    /// is trivially greppable (`rg -n "<!-- page 4 -->"`). The anchors are
+    /// also what makes **per-page** recovery ratios computable in
+    /// `kopitiam-document`'s validator, so leaving them on by default keeps
+    /// that diagnostic available for every conversion. Turn them off only for
+    /// a human-facing export where even invisible scaffolding is unwanted.
+    pub page_anchors: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self { page_anchors: true }
+    }
+}
+
+/// Renders a full document with page anchors **on** (the agent default; see
+/// [`RenderOptions::page_anchors`]). Back-compatible entry point kept so the
+/// common call site stays `render_document(&doc)`.
+///
+/// Blocks are joined by a single blank line and the output always ends in
+/// exactly one trailing newline, so re-rendering an unchanged `Document`
+/// byte-for-byte reproduces the same file (deterministic output, stable diffs).
 pub fn render_document(document: &Document) -> String {
-    let mut out = document
-        .blocks
-        .iter()
-        .map(RenderMarkdown::render)
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    render_document_with(document, RenderOptions::default())
+}
+
+/// Formats the page-boundary anchor for page `n`.
+///
+/// The literal `<!-- page N -->` form is **duplicated** in
+/// `kopitiam-document`'s validator, which must recognize and strip it before
+/// counting rendered characters and must split the rendered side on it to
+/// compute per-page recovery (`kopitiam_token_max.md` §2.1, §2.3). If this
+/// wording changes, `validation/mod.rs`'s `parse_page_anchor` must change with
+/// it — the two are kept in sync by tests on both sides, not by a shared
+/// constant (dependencies flow markdown -> document, not the other way).
+fn page_anchor(n: usize) -> String {
+    format!("<!-- page {n} -->")
+}
+
+/// Renders a full document, optionally emitting a `<!-- page N -->` anchor at
+/// each page boundary.
+///
+/// Blocks are joined by a single blank line and the output ends in exactly one
+/// trailing newline. When [`RenderOptions::page_anchors`] is set and the
+/// `Document` carries page provenance ([`Document::block_pages`]), a single
+/// anchor is emitted at every boundary — the point where a block starts a
+/// higher-numbered page than its predecessor — carrying that new page's number.
+/// No anchor precedes the first page (its content is simply everything before
+/// the first anchor), so there is exactly **one anchor per boundary**. A
+/// `Document` without page information (e.g. one built by hand or via
+/// `Default`) emits no anchors regardless of the option, because there is no
+/// honest page number to attach.
+pub fn render_document_with(document: &Document, options: RenderOptions) -> String {
+    let mut pieces: Vec<String> = Vec::with_capacity(document.blocks.len());
+    let mut previous_page: Option<usize> = None;
+
+    for (index, block) in document.blocks.iter().enumerate() {
+        if options.page_anchors {
+            // `page_of` is `None` for a document without provenance, and only
+            // then; in that case we never emit an anchor (nothing to cite).
+            if let Some(page) = document.page_of(index) {
+                if previous_page.is_some_and(|prev| prev != page) {
+                    // A boundary: this block begins a new page. Page numbers are
+                    // monotonic non-decreasing (blocks are in reading order), so
+                    // this fires once per boundary and never emits a leading
+                    // anchor for the very first page.
+                    pieces.push(page_anchor(page));
+                }
+                previous_page = Some(page);
+            }
+        }
+        pieces.push(block.render());
+    }
+
+    let mut out = pieces.join("\n\n");
     if !out.is_empty() {
         out.push('\n');
     }
@@ -213,12 +292,20 @@ mod tests {
 
     #[test]
     fn document_blocks_are_joined_by_a_blank_line_with_trailing_newline() {
+        // Updated deliberately for I-B (`kopitiam_token_max.md` §8, §2.5). The
+        // renderer now emits a `<!-- page N -->` anchor at each page boundary
+        // when `page_anchors` is on (the default). This test guards the
+        // *block-joining* invariant — blocks separated by exactly one blank
+        // line, output ending in one trailing newline — which anchors must not
+        // disturb, so it now pins the anchors-**off** path explicitly. The
+        // fixture is given real page provenance that spans a boundary
+        // (`block_pages = [1, 2]`) precisely so this asserts anchors are
+        // suppressed when off, rather than being vacuously absent. The
+        // anchors-on behavior is covered by the two tests below.
         let document = Document {
             title: None,
             metadata: Metadata::default(),
-            // Rendering does not need page provenance; this fixture is
-            // hand-built rather than reconstructed, so it honestly has none.
-            block_pages: Vec::new(),
+            block_pages: vec![1, 2],
             blocks: vec![
                 Block::Heading(Heading {
                     level: 1,
@@ -230,6 +317,88 @@ mod tests {
             ],
             citations: Vec::new(),
         };
-        assert_eq!(render_document(&document), "# Title\n\nBody text.\n");
+        let rendered = render_document_with(&document, RenderOptions { page_anchors: false });
+        assert_eq!(rendered, "# Title\n\nBody text.\n");
+    }
+
+    #[test]
+    fn page_anchors_default_on_emit_one_anchor_per_boundary_matching_block_pages() {
+        // Multi-page fixture: three blocks on pages 1, 2, 2. There is exactly
+        // one page boundary (1 -> 2), so exactly one anchor is emitted, and it
+        // carries the new page's number from `block_pages`. No leading anchor
+        // precedes page 1, and the second page-2 block adds no second anchor.
+        let document = Document {
+            title: None,
+            metadata: Metadata::default(),
+            block_pages: vec![1, 2, 2],
+            blocks: vec![
+                Block::Paragraph(Paragraph {
+                    text: "Page one body.".to_string(),
+                }),
+                Block::Heading(Heading {
+                    level: 2,
+                    text: "Second Page".to_string(),
+                }),
+                Block::Paragraph(Paragraph {
+                    text: "Page two body.".to_string(),
+                }),
+            ],
+            citations: Vec::new(),
+        };
+        let rendered = render_document(&document);
+        assert_eq!(
+            rendered,
+            "Page one body.\n\n<!-- page 2 -->\n\n## Second Page\n\nPage two body.\n"
+        );
+        // Exactly one anchor, and it is literal + greppable (acceptance:
+        // `rg -n "<!-- page 2 -->"` locates the page).
+        assert_eq!(rendered.matches("<!-- page ").count(), 1);
+        assert!(rendered.contains("<!-- page 2 -->"));
+    }
+
+    #[test]
+    fn page_anchor_number_jumps_when_a_page_has_no_blocks() {
+        // A boundary that skips a page number (page 2 produced no blocks) still
+        // emits exactly one anchor, carrying the *next* page that actually has
+        // content (page 3), so the anchor number always matches `block_pages`.
+        let document = Document {
+            title: None,
+            metadata: Metadata::default(),
+            block_pages: vec![1, 3],
+            blocks: vec![
+                Block::Paragraph(Paragraph {
+                    text: "First.".to_string(),
+                }),
+                Block::Paragraph(Paragraph {
+                    text: "Third.".to_string(),
+                }),
+            ],
+            citations: Vec::new(),
+        };
+        assert_eq!(
+            render_document(&document),
+            "First.\n\n<!-- page 3 -->\n\nThird.\n"
+        );
+    }
+
+    #[test]
+    fn a_document_without_page_provenance_emits_no_anchors_even_with_anchors_on() {
+        // `Default`/hand-built documents carry no page numbers; there is no
+        // honest page to cite, so no anchor is emitted regardless of the option.
+        let document = Document {
+            title: None,
+            metadata: Metadata::default(),
+            block_pages: Vec::new(),
+            blocks: vec![
+                Block::Paragraph(Paragraph {
+                    text: "One.".to_string(),
+                }),
+                Block::Paragraph(Paragraph {
+                    text: "Two.".to_string(),
+                }),
+            ],
+            citations: Vec::new(),
+        };
+        assert_eq!(render_document(&document), "One.\n\nTwo.\n");
     }
 }

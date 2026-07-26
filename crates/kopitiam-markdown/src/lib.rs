@@ -3,4 +3,4 @@
 
 mod renderer;
 
-pub use renderer::{RenderMarkdown, render_document};
+pub use renderer::{RenderMarkdown, RenderOptions, render_document, render_document_with};

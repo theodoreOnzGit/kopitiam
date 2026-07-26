@@ -1,6 +1,8 @@
 mod report;
 
-pub use report::ConversionReport;
+pub use report::{ConversionReport, PageRecovery};
+
+use std::collections::BTreeMap;
 
 use kopitiam_pdf::{Page, TextSpan};
 
@@ -79,7 +81,105 @@ pub fn validate(pages: &[Page], document: &Document, rendered_markdown: &str) ->
         lists_found,
         tables_found,
         citations_found: document.citations.len(),
+        per_page: per_page_recovery(&stripped, document, rendered_markdown),
     }
+}
+
+/// Attributes character recovery to individual source pages using the
+/// `<!-- page N -->` anchors the renderer emits at page boundaries
+/// (`kopitiam_token_max.md` §8 card I-B).
+///
+/// # How pages are numbered
+///
+/// Both sides use the **same** 1-based page numbering: `reconstruct` labels a
+/// block with `page_index + 1` (its position in the input `pages`, see
+/// `reconstruction::merge_page_breaks`), and the renderer's anchors carry those
+/// same `block_pages` numbers. `strip_marginalia`/`collapse_figure_regions`
+/// preserve the one-page-per-input-page mapping, so `stripped[i]` is page
+/// `i + 1` — the same number a block on that page records. That alignment is
+/// what lets the extracted side (indexed by position) and the rendered side
+/// (split on anchors) be compared page-for-page.
+///
+/// # Honesty (`kopitiam_token_max.md` §2.1)
+///
+/// The extracted side is the *same* `strip_marginalia` + `collapse_figure_regions`
+/// pages the document-wide count uses, summed per page; the rendered side is the
+/// *same* `strip_rendered_markdown_syntax` normalization, applied per anchor
+/// segment. The anchor lines strip to nothing, so the per-page figures partition
+/// the document-wide totals exactly (they sum back to them).
+///
+/// Returns an empty vec for a document with no page provenance
+/// (`block_pages` empty): there is no page to attribute content to, and
+/// guessing page 1 for everything would be dishonest.
+fn per_page_recovery(
+    stripped: &[Page],
+    document: &Document,
+    rendered_markdown: &str,
+) -> Vec<PageRecovery> {
+    let Some(&first_page) = document.block_pages.first() else {
+        return Vec::new();
+    };
+
+    let rendered_by_page = rendered_chars_by_page(rendered_markdown, first_page);
+
+    (0..stripped.len())
+        .map(|i| {
+            let page = i + 1;
+            PageRecovery {
+                page,
+                extracted_chars: extracted_content_chars(std::slice::from_ref(&stripped[i])),
+                rendered_chars: rendered_by_page.get(&page).copied().unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
+/// Splits the rendered Markdown on `<!-- page N -->` anchors and returns the
+/// non-whitespace content-character count per page number.
+///
+/// The segment *before* the first anchor belongs to `first_page` (the page the
+/// document's first block starts on — no anchor precedes the first page); each
+/// segment after an anchor belongs to that anchor's page. Every segment is run
+/// through [`strip_rendered_markdown_syntax`] before counting, exactly like the
+/// document-wide figure, so the per-page counts sum back to it.
+fn rendered_chars_by_page(markdown: &str, first_page: usize) -> BTreeMap<usize, usize> {
+    let mut by_page: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut current_page = first_page;
+    let mut segment = String::new();
+
+    let mut flush = |page: usize, segment: &mut String| {
+        let chars = content_char_count(&strip_rendered_markdown_syntax(segment));
+        *by_page.entry(page).or_insert(0) += chars;
+        segment.clear();
+    };
+
+    for line in markdown.lines() {
+        if let Some(page) = parse_page_anchor(line.trim()) {
+            flush(current_page, &mut segment);
+            current_page = page;
+        } else {
+            segment.push_str(line);
+            segment.push('\n');
+        }
+    }
+    flush(current_page, &mut segment);
+
+    by_page
+}
+
+/// Parses a `<!-- page N -->` page-boundary anchor line, returning `N`.
+///
+/// The literal form is **duplicated** from `kopitiam-markdown`'s renderer
+/// (`page_anchor`), the same way [`FIGURE_PLACEHOLDER`] is: `kopitiam-document`
+/// does not depend on `kopitiam-markdown` (dependencies flow the other way), so
+/// the two are kept in sync by tests on both sides rather than a shared
+/// constant (`kopitiam_token_max.md` §2.3). If the renderer's anchor wording
+/// changes, this must change with it.
+fn parse_page_anchor(line: &str) -> Option<usize> {
+    line.strip_prefix("<!-- page ")?
+        .strip_suffix(" -->")?
+        .parse()
+        .ok()
 }
 
 fn word_count(text: &str) -> usize {
@@ -182,6 +282,15 @@ fn strip_rendered_markdown_syntax(markdown: &str) -> String {
         if trimmed == FIGURE_PLACEHOLDER {
             continue; // renderer boilerplate, never present in the source PDF
         }
+        if parse_page_anchor(trimmed).is_some() {
+            // Page-boundary anchor (`<!-- page N -->`, I-B). The renderer adds it
+            // for navigation/citation; it is not content from the source PDF, so
+            // it must not inflate `rendered_chars` and push the ratio above 1.0
+            // (`kopitiam_token_max.md` §2.1). Stripping it here also makes the
+            // per-page split (`rendered_chars_by_page`) sum back to the
+            // document-wide total, since the anchor lines count as zero.
+            continue;
+        }
         if is_table_separator_line(trimmed) {
             continue; // e.g. "| --- | --- |"
         }
@@ -277,8 +386,12 @@ mod tests {
     }
 
     fn page(spans: Vec<TextSpan>) -> Page {
+        page_n(1, spans)
+    }
+
+    fn page_n(number: usize, spans: Vec<TextSpan>) -> Page {
         Page {
-            number: 1,
+            number,
             width: 600.0,
             height: 800.0,
             spans,
@@ -548,13 +661,17 @@ mod tests {
              fn main() {}\n\
              ```\n\n\
              Caption text.\n\n\
-             [figure]\n";
+             [figure]\n\n\
+             <!-- page 2 -->\n";
         let stripped = strip_rendered_markdown_syntax(markdown);
 
         assert!(!stripped.contains('#'));
         assert!(!stripped.contains('|'));
         assert!(!stripped.contains('>'));
         assert!(!stripped.contains("```"));
+        // The page-boundary anchor (I-B, §2.1) is renderer scaffolding, not
+        // source content, and must be stripped before counting.
+        assert!(!stripped.contains("<!-- page"));
         // The caption-less figure marker (I-D shortened it to "[figure]", §2.3)
         // is renderer boilerplate and must be stripped before counting.
         assert!(!stripped.contains("[figure]"));
@@ -578,5 +695,135 @@ mod tests {
         let report = validate(&[], &empty_document(vec![]), "");
         assert_eq!(report.recovery_ratio(), 1.0);
         assert!(report.passes());
+    }
+
+    // -- I-B: page anchors + per-page recovery --
+
+    #[test]
+    fn page_anchor_scaffolding_does_not_inflate_recovery() {
+        // The §2.1 recovery-ratio trap for I-B: the `<!-- page N -->` anchors the
+        // renderer now emits are NOT source content. If they counted toward
+        // `rendered_chars`, a two-page doc would report >100% recovery and mask
+        // real content loss. Because `strip_rendered_markdown_syntax` drops the
+        // anchor lines, the ratio stays honestly in [0.98, 1.0]. NEVER weaken 0.98.
+        let body1 = "First page body sentence carrying the real content.";
+        let body2 = "Second page body sentence carrying the real content.";
+        let pages = vec![
+            page_n(1, vec![span(body1, 50.0, 400.0, 400.0, 10.0)]),
+            page_n(2, vec![span(body2, 50.0, 400.0, 400.0, 10.0)]),
+        ];
+        let document = Document {
+            title: None,
+            metadata: Metadata { source_pages: 2 },
+            block_pages: vec![1, 2],
+            blocks: vec![
+                Block::Paragraph(Paragraph { text: body1.to_string() }),
+                Block::Paragraph(Paragraph { text: body2.to_string() }),
+            ],
+            citations: Vec::new(),
+        };
+        // Exactly what `render_document` produces: one anchor at the boundary.
+        let rendered = format!("{body1}\n\n<!-- page 2 -->\n\n{body2}\n");
+        let report = validate(&pages, &document, &rendered);
+
+        assert!(
+            report.recovery_ratio() <= 1.0 + 1e-9,
+            "page anchors must not push recovery above 100%, got {}",
+            report.recovery_ratio()
+        );
+        assert!(
+            report.recovery_ratio() >= 0.98,
+            "expected ~100% once anchors are stripped, got {}",
+            report.recovery_ratio()
+        );
+        assert!(report.passes());
+    }
+
+    #[test]
+    fn per_page_recovery_is_reported_and_sums_to_the_document_wide_figure() {
+        // Two full pages plus a third page whose body was truncated in the
+        // rendered output (content loss confined to page 3). The per-page split
+        // localizes the loss to page 3 while pages 1 and 2 stay ~100%, and the
+        // per-page char totals partition the document-wide totals exactly.
+        let body1 = "Alpha content on the very first page here.";
+        let body2 = "Beta content on the second page as well now.";
+        let body3_full = "Gamma content on the third page that is mostly dropped downstream.";
+        let body3_rendered = "Gamma content"; // truncated: real loss on page 3
+        let pages = vec![
+            page_n(1, vec![span(body1, 50.0, 400.0, 400.0, 10.0)]),
+            page_n(2, vec![span(body2, 50.0, 400.0, 400.0, 10.0)]),
+            page_n(3, vec![span(body3_full, 50.0, 400.0, 400.0, 10.0)]),
+        ];
+        let document = Document {
+            title: None,
+            metadata: Metadata { source_pages: 3 },
+            block_pages: vec![1, 2, 3],
+            blocks: vec![
+                Block::Paragraph(Paragraph { text: body1.to_string() }),
+                Block::Paragraph(Paragraph { text: body2.to_string() }),
+                Block::Paragraph(Paragraph { text: body3_rendered.to_string() }),
+            ],
+            citations: Vec::new(),
+        };
+        let rendered =
+            format!("{body1}\n\n<!-- page 2 -->\n\n{body2}\n\n<!-- page 3 -->\n\n{body3_rendered}\n");
+        let report = validate(&pages, &document, &rendered);
+
+        // One entry per source page, in page order.
+        assert_eq!(report.per_page.len(), 3);
+        assert_eq!(
+            report.per_page.iter().map(|p| p.page).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // Pages 1 and 2 are fully recovered; page 3 is not.
+        assert!(report.per_page[0].recovery_ratio() >= 0.99);
+        assert!(report.per_page[1].recovery_ratio() >= 0.99);
+        assert!(
+            report.per_page[2].recovery_ratio() < 0.5,
+            "the truncated page 3 must show a low per-page ratio, got {}",
+            report.per_page[2].recovery_ratio()
+        );
+
+        // Consistency: the per-page figures partition the document-wide totals.
+        let sum_extracted: usize = report.per_page.iter().map(|p| p.extracted_chars).sum();
+        let sum_rendered: usize = report.per_page.iter().map(|p| p.rendered_chars).sum();
+        assert_eq!(sum_extracted, report.extracted_chars);
+        assert_eq!(sum_rendered, report.rendered_chars);
+
+        // The document-wide ratio lies within the span of the per-page ratios
+        // (page 3 drags it down without the per-page view, we would not know
+        // *which* page).
+        let doc_ratio = report.recovery_ratio();
+        assert!(doc_ratio < report.per_page[0].recovery_ratio());
+        assert!(doc_ratio > report.per_page[2].recovery_ratio());
+    }
+
+    #[test]
+    fn a_specific_page_anchor_is_literal_and_greppable_in_the_rendered_output() {
+        // Acceptance: `rg -n "<!-- page 2 -->"` (conceptually) locates page 2.
+        // The anchor is a plain literal string, not an escaped/encoded token.
+        let rendered = "Page one.\n\n<!-- page 2 -->\n\nPage two.\n";
+        assert!(rendered.contains("<!-- page 2 -->"));
+        assert_eq!(parse_page_anchor("<!-- page 2 -->"), Some(2));
+        assert_eq!(parse_page_anchor("<!-- page 717 -->"), Some(717));
+        // Not every comment-shaped line is an anchor.
+        assert_eq!(parse_page_anchor("<!-- note -->"), None);
+        assert_eq!(parse_page_anchor("plain text"), None);
+    }
+
+    #[test]
+    fn a_document_without_page_provenance_reports_no_per_page_breakdown() {
+        // No `block_pages` -> no honest page attribution -> empty per_page.
+        let document = Document {
+            title: None,
+            metadata: Metadata::default(),
+            block_pages: Vec::new(),
+            blocks: vec![Block::Paragraph(Paragraph { text: "Body.".to_string() })],
+            citations: Vec::new(),
+        };
+        let pages = vec![page(vec![span("Body.", 50.0, 400.0, 100.0, 10.0)])];
+        let report = validate(&pages, &document, "Body.\n");
+        assert!(report.per_page.is_empty());
     }
 }

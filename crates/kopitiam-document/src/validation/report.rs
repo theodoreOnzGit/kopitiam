@@ -20,6 +20,39 @@
 /// [`strip_rendered_markdown_syntax`]: super::strip_rendered_markdown_syntax
 const MIN_RECOVERY_RATIO: f64 = 0.98;
 
+/// Character recovery for a single source page, attributed via the
+/// `<!-- page N -->` anchors the renderer emits at page boundaries
+/// (`kopitiam_token_max.md` §8 card I-B).
+///
+/// The document-wide [`ConversionReport::recovery_ratio`] answers "did we lose
+/// content *somewhere*?"; these answer "*which page*?" — turning "97% overall,
+/// re-check everything" into "page 4 is 71%, check only page 4". Their
+/// `extracted_chars`/`rendered_chars` partition the document-wide totals
+/// exactly (they sum back to [`ConversionReport::extracted_chars`] /
+/// [`ConversionReport::rendered_chars`]), because the same normalization is
+/// applied and the anchor lines themselves contribute zero content.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageRecovery {
+    /// 1-based page number, matching the block's `Document::block_pages` value
+    /// and the `<!-- page N -->` anchor.
+    pub page: usize,
+    pub extracted_chars: usize,
+    pub rendered_chars: usize,
+}
+
+impl PageRecovery {
+    /// This page's `rendered_chars / extracted_chars`, with the same
+    /// empty-extraction convention as [`ConversionReport::recovery_ratio`]: a
+    /// page from which nothing was extracted (e.g. one that was entirely a
+    /// running head, now stripped) is full recovery, not a divide-by-zero.
+    pub fn recovery_ratio(&self) -> f64 {
+        if self.extracted_chars == 0 {
+            return 1.0;
+        }
+        self.rendered_chars as f64 / self.extracted_chars as f64
+    }
+}
+
 /// Audits one PDF-to-Markdown conversion: how much of the extracted text
 /// survived into the rendered output, plus a tally of the structural
 /// blocks found, so every conversion is auditable rather than a silent
@@ -53,6 +86,13 @@ pub struct ConversionReport {
     pub lists_found: usize,
     pub tables_found: usize,
     pub citations_found: usize,
+
+    /// Per-page character recovery, one entry per source page, in page order.
+    /// Populated only when the `Document` carries page provenance
+    /// (`Document::block_pages`); empty otherwise (a hand-built document has no
+    /// page to attribute content to, and guessing would be dishonest). See
+    /// [`PageRecovery`].
+    pub per_page: Vec<PageRecovery>,
 }
 
 impl ConversionReport {
@@ -113,6 +153,20 @@ impl std::fmt::Display for ConversionReport {
         writeln!(f, "  Extracted: {} chars", self.extracted_chars)?;
         writeln!(f, "  Rendered:  {} chars", self.rendered_chars)?;
         writeln!(f, "  Ratio:     {:.1}%", self.recovery_ratio() * 100.0)?;
+        if !self.per_page.is_empty() {
+            writeln!(f)?;
+            writeln!(f, "  Per page:")?;
+            for page in &self.per_page {
+                writeln!(
+                    f,
+                    "    Page {:>3}: {:>5.1}%  ({}/{} chars)",
+                    page.page,
+                    page.recovery_ratio() * 100.0,
+                    page.rendered_chars,
+                    page.extracted_chars,
+                )?;
+            }
+        }
         writeln!(f)?;
         writeln!(f, "Words (informational only, not authoritative -- see kopitiam-wwr):")?;
         writeln!(f, "  Extracted: {}", self.extracted_words)?;
