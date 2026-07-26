@@ -21,10 +21,8 @@ pub mod contract;
 pub mod event_wal;
 #[cfg(feature = "wal-fs")]
 pub mod frame;
-#[cfg(all(feature = "wal-fs", feature = "wal-sqlite"))]
+#[cfg(feature = "wal-fs")]
 pub mod fsck;
-#[cfg(feature = "wal-sqlite")]
-pub mod index;
 pub mod memory_index;
 #[cfg(feature = "wal-fs")]
 pub mod memory_wal;
@@ -41,8 +39,6 @@ pub mod segment;
 pub use event_wal::{EventWal, SegmentSnapshot};
 #[cfg(feature = "wal-fs")]
 pub use frame::{FRAME_CRC_OFFSET, FRAME_HEADER_LEN, FrameReader, FrameWriter};
-#[cfg(feature = "wal-sqlite")]
-pub use index::SqliteWalIndex;
 pub use memory_index::{MemoryWalIndex, MemoryWalIndexSnapshot};
 #[cfg(feature = "wal-fs")]
 pub use memory_wal::MemoryEventWal;

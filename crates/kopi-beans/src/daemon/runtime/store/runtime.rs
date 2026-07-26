@@ -36,8 +36,8 @@ use crate::daemon::remote::RemoteUrl;
 use crate::daemon::runtime::repl::PeerAckTable;
 use crate::daemon::runtime::store::lock::{StoreLock, StoreLockError};
 use crate::daemon::runtime::wal::{
-    EventWal, HlcRow, IndexDurabilityMode, ReplayStats, SqliteWalIndex, WalIndex, WalIndexError,
-    WalReplayError, catch_up_index, rebuild_index,
+    EventWal, HlcRow, IndexDurabilityMode, MemoryWalIndex, ReplayStats, WalIndex, WalIndexError,
+    WalReplayError, rebuild_index,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,33 +685,18 @@ impl StoreRuntime {
             .pending()
             .map(|pending| pending.pending_path.clone());
         let open_result =
-            (|| -> Result<(SqliteWalIndex, ReplayStats, StoreMeta), StoreRuntimeError> {
+            (|| -> Result<(MemoryWalIndex, ReplayStats, StoreMeta), StoreRuntimeError> {
                 let store_dir = layout.store_dir(&store_id);
                 let store_config = load_store_config_with_layout(layout, store_id, true)?;
-                let (mut wal_index, needs_rebuild) = open_wal_index_with_layout(
-                    layout,
-                    store_id,
-                    &store_dir,
-                    meta_state.meta(),
-                    store_config.index_durability_mode,
-                )?;
-                let replay_stats = if needs_rebuild {
-                    rebuild_index(&store_dir, meta_state.meta(), &wal_index, limits)?
-                } else {
-                    match catch_up_index(&store_dir, meta_state.meta(), &wal_index, limits) {
-                        Ok(stats) => stats,
-                        Err(WalReplayError::IndexOffsetInvalid { .. }) => {
-                            remove_wal_index_files_with_layout(layout, store_id)?;
-                            wal_index = SqliteWalIndex::open(
-                                &store_dir,
-                                meta_state.meta(),
-                                store_config.index_durability_mode,
-                            )?;
-                            rebuild_index(&store_dir, meta_state.meta(), &wal_index, limits)?
-                        }
-                        Err(err) => return Err(StoreRuntimeError::WalReplay(Box::new(err))),
-                    }
-                };
+                // The WAL index is a pure-Rust in-memory materialized view. The
+                // durable WAL segments are the source of truth, so the index is
+                // always rebuilt from them on open (a fresh in-memory index is
+                // empty and therefore always requires a full rebuild). Any legacy
+                // on-disk index left by older (SQLite) builds is ignored; the
+                // meta-transition paths still clean up those files.
+                let wal_index = MemoryWalIndex::with_mode(store_config.index_durability_mode);
+                let replay_stats =
+                    rebuild_index(&store_dir, meta_state.meta(), &wal_index, limits)?;
                 #[cfg(test)]
                 maybe_panic_store_meta_transition("store_meta_transition_before_meta_commit");
                 let meta = meta_state.commit()?;
@@ -1519,28 +1504,6 @@ impl IntoErrorPayload for StoreRuntimeError {
     }
 }
 
-fn open_wal_index_with_layout(
-    layout: &DaemonLayout,
-    store_id: StoreId,
-    store_dir: &Path,
-    meta: &StoreMeta,
-    mode: IndexDurabilityMode,
-) -> Result<(SqliteWalIndex, bool), StoreRuntimeError> {
-    let db_path = layout.wal_index_path(&store_id);
-    let mut needs_rebuild = !db_path.exists();
-
-    match SqliteWalIndex::open(store_dir, meta, mode) {
-        Ok(index) => Ok((index, needs_rebuild)),
-        Err(WalIndexError::SchemaVersionMismatch { .. }) => {
-            needs_rebuild = true;
-            remove_wal_index_files_with_layout(layout, store_id)?;
-            let index = SqliteWalIndex::open(store_dir, meta, mode)?;
-            Ok((index, needs_rebuild))
-        }
-        Err(err) => Err(StoreRuntimeError::WalIndex(err)),
-    }
-}
-
 fn can_upgrade_index_schema_only(got: StoreMetaVersions, expected: StoreMetaVersions) -> bool {
     got.store_format_version == expected.store_format_version
         && got.wal_format_version == expected.wal_format_version
@@ -2155,7 +2118,7 @@ mod tests {
     use crate::daemon::paths;
     use crate::daemon::remote::RemoteUrl;
     use crate::daemon::runtime::store::lock::{StoreLockMeta, read_lock_meta};
-    use crate::daemon::runtime::wal::{IndexDurabilityMode, SqliteWalIndex, WalIndex};
+    use crate::daemon::runtime::wal::{IndexDurabilityMode, MemoryWalIndex, WalIndex};
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use uuid::Uuid;
@@ -2180,47 +2143,17 @@ mod tests {
         meta
     }
 
-    fn write_legacy_index_with_sentinel(store_id: StoreId, meta: &StoreMeta) {
+    fn write_legacy_index_with_sentinel(store_id: StoreId, _meta: &StoreMeta) {
+        // Simulate a leftover on-disk index file from an older (SQLite) build.
+        // The pure-Rust store keeps its WAL index in memory and rebuilds it from
+        // the WAL on open, so any such legacy file must be ignored and cleaned up
+        // rather than reused.
         let db_path = paths::store_dir(store_id).join("index").join("wal.sqlite");
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).expect("create index dir");
         }
-        let conn = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (
-               key TEXT PRIMARY KEY,
-               value TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS legacy_sentinel (
-               id INTEGER PRIMARY KEY
-             );",
-        )
-        .expect("create legacy schema");
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            rusqlite::params!["store_id", meta.store_id().to_string()],
-        )
-        .expect("insert store_id");
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            rusqlite::params!["store_epoch", meta.store_epoch().get().to_string()],
-        )
-        .expect("insert store_epoch");
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            rusqlite::params![
-                "index_schema_version",
-                meta.index_schema_version.to_string()
-            ],
-        )
-        .expect("insert index_schema_version");
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            rusqlite::params!["wal_format_version", meta.wal_format_version.to_string()],
-        )
-        .expect("insert wal_format_version");
-        conn.execute("INSERT INTO legacy_sentinel (id) VALUES (1)", [])
-            .expect("insert sentinel");
+        std::fs::write(&db_path, b"legacy sqlite index sentinel")
+            .expect("write legacy index file");
     }
 
     fn write_stale_lock_meta(
@@ -2259,7 +2192,7 @@ mod tests {
         let replica_id = ReplicaId::new(Uuid::from_bytes([11u8; 16]));
         let now_ms = 1_700_000_000_000;
         let meta = write_meta_for(store_id, replica_id, now_ms);
-        let index = SqliteWalIndex::open(
+        let index = MemoryWalIndex::open(
             &paths::store_dir(store_id),
             &meta,
             IndexDurabilityMode::Cache,
@@ -2349,36 +2282,12 @@ mod tests {
             StoreMetaVersions::INDEX_SCHEMA_VERSION
         );
 
-        let db_path = paths::store_dir(store_id).join("index").join("wal.sqlite");
-        let conn = rusqlite::Connection::open(&db_path).expect("open rebuilt wal sqlite");
-        let sentinel_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                rusqlite::params!["legacy_sentinel"],
-                |row| row.get(0),
-            )
-            .expect("query sqlite_master");
-        assert_eq!(sentinel_count, 0, "legacy index should be replaced");
-
-        let namespace = NamespaceId::core();
-        let origin = ReplicaId::new(Uuid::from_bytes([22u8; 16]));
-        let insert_err = conn
-            .execute(
-                "INSERT INTO watermarks (namespace, origin_replica_id, applied_seq, durable_seq, applied_head_sha, durable_head_sha) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    namespace.as_str(),
-                    origin.as_uuid().as_bytes().to_vec(),
-                    1i64,
-                    0i64,
-                    Option::<Vec<u8>>::None,
-                    Option::<Vec<u8>>::None,
-                ],
-            )
-            .expect_err("invalid watermark insert should fail");
+        // The pure-Rust store keeps its WAL index in memory and rebuilds it from
+        // the WAL on open, so the leftover legacy on-disk index file must have
+        // been cleaned up as part of the stale-schema upgrade rebuild.
         assert!(
-            insert_err.to_string().contains("CHECK constraint failed"),
-            "expected CHECK constraint failure, got {insert_err}"
+            !paths::wal_index_path(store_id).exists(),
+            "legacy on-disk index should be removed after stale-schema rebuild"
         );
     }
 

@@ -795,7 +795,7 @@ fn scrub_index_offsets(
 fn verify_index_offset(
     namespace: &NamespaceId,
     origin: &ReplicaId,
-    item: &crate::daemon::runtime::wal::index::IndexedRangeItem,
+    item: &crate::daemon::runtime::wal::IndexedRangeItem,
     max_record_bytes: usize,
     segment_paths: &BTreeMap<SegmentId, PathBuf>,
     handles: &mut HashMap<SegmentId, SegmentHandle>,

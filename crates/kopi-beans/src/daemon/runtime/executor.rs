@@ -843,7 +843,7 @@ mod tests {
     use crate::daemon::runtime::core::{HandleOutcome, insert_store_for_tests};
     use crate::daemon::runtime::ipc::{CreatePayload, MutationCtx, MutationMeta, Request, ResponsePayload};
     use crate::daemon::runtime::wal::{
-        IndexDurabilityMode, SegmentConfig, SegmentWriter, SqliteWalIndex, rebuild_index,
+        IndexDurabilityMode, SegmentConfig, SegmentWriter, MemoryWalIndex, rebuild_index,
     };
     use tracing::Subscriber;
     use tracing::field::{Field, Visit};
@@ -891,13 +891,13 @@ mod tests {
         }
     }
 
-    fn open_index_for_store(store_id: StoreId) -> (SqliteWalIndex, StoreMeta) {
+    fn open_index_for_store(store_id: StoreId) -> (MemoryWalIndex, StoreMeta) {
         let store_dir = crate::daemon::paths::store_dir(store_id);
         let meta_path = crate::daemon::paths::store_meta_path(store_id);
         let meta: StoreMeta =
             serde_json::from_str(&std::fs::read_to_string(meta_path).expect("read store meta"))
                 .expect("parse store meta");
-        let index = SqliteWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache)
+        let index = MemoryWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache)
             .expect("open wal index");
         (index, meta)
     }
@@ -912,7 +912,7 @@ mod tests {
     }
 
     fn wal_index_snapshot(
-        index: &SqliteWalIndex,
+        index: &MemoryWalIndex,
         namespace: &NamespaceId,
         origin: ReplicaId,
         seq: Seq1,
@@ -1671,7 +1671,7 @@ mod tests {
         );
         let meta = StoreMeta::new(store, replica_id, versions, 1_700_000_000_000);
 
-        let index = SqliteWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache).unwrap();
         let limits = Limits::default();
         let engine = MutationEngine::new(limits.clone());
         let actor = actor_id("alice");
@@ -1809,7 +1809,7 @@ mod tests {
         );
         let meta = StoreMeta::new(store, replica_id, versions, 1_700_000_100_000);
 
-        let index = SqliteWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache).unwrap();
         let limits = Limits::default();
         let engine = MutationEngine::new(limits.clone());
         let actor = actor_id("alice");
@@ -2016,7 +2016,7 @@ mod tests {
         );
         let meta = StoreMeta::new(store, replica_id, versions, 1_700_000_200_000);
 
-        let index = SqliteWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache).unwrap();
         let limits = Limits::default();
         let engine = MutationEngine::new(limits.clone());
         let actor = actor_id("alice");

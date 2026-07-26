@@ -1444,7 +1444,7 @@ mod tests {
     use crate::daemon_core::wal::SegmentConfig;
     use crate::daemon_core::wal::record::{RecordHeader, RequestProof};
     use crate::daemon_core::wal::segment::SegmentWriter;
-    use crate::daemon_core::wal::{IndexDurabilityMode, IndexedRangeItem, SqliteWalIndex, WatermarkRow};
+    use crate::daemon_core::wal::{IndexDurabilityMode, IndexedRangeItem, MemoryWalIndex, WatermarkRow};
 
     fn test_meta(store_id: StoreId, store_epoch: StoreEpoch) -> StoreMeta {
         let identity = StoreIdentity::new(store_id, store_epoch);
@@ -1487,7 +1487,7 @@ mod tests {
     struct CatchUpAtomicFixture {
         temp: TempDir,
         meta: StoreMeta,
-        index: SqliteWalIndex,
+        index: MemoryWalIndex,
         limits: Limits,
         namespace: NamespaceId,
         origin: ReplicaId,
@@ -1701,7 +1701,7 @@ mod tests {
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
         let limits = Limits::default();
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
         let namespace = NamespaceId::core();
         let origin = ReplicaId::new(Uuid::from_bytes([42u8; 16]));
         let store = StoreIdentity::new(store_id, store_epoch);
@@ -1771,7 +1771,7 @@ mod tests {
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
         let limits = Limits::default();
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
         let namespace = NamespaceId::core();
         let origin = ReplicaId::new(Uuid::from_bytes([52u8; 16]));
         let store = StoreIdentity::new(store_id, store_epoch);
@@ -1810,7 +1810,7 @@ mod tests {
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
         let limits = Limits::default();
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
         let namespace = NamespaceId::core();
         let origin = ReplicaId::new(Uuid::from_bytes([62u8; 16]));
         let store = StoreIdentity::new(store_id, store_epoch);
@@ -1848,7 +1848,7 @@ mod tests {
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
         let limits = Limits::default();
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
         let namespace = NamespaceId::core();
         let origin = ReplicaId::new(Uuid::from_bytes([52u8; 16]));
         let store = StoreIdentity::new(store_id, store_epoch);
@@ -2216,7 +2216,7 @@ mod tests {
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
         let limits = Limits::default();
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
         let namespace = NamespaceId::core();
         let origin = ReplicaId::new(Uuid::from_bytes([62u8; 16]));
         let store = StoreIdentity::new(store_id, store_epoch);
@@ -2489,7 +2489,7 @@ mod tests {
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
         let limits = Limits::default();
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
         let namespace = NamespaceId::core();
         let origin = ReplicaId::new(Uuid::from_bytes([72u8; 16]));
         let store = StoreIdentity::new(store_id, store_epoch);
@@ -2895,7 +2895,7 @@ mod tests {
         let store_id = StoreId::new(Uuid::from_bytes([7u8; 16]));
         let store_epoch = StoreEpoch::new(1);
         let meta = test_meta(store_id, store_epoch);
-        let index = SqliteWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
+        let index = MemoryWalIndex::open(temp.path(), &meta, IndexDurabilityMode::Cache).unwrap();
 
         let namespace = NamespaceId::core();
         let wal_dir = temp.path().join("wal");

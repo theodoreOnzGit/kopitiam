@@ -14,7 +14,7 @@ use crate::daemon_core::core::{
 use crate::daemon_core::wal::frame::{FRAME_HEADER_LEN, FRAME_MAGIC};
 use crate::daemon_core::wal::record::{RecordVerifyError, UnverifiedRecord};
 use crate::daemon_core::wal::{
-    EventWalError, IndexDurabilityMode, SegmentHeader, SqliteWalIndex, WalIndex, WalIndexError,
+    EventWalError, IndexDurabilityMode, MemoryWalIndex, SegmentHeader, WalIndexError,
     WalReplayError, rebuild_index,
 };
 
@@ -1115,230 +1115,19 @@ fn read_segment_header(path: &Path) -> Result<(SegmentHeader, u64, u64), FsckErr
 }
 
 fn check_index_offsets(
-    store_dir: &Path,
-    meta: &StoreMeta,
-    segments_by_path: &BTreeMap<PathBuf, SegmentInfo>,
-    segments_by_id: &BTreeMap<crate::daemon_core::core::SegmentId, SegmentInfo>,
-    builder: &mut FsckReportBuilder,
+    _store_dir: &Path,
+    _meta: &StoreMeta,
+    _segments_by_path: &BTreeMap<PathBuf, SegmentInfo>,
+    _segments_by_id: &BTreeMap<crate::daemon_core::core::SegmentId, SegmentInfo>,
+    _builder: &mut FsckReportBuilder,
 ) {
-    let index_path = store_dir.join("index").join("wal.sqlite");
-    if !index_path.exists() {
-        return;
-    }
-
-    let mode = match store_index_durability_mode(store_dir) {
-        Ok(mode) => mode,
-        Err(err) => {
-            builder.record_issue(
-                FsckCheckId::IndexOffsets,
-                FsckStatus::Fail,
-                FsckSeverity::High,
-                FsckEvidence {
-                    code: FsckEvidenceCode::IndexOpenFailed,
-                    message: format!("failed to load store config: {err}"),
-                    path: Some(index_path),
-                    namespace: None,
-                    origin: None,
-                    seq: None,
-                    offset: None,
-                },
-                Some("fix store_config.toml and re-run fsck"),
-            );
-            return;
-        }
-    };
-
-    let index = match SqliteWalIndex::open(store_dir, meta, mode) {
-        Ok(index) => index,
-        Err(err) => {
-            builder.record_issue(
-                FsckCheckId::IndexOffsets,
-                FsckStatus::Fail,
-                FsckSeverity::High,
-                FsckEvidence {
-                    code: FsckEvidenceCode::IndexOpenFailed,
-                    message: format!("failed to open wal index: {err}"),
-                    path: Some(index_path),
-                    namespace: None,
-                    origin: None,
-                    seq: None,
-                    offset: None,
-                },
-                Some("rebuild wal.sqlite from WAL segments"),
-            );
-            return;
-        }
-    };
-
-    let mut indexed_segment_ids = BTreeSet::new();
-    let mut namespaces: BTreeSet<NamespaceId> = segments_by_path
-        .values()
-        .map(|segment| segment.namespace.clone())
-        .collect();
-    if let Ok(rows) = index.reader().load_watermarks() {
-        namespaces.extend(rows.into_iter().map(|row| row.namespace));
-    }
-    for namespace in namespaces {
-        match index.reader().list_segments(&namespace) {
-            Ok(rows) => {
-                for row in rows {
-                    indexed_segment_ids.insert(row.segment_id());
-                    let full_path = store_dir.join(row.segment_path());
-                    let Some(segment) = segments_by_path.get(&full_path).cloned() else {
-                        builder.record_issue(
-                            FsckCheckId::IndexOffsets,
-                            FsckStatus::Fail,
-                            FsckSeverity::High,
-                            FsckEvidence {
-                                code: FsckEvidenceCode::IndexMissingSegment,
-                                message: "wal.sqlite references missing segment".to_string(),
-                                path: Some(full_path),
-                                namespace: Some(namespace.clone()),
-                                origin: None,
-                                seq: None,
-                                offset: None,
-                            },
-                            Some("rebuild wal.sqlite from WAL segments"),
-                        );
-                        continue;
-                    };
-
-                    if row.segment_id() != segment.header.segment_id {
-                        builder.record_issue(
-                            FsckCheckId::IndexOffsets,
-                            FsckStatus::Fail,
-                            FsckSeverity::High,
-                            FsckEvidence {
-                                code: FsckEvidenceCode::IndexOffsetOutOfBounds,
-                                message:
-                                    "segment_id mismatch between wal.sqlite and segment header"
-                                        .to_string(),
-                                path: Some(full_path.clone()),
-                                namespace: Some(namespace.clone()),
-                                origin: None,
-                                seq: None,
-                                offset: None,
-                            },
-                            Some("rebuild wal.sqlite from WAL segments"),
-                        );
-                    }
-
-                    if row.is_sealed() {
-                        let final_len = row.final_len().expect("sealed segments carry final_len");
-                        if final_len != segment.file_len {
-                            builder.record_issue(
-                                FsckCheckId::IndexOffsets,
-                                FsckStatus::Fail,
-                                FsckSeverity::High,
-                                FsckEvidence {
-                                    code: FsckEvidenceCode::SealedSegmentLenMismatch,
-                                    message: format!(
-                                        "sealed segment length mismatch (expected {final_len}, got {})",
-                                        segment.file_len
-                                    ),
-                                    path: Some(full_path.clone()),
-                                    namespace: Some(namespace.clone()),
-                                    origin: None,
-                                    seq: None,
-                                    offset: None,
-                                },
-                                Some("rebuild wal.sqlite from WAL segments"),
-                            );
-                        }
-                    }
-
-                    let last_indexed_offset = row.last_indexed_offset().get();
-                    if last_indexed_offset > segment.file_len {
-                        builder.record_issue(
-                            FsckCheckId::IndexOffsets,
-                            FsckStatus::Fail,
-                            FsckSeverity::High,
-                            FsckEvidence {
-                                code: FsckEvidenceCode::IndexOffsetOutOfBounds,
-                                message: "wal.sqlite last_indexed_offset exceeds segment length"
-                                    .to_string(),
-                                path: Some(full_path.clone()),
-                                namespace: Some(namespace.clone()),
-                                origin: None,
-                                seq: None,
-                                offset: Some(last_indexed_offset),
-                            },
-                            Some("rebuild wal.sqlite from WAL segments"),
-                        );
-                    } else if last_indexed_offset < segment.header_len {
-                        builder.record_issue(
-                            FsckCheckId::IndexOffsets,
-                            FsckStatus::Fail,
-                            FsckSeverity::High,
-                            FsckEvidence {
-                                code: FsckEvidenceCode::IndexOffsetOutOfBounds,
-                                message: "wal.sqlite last_indexed_offset precedes segment header"
-                                    .to_string(),
-                                path: Some(full_path.clone()),
-                                namespace: Some(namespace.clone()),
-                                origin: None,
-                                seq: None,
-                                offset: Some(last_indexed_offset),
-                            },
-                            Some("rebuild wal.sqlite from WAL segments"),
-                        );
-                    } else if last_indexed_offset < segment.file_len {
-                        builder.record_issue(
-                            FsckCheckId::IndexOffsets,
-                            FsckStatus::Warn,
-                            FsckSeverity::Medium,
-                            FsckEvidence {
-                                code: FsckEvidenceCode::IndexBehindWal,
-                                message: "wal.sqlite last_indexed_offset behind segment length"
-                                    .to_string(),
-                                path: Some(full_path.clone()),
-                                namespace: Some(namespace.clone()),
-                                origin: None,
-                                seq: None,
-                                offset: Some(last_indexed_offset),
-                            },
-                            Some("rebuild wal.sqlite from WAL segments"),
-                        );
-                    }
-                }
-            }
-            Err(err) => builder.record_issue(
-                FsckCheckId::IndexOffsets,
-                FsckStatus::Fail,
-                FsckSeverity::High,
-                FsckEvidence {
-                    code: FsckEvidenceCode::IndexOpenFailed,
-                    message: format!("failed to read wal.sqlite segments: {err}"),
-                    path: Some(index_path.clone()),
-                    namespace: Some(namespace),
-                    origin: None,
-                    seq: None,
-                    offset: None,
-                },
-                Some("rebuild wal.sqlite from WAL segments"),
-            ),
-        }
-    }
-
-    for (segment_id, segment) in segments_by_id {
-        if !indexed_segment_ids.contains(segment_id) {
-            builder.record_issue(
-                FsckCheckId::IndexOffsets,
-                FsckStatus::Warn,
-                FsckSeverity::Medium,
-                FsckEvidence {
-                    code: FsckEvidenceCode::IndexMissingSegment,
-                    message: "wal.sqlite missing segment entry".to_string(),
-                    path: Some(segment.path.clone()),
-                    namespace: Some(segment.namespace.clone()),
-                    origin: None,
-                    seq: None,
-                    offset: None,
-                },
-                Some("rebuild wal.sqlite from WAL segments"),
-            );
-        }
-    }
+    // The WAL index is a rebuildable, in-memory materialized view of the WAL
+    // (there is no persisted index file), so it cannot drift on disk relative to
+    // the WAL segments the way the former on-disk SQLite index could. Integrity
+    // of the WAL segments themselves is already verified by the segment-header,
+    // frame, record-hash and origin-contiguity checks above, and the index is
+    // fully rebuilt from those segments on every store open. The IndexOffsets
+    // check is therefore intentionally a no-op and always passes.
 }
 
 fn check_checkpoint_cache(store_dir: &Path, builder: &mut FsckReportBuilder) {
@@ -1697,9 +1486,13 @@ fn rebuild_index_after_repair(
     meta: &StoreMeta,
     options: &FsckOptions,
 ) -> Result<(), FsckError> {
+    // Remove any legacy on-disk index left by older (SQLite) builds, then verify
+    // the repaired WAL replays cleanly into a fresh in-memory index. The index
+    // itself is a rebuildable materialized view, so there is nothing durable to
+    // rewrite here beyond confirming the WAL is replayable.
     remove_wal_index_files(store_dir)?;
     let mode = store_index_durability_mode(store_dir)?;
-    let index = SqliteWalIndex::open(store_dir, meta, mode)?;
+    let index = MemoryWalIndex::with_mode(mode);
     rebuild_index(store_dir, meta, &index, &options.limits)?;
     Ok(())
 }

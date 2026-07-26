@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::daemon_core::core::{
-    ActorId, ClientRequestId, EventId, NamespaceId, ReplicaId, SegmentId, Seq0, Seq1, TxnId,
-    WatermarkPair,
+    ActorId, ClientRequestId, EventId, NamespaceId, ReplicaId, SegmentId, Seq0, Seq1, StoreMeta,
+    TxnId, WatermarkPair,
 };
 use crate::daemon_core::durability::DurabilityRequestClaim;
 
@@ -64,6 +65,22 @@ impl MemoryWalIndex {
             txn_gate: Arc::new(AtomicBool::new(false)),
             mode,
         }
+    }
+
+    /// Drop-in constructor mirroring the former on-disk index `open` signature.
+    ///
+    /// The WAL index is a rebuildable, in-memory materialized view: it holds no
+    /// durable state of its own (the WAL segments under `store_dir` are the
+    /// source of truth), so "opening" simply constructs an empty index in the
+    /// requested durability mode. Callers repopulate it from the WAL via
+    /// `rebuild_index`. `store_dir`/`meta` are accepted (and ignored) purely so
+    /// this is a drop-in replacement for the removed SQLite backend.
+    pub fn open(
+        _store_dir: &Path,
+        _meta: &StoreMeta,
+        mode: IndexDurabilityMode,
+    ) -> Result<Self, WalIndexError> {
+        Ok(Self::with_mode(mode))
     }
     pub fn model_snapshot(&self) -> MemoryWalIndexSnapshot {
         let state = self

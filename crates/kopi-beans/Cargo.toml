@@ -62,10 +62,6 @@ ureq = { version = "2", default-features = true }
 tempfile = "3"
 bytes = "1"
 minicbor = { version = "0.24", features = ["std"] }
-# `bundled` compiles SQLite from source via `cc` on every platform, so the `bn`
-# binary does not depend on a system libsqlite3 being present (there is none on a
-# stock Windows box).
-rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Unix-only process/user/signal facilities. On Windows the code paths that need
 # these are replaced under `#[cfg(windows)]` (see the surface/ and daemon/ modules,
@@ -86,12 +82,14 @@ uds_windows = "1.1"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
-default = ["cli", "wal-sqlite", "wal-fs"]
+default = ["cli", "wal-fs"]
 # `cli` gates the top-level `cli` module + `run_cli_entrypoint`/`bn` binary.
 cli = []
-# WAL backends in the daemon_core module (formerly beads-daemon-core features).
-# rusqlite/dirs/rand/toml/tracing are non-optional here, so these are pure gates.
-wal-sqlite = []
+# WAL backend in the daemon_core module (formerly a beads-daemon-core feature).
+# `wal-fs` is the pure-Rust filesystem WAL (the durable source of truth). The WAL
+# index is a rebuildable in-memory materialized view (`MemoryWalIndex`), so there
+# is no separate index-backend feature and no C SQLite dependency: `bn`
+# cross-compiles to Termux/Android with no NDK/C toolchain.
 wal-fs = []
 # Was `beads-*/test-harness`; now a single crate-wide gate.
 test-harness = []
