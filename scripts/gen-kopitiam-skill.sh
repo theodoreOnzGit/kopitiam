@@ -195,6 +195,81 @@ kopitiam models path <id>     # print expected on-disk paths (bring-your-own)
 kopitiam models verify <id>   # re-check a present model against its checksums
 ```
 
+### Navigate Rust code without reading whole files (the token-max loop)
+
+When you are working *in a Rust codebase* (including kopitiam's own source),
+do NOT open files blind. The whole point of these commands is to spend a few
+dozen tokens on coordinates and skeletons instead of thousands on file bodies.
+The loop is **measure → skeleton → coordinates → read only the slice you need**:
+
+**1. `kopitiam tokens <path>` BEFORE you read anything.** It prints a
+deterministic BPE token estimate for a file or a whole directory (no
+rust-analyzer, instant). Let the number decide read-vs-outline: a 2k-token file
+you can afford to read; a 130k-token directory you must *not* — target its call
+sites instead.
+
+```bash
+kopitiam tokens crates/kopitiam-document/src/reconstruction   # a directory: total to budget against
+kopitiam tokens apps/cli/src/main.rs                          # one file: is it cheap enough to read whole?
+kopitiam tokens --json src/ | jq '.total'                     # gate programmatically, no prose parsing
+```
+
+**2. `kopitiam outline <file>` instead of reading the file for orientation.**
+It prints a body-free skeleton — every declaration with its line number, no
+function bodies — roughly a 10x reduction versus a full read. Read the outline,
+pick the one item you actually need, then read just those lines.
+
+```bash
+kopitiam outline crates/kopitiam-document/src/reconstruction/mod.rs
+kopitiam outline --json src/foo.rs        # machine-readable items[] with line/kind/name
+```
+
+**3. `kopitiam refs` / `def` / `sig` / `callers` / `callees` / `impls` instead
+of grep-then-read.** These answer "who calls this / where is it defined / what
+is its signature" as `file:line:character` coordinates (and a signature), not
+code bodies — the deterministic, exact answer rust-analyzer already knows. Pass
+`--file <FILE>` naming the file that declares the symbol (its identifier
+position is the query anchor):
+
+```bash
+kopitiam def  --file crates/kopitiam-document/src/reconstruction/tables.rs try_table   # where + signature
+kopitiam sig  --file src/tables.rs try_table                                           # signature alone
+kopitiam refs --file src/tables.rs try_table                                           # every call site, as coordinates
+kopitiam callers --file src/tables.rs try_table --depth 2                              # up the call graph
+```
+
+Then read only the coordinates that matter — never the whole file to find them.
+
+**4. `kopitiam check --compact` / `test --compact` instead of raw cargo
+output.** `check --compact` collapses cargo's diagnostics to one deduplicated
+line per distinct problem, sorted by file (one bad type stops spamming forty
+identical errors); `test --compact` reports each failure as
+`name — assertion @ file:line` rather than the full captured stdout. Add
+`--json` to gate on the result without parsing prose:
+
+```bash
+kopitiam check --compact          # dedup'd diagnostics, one line each
+kopitiam test  --compact          # failures as name — assertion @ file:line
+kopitiam check --json | jq length # zero == clean, gate on it
+```
+
+**On a large workspace, `outline`/`refs`/`def`/`sig`/`callers`/`callees`/`impls`
+try rust-analyzer first** and wait for it to index (default **180 s**,
+overridable with the `KOPITIAM_RA_TIMEOUT_SECS` env var) before falling back.
+On a workspace too big for rust-analyzer to index in bounded time — kopitiam's
+own tree is one — that wait is wasted. Pass **`--no-lsp`** (alias `--syntactic`)
+to skip rust-analyzer entirely and answer from a deterministic, dependency-free
+scan: instant, and the guaranteed path. It is textual (grep-grade) rather than
+semantic, so `refs`/`callers` hits are labelled `(syntactic, not semantic —
+verify)`; use `--lsp` to *require* rust-analyzer and fail instead of falling
+back when you need semantic precision.
+
+```bash
+kopitiam outline --no-lsp src/foo.rs                 # instant skeleton, no rust-analyzer
+kopitiam refs --no-lsp --file src/tables.rs try_table   # instant textual call sites, verify each
+KOPITIAM_RA_TIMEOUT_SECS=20 kopitiam def --file src/tables.rs try_table  # shorten the RA wait
+```
+
 ## Command reference
 
 Each subsection embeds the command's real `kopitiam ... --help` output verbatim
