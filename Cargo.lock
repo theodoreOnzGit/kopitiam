@@ -1990,6 +1990,7 @@ dependencies = [
  "miniz_oxide",
  "pdf-extract",
  "thiserror 2.0.18",
+ "zune-jpeg",
 ]
 
 [[package]]

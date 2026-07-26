@@ -82,6 +82,16 @@ miniz_oxide = "0.8"
 # `pdf-extract`'s own `OutputDev` callback API does not expose. Pure Rust,
 # no new C/C++ surface.
 lopdf = "0.42"
+# Pure-Rust baseline/progressive JPEG decoder for the MuPDF port's image layer
+# (crates/kopitiam-pdf/src/mupdf/page_image.rs). PDF stores scanned pages and
+# photos as DCTDecode (JPEG) Image XObjects; MuPDF decodes them via libjpeg
+# (`source/fitz/load-jpeg.c`, `<jpeglib.h>`). We substitute `zune-jpeg`, which
+# is pure Rust with NO C toolchain -- it has `build = false` and a single
+# dependency, `zune-core` (also pure Rust) -- keeping the "Pure Rust Core"
+# standard (cf. the miniz_oxide note above: the C codec is replaced by its
+# pure-Rust equivalent, the surrounding image plumbing stays translated from
+# MuPDF). MIT/Apache-2.0/Zlib licensed. See AID-0051.
+zune-jpeg = "0.5"
 
 # Semantic Runtime knowledge providers
 cargo_metadata = "0.23"

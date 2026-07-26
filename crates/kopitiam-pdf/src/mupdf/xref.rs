@@ -335,6 +335,26 @@ impl PdfDocument {
     /// Decode object `num`'s stream body: resolve `/Length` (may be indirect),
     /// slice the raw bytes, and apply the `/Filter` (+ `/DecodeParms`) chain.
     pub fn open_stream_num(&self, num: i32) -> Result<Vec<u8>> {
+        let (raw, filter, parms) = self.stream_raw_num(num)?;
+        decode_stream(raw, &filter, &parms)
+    }
+
+    /// Return object `num`'s **undecoded** stream body plus its resolved
+    /// `/Filter` and `/DecodeParms`. Unlike [`open_stream_num`] this does not run
+    /// the filter chain, so a caller that owns an image codec (DCTDecode / …,
+    /// which [`decode_stream`] refuses) can decode the bytes itself while still
+    /// applying any *leading* non-image filters. The returned filter/parms follow
+    /// MuPDF's `/F` and `/DP` abbreviation fallbacks.
+    // MuPDF: pdf_open_raw_stream_number (pdf-stream.c) -- the pre-filter slice.
+    pub fn stream_raw(&self, obj: &Object) -> Result<(Vec<u8>, Object, Object)> {
+        match obj {
+            Object::Ref { num, .. } => self.stream_raw_num(*num),
+            _ => Err(Error::format("object is not an indirect stream reference")),
+        }
+    }
+
+    /// The object-number form of [`stream_raw`].
+    pub fn stream_raw_num(&self, num: i32) -> Result<(Vec<u8>, Object, Object)> {
         self.ensure_cached(num)?;
         let (dict, stm_ofs) = {
             let cache = self.cache.borrow();
@@ -364,7 +384,7 @@ impl PdfDocument {
         // /Filter and /DecodeParms (abbreviations /F and /DP), resolved.
         let filter = self.resolve_get_first(&dict, "Filter", "F")?;
         let parms = self.resolve_get_first(&dict, "DecodeParms", "DP")?;
-        decode_stream(raw, &filter, &parms)
+        Ok((raw, filter, parms))
     }
 
     /// Resolve `dict[primary]`, falling back to `dict[abbrev]` (MuPDF's

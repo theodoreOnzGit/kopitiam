@@ -24,3 +24,8 @@ thiserror = { workspace = true }
 # `<zlib.h>` dependency; the filter wiring is still translated from
 # source/fitz/filter-flate.c. See the workspace Cargo.toml note.
 miniz_oxide = { workspace = true }
+# Pure-Rust JPEG decoder for the MuPDF port's embedded-image layer
+# (crates/kopitiam-pdf/src/mupdf/page_image.rs), decoding DCTDecode Image
+# XObjects. Substitutes MuPDF's C `<jpeglib.h>` (source/fitz/load-jpeg.c); no C
+# toolchain (build = false). See the workspace Cargo.toml note and AID-0051.
+zune-jpeg = { workspace = true }
