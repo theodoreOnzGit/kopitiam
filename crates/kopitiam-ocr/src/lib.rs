@@ -124,6 +124,29 @@
 //! Only the minimal LSTM-path subset is ported; deskew/rotate, morphology,
 //! color, the packed 1-bpp `Pix` API, tiled/adaptive thresholding, and image
 //! I/O are deferred (each module documents what and why).
+//!
+//! ## Phase 8: pragmatic line finding
+//!
+//! This phase turns a binarized page ([`BinaryImage`]) plus its source
+//! [`GrayImage`] into the individual [`GrayLine`]s the recognizer consumes,
+//! in reading order:
+//!
+//! * [`linefind`] — [`find_text_lines`]: a **column split** on full-height
+//!   vertical-whitespace gutters, then a **horizontal ink-projection profile**
+//!   per column that groups rows into line bands (with an adaptive small-gap
+//!   merge so descenders/diacritics stay with their line), then a **gray crop**
+//!   trimmed to each line's ink extent. Lines come back per column
+//!   top-to-bottom, columns left-to-right.
+//!
+//! Unlike the rest of the crate this is **not** a translation of Tesseract's
+//! `textord`: that ~35k-LOC column/table analysis is out of scope. It is an
+//! original pragmatic reimplementation, good enough for born-digital / cleanly
+//! scanned 1–2 column pages; the algorithm shape was studied from Tesseract's
+//! `makerow.cpp` projection idea, Leptonica's per-row/column pixel counts, and
+//! the MuPDF boxer's whitespace-gutter principle (clean-room / adaptation,
+//! credited in the module header). Deskew, curved baselines, full column/table
+//! analysis, and touching-line separation are deferred; the binary/gray page
+//! pair will come from Phase 7 preprocessing of the (future) rasterizer output.
 
 pub mod error;
 pub mod serialis;
@@ -144,6 +167,7 @@ pub mod unicharset;
 pub mod convolve;
 pub mod fullyconnected;
 pub mod input;
+pub mod linefind;
 pub mod lstm;
 pub mod lstmrecognizer;
 pub mod maxpool;
@@ -168,6 +192,7 @@ pub use error::{Error, ErrorKind, Result};
 pub use image::{
     BINARY_BG, BINARY_FG, BinaryImage, GrayImage, RgbImage, RgbSource, RgbaImage, to_gray,
 };
+pub use linefind::{find_text_lines, find_text_lines_in_column};
 pub use lstmrecognizer::{GrayLine, LstmRecognizer};
 pub use scale::{scale_gray, scale_gray_li};
 pub use network::{Network, NetworkHeader, NetworkNode, NetworkType, TYPE_NAMES, create_from_file};
