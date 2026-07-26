@@ -82,6 +82,25 @@
 //!
 //! The non-dictionary (raw CTC beam) path is ported in full; the dawg/dictionary
 //! beam and char-box/`WERD_RES` extraction are deferred (see the module docs).
+//!
+//! ## Phase 6: the LSTM recognizer line driver
+//!
+//! This phase ties phases 1–5 together (`src/lstm/lstmrecognizer.{cpp,h}` +
+//! `src/lstm/input.cpp`): load a recognizer from a `.traineddata` and recognize
+//! a single normalized grayscale line image into text.
+//!
+//! * [`lstmrecognizer`] — [`LstmRecognizer`], the line driver.
+//!   [`LstmRecognizer::load`] reads the `LstmUnicharset`, `LstmRecoder`, and
+//!   `Lstm` components (network tree + scalar params, of which only `null_char_`
+//!   matters at inference) and enforces the `num_outputs == code_range + 1`
+//!   CTC-null invariant. [`LstmRecognizer::recognize_line`] normalizes a
+//!   [`GrayLine`] (scale-to-height + the adaptive black/white contrast stretch
+//!   from `input.cpp`/`networkio.cpp`, *not* a plain pixel/255), runs the forward
+//!   pass, and decodes with the raw beam from phase 5.
+//!
+//! The image side that *produces* the [`GrayLine`] — the page rasterizer,
+//! Leptonica preprocessing, and line-finding — is a later phase; `pixScale` is
+//! approximated with bilinear resampling for now (see the module docs).
 
 pub mod error;
 pub mod serialis;
@@ -96,6 +115,7 @@ pub mod convolve;
 pub mod fullyconnected;
 pub mod input;
 pub mod lstm;
+pub mod lstmrecognizer;
 pub mod maxpool;
 pub mod network;
 pub mod networkio;
@@ -114,6 +134,7 @@ mod network_tests;
 mod test_support;
 
 pub use error::{Error, ErrorKind, Result};
+pub use lstmrecognizer::{GrayLine, LstmRecognizer};
 pub use network::{Network, NetworkHeader, NetworkNode, NetworkType, TYPE_NAMES, create_from_file};
 pub use networkio::NetworkIO;
 pub use recodebeam::{
