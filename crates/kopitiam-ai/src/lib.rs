@@ -38,6 +38,7 @@ mod glossary;
 mod message;
 mod preprocess;
 mod stream;
+mod translate;
 
 #[cfg(feature = "local")]
 mod local;
@@ -54,3 +55,8 @@ pub use preprocess::{
     draft_commit_message, summarize, triage,
 };
 pub use stream::StreamChunk;
+pub use translate::{
+    ConfidenceSignals, Decision, SegmentPlan, TwoPassConfig, TwoPassPlan, TwoPassSummary,
+    DEFAULT_ACCEPT_THRESHOLD, ECHO_PASSTHROUGH_NOTE as TWO_PASS_ECHO_PASSTHROUGH_NOTE,
+    dice_similarity, draft_and_route, glossary_score, length_score,
+};
