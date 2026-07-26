@@ -65,6 +65,7 @@
 //! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.
 
 pub mod buffer;
+pub mod doc_stream;
 pub mod encodings;
 pub mod error;
 pub mod filter_basic;
@@ -79,8 +80,10 @@ pub mod parse;
 pub mod pool;
 pub mod stream;
 pub mod string_util;
+pub mod xref;
 
 pub use buffer::Buffer;
+pub use doc_stream::decode_stream;
 pub use encodings::BaseEncoding;
 pub use error::{Error, ErrorKind, Result};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
@@ -90,3 +93,4 @@ pub use object::Object;
 pub use parse::{parse_array, parse_dict, parse_ind_obj, IndirectObject, StreamRange};
 pub use pool::{Handle, Pool};
 pub use stream::{Stream, StreamSource, Whence};
+pub use xref::PdfDocument;
