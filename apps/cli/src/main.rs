@@ -23,6 +23,7 @@
 
 mod adapter;
 mod ai;
+mod bn;
 mod code_actions;
 mod diagnostics;
 mod digest;
@@ -319,6 +320,17 @@ enum Command {
     /// <candidate>...` filters, both over `kopitiam_ai`'s preprocess helpers with
     /// a `DropReport` of what was set aside. See `apps/cli/src/preprocess.rs`.
     Preprocess(preprocess::PreprocessArgs),
+
+    /// Run the `kopi-beans` task ledger via its `bn` binary — issue #30.
+    ///
+    /// An arm's-length passthrough: every argument after `bn` is forwarded
+    /// verbatim to the `bn` binary on `PATH` (`kopitiam bn create "x" -t task`
+    /// runs `bn create "x" -t task`), with stdin/stdout/stderr inherited and the
+    /// child's exit code propagated. `kopitiam` takes no `kopi-beans` dependency
+    /// and stays pure-Rust; if `bn` is not installed the command prints an
+    /// install hint and exits non-zero. Non-interactive. See `apps/cli/src/bn.rs`.
+    #[command(trailing_var_arg = true, allow_hyphen_values = true)]
+    Bn(bn::BnArgs),
 }
 
 // `main` return `anyhow::Result<ExitCode>` (not `Result<()>`) because one
@@ -448,6 +460,7 @@ fn main() -> anyhow::Result<ExitCode> {
             preprocess::run(args)?;
             ExitCode::SUCCESS
         }
+        Command::Bn(args) => bn::run(args)?,
     };
     Ok(code)
 }
@@ -909,9 +922,31 @@ fn parse_page_anchor_line(line: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use kopitiam_document::{
         Block, ConversionReport, Document, Heading, Metadata, PageRecovery, Paragraph,
     };
+
+    // ---- #30: `bn` passthrough parsing --------------------------------------
+
+    /// `kopitiam bn <...>` must hand EVERY following token to the `bn` binary
+    /// verbatim — subcommand words, positional values, and hyphen flags alike —
+    /// without clap trying to interpret any of them. This is the whole contract
+    /// of the passthrough (`trailing_var_arg` + `allow_hyphen_values`).
+    #[test]
+    fn bn_passes_all_args_through_verbatim() {
+        let cli = Cli::parse_from(["kopitiam", "bn", "create", "x", "-t", "task"]);
+        match cli.command {
+            Command::Bn(args) => {
+                let forwarded = format!("{args:?}");
+                assert!(forwarded.contains("create"));
+                assert!(forwarded.contains("\"x\""));
+                assert!(forwarded.contains("-t"));
+                assert!(forwarded.contains("task"));
+            }
+            _ => panic!("expected `kopitiam bn ...` to parse as Command::Bn"),
+        }
+    }
 
     // ---- I-H: --pages A-B parsing -------------------------------------------
 

@@ -44,7 +44,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use kopitiam_models::{
     Artifact, Catalog, Error as ModelsError, Fetcher, HttpFetcher, ModelSpec, ModelStore,
-    ensure_available,
+    ensure_available_resolving, hf_token_from_env,
 };
 
 /// Options for `kopitiam models`.
@@ -191,13 +191,22 @@ fn pull(id: &str) -> Result<()> {
 
     // Why wrap the fetcher instead of just passing `HttpFetcher::new()`:
     // the frozen `kopitiam-models` contract puts the `progress` closure on
-    // `Fetcher::fetch`, and `ensure_available` is the one that call `fetch`
-    // — not us. So the ONLY way to get a live progress indicator onto the
-    // terminal is to hand `ensure_available` a `Fetcher` that print progress
-    // by itself. `ProgressFetcher` do exactly that: it swap in a closure that
-    // print downloaded / total bytes, then forward to the real HTTP fetcher.
+    // `Fetcher::fetch`, and `ensure_available_resolving` is the one that call
+    // `fetch` — not us. So the ONLY way to get a live progress indicator onto
+    // the terminal is to hand it a `Fetcher` that print progress by itself.
+    // `ProgressFetcher` do exactly that: it swap in a closure that print
+    // downloaded / total bytes, then forward to the real HTTP fetcher.
     let fetcher = ProgressFetcher::new(HttpFetcher::new());
-    let acquired = ensure_available(&store, &spec, &fetcher)?;
+
+    // `ensure_available_resolving` (not plain `ensure_available`): for any
+    // artifact carrying a HuggingFace source, it first resolves the real sha256
+    // (and size / url) from the hub, cross-checks any pin, THEN downloads and
+    // verifies against the resolved checksum. That is what makes `pull`
+    // auto-resolve the SHA rather than fail the catalog's placeholder (64-zero)
+    // hashes. `hf_token_from_env()` supplies an optional `HF_TOKEN` for gated /
+    // private repos; plain-URL artifacts are passed through untouched.
+    let token = hf_token_from_env();
+    let acquired = ensure_available_resolving(&store, &spec, &fetcher, token.as_deref())?;
 
     println!("Verified already. Local artifact path(s):");
     for path in &acquired.artifact_paths {

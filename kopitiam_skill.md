@@ -1018,6 +1018,26 @@ Options:
   -h, --help  Print help
 ```
 
+### `kopitiam bn`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Run the `kopi-beans` task ledger via its `bn` binary — issue #30.
+
+An arm's-length passthrough: every argument after `bn` is forwarded verbatim to the `bn` binary on `PATH` (`kopitiam bn create "x" -t task` runs `bn create "x" -t task`), with stdin/stdout/stderr inherited and the child's exit code propagated. `kopitiam` takes no `kopi-beans` dependency and stays pure-Rust; if `bn` is not installed the command prints an install hint and exits non-zero. Non-interactive. See `apps/cli/src/bn.rs`.
+
+Usage: kopitiam.exe bn [ARGS]...
+
+Arguments:
+  [ARGS]...
+          Every argument after `bn`, forwarded to the `bn` binary untouched
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ## Gotchas
 
 - **Quote paths with spaces.** `kopitiam pdf2md "My Paper (v2).pdf" -o "My Paper.md"`.
