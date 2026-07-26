@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::Args;
-use kopitiam_workspace::ProjectState;
+use kopitiam_workspace::{ConclusionLog, ProjectState, SourceDrift};
 
 /// Options for `kopitiam status`.
 #[derive(Args, Debug)]
@@ -20,12 +20,22 @@ pub struct StatusArgs {
     /// Defaults to the current directory.
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
+
+    /// Instead of the session summary, list conclusions whose source files
+    /// have drifted (content hash mismatch) and can no longer be trusted.
+    #[arg(long)]
+    pub stale: bool,
 }
 
-/// Runs `kopitiam status`: load and print the persisted [`ProjectState`].
+/// Runs `kopitiam status`: load and print the persisted [`ProjectState`],
+/// or, with `--stale`, the stale-conclusion report.
 pub fn run(args: StatusArgs) -> Result<()> {
     let root = std::fs::canonicalize(&args.root)?;
-    print!("{}", report(&root)?);
+    if args.stale {
+        print!("{}", stale_report(&root)?);
+    } else {
+        print!("{}", report(&root)?);
+    }
     Ok(())
 }
 
@@ -55,6 +65,62 @@ pub fn report(root: &Path) -> Result<String> {
 
     if let Some(updated_at) = state.updated_at {
         writeln!(out, "Last updated: {updated_at} (unix seconds)")?;
+    }
+
+    // A live conclusion is a fact a prior session paid to derive and that is
+    // still valid (its sources have not drifted), so the current session can
+    // trust it without re-deriving. See `kopitiam status --stale` for the
+    // ones that have gone stale.
+    let log = ConclusionLog::load(&root)?;
+    let total = log.conclusions().len();
+    let stale = log.stale_conclusions().len();
+    let live = total - stale;
+    if total == 0 {
+        writeln!(out, "Conclusions: (none recorded)")?;
+    } else if stale == 0 {
+        writeln!(out, "Conclusions: {live} live")?;
+    } else {
+        writeln!(
+            out,
+            "Conclusions: {live} live, {stale} stale (run `status --stale`)"
+        )?;
+    }
+
+    Ok(out)
+}
+
+/// Build the `--stale` report: every conclusion whose sources have drifted,
+/// naming which source drifted and how. This is the read side of Task II-5's
+/// "invalidate on content hash, never time" rule — a caller uses it to tell
+/// fresh conclusions (safe to reuse) from stale ones (must be re-derived).
+pub fn stale_report(root: &Path) -> Result<String> {
+    let root = std::fs::canonicalize(root)?;
+    let log = ConclusionLog::load(&root)?;
+    let stale = log.stale_conclusions();
+    let mut out = String::new();
+
+    if stale.is_empty() {
+        writeln!(
+            out,
+            "Stale conclusions: (none) — all {} recorded conclusion(s) are live.",
+            log.conclusions().len()
+        )?;
+        return Ok(out);
+    }
+
+    writeln!(out, "Stale conclusions ({}):", stale.len())?;
+    for entry in &stale {
+        writeln!(out, "  - {}", entry.conclusion.text)?;
+        for drift in &entry.drifted {
+            match drift {
+                SourceDrift::Changed { path, .. } => {
+                    writeln!(out, "      changed: {}", path.display())?;
+                }
+                SourceDrift::Missing { path } => {
+                    writeln!(out, "      missing: {}", path.display())?;
+                }
+            }
+        }
     }
 
     Ok(out)

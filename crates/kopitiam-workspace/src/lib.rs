@@ -6,6 +6,10 @@
 //! remembers what a session was recently focused on, so the next session
 //! (or a different interface) can resume.
 
+mod conclusion;
 mod state;
 
+pub use conclusion::{
+    Conclusion, ConclusionLog, SourceDrift, SourceHash, StaleConclusion, content_hash,
+};
 pub use state::{ProjectState, WORKING_SET_CAPACITY};
