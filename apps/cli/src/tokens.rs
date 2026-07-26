@@ -101,15 +101,24 @@ fn collect_files(path: &Path) -> Result<Vec<(String, String)>> {
             // A directory sweep skips binaries and unreadable files rather than
             // aborting the whole scan on the first one.
             if let Ok(text) = std::fs::read_to_string(&p) {
-                out.push((p.display().to_string(), text));
+                out.push((to_slash(&p), text));
             }
         }
         Ok(out)
     } else {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        Ok(vec![(path.display().to_string(), text)])
+        Ok(vec![(to_slash(path), text)])
     }
+}
+
+/// Normalise a path to forward-slash form for stable output on BOTH Windows
+/// (`\`) and Termux / Linux (`/`). `walkdir` joins the user-given base (often
+/// already `/`) with the OS separator, so on Windows the raw display leaks
+/// mixed `a/b\c`; forcing `/` keeps output copy-paste-, `grep`-, and
+/// cross-platform-consistent. See CLAUDE.md "Cross-platform paths".
+fn to_slash(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
 }
 
 /// Builds the [`TokensReport`] from already-read `(path, content)` pairs. This
@@ -232,5 +241,14 @@ mod tests {
         assert_eq!(files[0]["path"], "f.rs");
         assert!(files[0]["tokens"].as_u64().is_some());
         assert!(files[0]["by_line"].as_array().is_some());
+    }
+
+    #[test]
+    fn to_slash_normalises_backslashes_cross_platform() {
+        // On Windows the OS separator is `\`; forcing `/` gives identical,
+        // grep-friendly output on Windows and Termux/Linux alike.
+        assert_eq!(to_slash(Path::new("a\\b\\c")), "a/b/c");
+        assert_eq!(to_slash(Path::new("a/b/c")), "a/b/c");
+        assert_eq!(to_slash(Path::new("crates/x/src\\mod.rs")), "crates/x/src/mod.rs");
     }
 }
