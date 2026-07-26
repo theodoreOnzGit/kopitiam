@@ -640,13 +640,12 @@ impl LspClient {
     /// preserve.
     ///
     /// The document must have been opened first with [`Self::did_open_as`].
-    // Public API for the language adapters, but no in-crate caller uses the
-    // shared `LspClient` for it yet — the C++/C# adapters currently roll their
-    // own per-server clients (see beads `kopitiam-gjg`/`kopitiam-mfo`). Kept
-    // rather than deleted so that the moment an adapter switches to the shared
-    // client the method is already here and correct; `#[allow(dead_code)]`
-    // pending that first caller.
-    #[allow(dead_code)]
+    //
+    // Reached in-crate via [`crate::session::RustAnalyzerSession::document_symbols`],
+    // which backs [`crate::outline`] (token-max Task II-2). The language
+    // adapters (C++/C#) still roll their own per-server clients today (see
+    // beads `kopitiam-gjg`/`kopitiam-mfo`); when they switch to the shared
+    // client this method is already here and correct.
     pub fn document_symbols(&mut self, uri: &str) -> Result<Vec<Value>> {
         let result: Value = self.request(
             "textDocument/documentSymbol",

@@ -10,6 +10,7 @@ mod async_session;
 pub mod edit;
 mod lsp_client;
 mod lsp_types;
+mod outline;
 mod position;
 mod provider;
 pub mod providers;
@@ -17,6 +18,7 @@ mod session;
 
 pub use async_session::{AsyncRustAnalyzerSession, DEFAULT_INDEX_TIMEOUT, LspState, ProgressSnapshot, RequestError};
 pub use lsp_client::{ProgressKind, ProgressUpdate};
+pub use outline::{Outline, OutlineItem, outline};
 pub use lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, Hover, Location, Position, Range, Severity,
 };

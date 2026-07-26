@@ -205,6 +205,23 @@ impl RustAnalyzerSession {
         self.client.completion(&uri, line, wire_character)
     }
 
+    /// Returns the raw `textDocument/documentSymbol` tree for `file` — the
+    /// hierarchical `DocumentSymbol[]` (rust-analyzer's shape, containment
+    /// preserved) or, from a server that only speaks the legacy variant, the
+    /// flat `SymbolInformation[]`. Opens the document from disk first, exactly
+    /// like the read-only queries above.
+    ///
+    /// This is the raw feed behind [`crate::outline`], which flattens it into a
+    /// line-numbered, body-free skeleton (token-max Task II-2); a caller that
+    /// wants the outline should use that rather than parsing this JSON itself.
+    /// Positions inside the tree are wire-encoded, but the outline only reads
+    /// line numbers, which are encoding-independent — so no conversion happens
+    /// here (contrast [`Self::definition`] and friends).
+    pub fn document_symbols(&mut self, file: &Path) -> Result<Vec<Value>> {
+        let (uri, _text) = self.open(file)?;
+        self.client.document_symbols(&uri)
+    }
+
     /// Announces `file`'s current `text` to the server as an open document.
     ///
     /// [`Self::definition`], [`Self::hover`] and friends open the document
