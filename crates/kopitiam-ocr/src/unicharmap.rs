@@ -37,7 +37,10 @@ impl Node {
 
     /// A fresh array of 256 empty nodes (Tesseract: `new UNICHARMAP_NODE[256]`).
     fn new_array() -> Box<[Node]> {
-        (0..256).map(|_| Node::new()).collect::<Vec<_>>().into_boxed_slice()
+        (0..256)
+            .map(|_| Node::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 }
 

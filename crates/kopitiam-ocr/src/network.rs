@@ -305,9 +305,9 @@ pub fn create_from_file(fp: &mut TFile<'_>) -> Result<Box<dyn NetworkNode>> {
         Lstm | LstmSoftmax | LstmSoftmaxEncoded | LstmSummary => {
             Box::new(crate::lstm::Lstm::deserialize(header, fp)?)
         }
-        Softmax | SoftmaxNoCtc | Relu | Tanh | Linear | Logistic | Posclip | Symclip => {
-            Box::new(crate::fullyconnected::FullyConnected::deserialize(header, fp)?)
-        }
+        Softmax | SoftmaxNoCtc | Relu | Tanh | Linear | Logistic | Posclip | Symclip => Box::new(
+            crate::fullyconnected::FullyConnected::deserialize(header, fp)?,
+        ),
         TensorFlow => return Err(Error::format("unsupported TensorFlow model")),
         None => return Err(Error::format("invalid network layer type: None")),
     };

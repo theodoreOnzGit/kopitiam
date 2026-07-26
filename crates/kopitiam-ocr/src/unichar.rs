@@ -303,7 +303,9 @@ pub fn utf32_to_utf8(str32: &[Char32]) -> Result<Vec<u8>> {
         if uni.utf8_len() > 0 && utf8_step(uni.utf8()) > 0 {
             out.extend_from_slice(uni.utf8());
         } else {
-            return Err(Error::format(format!("utf32_to_utf8: illegal codepoint {ch}")));
+            return Err(Error::format(format!(
+                "utf32_to_utf8: illegal codepoint {ch}"
+            )));
         }
     }
     Ok(out)

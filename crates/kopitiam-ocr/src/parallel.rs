@@ -61,9 +61,8 @@ impl NetworkNode for Parallel {
         let mut offset = 0;
         for layer in &self.inner.stack {
             let part = layer.forward(input)?;
-            let out = result.get_or_insert_with(|| {
-                NetworkIO::new(part.stride_map().clone(), total_features)
-            });
+            let out = result
+                .get_or_insert_with(|| NetworkIO::new(part.stride_map().clone(), total_features));
             if part.width() != out.width() {
                 return Err(Error::format(format!(
                     "Parallel: sub-network width {} disagrees with {}",

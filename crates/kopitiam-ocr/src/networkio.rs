@@ -53,7 +53,11 @@ impl NetworkIO {
     /// from row-major `data` of length `width * num_features`. Convenience for
     /// constructing network input and for tests.
     pub fn from_rows(width: usize, num_features: usize, data: Vec<f32>) -> Self {
-        assert_eq!(data.len(), width * num_features, "row-major length mismatch");
+        assert_eq!(
+            data.len(),
+            width * num_features,
+            "row-major length mismatch"
+        );
         NetworkIO {
             stride_map: StrideMap::single(1, width as i32),
             num_features,

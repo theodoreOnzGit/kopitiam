@@ -70,7 +70,8 @@ pub const SPECIAL_UNICHAR_CODES_COUNT: usize = 3;
 
 /// `kSpecialUnicharCodes` (unicharset.cpp:79): the representations of the three
 /// special codes, in id order.
-pub const SPECIAL_UNICHAR_CODES: [&str; SPECIAL_UNICHAR_CODES_COUNT] = [" ", "Joined", "|Broken|0|1"];
+pub const SPECIAL_UNICHAR_CODES: [&str; SPECIAL_UNICHAR_CODES_COUNT] =
+    [" ", "Joined", "|Broken|0|1"];
 
 /// The null script name. Tesseract: `UNICHARSET::null_script = "NULL"`
 /// (unicharset.cpp:82).
@@ -460,15 +461,21 @@ impl Unicharset {
 
     /// The other-case id of `id`. Tesseract: `get_other_case` (unicharset.h:703).
     pub fn get_other_case(&self, id: UnicharId) -> UnicharId {
-        self.prop(id).map(|p| p.other_case).unwrap_or(INVALID_UNICHAR_ID)
+        self.prop(id)
+            .map(|p| p.other_case)
+            .unwrap_or(INVALID_UNICHAR_ID)
     }
     /// The direction of `id`. Tesseract: `get_direction` (unicharset.h:712).
     pub fn get_direction(&self, id: UnicharId) -> i32 {
-        self.prop(id).map(|p| p.direction).unwrap_or(10 /* U_OTHER_NEUTRAL */)
+        self.prop(id)
+            .map(|p| p.direction)
+            .unwrap_or(10 /* U_OTHER_NEUTRAL */)
     }
     /// The mirror id of `id`. Tesseract: `get_mirror` (unicharset.h:721).
     pub fn get_mirror(&self, id: UnicharId) -> UnicharId {
-        self.prop(id).map(|p| p.mirror).unwrap_or(INVALID_UNICHAR_ID)
+        self.prop(id)
+            .map(|p| p.mirror)
+            .unwrap_or(INVALID_UNICHAR_ID)
     }
     /// The normalised representation of `id`. Tesseract: `get_normed_unichar`
     /// (unicharset.h:859).

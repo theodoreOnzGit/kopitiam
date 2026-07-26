@@ -179,7 +179,10 @@ impl WeightMatrix {
     /// The dequantized `[rows, cols]` weights as a [`Tensor`], bias column
     /// included. Used by the batched [`crate::fullyconnected`] matmul path.
     pub fn weights_tensor(&self) -> Result<Tensor> {
-        Ok(Tensor::from_f32(self.dense.clone(), [self.rows, self.cols])?)
+        Ok(Tensor::from_f32(
+            self.dense.clone(),
+            [self.rows, self.cols],
+        )?)
     }
 
     /// Computes `v = W·u` with the implied bias: `u` has length
@@ -351,9 +354,10 @@ mod tests {
         let b = [K_INT8_FLAG]; // no kDoubleFlag
         let mut fp = TFile::new(&b);
         assert_eq!(
-            WeightMatrix::deserialize(false, &mut fp).unwrap_err().kind(),
+            WeightMatrix::deserialize(false, &mut fp)
+                .unwrap_err()
+                .kind(),
             crate::error::ErrorKind::Format
         );
     }
-
 }

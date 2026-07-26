@@ -162,10 +162,7 @@ impl NetworkNode for Lstm {
     }
 
     fn forward(&self, input: &NetworkIO) -> Result<NetworkIO> {
-        if self.is_2d
-            || self.softmax.is_some()
-            || self.header.ntype != NetworkType::Lstm
-        {
+        if self.is_2d || self.softmax.is_some() || self.header.ntype != NetworkType::Lstm {
             return Err(Error::format(
                 "Lstm: forward is implemented for plain 1-D NT_LSTM only \
                  (2-D / summary / softmax-feedback variants deserialize but their \

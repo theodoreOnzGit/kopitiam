@@ -240,14 +240,19 @@ impl UnicharCompress {
         if len == 0 || len as usize > RecodedCharID::MAX_CODE_LEN {
             return INVALID_UNICHAR_ID;
         }
-        self.decoder.get(code).copied().unwrap_or(INVALID_UNICHAR_ID)
+        self.decoder
+            .get(code)
+            .copied()
+            .unwrap_or(INVALID_UNICHAR_ID)
     }
 
     /// Whether `code` is a valid start-or-single unit.
     ///
     /// Tesseract: `IsValidFirstCode` (unicharcompress.h:192).
     pub fn is_valid_first_code(&self, code: i32) -> bool {
-        code >= 0 && (code as usize) < self.is_valid_start.len() && self.is_valid_start[code as usize]
+        code >= 0
+            && (code as usize) < self.is_valid_start.len()
+            && self.is_valid_start[code as usize]
     }
 
     /// Valid non-final next units for the given prefix, if any.
@@ -373,7 +378,8 @@ impl UnicharCompress {
             len -= 1;
             prefix.truncate(len);
             if !self.final_codes.contains_key(&prefix) {
-                self.final_codes.insert(prefix, vec![code.get(len as usize)]);
+                self.final_codes
+                    .insert(prefix, vec![code.get(len as usize)]);
                 while len > 0 {
                     len -= 1;
                     prefix.truncate(len);
@@ -503,7 +509,9 @@ mod tests {
         // The length-3 codes share the prefix [3]; its next-code list has 7 and 8.
         let mut prefix = RecodedCharID::new();
         prefix.set(0, 3);
-        let next = rec.get_next_codes(&prefix).expect("prefix [3] has next codes");
+        let next = rec
+            .get_next_codes(&prefix)
+            .expect("prefix [3] has next codes");
         assert!(next.contains(&7) && next.contains(&8));
     }
 
@@ -556,7 +564,8 @@ mod tests {
         let mut uni_fp = mgr
             .component_reader(TessdataType::LstmUnicharset)
             .expect("traineddata should contain an lstm-unicharset");
-        let unicharset = Unicharset::load(&mut uni_fp, false).expect("failed to load lstm-unicharset");
+        let unicharset =
+            Unicharset::load(&mut uni_fp, false).expect("failed to load lstm-unicharset");
         assert!(unicharset.size() > 3, "unicharset should be non-trivial");
 
         // Load the recoder (a binary component) and rebuild the decoder.
@@ -564,7 +573,9 @@ mod tests {
             .component_reader(TessdataType::LstmRecoder)
             .expect("traineddata should contain an lstm-recoder");
         let mut recoder = UnicharCompress::new();
-        recoder.deserialize(&mut rec_fp).expect("failed to deserialize lstm-recoder");
+        recoder
+            .deserialize(&mut rec_fp)
+            .expect("failed to deserialize lstm-recoder");
 
         // The recoder covers every unichar id (plus possibly a null code).
         assert!(recoder.size() >= unicharset.size());
@@ -582,7 +593,9 @@ mod tests {
             {
                 continue; // skip Joined/Broken, whose codes can collide
             }
-            let code = recoder.encode_unichar(id as usize).expect("id should encode");
+            let code = recoder
+                .encode_unichar(id as usize)
+                .expect("id should encode");
             assert_eq!(
                 recoder.decode_unichar(&code),
                 id,
@@ -591,7 +604,10 @@ mod tests {
             roundtripped = true;
             break;
         }
-        assert!(roundtripped, "expected at least one common character to round-trip");
+        assert!(
+            roundtripped,
+            "expected at least one common character to round-trip"
+        );
     }
 
     #[test]
@@ -599,7 +615,10 @@ mod tests {
         // 가 (U+AC00) is the first Hangul: L=0, V=0, T=0.
         assert_eq!(UnicharCompress::decompose_hangul(0xAC00), Some((0, 0, 0)));
         // 힣 (U+D7A3) is the last Hangul: L=18, V=20, T=27.
-        assert_eq!(UnicharCompress::decompose_hangul(0xD7A3), Some((18, 20, 27)));
+        assert_eq!(
+            UnicharCompress::decompose_hangul(0xD7A3),
+            Some((18, 20, 27))
+        );
         // Non-Hangul returns None.
         assert_eq!(UnicharCompress::decompose_hangul(0x41), None);
         assert_eq!(UnicharCompress::decompose_hangul(0xD7A4), None);

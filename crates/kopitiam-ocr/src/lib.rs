@@ -64,6 +64,24 @@
 //!
 //! Every node type deserializes; forward evaluation targets the 1-D text-line
 //! path (each layer's module documents what its forward defers).
+//!
+//! ## Phase 5: the recode/CTC beam-search decoder
+//!
+//! This phase ports Tesseract's beam decoder (`src/lstm/recodebeam.{cpp,h}`), the
+//! last recognition step: it turns the network's per-timestep softmax over the
+//! recoded alphabet into recognized text.
+//!
+//! * [`recodebeam`] — [`RecodeBeamSearch`]/[`RecodeNode`], the beam over the
+//!   **recoded** alphabet. It tracks the CTC blank (`null_char`), folds duplicate
+//!   frames, and extends beam nodes only by the recoder's valid next codes, so a
+//!   multi-unit CJK code sequence reassembles (via [`UnicharCompress`]) into one
+//!   unichar id. [`RecodeBeamSearch::decode`] runs the beam across all timesteps;
+//!   [`RecodeBeamSearch::extract_best_path_as_unichar_ids`] /
+//!   [`RecodeBeamSearch::best_path_string`] emit the best path (with the
+//!   [`decode_to_unichar_ids`]/[`decode_to_string`] convenience wrappers).
+//!
+//! The non-dictionary (raw CTC beam) path is ported in full; the dawg/dictionary
+//! beam and char-box/`WERD_RES` extraction are deferred (see the module docs).
 
 pub mod error;
 pub mod serialis;
@@ -83,6 +101,7 @@ pub mod network;
 pub mod networkio;
 pub mod parallel;
 pub mod plumbing;
+pub mod recodebeam;
 pub mod reconfig;
 pub mod reversed;
 pub mod series;
@@ -90,16 +109,20 @@ pub mod stridemap;
 pub mod weightmatrix;
 
 #[cfg(test)]
-mod test_support;
-#[cfg(test)]
 mod network_tests;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{Error, ErrorKind, Result};
 pub use network::{Network, NetworkHeader, NetworkNode, NetworkType, TYPE_NAMES, create_from_file};
 pub use networkio::NetworkIO;
+pub use recodebeam::{
+    BestPath, RecodeBeamSearch, RecodeNode, decode_to_string, decode_to_unichar_ids,
+};
 pub use serialis::TFile;
-pub use tessdata::{FILE_SUFFIXES, MAX_NUM_TESSDATA_ENTRIES, NUM_ENTRIES, TessdataManager, TessdataType};
-pub use weightmatrix::WeightMatrix;
+pub use tessdata::{
+    FILE_SUFFIXES, MAX_NUM_TESSDATA_ENTRIES, NUM_ENTRIES, TessdataManager, TessdataType,
+};
 pub use unichar::{
     Char32, INVALID_UNICHAR, INVALID_UNICHAR_ID, UNICHAR_LEN, Unichar, UnicharId, utf8_step,
     utf8_to_utf32, utf32_to_utf8,
@@ -110,3 +133,4 @@ pub use unicharset::{
     CharFragment, SPECIAL_UNICHAR_CODES, SPECIAL_UNICHAR_CODES_COUNT, UNICHAR_BROKEN,
     UNICHAR_JOINED, UNICHAR_SPACE, Unicharset,
 };
+pub use weightmatrix::WeightMatrix;

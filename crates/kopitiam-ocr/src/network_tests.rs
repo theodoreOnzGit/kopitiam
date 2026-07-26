@@ -53,7 +53,10 @@ fn series_of_softmax_fully_connected_deserializes_and_forwards() {
     for (g, e) in got.iter().zip(&expected) {
         assert!((g - e).abs() < 1e-6, "softmax mismatch: got {g}, want {e}");
     }
-    assert!((got.iter().sum::<f32>() - 1.0).abs() < 1e-6, "softmax must normalize");
+    assert!(
+        (got.iter().sum::<f32>() - 1.0).abs() < 1e-6,
+        "softmax must normalize"
+    );
 }
 
 #[test]
@@ -203,7 +206,9 @@ fn real_traineddata_network_builds_and_output_matches_recoder() {
     // Cross-check against the recoder's code range, when the recoder is present.
     if let Some(mut rec_fp) = mgr.component_reader(crate::TessdataType::LstmRecoder) {
         let mut recoder = crate::UnicharCompress::new();
-        recoder.deserialize(&mut rec_fp).expect("deserialize recoder");
+        recoder
+            .deserialize(&mut rec_fp)
+            .expect("deserialize recoder");
         assert_eq!(
             net.num_outputs(),
             recoder.code_range() + 1,

@@ -197,7 +197,8 @@ impl<'a> Index<'a> {
         }
         let batch = self.indices[FD_BATCH] as usize;
         if dim == FD_HEIGHT {
-            if batch >= self.stride_map.heights.len() || self.stride_map.heights[batch] > max_index {
+            if batch >= self.stride_map.heights.len() || self.stride_map.heights[batch] > max_index
+            {
                 return max_index;
             }
             return self.stride_map.heights[batch] - 1;
