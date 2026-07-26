@@ -13,6 +13,7 @@
 //!     `unicode_map` is `Some(..)` yet `.get(code)` returns `None`); and
 //!   * no `/Encoding`, and a non-core `BaseFont`, so `pdf-extract` builds no
 //!     fallback encoding table (`encoding` stays `None`).
+//!
 //! With both conditions met, `decode_char` reaches
 //! `self.encoding.as_ref()...expect("missing unicode map and encoding")` and
 //! panics. (Note: a font with *no* `/ToUnicode` at all does NOT panic -- it
