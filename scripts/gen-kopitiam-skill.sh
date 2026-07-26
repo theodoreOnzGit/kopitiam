@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+#
+# gen-kopitiam-skill.sh — deterministically generate `kopitiam_skill.md`,
+# an agent-facing "skill" doc that teaches any Claude/AI agent to drive the
+# kopitiam CLI non-interactively.
+#
+# DETERMINISM CONTRACT
+# --------------------
+# The generated file is a PURE FUNCTION of exactly two inputs:
+#   (a) the kopitiam binary's own `--help` output — clap is the single source
+#       of truth for the command surface, so the doc can never drift from the
+#       real commands; and
+#   (b) the static, curated agent-guidance prose embedded in this script.
+#
+# Consequences enforced here:
+#   * NO `date`/timestamps, NO `$RANDOM`, NO hostnames, NO machine-varying
+#     paths ever reach the output. The only place a path is printed is the
+#     "using binary: ..." line, which goes to STDERR and never to the file.
+#   * Subcommands are emitted in the exact order `kopitiam --help` lists them
+#     (stable, single ordering — no re-sorting).
+#   * Running this twice against the same binary yields a byte-identical file.
+#     Step 4 proves this with a self-check: it regenerates to a temp file and
+#     `diff`s; a mismatch is a hard failure (exit non-zero).
+#
+# USAGE
+#   bash scripts/gen-kopitiam-skill.sh [OUTPUT_PATH]
+#   KOPITIAM_BIN=/path/to/kopitiam bash scripts/gen-kopitiam-skill.sh
+#
+# Default OUTPUT_PATH is `kopitiam_skill.md` in the current directory.
+
+set -euo pipefail
+
+# --------------------------------------------------------------------------
+# 1. Resolve the kopitiam binary: $KOPITIAM_BIN, else PATH, else build it.
+#    The chosen path is announced on STDERR so it never pollutes the output.
+# --------------------------------------------------------------------------
+resolve_bin() {
+	if [ -n "${KOPITIAM_BIN:-}" ]; then
+		printf '%s\n' "$KOPITIAM_BIN"
+		return 0
+	fi
+	if command -v kopitiam >/dev/null 2>&1; then
+		command -v kopitiam
+		return 0
+	fi
+	echo "gen-kopitiam-skill: kopitiam not on PATH; building (cargo build -q --release -p kopitiam)..." >&2
+	cargo build -q --release -p kopitiam >&2
+	for cand in target/release/kopitiam target/release/kopitiam.exe; do
+		if [ -f "$cand" ]; then
+			printf '%s\n' "$cand"
+			return 0
+		fi
+	done
+	echo "gen-kopitiam-skill: error: could not locate a built kopitiam binary under target/release/" >&2
+	return 1
+}
+
+# --------------------------------------------------------------------------
+# 2. Help parsing helpers.
+# --------------------------------------------------------------------------
+
+# Extract the subcommand names from a `--help` text's `Commands:` block, in
+# listed order. Awk scopes strictly to the region between `^Commands:` and the
+# next `^Options:` line, and takes the first token of each indented row.
+list_subcommands() {
+	printf '%s\n' "$1" | awk '
+		/^Commands:/ { in_cmds = 1; next }
+		/^Options:/  { in_cmds = 0 }
+		in_cmds && /^[[:space:]]+[A-Za-z]/ { print $1 }
+	'
+}
+
+# Static, curated classification: the two INTERACTIVE commands an agent must
+# never spawn. Everything else is non-interactive and agent-safe.
+is_interactive() {
+	case "$1" in
+	"tui" | "ai chat") return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Emit one command's reference subsection: heading, safety marker, and its
+# `--help` verbatim in a fenced block. Recurses one level into command groups
+# (e.g. `ai`, `models`), which is detected by a nested `Commands:` block.
+emit_cmd() {
+	local bin="$1" path="$2" level="$3"
+	local help_txt nested marker
+
+	# shellcheck disable=SC2086
+	help_txt="$("$bin" $path --help 2>&1)"
+	nested="$(list_subcommands "$help_txt")"
+
+	if [ -n "$nested" ]; then
+		marker='**Command group** — not invoked directly; dispatch to one of its subcommands below.'
+	elif is_interactive "$path"; then
+		marker='**INTERACTIVE — DO NOT RUN from an agent.** Full-screen / token-streamed; it blocks on stdin and will HANG a non-interactive session.'
+	else
+		marker='**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.'
+	fi
+
+	printf '%s `kopitiam %s`\n\n' "$level" "$path"
+	printf '%s\n\n' "$marker"
+	printf '```text\n%s\n```\n\n' "$help_txt"
+
+	if [ -n "$nested" ]; then
+		local sub
+		while IFS= read -r sub; do
+			[ -z "$sub" ] && continue
+			[ "$sub" = "help" ] && continue
+			emit_cmd "$bin" "$path $sub" "####"
+		done <<-EOF
+			$nested
+		EOF
+	fi
+}
+
+# --------------------------------------------------------------------------
+# 3. Generate the whole document to STDOUT. Static prose lives in quoted
+#    heredocs (`<<'EOF'`) so nothing expands; dynamic help is interleaved.
+# --------------------------------------------------------------------------
+generate() {
+	local bin="$1"
+
+	cat <<'EOF'
+---
+name: kopitiam-cli
+description: Use when you need to convert PDFs to semantic Markdown or otherwise drive the kopitiam Rust CLI non-interactively — batch document conversion, Rust-project scans/refactors, and local model management from scripts or agents.
+---
+
+# kopitiam CLI skill
+
+## What kopitiam is
+
+`kopitiam` is a Rust command-line tool. Its headline job is turning PDFs into
+semantic Markdown via the `pdf2md` command (a text-extract → structure-recover
+→ Markdown-render pipeline), and it also ships Rust-project tooling (scan,
+rename, code-actions, plan) and a local-AI layer (offline model store plus a
+chat/TUI front end that runs even with no weights present).
+
+## CRITICAL agent guidance (read first)
+
+- **Use the non-interactive subcommands.** They accept flags, read/write
+  files, and return meaningful exit codes — exactly what an agent needs.
+- **NEVER run `kopitiam tui` or `kopitiam ai chat` from an agent.** Both are
+  INTERACTIVE programs: `tui` is a full-screen terminal UI and `ai chat`
+  streams tokens while blocking on stdin. From a non-interactive agent they do
+  not return — they will **HANG the session**. They exist for humans at a real
+  terminal, not for automation.
+- **The primary agent workflow is `pdf2md`.** Convert one file, or loop over a
+  folder, then read the printed validation report to confirm nothing dropped.
+- Everything else in the Command reference below is marked **Agent-safe** or
+  **INTERACTIVE** so you can tell at a glance what is drivable.
+
+## Recipes
+
+All commands are non-interactive unless noted. **Always quote paths that
+contain spaces.**
+
+Convert a single PDF to a chosen output file:
+
+```bash
+kopitiam pdf2md "in.pdf" -o "out.md"
+```
+
+Convert every PDF in the current folder into a `markdown/` subfolder,
+preserving base names:
+
+```bash
+mkdir -p markdown
+for f in *.pdf; do
+  kopitiam pdf2md "$f" -o "markdown/${f%.pdf}.md"
+done
+```
+
+Read the validation / recovery report: `pdf2md` prints a report comparing the
+extracted word count against the rendered Markdown word count, ending in a
+PASS/FAIL line. After a batch, check exit codes and scan the output for FAIL to
+find documents that need a second look:
+
+```bash
+kopitiam pdf2md "paper.pdf" -o "paper.md" || echo "conversion returned non-zero for paper.pdf"
+```
+
+Manage local AI model weights (all non-interactive):
+
+```bash
+kopitiam models list          # show the catalog and what is present on disk
+kopitiam models pull <id>     # download + SHA-256 verify a model by catalog id
+kopitiam models path <id>     # print expected on-disk paths (bring-your-own)
+kopitiam models verify <id>   # re-check a present model against its checksums
+```
+
+## Command reference
+
+Each subsection embeds the command's real `kopitiam ... --help` output verbatim
+(clap is the source of truth) and flags whether it is agent-safe or interactive.
+
+EOF
+
+	# --- deterministic core: iterate top-level subcommands in listed order ---
+	local top c
+	top="$(list_subcommands "$("$bin" --help 2>&1)")"
+	while IFS= read -r c; do
+		[ -z "$c" ] && continue
+		[ "$c" = "help" ] && continue
+		emit_cmd "$bin" "$c" "###"
+	done <<-EOF
+		$top
+	EOF
+
+	cat <<'EOF'
+## Gotchas
+
+- **Quote paths with spaces.** `kopitiam pdf2md "My Paper (v2).pdf" -o "My Paper.md"`.
+  Unquoted paths split on whitespace and the command will read the wrong file
+  or fail.
+- **`pdf2md` prints a PASS/FAIL recovery report.** It compares extracted vs.
+  rendered word counts as a cheap check that structure reconstruction did not
+  silently drop content. Treat FAIL (or a large word-count gap) as a signal to
+  inspect that document, not necessarily a hard error.
+- **Some PDFs skip unreadable pages.** A page that cannot be extracted may be
+  omitted from the Markdown; the report is how you notice.
+- **Do not rely on OCR yet.** An automatic OCR fallback for image-only or
+  scanned pages is *planned* but not something to depend on today. If a PDF is
+  scanned images, `pdf2md` may produce little or no text.
+- **`tui` and `ai chat` are interactive** and must never be launched by an
+  agent (see CRITICAL agent guidance above).
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Main.
+# --------------------------------------------------------------------------
+OUT="${1:-kopitiam_skill.md}"
+
+BIN="$(resolve_bin)"
+echo "gen-kopitiam-skill: using binary: $BIN" >&2
+
+generate "$BIN" >"$OUT"
+
+# --------------------------------------------------------------------------
+# 4. Determinism self-check: regenerate to a temp file and diff. A second,
+#    guarded run (KOPITIAM_SKILL_SELFCHECK=1) skips this block so there is no
+#    infinite recursion. KOPITIAM_BIN is pinned so the inner run uses the same
+#    binary without re-resolving or rebuilding.
+# --------------------------------------------------------------------------
+if [ -z "${KOPITIAM_SKILL_SELFCHECK:-}" ]; then
+	tmp="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/kopitiam_skill_selfcheck.$$")"
+	KOPITIAM_SKILL_SELFCHECK=1 KOPITIAM_BIN="$BIN" bash "$0" "$tmp"
+	if diff -q "$OUT" "$tmp" >/dev/null 2>&1; then
+		echo "gen-kopitiam-skill: determinism self-check PASSED (byte-identical regeneration)" >&2
+		rm -f "$tmp"
+	else
+		echo "gen-kopitiam-skill: determinism self-check FAILED — output is not reproducible:" >&2
+		diff "$OUT" "$tmp" >&2 || true
+		rm -f "$tmp"
+		exit 1
+	fi
+fi
+
+echo "gen-kopitiam-skill: wrote $OUT" >&2

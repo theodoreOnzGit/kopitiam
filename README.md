@@ -41,6 +41,15 @@ written for humans and AI agents alike — see
 [`apps/cli/README.md`](apps/cli/README.md). That page is also what
 crates.io shows once the `kopitiam` package is published.
 
+### Agent skill doc
+
+[`kopitiam_skill.md`](kopitiam_skill.md) teaches an AI agent to drive the CLI
+non-interactively. It is **generated** — do not edit it by hand — by
+`scripts/gen-kopitiam-skill.sh`, which embeds each command's live `--help`
+output verbatim (clap is the source of truth). Regenerate it after any CLI
+change with `bash scripts/gen-kopitiam-skill.sh` (it self-checks that the
+output is byte-for-byte reproducible).
+
 ---
 
 # KOPITIAM
