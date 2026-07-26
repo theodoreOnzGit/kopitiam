@@ -9,6 +9,7 @@ mod font_resources;
 mod geometry;
 mod mupdf_extract;
 mod page;
+mod textnorm;
 
 // Faithful Rust port of MuPDF's text-extraction vertical (fitz geometry, and
 // later the stext device). Kept as a namespaced module -- its `Rect` is MuPDF's

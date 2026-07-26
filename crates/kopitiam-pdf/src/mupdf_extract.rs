@@ -123,9 +123,20 @@ fn line_to_span(line: &StextLine) -> Option<TextSpan> {
         return None;
     }
 
-    let text: String = line.chars.iter().map(|ch| ch.c).collect();
-    // A line that is nothing but whitespace carries no content; drop it so it
-    // does not become an empty paragraph downstream.
+    // Sanitize at the extraction boundary (Task I-A), using the same
+    // `textnorm` source of truth as the legacy `pdf-extract` path so a stray
+    // control char from *either* engine can never reach the output: drop
+    // control/format/private-use chars (a `U+0000` here would make ripgrep
+    // treat the file as binary), expand ligatures, collapse exotic spaces and
+    // strip the BOM. The synthesised spaces the stext stream already carries are
+    // plain ASCII `' '` and pass through untouched.
+    let mut text = String::new();
+    for ch in &line.chars {
+        crate::textnorm::normalize_char(ch.c, &mut text);
+    }
+    // A line that is nothing but whitespace (or whose only chars were dropped)
+    // carries no content; drop it so it does not become an empty paragraph
+    // downstream.
     if text.trim().is_empty() {
         return None;
     }

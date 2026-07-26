@@ -292,7 +292,12 @@ impl WordBuilder {
             self.max_y = y + font_size;
             self.font_size = font_size;
         }
-        self.text.push_str(ch);
+        // Sanitize at the extraction boundary (Task I-A): drop control/format/
+        // private-use chars (notably the `U+0000` that `pdf-extract`'s
+        // `decode_char` can emit for a `/ToUnicode` NUL mapping, which turns the
+        // output binary to ripgrep), expand ligatures, collapse exotic spaces
+        // and strip the BOM. One source of truth shared with the MuPDF path.
+        crate::textnorm::normalize_into(ch, &mut self.text);
         self.min_x = self.min_x.min(x);
         self.min_y = self.min_y.min(y);
         self.max_x = self.max_x.max(x + advance);
