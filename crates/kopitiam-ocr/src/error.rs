@@ -120,6 +120,16 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A tensor-op failure from `kopitiam-tensor` (a shape/dtype disagreement in the
+/// LSTM forward pass) is mapped to [`ErrorKind::Format`]: from this crate's point
+/// of view it means the deserialized network's dimensions did not line up, i.e.
+/// the model bytes were structurally wrong for the computation attempted.
+impl From<kopitiam_tensor::Error> for Error {
+    fn from(e: kopitiam_tensor::Error) -> Self {
+        Error::format(format!("tensor op failed: {e}"))
+    }
+}
+
 /// The crate-wide fallible result. `Ok` is Tesseract's `true`; an [`Error`] `Err`
 /// is one of its `return false` failure paths.
 pub type Result<T> = core::result::Result<T, Error>;

@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Phase 4 (LSTM network evaluation) drives the recognizer's forward pass through
+# the Kopitiam Runtime tensor ops (matmul, tanh/sigmoid, lstm_cell,
+# tessdata_int8_to_f32, softmax). See src/lstm.rs / src/fullyconnected.rs.
+kopitiam-tensor = { workspace = true }

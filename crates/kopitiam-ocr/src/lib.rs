@@ -42,6 +42,28 @@
 //! * [`unicharcompress`] — [`UnicharCompress`]/[`RecodedCharID`], the **CJK
 //!   recoder** that maps each unichar id to a short sequence of small codes and
 //!   back — why chi_sim/jpn work (`src/ccutil/unicharcompress.{cpp,h}`).
+//!
+//! ## Phase 4: the LSTM recognizer network (forward evaluation)
+//!
+//! This phase ports Tesseract's neural-network engine (`src/lstm/*`) so a
+//! KOPITIAM crate can build the recognizer graph from a `.traineddata` `Lstm`
+//! component and run a forward pass, producing per-timestep softmax logits over
+//! the recoded alphabet — the input to the beam decoder (phase 5, later). The
+//! numeric work runs on the [`kopitiam_tensor`] runtime (matmul, `tanh`/
+//! `sigmoid`, `lstm_cell`, `tessdata_int8_to_f32`, `softmax`).
+//!
+//! * [`network`] — the [`Network`] graph loader: the [`NetworkType`] tags, the
+//!   [`NetworkNode`] trait, and [`create_from_file`], the node-type dispatch.
+//! * [`stridemap`]/[`networkio`] — the 4-D→2-D index arithmetic and the
+//!   `[timesteps × features]` float activation buffer passed between layers.
+//! * [`weightmatrix`] — the [`WeightMatrix`] (int8 + per-row scale, or float)
+//!   and `MatrixDotVector` with the trailing-bias convention.
+//! * [`plumbing`]/[`series`]/[`parallel`]/[`reversed`] — the composite layers.
+//! * [`fullyconnected`]/[`lstm`] — the dense + recurrent functional layers.
+//! * [`input`]/[`reconfig`]/[`maxpool`]/[`convolve`] — the I/O and 2-D plumbing.
+//!
+//! Every node type deserializes; forward evaluation targets the 1-D text-line
+//! path (each layer's module documents what its forward defers).
 
 pub mod error;
 pub mod serialis;
@@ -51,9 +73,33 @@ pub mod unicharcompress;
 pub mod unicharmap;
 pub mod unicharset;
 
+// Phase 4: the LSTM recognizer network — graph loader + forward evaluation.
+pub mod convolve;
+pub mod fullyconnected;
+pub mod input;
+pub mod lstm;
+pub mod maxpool;
+pub mod network;
+pub mod networkio;
+pub mod parallel;
+pub mod plumbing;
+pub mod reconfig;
+pub mod reversed;
+pub mod series;
+pub mod stridemap;
+pub mod weightmatrix;
+
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod network_tests;
+
 pub use error::{Error, ErrorKind, Result};
+pub use network::{Network, NetworkHeader, NetworkNode, NetworkType, TYPE_NAMES, create_from_file};
+pub use networkio::NetworkIO;
 pub use serialis::TFile;
 pub use tessdata::{FILE_SUFFIXES, MAX_NUM_TESSDATA_ENTRIES, NUM_ENTRIES, TessdataManager, TessdataType};
+pub use weightmatrix::WeightMatrix;
 pub use unichar::{
     Char32, INVALID_UNICHAR, INVALID_UNICHAR_ID, UNICHAR_LEN, Unichar, UnicharId, utf8_step,
     utf8_to_utf32, utf32_to_utf8,

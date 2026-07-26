@@ -1931,6 +1931,9 @@ dependencies = [
 [[package]]
 name = "kopitiam-ocr"
 version = "0.1.0"
+dependencies = [
+ "kopitiam-tensor",
+]
 
 [[package]]
 name = "kopitiam-ontology"

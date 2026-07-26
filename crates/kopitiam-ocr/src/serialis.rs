@@ -164,6 +164,65 @@ impl<'a> TFile<'a> {
         Ok(buf[0])
     }
 
+    /// Read one `i8`. (Single bytes are never swapped.)
+    ///
+    /// Tesseract: `DeSerialize(int8_t*)` (serialis.h:89). Used by the LSTM
+    /// network loader for the layer type tag and the int8 flag/training bytes
+    /// (`network.cpp:191` `getNetworkType`).
+    pub fn read_i8(&mut self) -> Result<i8> {
+        Ok(self.read_u8()? as i8)
+    }
+
+    /// Read one `f64` (IEEE-754 double), honouring the swap flag.
+    ///
+    /// Tesseract weight matrices and per-row int8 scales are serialized as
+    /// doubles (`weightmatrix.cpp:257`, `matrix.h` `GENERIC_2D_ARRAY<double>`),
+    /// so the LSTM loader ([`crate::weightmatrix`]) reads them through this.
+    pub fn read_f64(&mut self) -> Result<f64> {
+        let mut buf = [0u8; 8];
+        if self.fread_endian(&mut buf, 8, 1) != 1 {
+            return Err(Error::unexpected_eof("read_f64: buffer exhausted"));
+        }
+        Ok(f64::from_ne_bytes(buf))
+    }
+
+    /// Read `count` `i8` values into a fresh `Vec`. (Single-byte items are
+    /// never swapped.) The array form used to read an int8 weight matrix's data
+    /// block (`matrix.h` `GENERIC_2D_ARRAY<int8_t>::DeSerialize`).
+    pub fn read_i8_vec(&mut self, count: usize) -> Result<Vec<i8>> {
+        let bytes = self.read_bytes(count)?;
+        Ok(bytes.into_iter().map(|b| b as i8).collect())
+    }
+
+    /// Read `count` `f64` values into a fresh `Vec`, honouring the swap flag.
+    /// The array form used to read a double weight matrix's data block and the
+    /// per-row scale vector.
+    pub fn read_f64_vec(&mut self, count: usize) -> Result<Vec<f64>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut bytes = vec![0u8; count * 8];
+        if self.fread_endian(&mut bytes, 8, count) != count {
+            return Err(Error::unexpected_eof("read_f64_vec: buffer exhausted"));
+        }
+        Ok(bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+
+    /// Read a length-prefixed UTF-8 string: a `uint32` count followed by that
+    /// many raw bytes, decoded lossily as UTF-8.
+    ///
+    /// Tesseract: `TFile::DeSerialize(std::string &)` (serialis.cpp:98),
+    /// including the 50,000,000-byte guard. This is how a network layer's name
+    /// and the serialized layer-type name are read (`network.cpp:198`,
+    /// `network.cpp:246`).
+    pub fn de_serialize_string(&mut self) -> Result<String> {
+        let bytes = self.de_serialize_char_vec()?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// Read one `u16`, honouring the swap flag.
     pub fn read_u16(&mut self) -> Result<u16> {
         let mut buf = [0u8; 2];
