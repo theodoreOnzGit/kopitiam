@@ -94,6 +94,23 @@ As with every other reference here, these are credited up front, their upstream
 licenses are recorded and honored, and any close translation records its
 provenance at the point of use — they are studied, not shipped.
 
+## OCR references (translation / close adaptation)
+
+KOPITIAM's OCR fallback (`kopitiam-ocr`) — the automatic path when a PDF has no
+embedded text — is a **pure-Rust translation of the Tesseract LSTM engine**
+(English, Simplified Chinese, Japanese), running its recognizer on
+`kopitiam-tensor` and fetching `.traineddata` language models through
+`kopitiam-models`. Both upstreams are permissively licensed and translate cleanly
+into AGPL-3.0; every ported file keeps the upstream copyright / author / license
+header at the point of use, and the language models are downloaded, never
+vendored or committed.
+
+| Project | License | Pinned commit | Studied / translated for |
+| --- | --- | --- | --- |
+| [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) | Apache-2.0 | `db0ec62` | The LSTM OCR engine: `.traineddata` container + unicharset/recoder parsers, the LSTM recognizer and CTC/recode beam decoder, line-finding (`kopitiam-ocr`) |
+| [Leptonica](https://github.com/DanBloomberg/leptonica) | BSD-2-Clause | `10bdea2` | Image preprocessing on the OCR path: binarization (Otsu / Sauvola), grayscale, scale-to-line-height (`kopitiam-ocr`) |
+| [tessdata_best](https://github.com/tesseract-ocr/tessdata_best) | Apache-2.0 | — | Source of the `eng` / `chi_sim` / `jpn` LSTM language models — **downloaded at runtime via `kopitiam-models`, not vendored** |
+
 ---
 
 ## Forks (direct code reuse — notices retained)
