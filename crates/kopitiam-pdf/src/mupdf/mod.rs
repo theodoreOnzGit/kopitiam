@@ -48,8 +48,19 @@
 //! * `hash` -- MuPDF's fixed-key open-addressing hash table (exact hash fn).
 //! * `pool` -- the block-chained bump arena (the `stext` page lives in one).
 //!
-//! Still ahead: buffers/streams, the `filter-*` decoders, the PDF object model /
-//! parser / xref, the content interpreter, fonts/CMaps/ToUnicode, and the `stext`
+//! The PDF OBJECT layer (bytes -> PDF objects), on top of the streams:
+//! * `object` -- MuPDF's polymorphic `pdf_obj` as the Rust [`Object`] enum
+//!   (null/bool/int/real/string/name/array/dict/indirect), with the `pdf_is_*`
+//!   predicates and `pdf_to_*` / dict / array accessors. Streams stay dicts (as
+//!   in MuPDF); the raw-byte seam lives on the parser's indirect-object result.
+//! * `lex` -- the `pdf_lex` tokenizer over a `Stream` ([`Token`]).
+//! * `parse` -- `pdf_parse_array`/`dict`/`ind_obj`: tokens -> [`Object`] trees,
+//!   returning an [`IndirectObject`] that records the stream body's start offset
+//!   ([`StreamRange`]) for the xref layer to resolve.
+//!
+//! Still ahead: the `filter-*` decoders' remaining wiring, the xref / document
+//! layer (indirect resolution, `/ObjStm` object streams, stream decode,
+//! encryption), the content interpreter, fonts/CMaps/ToUnicode, and the `stext`
 //! device + layout analysis (`boxer`/`para`) -- the parts that actually fix the
 //! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.
 
@@ -62,6 +73,9 @@ pub mod filter_lzw;
 pub mod filter_predict;
 pub mod geometry;
 pub mod hash;
+pub mod lex;
+pub mod object;
+pub mod parse;
 pub mod pool;
 pub mod stream;
 pub mod string_util;
@@ -71,5 +85,8 @@ pub use encodings::BaseEncoding;
 pub use error::{Error, ErrorKind, Result};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
 pub use hash::HashTable;
+pub use lex::{lex, Token};
+pub use object::Object;
+pub use parse::{parse_array, parse_dict, parse_ind_obj, IndirectObject, StreamRange};
 pub use pool::{Handle, Pool};
 pub use stream::{Stream, StreamSource, Whence};
