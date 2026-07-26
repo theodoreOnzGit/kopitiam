@@ -35,6 +35,7 @@ mod adapter;
 mod cloud;
 mod echo;
 mod message;
+mod preprocess;
 mod stream;
 
 #[cfg(feature = "local")]
@@ -46,4 +47,8 @@ pub use echo::EchoAdapter;
 #[cfg(feature = "local")]
 pub use local::LocalAdapter;
 pub use message::{CompletionRequest, CompletionResponse, Message, Role};
+pub use preprocess::{
+    Bucket, DiagnosticBuckets, DropReport, Preprocessed, ECHO_PASSTHROUGH_NOTE, classify_diagnostics,
+    draft_commit_message, summarize, triage,
+};
 pub use stream::StreamChunk;
