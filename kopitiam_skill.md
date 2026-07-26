@@ -652,6 +652,190 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+### `kopitiam translate`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Translate a converted Markdown document end to end — token-max Tasks III-4..7.
+
+Segments the document (`kopitiam_document::segments`), reuses cached translations from the `.kopitiam` translation memory, drafts cache-misses with the local model and routes each (`kopitiam_ai::draft_and_route`), applies a `--glossary` deterministically, and writes aligned bilingual output with per-segment anchors. See `apps/cli/src/translate.rs`.
+
+Usage: kopitiam.exe translate [OPTIONS] <INPUT>
+
+Arguments:
+  <INPUT>
+          The converted Markdown document to translate (typically a `pdf2md` output). Split into segments at block boundaries; page anchors and other bare HTML comments are not translatable and are skipped
+
+Options:
+      --glossary <GLOSSARY>
+          A project glossary applied deterministically as the post-pass (III-5), in the simple `source = target` line format (`#` comments allowed). Every occurrence of a source term becomes byte-identical target text — zero model tokens spent on terminology, no drift across the document
+
+      --layout <LAYOUT>
+          Bilingual layout: `interleaved` (anchor, source, target-as-blockquote per segment) or `table` (one Markdown table, `seg | source | target | review` rows). Both carry the stable `<!-- seg N -->` anchors (III-7)
+          
+          [default: interleaved]
+
+          Possible values:
+          - interleaved: Anchor, source, then target as a blockquote, per segment
+          - table:       A single `seg | source | target | review` Markdown table
+
+      --no-cache
+          Skip the translation memory entirely: neither reuse cached translations nor record new ones. Every segment is (re-)drafted. Without this flag the TM in `<root>/.kopitiam` is consulted and updated (III-4)
+
+  -o, --output <OUTPUT>
+          Where to write the bilingual Markdown. Defaults to the input path with a `.bilingual.md` extension beside it
+
+      --root <ROOT>
+          Directory holding the project's `.kopitiam` translation-memory store. Defaults to the current directory
+          
+          [default: .]
+
+      --json
+          Emit the machine-readable report (`reuse_fraction`, the two-pass summary, and `review_targets`) as JSON instead of the human summary, so a caller gates on the saving without parsing prose (§0.2). The "Wrote ..." notice and the adapter notice go to stderr in this mode
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `kopitiam digest`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Print (and cache) a compact per-crate architecture digest — token-max Task II-3.
+
+`cargo metadata` → crate → responsibility → workspace-internal deps, persisted in `.kopitiam/state.redb` and regenerated only when a manifest hash changes. See `apps/cli/src/digest.rs`.
+
+Usage: kopitiam.exe digest [OPTIONS]
+
+Options:
+      --root <ROOT>
+          The workspace root (holding the top `Cargo.toml` and `.kopitiam`). Defaults to the current directory
+          
+          [default: .]
+
+      --refresh
+          Force a rebuild from `cargo metadata` even if the cached digest is still fresh for the current manifests
+
+      --json
+          Print the digest as JSON (crate → responsibility → deps + the source hash) instead of the human-readable listing (§0.2). Notices go to stderr
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+### `kopitiam port`
+
+**Command group** — not invoked directly; dispatch to one of its subcommands below.
+
+```text
+Code-translation (porting) helpers — token-max Tasks III-1 / III-3.
+
+`port status` surfaces the machine-maintained port ledger and `port skeleton <file>` emits Rust signature stubs, as thin wrappers over the committed `scripts/port-ledger.sh` / `scripts/skeleton-gen.sh`. See `apps/cli/src/port.rs`.
+
+Usage: kopitiam.exe port <COMMAND>
+
+Commands:
+  status    Show the port ledger (`scripts/port-ledger.sh --report`), or the raw `docs/port-ledger.json` with `--json`
+  skeleton  Generate Rust signature stubs for a vendored source file (`scripts/skeleton-gen.sh <file>`)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `kopitiam port status`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Show the port ledger (`scripts/port-ledger.sh --report`), or the raw `docs/port-ledger.json` with `--json`
+
+Usage: kopitiam.exe port status [OPTIONS]
+
+Options:
+      --root <ROOT>  Where to start looking for the kopitiam repo root (the directory holding `scripts/port-ledger.sh`). Defaults to the current directory; the root is found by walking up from here [default: .]
+      --json         Print `docs/port-ledger.json` directly (the machine view), instead of shelling the script's human `--report`. No subprocess is spawned
+  -h, --help         Print help
+```
+
+#### `kopitiam port skeleton`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Generate Rust signature stubs for a vendored source file (`scripts/skeleton-gen.sh <file>`)
+
+Usage: kopitiam.exe port skeleton [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  The vendored source file to generate signature stubs for
+
+Options:
+      --root <ROOT>  Where to start looking for the repo root (holding `scripts/skeleton-gen.sh`). Defaults to the current directory [default: .]
+      --report       Pass `--report` to the script: print its found/skipped breakdown instead of the stubs
+  -h, --help         Print help
+```
+
+### `kopitiam preprocess`
+
+**Command group** — not invoked directly; dispatch to one of its subcommands below.
+
+```text
+Route high-volume, low-judgment work to the local model — token-max Task II-6.
+
+`preprocess summarize <file>` compresses and `preprocess triage <query> <candidate>...` filters, both over `kopitiam_ai`'s preprocess helpers with a `DropReport` of what was set aside. See `apps/cli/src/preprocess.rs`.
+
+Usage: kopitiam.exe preprocess <COMMAND>
+
+Commands:
+  summarize  Compress a file to at most `--lines N` lines via the local model
+  triage     Keep only the candidates plausibly relevant to a query (conservative: keeps all on an unusable reply)
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+#### `kopitiam preprocess summarize`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Compress a file to at most `--lines N` lines via the local model
+
+Usage: kopitiam.exe preprocess summarize [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  The file to compress
+
+Options:
+      --lines <LINES>  The line budget the summary is hard-capped to (overflow is listed in the drop report, never silently discarded) [default: 10]
+      --json           Emit the `Preprocessed` result (output + drop report) as JSON
+  -h, --help           Print help
+```
+
+#### `kopitiam preprocess triage`
+
+**Agent-safe** — non-interactive: takes flags, writes files, and returns an exit code.
+
+```text
+Keep only the candidates plausibly relevant to a query (conservative: keeps all on an unusable reply)
+
+Usage: kopitiam.exe preprocess triage [OPTIONS] <QUERY> [CANDIDATES]...
+
+Arguments:
+  <QUERY>          What the candidates are being filtered for relevance to
+  [CANDIDATES]...  The candidate snippets (e.g. grep hits) to filter
+
+Options:
+      --json  Emit the `Preprocessed` result (kept subset + drop report) as JSON
+  -h, --help  Print help
+```
+
 ## Gotchas
 
 - **Quote paths with spaces.** `kopitiam pdf2md "My Paper (v2).pdf" -o "My Paper.md"`.

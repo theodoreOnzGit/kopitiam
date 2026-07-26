@@ -25,14 +25,18 @@ mod adapter;
 mod ai;
 mod code_actions;
 mod diagnostics;
+mod digest;
 mod models;
 mod outline;
 mod plan;
+mod port;
+mod preprocess;
 mod rename;
 mod scan;
 mod semq;
 mod status;
 mod tokens;
+mod translate;
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -240,6 +244,40 @@ enum Command {
     /// A thin shell over `kopitiam_tokenizer::estimate_tokens`. See
     /// `apps/cli/src/tokens.rs`.
     Tokens(tokens::TokensArgs),
+
+    /// Translate a converted Markdown document end to end — token-max Tasks
+    /// III-4..7.
+    ///
+    /// Segments the document (`kopitiam_document::segments`), reuses cached
+    /// translations from the `.kopitiam` translation memory, drafts cache-misses
+    /// with the local model and routes each (`kopitiam_ai::draft_and_route`),
+    /// applies a `--glossary` deterministically, and writes aligned bilingual
+    /// output with per-segment anchors. See `apps/cli/src/translate.rs`.
+    Translate(translate::TranslateArgs),
+
+    /// Print (and cache) a compact per-crate architecture digest — token-max
+    /// Task II-3.
+    ///
+    /// `cargo metadata` → crate → responsibility → workspace-internal deps,
+    /// persisted in `.kopitiam/state.redb` and regenerated only when a manifest
+    /// hash changes. See `apps/cli/src/digest.rs`.
+    Digest(digest::DigestArgs),
+
+    /// Code-translation (porting) helpers — token-max Tasks III-1 / III-3.
+    ///
+    /// `port status` surfaces the machine-maintained port ledger and `port
+    /// skeleton <file>` emits Rust signature stubs, as thin wrappers over the
+    /// committed `scripts/port-ledger.sh` / `scripts/skeleton-gen.sh`. See
+    /// `apps/cli/src/port.rs`.
+    Port(port::PortArgs),
+
+    /// Route high-volume, low-judgment work to the local model — token-max Task
+    /// II-6.
+    ///
+    /// `preprocess summarize <file>` compresses and `preprocess triage <query>
+    /// <candidate>...` filters, both over `kopitiam_ai`'s preprocess helpers with
+    /// a `DropReport` of what was set aside. See `apps/cli/src/preprocess.rs`.
+    Preprocess(preprocess::PreprocessArgs),
 }
 
 // `main` return `anyhow::Result<ExitCode>` (not `Result<()>`) because one
@@ -339,6 +377,22 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Tokens(args) => {
             tokens::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Translate(args) => {
+            translate::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Digest(args) => {
+            digest::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Port(args) => {
+            port::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Preprocess(args) => {
+            preprocess::run(args)?;
             ExitCode::SUCCESS
         }
     };
