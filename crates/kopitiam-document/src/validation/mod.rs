@@ -4,6 +4,7 @@ pub use report::ConversionReport;
 
 use kopitiam_pdf::{Page, TextSpan};
 
+use crate::reconstruction::strip_marginalia;
 use crate::{Block, Document};
 
 /// Markdown text `Figure::render` emits in place of an image (see
@@ -24,7 +25,20 @@ const FIGURE_PLACEHOLDER: &str = "[Figure omitted from Markdown output]";
 /// rustdoc for why. Word counts are still gathered and reported alongside
 /// it as an informational secondary signal (see kopitiam-wwr).
 pub fn validate(pages: &[Page], document: &Document, rendered_markdown: &str) -> ConversionReport {
-    let extracted_words = pages
+    // Recovery-ratio honesty (`kopitiam_token_max.md` §2.1). Reconstruction
+    // deletes running heads, running feet, and bare page numbers, so those
+    // characters are legitimately absent from `rendered_markdown`. If the
+    // extracted side still counted them, `recovery_ratio` would sink below the
+    // 0.98 PASS threshold on every document that has a running head -- masking
+    // real content loss behind noise we intended to drop. `strip_marginalia` is
+    // a pure, deterministic function of `pages`, and reconstruction ran it over
+    // exactly these same pages, so rerunning it here removes byte-for-byte the
+    // same spans. The removed header/footer text is then absent from *both*
+    // `extracted_chars` and `rendered_chars`, and the ratio measures only body
+    // recovery, staying honestly inside [0.98, 1.0].
+    let stripped = strip_marginalia(pages);
+
+    let extracted_words = stripped
         .iter()
         .flat_map(|page| &page.spans)
         .map(|span| word_count(&span.text))
@@ -47,7 +61,7 @@ pub fn validate(pages: &[Page], document: &Document, rendered_markdown: &str) ->
         pages: pages.len(),
         extracted_words,
         rendered_words: word_count(rendered_markdown),
-        extracted_chars: extracted_content_chars(pages),
+        extracted_chars: extracted_content_chars(&stripped),
         rendered_chars: rendered_content_chars(rendered_markdown),
         headings_found,
         lists_found,
@@ -394,6 +408,62 @@ mod tests {
     }
 
     // -- normalization building blocks --
+
+    #[test]
+    fn stripped_running_head_keeps_recovery_ratio_honest() {
+        // The recovery-ratio trap (kopitiam_token_max.md §2.1). A 4-page doc
+        // (enough to engage signature stripping) with a running head in the top
+        // zone on every page. Reconstruction drops that head, so the rendered
+        // Markdown never contains it. If `validate` still counted the head on
+        // the extracted side, the ratio would fall below 0.98 and the doc would
+        // FAIL purely for having a running head. Because `validate` reruns the
+        // same `strip_marginalia`, the head is discounted on both sides and the
+        // ratio stays honestly in [0.98, 1.0].
+        let head = "Confidential Draft Running Header";
+        let body = "Body sentence carrying the real content of the page.";
+        let pages: Vec<Page> = (1..=4)
+            .map(|n| Page {
+                number: n,
+                width: 600.0,
+                height: 800.0,
+                spans: vec![
+                    // y = 770 / 800 -> top 10% zone.
+                    span(head, 50.0, 770.0, 300.0, 10.0),
+                    span(body, 50.0, 400.0, 400.0, 10.0),
+                ],
+            })
+            .collect();
+
+        // Rendered output is the body only (the head was stripped before render).
+        let rendered = format!("{body}\n").repeat(4);
+        let document = empty_document(vec![Block::Paragraph(Paragraph {
+            text: body.to_string(),
+        })]);
+        let report = validate(&pages, &document, &rendered);
+
+        assert!(
+            report.recovery_ratio() <= 1.0 + 1e-9,
+            "ratio must not exceed 1.0, got {}",
+            report.recovery_ratio()
+        );
+        assert!(
+            report.recovery_ratio() >= 0.98,
+            "discounting the stripped head on the extracted side must keep the \
+             ratio within PASS range, got {}",
+            report.recovery_ratio()
+        );
+        assert!(report.passes(), "a doc whose only loss is a running head must PASS");
+
+        // Sanity: the head really was removed from the extracted count. Had it
+        // been left in, `extracted_chars` would carry the head's characters
+        // (4 x 28 non-whitespace) on top of the body, dropping the ratio well
+        // below 0.98.
+        let body_chars = content_char_count(body) * 4;
+        assert_eq!(
+            report.extracted_chars, body_chars,
+            "extracted side must count body only, not the stripped head"
+        );
+    }
 
     #[test]
     fn strip_rendered_markdown_syntax_removes_all_known_scaffolding() {

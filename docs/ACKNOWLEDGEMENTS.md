@@ -87,6 +87,7 @@ combine one-way into AGPLv3 as usual, with their notices retained.
 | [pdfplumber](https://github.com/jsvine/pdfplumber) | MIT | `4c64b92` | Word / table extraction with coordinates |
 | [pypdf](https://github.com/py-pdf/pypdf) | BSD-3-Clause | `0a87f78` | Layout-mode text reconstruction cross-check |
 | [pdf-to-markdown](https://github.com/iamarunbrahma/pdf-to-markdown) | MIT | `54baa2e` | PDF→Markdown pipeline: multi-column reading order, header / footer stripping, heading / table reconstruction |
+| [marker](https://github.com/datalab-to/marker) | Apache-2.0 | — | **Clean-room study only — no code copied.** The running-head / running-foot detection *guard rails* in `kopitiam-document`'s `reconstruction/headers.rs` (the margin-zone constraint and the "be conservative on short documents" minimum-page rule) were informed by reading marker's `processors/marginalia.py` and `processors/ignoretext.py`. The signature-recurrence algorithm itself is adapted from pdf-to-markdown (above); marker was studied for the safety conditions wrapped around it. Original Rust throughout. |
 | [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | AGPL-3.0 | — | High-capability text extraction (blocks / lines / spans with bounding boxes); now license-compatible under the AGPLv3 relicense |
 | [MuPDF](https://github.com/ArtifexSoftware/mupdf) | AGPL-3.0 | — | The C extraction engine PyMuPDF binds |
 

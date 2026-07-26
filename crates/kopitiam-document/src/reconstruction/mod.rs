@@ -1,5 +1,6 @@
 mod citations;
 mod figures;
+mod headers;
 mod headings;
 mod lists;
 mod paragraphs;
@@ -10,6 +11,11 @@ use std::cmp::Ordering;
 use kopitiam_pdf::{Page, TextSpan};
 
 use crate::{Block, Document, Heading, Metadata, Paragraph};
+
+/// Re-exported for `validation`, which must run the *identical* stripping over
+/// the same pages to keep the recovery ratio honest -- see `headers.rs` and
+/// `kopitiam_token_max.md` §2.1.
+pub(crate) use headers::strip_marginalia;
 
 /// One visual line of text on a page: spans grouped by shared baseline and
 /// sorted left to right.
@@ -42,6 +48,12 @@ const FULL_WIDTH_CELL_MIN_RATIO: f32 = 0.66;
 /// see by construction: a paragraph split across a page break (see
 /// `merge_page_breaks` / kopitiam-d3n).
 pub fn reconstruct(pages: &[Page]) -> Document {
+    // Drop running heads/feet and bare page numbers before any layout analysis,
+    // so they never become spurious paragraphs. `validation::validate` reruns
+    // this same pass so the recovery ratio is not distorted (see `headers.rs`).
+    let pages = strip_marginalia(pages);
+    let pages = pages.as_slice();
+
     let body_font_size = estimate_body_font_size(pages);
     let mut citations = Vec::new();
     let mut pages_blocks: Vec<Vec<Block>> = Vec::with_capacity(pages.len());
@@ -102,6 +114,13 @@ pub fn reconstruct(pages: &[Page]) -> Document {
 /// cell, so multi-column table recognition degrades to best-effort. Headings,
 /// lists, paragraphs, citations, and cross-page merge are unaffected.
 pub fn reconstruct_preordered(pages: &[Page]) -> Document {
+    // Same marginalia strip as the legacy path. `strip_marginalia` preserves
+    // span order within each page, so the pre-ordered reading order this path
+    // trusts is not disturbed -- only header/footer/page-number spans are
+    // removed. `validation::validate` reruns it to keep the ratio honest.
+    let pages = strip_marginalia(pages);
+    let pages = pages.as_slice();
+
     let body_font_size = estimate_body_font_size(pages);
     let mut citations = Vec::new();
     let mut pages_blocks: Vec<Vec<Block>> = Vec::with_capacity(pages.len());
