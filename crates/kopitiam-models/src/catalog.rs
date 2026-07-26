@@ -92,32 +92,38 @@ pub struct Catalog;
 impl Catalog {
     /// The whole built-in catalog, one entry per known model.
     ///
-    /// # WARNING -- the checksums here are placeholders, on purpose
+    /// # WARNING -- some checksums here are placeholders, on purpose
     ///
-    /// Every GGUF LLM [`Artifact::sha256`] below is the sentinel value
-    /// `"0000...0000"` (64 zeros), NOT a real hash. Reason: a real sha256 can
-    /// only be gotten by actually downloading the hundreds-of-MB weights file
-    /// and hashing it, which cannot be done at authoring time. Better to be
-    /// honest than to ship a catalog that lies about hashes it never checked.
+    /// The two **SmolLM2** entries (the default [`DEFAULT_MODEL_ID`] and its
+    /// larger sibling) carry **real** sha256/size values, read from the
+    /// git-LFS pointer published on the official HuggingFaceTB GGUF repos, so
+    /// they acquire and verify clean. The small Tesseract `tessdata-*` OCR
+    /// entries likewise carry genuine sha256/size (their `.traineddata` files
+    /// were pulled and hashed for real).
     ///
-    /// The small Tesseract `tessdata-*` OCR entries are the exception -- their
-    /// `.traineddata` files are small enough to have been pulled and hashed for
-    /// real, so those carry genuine sha256/size values and verify clean.
+    /// The remaining GGUF LLM entries (Qwen2, Llama) still use the sentinel
+    /// value `"0000...0000"` (64 zeros), NOT a real hash. Reason: a real
+    /// sha256 can only be gotten by actually downloading the hundreds-of-MB
+    /// weights file and hashing it, which was not done at authoring time for
+    /// those. Better to be honest than to ship a catalog that lies about
+    /// hashes it never checked.
     ///
-    /// The direct consequence, and this is by design: any [`crate::verify`]
-    /// (via [`crate::ModelStore::verify`]) or [`crate::ensure_available`] on a
-    /// shipped entry **will fail with [`crate::Error::ChecksumMismatch`]** the
-    /// moment real bytes land -- because real bytes will never hash to 64 zeros.
-    /// Each entry carries a `TODO: record real sha256 after first successful
-    /// pull`. The workflow is: pull once, read the `actual` value out of the
-    /// `ChecksumMismatch` error, eyeball it against the upstream's published
-    /// checksum, then paste it in here. Only then does that entry acquire clean.
+    /// The direct consequence for the *placeholder* entries, and this is by
+    /// design: any [`crate::ModelStore::verify`] or [`crate::ensure_available`]
+    /// on a Qwen2/Llama entry **will fail with
+    /// [`crate::Error::ChecksumMismatch`]** the moment real bytes land --
+    /// because real bytes will never hash to 64 zeros. Each carries a `TODO:
+    /// record real sha256 after first successful pull`. The workflow is: pull
+    /// once, read the `actual` value out of the `ChecksumMismatch` error,
+    /// eyeball it against the upstream's published checksum, then paste it in
+    /// here. Only then does that entry acquire clean. The SmolLM2 and
+    /// `tessdata-*` entries already went through this and carry real hashes.
     ///
-    /// The URLs are real, plausible HuggingFace GGUF locations. Any entry whose
-    /// exact filename we are not 100% sure of carries a `// TODO(verify-url)`.
+    /// The URLs are real HuggingFace GGUF locations. Any entry whose exact
+    /// filename we are not 100% sure of carries a `// TODO(verify-url)`.
     ///
-    /// This ships **two different families** on purpose (Qwen2 and Llama), so
-    /// the model-agnostic promise is not just talk.
+    /// This ships **two different families** on purpose (SmolLM2/Llama and
+    /// Qwen2), so the model-agnostic promise is not just talk.
     pub fn builtin() -> Vec<ModelSpec> {
         // maintainer will populate: once specific HF-hosted models are named,
         // declare them the clean way via [`crate::hf::HfModel`] (repo / revision
@@ -126,9 +132,56 @@ impl Catalog {
         // `kopitiam-56q`. The two hand-written entries below predate that
         // mechanism and stay until the real models + hashes are chosen.
         vec![
-            // ---- Qwen2 family --------------------------------------------
-            // Qwen2.5-0.5B-Instruct, Q4_0 GGUF. Small (~350MB), Apache-2.0,
-            // the sensible default first pull.
+            // ---- SmolLM2 family (the DEFAULT) ----------------------------
+            // SmolLM2-360M-Instruct, Q8_0 GGUF. Tiny (~369MB), Apache-2.0,
+            // HuggingFaceTB. This is the sensible default first pull ([`DEFAULT_MODEL_ID`]) --
+            // small and fast enough for local-first / Termux, and the
+            // successor to the old Qwen2.5-0.5B default. SmolLM2 is a
+            // LLaMA-shaped architecture (`is_llama_config: true` in its
+            // upstream configs -- see the vendored reference clone at
+            // `crates/kopitiam-models/vendor/smollm`), hence
+            // [`Architecture::Llama`].
+            //
+            // Unlike the Qwen2 / Llama entries below, these two SmolLM2
+            // sha256/size values are REAL -- taken from the git-LFS pointer
+            // (`oid sha256:`) published on the official HuggingFaceTB GGUF
+            // repos -- so they acquire and verify clean.
+            ModelSpec {
+                id: "smollm2-360m-instruct-q8_0".to_string(),
+                display_name: "SmolLM2 360M Instruct (Q8_0)".to_string(),
+                architecture: Architecture::Llama,
+                license: "Apache-2.0".to_string(),
+                artifacts: vec![Artifact {
+                    filename: "smollm2-360m-instruct-q8_0.gguf".to_string(),
+                    // Official HuggingFaceTB GGUF repo.
+                    url: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q8_0.gguf".to_string(),
+                    // REAL sha256 -- HF git-LFS oid, cross-checked via the
+                    // tree API and the /raw/ LFS pointer.
+                    sha256: "48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201".to_string(),
+                    size_bytes: 386_404_992,
+                }],
+            },
+            // SmolLM2-1.7B-Instruct, Q4_K_M GGUF. The larger local option --
+            // still Apache-2.0, still HuggingFaceTB, still LLaMA-shaped.
+            ModelSpec {
+                id: "smollm2-1.7b-instruct-q4_k_m".to_string(),
+                display_name: "SmolLM2 1.7B Instruct (Q4_K_M)".to_string(),
+                architecture: Architecture::Llama,
+                license: "Apache-2.0".to_string(),
+                artifacts: vec![Artifact {
+                    filename: "smollm2-1.7b-instruct-q4_k_m.gguf".to_string(),
+                    url: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf".to_string(),
+                    // REAL sha256 -- HF git-LFS oid, cross-checked via the
+                    // tree API and the /raw/ LFS pointer.
+                    sha256: "decd2598bc2c8ed08c19adc3c8fdd461ee19ed5708679d1c54ef54a5a30d4f33".to_string(),
+                    size_bytes: 1_055_609_536,
+                }],
+            },
+            // ---- Qwen2 family (kept, but NO LONGER the default) ----------
+            // Qwen2.5-0.5B-Instruct, Q4_0 GGUF. Small (~350MB), Apache-2.0.
+            // Kept available so existing `kopitiam models pull
+            // qwen2.5-0.5b-instruct-q4_0` users don't break; it is no longer
+            // the default (SmolLM2-360M is). Its sha256 stays a placeholder.
             ModelSpec {
                 id: "qwen2.5-0.5b-instruct-q4_0".to_string(),
                 display_name: "Qwen2.5 0.5B Instruct (Q4_0)".to_string(),
@@ -224,6 +277,24 @@ impl Catalog {
     /// caller from holding a borrow into the built-in list.
     pub fn find(id: &str) -> Option<ModelSpec> {
         Self::builtin().into_iter().find(|spec| spec.id == id)
+    }
+
+    /// The id of the **default local model** -- [`DEFAULT_MODEL_ID`], currently
+    /// SmolLM2-360M-Instruct (Q8_0). This is the single source of truth for
+    /// "which model when nothing is configured": selection code (e.g. the
+    /// CLI's `select_adapter`) should reach for this rather than hardcoding an
+    /// id, so the default only ever changes in one place -- here. It is
+    /// guaranteed to resolve in [`Catalog::builtin`] (there is a test).
+    pub fn default_id() -> &'static str {
+        DEFAULT_MODEL_ID
+    }
+
+    /// The [`ModelSpec`] of the default local model. Convenience over
+    /// `Catalog::find(Catalog::default_id())`; always `Some` for the built-in
+    /// catalog, so it unwraps safely (see the accompanying test).
+    pub fn default_spec() -> ModelSpec {
+        Self::find(DEFAULT_MODEL_ID)
+            .expect("the default model id must always resolve in the built-in catalog")
     }
 
     /// Sanity-check a whole catalog and hand back **every** invariant it breaks
@@ -444,3 +515,10 @@ fn is_sha256_hex(s: &str) -> bool {
 /// warning on [`Catalog::builtin`].
 const PLACEHOLDER_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The catalog id of the **default local model**: SmolLM2-360M-Instruct
+/// (Q8_0), HuggingFaceTB, Apache-2.0. Tiny and fast enough for local-first /
+/// Termux, and the successor to the old Qwen2.5-0.5B default. Exposed via
+/// [`Catalog::default_id`] so selection code has one place to read the default
+/// from; an explicit `KOPITIAM_MODEL` / BYO override still wins over it.
+pub const DEFAULT_MODEL_ID: &str = "smollm2-360m-instruct-q8_0";

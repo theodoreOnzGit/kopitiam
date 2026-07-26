@@ -12,7 +12,7 @@ use tempfile::tempdir;
 
 use kopitiam_models::{
     ensure_available, Architecture, Artifact, Catalog, CatalogProblem, Error, Fetcher,
-    ModelSpec, ModelStore,
+    ModelSpec, ModelStore, DEFAULT_MODEL_ID,
 };
 
 /// The bytes our fake "model" is made of. Small, known, and hashable.
@@ -250,14 +250,14 @@ fn builtin_catalog_has_at_least_two_families() {
 }
 
 #[test]
-fn builtin_checksums_are_placeholders() {
-    // Documents the intentional placeholder state: every shipped GGUF LLM
-    // checksum is 64 zeros until a real pull records the true value. The
-    // Tesseract `tessdata-*` entries are exempt -- their `.traineddata`
-    // hashes are REAL (computed from an actual pull), so they carry a genuine
-    // digest, not the sentinel.
+fn qwen_and_llama_checksums_are_still_placeholders() {
+    // Documents the intentional placeholder state for the Qwen2/Llama GGUF
+    // entries: their checksum is 64 zeros until a real pull records the true
+    // value. Exempt, because their hashes are REAL: the `tessdata-*`
+    // Tesseract models (pulled + hashed) and the `smollm2-*` default models
+    // (HF git-LFS oid). Everything else must still be the sentinel.
     for s in Catalog::builtin() {
-        if s.id.starts_with("tessdata-") {
+        if s.id.starts_with("tessdata-") || s.id.starts_with("smollm2-") {
             continue;
         }
         for a in &s.artifacts {
@@ -268,8 +268,49 @@ fn builtin_checksums_are_placeholders() {
 
 #[test]
 fn find_returns_known_and_none_for_unknown() {
+    // Qwen2.5-0.5B is kept in the catalog (non-default) so existing
+    // `models pull` users don't break.
     assert!(Catalog::find("qwen2.5-0.5b-instruct-q4_0").is_some());
     assert!(Catalog::find("no-such-model").is_none());
+}
+
+/// The default local model is now SmolLM2-360M-Instruct, not Qwen. Lock in
+/// that `default_id`/`default_spec` agree, that the id actually resolves, and
+/// that it is the SmolLM2 entry (the successor to the old Qwen default).
+#[test]
+fn default_model_is_smollm2_360m() {
+    assert_eq!(DEFAULT_MODEL_ID, "smollm2-360m-instruct-q8_0");
+    assert_eq!(Catalog::default_id(), DEFAULT_MODEL_ID);
+    let spec = Catalog::default_spec();
+    assert_eq!(spec.id, DEFAULT_MODEL_ID);
+    assert_eq!(spec.architecture, Architecture::Llama);
+    assert_eq!(spec.license, "Apache-2.0");
+    // The default is the first entry in the catalog, on purpose.
+    assert_eq!(Catalog::builtin().first().unwrap().id, DEFAULT_MODEL_ID);
+}
+
+/// Both SmolLM2 entries must carry a REAL, well-formed sha256 (not the 64-zero
+/// placeholder) and a proper HF `resolve/main` download URL, so they acquire
+/// and verify clean. If a checksum ever gets left as a TODO/placeholder, this
+/// test fails loudly rather than shipping a broken default.
+#[test]
+fn smollm2_entries_have_real_checksums_and_urls() {
+    let ids = ["smollm2-360m-instruct-q8_0", "smollm2-1.7b-instruct-q4_k_m"];
+    for id in ids {
+        let spec = Catalog::find(id).unwrap_or_else(|| panic!("{id} must be in the catalog"));
+        let a = spec.artifacts.first().expect("one gguf artifact");
+        // Well-formed 64 lowercase-hex, and NOT the placeholder sentinel.
+        assert_eq!(a.sha256.len(), 64, "{id}: sha256 must be 64 hex chars");
+        assert!(
+            a.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{id}: sha256 must be lowercase hex"
+        );
+        assert_ne!(a.sha256, "0".repeat(64), "{id}: sha256 must not be the placeholder");
+        // Real HF GGUF download URL.
+        assert!(a.url.starts_with("https://huggingface.co/HuggingFaceTB/"), "{id}: HF url");
+        assert!(a.url.contains("/resolve/main/"), "{id}: resolve URL");
+        assert!(a.url.ends_with(".gguf"), "{id}: gguf url");
+    }
 }
 
 // -------------------------------------------------------------------------

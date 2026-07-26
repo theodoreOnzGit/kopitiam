@@ -12,8 +12,9 @@
 //!
 //! # Be honest about capability (this is the card's central requirement)
 //!
-//! The default local model is `qwen2.5-0.5b` (see `apps/cli/src/adapter.rs`).
-//! **A 0.5B model cannot be trusted with judgment.** These helpers are for
+//! The default local model is SmolLM2-360M-Instruct
+//! (`kopitiam_models::DEFAULT_MODEL_ID`; the CLI's `select_adapter` resolves
+//! it). **A ~360M model cannot be trusted with judgment.** These helpers are for
 //! *filtering* and *compression* only — situations where a wrong call is
 //! **recoverable**: a summary is re-derivable from the untouched source, and a
 //! false negative in triage only means the cloud model reads one extra snippet.

@@ -60,6 +60,29 @@ loop and the copied string is a small test fixture, not an algorithm — but it 
 a close adaptation, not clean-room study, and is labelled as such here rather
 than being quietly filed under "studied for."
 
+### The default shipped local model — SmolLM2 (downloaded, not vendored)
+
+KOPITIAM's **default local model** is **SmolLM2-360M-Instruct**
+(`kopitiam_models::DEFAULT_MODEL_ID`), by **HuggingFaceTB**, under
+**Apache-2.0** — tiny (~369 MB Q8_0) and fast enough for local-first / Termux
+use, the successor to the earlier Qwen2.5-0.5B default. A larger option,
+**SmolLM2-1.7B-Instruct** (Q4_K_M, also Apache-2.0), is offered alongside it.
+Both are LLaMA-shaped architectures.
+
+| Project | License | Role |
+| --- | --- | --- |
+| [SmolLM2](https://huggingface.co/HuggingFaceTB) (HuggingFaceTB) | Apache-2.0 | The **default local model weights**, in GGUF form. Pulled from the official HuggingFaceTB GGUF repos at runtime via `kopitiam-models` (`kopitiam models pull …`, checksum-verified against the catalog's recorded sha256) — **downloaded, never vendored or committed** as weights. Apache-2.0 combines one-way into KOPITIAM's AGPL-3.0-only, and the licence travels with the downloaded files. |
+
+A read-only **reference clone** of the upstream SmolLM repository is vendored
+at **`crates/kopitiam-models/vendor/smollm`** (Apache-2.0, HuggingFaceTB),
+shallow-cloned for study of the tokenizer and the LLaMA-shaped architecture
+(the configs there carry `is_llama_config: true`, which is why the catalog
+files these entries under `Architecture::Llama`). Like every other vendored
+clone, it is reference material only — never built, linked, or shipped as part
+of any KOPITIAM crate — and is gitignored. Note the location differs from the
+AI-runtime clones under `crates/kopitiam-ai/vendor/`: this one lives beside the
+acquisition layer that knows how to fetch the model.
+
 ---
 
 ## PDF & document-extraction references (translation / close adaptation)

@@ -99,7 +99,9 @@ mod fetch;
 pub mod hf;
 mod store;
 
-pub use catalog::{Architecture, Artifact, Catalog, CatalogProblem, ModelSpec};
+pub use catalog::{
+    Architecture, Artifact, Catalog, CatalogProblem, ModelSpec, DEFAULT_MODEL_ID,
+};
 pub use error::Error;
 pub use fetch::{ensure_available, AcquiredModel, Fetcher};
 pub use hf::{
