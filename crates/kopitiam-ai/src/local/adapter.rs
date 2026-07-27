@@ -42,11 +42,13 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use anyhow::{Context, Result};
-use kopitiam_runtime::{GenerationConfig, QwenModel, generate, tokenizer_from_gguf};
+use kopitiam_runtime::{
+    GenerationConfig, QwenModel, StochasticSampler, generate_with_sampler, tokenizer_from_gguf,
+};
 use kopitiam_tokenizer::BpeTokenizer;
 
 use super::chat_template::render_chatml;
-use super::generation::{resolve_eos_token_id, resolve_max_new_tokens};
+use super::generation::{default_sampling, resolve_eos_token_id, resolve_max_new_tokens};
 use crate::{CompletionRequest, CompletionResponse, ModelAdapter, StreamChunk};
 
 const IM_END: &str = "<|im_end|>";
@@ -149,8 +151,19 @@ impl ModelAdapter for LocalAdapter {
             eos_token_id: self.eos_token_id,
         };
 
-        let content = generate(&*self.model, &*self.tokenizer, &prompt, &config, |_id, _text| {})
-            .context("local Qwen generation failed")?;
+        // Stochastic, NOT greedy: see `super::generation::default_sampling` for
+        // the degenerate-repetition bug greedy argmax caused here, and for why
+        // every number in that config is ollama's rather than ours.
+        let mut sampler = StochasticSampler::new(default_sampling());
+        let content = generate_with_sampler(
+            &*self.model,
+            &*self.tokenizer,
+            &prompt,
+            &config,
+            &mut sampler,
+            |_id, _text| {},
+        )
+        .context("local model generation failed")?;
 
         Ok(CompletionResponse { content, model: self.model_name.clone() })
     }
@@ -201,11 +214,22 @@ impl ModelAdapter for LocalAdapter {
         let tokenizer = Arc::clone(&self.tokenizer);
 
         std::thread::spawn(move || {
-            let result = generate(&*model, &*tokenizer, &prompt, &config, |_id, text| {
-                // Ignore send errors: they only happen once the receiver is
-                // gone, and there's nothing further to deliver to.
-                let _ = tx.send(StreamChunk::Token(text.to_string()));
-            });
+            // Same sampler as `complete` — a streamed reply and a batched one
+            // must not decode differently, or a bug reproduces in one and not
+            // the other.
+            let mut sampler = StochasticSampler::new(default_sampling());
+            let result = generate_with_sampler(
+                &*model,
+                &*tokenizer,
+                &prompt,
+                &config,
+                &mut sampler,
+                |_id, text| {
+                    // Ignore send errors: they only happen once the receiver is
+                    // gone, and there's nothing further to deliver to.
+                    let _ = tx.send(StreamChunk::Token(text.to_string()));
+                },
+            );
             match result {
                 Ok(_) => {
                     let _ = tx.send(StreamChunk::Done);
