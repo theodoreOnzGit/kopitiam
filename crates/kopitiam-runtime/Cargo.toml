@@ -7,6 +7,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Kopitiam Runtime: the Qwen transformer forward pass (embedding, RoPE, grouped-query attention, SwiGLU MLP, KV cache, greedy sampling) running entirely in Rust on CPU."
+# vendor/ holds a gitignored huggingface/transformers reference checkout
+# (reference only, never compiled). Keep it out of the published .crate tarball.
+exclude = ["vendor/"]
 
 [dependencies]
 kopitiam-core.workspace = true

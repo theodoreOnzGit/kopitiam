@@ -8,6 +8,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "KOPITIAM model acquisition: curated multi-family model catalog, XDG cache resolution, sha256 verification, and an autofetch-first / bring-your-own acquire path. Sits below kopitiam-ai; hands verified on-disk paths to kopitiam-loader."
+# vendor/ holds a gitignored huggingface/smollm reference checkout (~12MB,
+# catalog/SHA reference only, never compiled). Keep it out of the .crate.
+exclude = ["vendor/"]
 
 [dependencies]
 thiserror.workspace = true

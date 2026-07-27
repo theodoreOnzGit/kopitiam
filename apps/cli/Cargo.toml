@@ -10,6 +10,9 @@ description = "Local-first Semantic Runtime CLI for Rust projects: real cargo/ru
 readme = "README.md"
 keywords = ["rust-analyzer", "semantic", "lsp", "scientific-computing"]
 categories = ["command-line-utilities", "development-tools"]
+# vendor/ holds a ~33MB gitignored lazygit reference drop-in (git-panel UX
+# reference only, never compiled). Keep it out of the published .crate tarball.
+exclude = ["vendor/"]
 
 [dependencies]
 kopitiam-pdf = { workspace = true }
