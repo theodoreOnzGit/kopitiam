@@ -43,6 +43,7 @@ mod slice;
 mod status;
 mod syntactic;
 mod tokens;
+mod vocab_inspect;
 mod translate;
 mod tui;
 mod view;

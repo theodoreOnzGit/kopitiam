@@ -2947,6 +2947,7 @@ dependencies = [
  "kopitiam-document",
  "kopitiam-index",
  "kopitiam-knowledge",
+ "kopitiam-loader",
  "kopitiam-markdown",
  "kopitiam-models",
  "kopitiam-neovim",
