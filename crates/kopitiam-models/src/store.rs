@@ -26,39 +26,66 @@ pub struct ModelStore {
 }
 
 impl ModelStore {
-    /// Build a store rooted at KOPITIAM's default model cache, following the
-    /// XDG Base Directory spec: `$XDG_CACHE_HOME/kopitiam/models`, and if
-    /// `XDG_CACHE_HOME` is not set, fall back to `$HOME/.cache/kopitiam/models`.
+    /// Build a store rooted at KOPITIAM's default model cache.
     ///
-    /// This does NOT create the directory yet -- it only resolves the path.
-    /// The directory gets made lazily when something is first written into it
-    /// (see [`crate::ensure_available`]). We hand-roll the XDG lookup with
-    /// `std::env` on purpose, to avoid pulling in the `directories` crate for
-    /// something this small.
+    /// An explicit `$XDG_CACHE_HOME` override wins on every platform. Otherwise
+    /// the base is the OS's conventional per-user cache directory:
+    /// * **Unix / macOS / Termux**: `$HOME/.cache` (Termux sets `HOME`).
+    /// * **Windows**: `%LOCALAPPDATA%` (Windows has no `HOME`/XDG; falling back
+    ///   to `HOME` there is why `kopitiam models` failed with a NotFound about
+    ///   XDG). `%USERPROFILE%\.cache` is a secondary fallback.
+    ///
+    /// The final path is `<base>/kopitiam/models`. This does NOT create the
+    /// directory yet -- it only resolves the path; the directory is made lazily
+    /// on first write (see [`crate::ensure_available`]). We hand-roll the lookup
+    /// with `std::env` on purpose, to avoid pulling in the `directories` crate.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] if neither `XDG_CACHE_HOME` nor `HOME` is set in the
-    /// environment -- without at least one of them there is no sensible place to
-    /// resolve to, and we would rather say so loudly than guess.
+    /// [`Error::NotFound`] only when none of the platform's location variables
+    /// are set (e.g. on Windows neither `LOCALAPPDATA` nor `USERPROFILE`; on Unix
+    /// no `HOME`) -- rather than guess, pass an explicit root with
+    /// [`ModelStore::with_root`].
     pub fn with_default_root() -> Result<Self, Error> {
-        let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
-            .filter(|v| !v.is_empty())
-        {
-            PathBuf::from(xdg)
-        } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty())
-        {
-            PathBuf::from(home).join(".cache")
-        } else {
-            return Err(Error::NotFound(
-                "cannot resolve default model cache: neither XDG_CACHE_HOME nor \
-                 HOME is set -- pass an explicit root with ModelStore::with_root"
-                    .to_string(),
-            ));
+        let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+            Some(xdg) => PathBuf::from(xdg),
+            None => Self::platform_cache_dir()?,
         };
         Ok(Self {
             root: base.join("kopitiam").join("models"),
         })
+    }
+
+    /// The OS cache directory on Windows: `%LOCALAPPDATA%`, else
+    /// `%USERPROFILE%\.cache`.
+    #[cfg(windows)]
+    fn platform_cache_dir() -> Result<PathBuf, Error> {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            Ok(PathBuf::from(local))
+        } else if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            Ok(PathBuf::from(profile).join(".cache"))
+        } else {
+            Err(Error::NotFound(
+                "cannot resolve default model cache: neither LOCALAPPDATA nor \
+                 USERPROFILE is set -- pass an explicit root with \
+                 ModelStore::with_root"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// The OS cache directory on Unix / macOS / Termux: `$HOME/.cache`.
+    #[cfg(not(windows))]
+    fn platform_cache_dir() -> Result<PathBuf, Error> {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            Ok(PathBuf::from(home).join(".cache"))
+        } else {
+            Err(Error::NotFound(
+                "cannot resolve default model cache: HOME is not set -- pass an \
+                 explicit root with ModelStore::with_root"
+                    .to_string(),
+            ))
+        }
     }
 
     /// Build a store rooted at an explicit path. This is the bring-your-own /
