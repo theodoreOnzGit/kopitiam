@@ -55,12 +55,26 @@
 //! * `KOPITIAM_NETFETCH_PATHS` uses the **platform's** path separator (`:` on
 //!   Unix/Termux, `;` on Windows), so it works on both.
 //!
+//! # Small models by default
+//!
+//! A routine run exercises only the **small** catalog weights (see
+//! [`MAX_DEFAULT_ARTIFACT_BYTES`]). The big ones are not a different kind of
+//! test, just a far more expensive one — SmolLM2-1.7B is 2.7× the file of the
+//! 360M and **45×** the wall clock, because the cost is the CPU forward pass. A
+//! suite nobody runs because it takes eight minutes proves nothing, so the
+//! default stays in the seconds and the big models are opt-in. Anything left out
+//! is printed by name with the reason, never silently dropped.
+//!
 //! ```bash
-//! # everything in the catalog that is chat weights
+//! # the small chat weights in the catalog — the routine run
 //! KOPITIAM_NETFETCH=1 cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
 //!
-//! # one model only
-//! KOPITIAM_NETFETCH=1 KOPITIAM_NETFETCH_ONLY=smollm2-360m-instruct-q8_0 \
+//! # include the big ones too
+//! KOPITIAM_NETFETCH=1 KOPITIAM_NETFETCH_BIG=1 \
+//!   cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
+//!
+//! # one model only — runs whatever its size, because you named it
+//! KOPITIAM_NETFETCH=1 KOPITIAM_NETFETCH_ONLY=smollm2-1.7b-instruct-q4_k_m \
 //!   cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
 //!
 //! # a model that is NOT in the catalog (e.g. a Gemma you dropped in by hand).
@@ -350,27 +364,89 @@ fn generate_something(
     Ok(())
 }
 
+/// The artifact size above which a model is **not** run by default.
+///
+/// Half a gigabyte, and the line is drawn from measurement rather than taste.
+/// On a 14-core ThinkPad the two SmolLM2 entries came in at:
+///
+/// | model | artifact | whole chain |
+/// |---|---|---|
+/// | SmolLM2-360M-Instruct Q8_0 | 386 MB | ~10 s |
+/// | SmolLM2-1.7B-Instruct Q4_K_M | 1.01 GB | ~453 s |
+///
+/// A 2.7× file for a **45×** wall-clock is the shape of the problem: the cost is
+/// the CPU forward pass, not the download, and it tracks size steeply. Termux on
+/// a tablet — a first-class target here — has a fraction of that machine's cores
+/// and RAM, so a routine run must stay in the seconds. 512 MB sits cleanly
+/// between the two and needs no revisiting for either.
+///
+/// This is a *default*, not a ban. Naming a model with
+/// `KOPITIAM_NETFETCH_ONLY` runs it whatever its size (an explicit request beats
+/// a default), and `KOPITIAM_NETFETCH_BIG=1` includes every size.
+const MAX_DEFAULT_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Include models above [`MAX_DEFAULT_ARTIFACT_BYTES`] too.
+const INCLUDE_BIG: &str = "KOPITIAM_NETFETCH_BIG";
+
 /// Catalog entries that are chat weights (single `.gguf` artifact), honouring
 /// `KOPITIAM_NETFETCH_ONLY`.
 ///
-/// Returns `(runnable, unverified)`. Entries whose checksum is still the
-/// placeholder sentinel are split off rather than run, because they are
-/// *documented* to fetch hundreds of MB and then be refused by their own
-/// checksum gate — that is the catalog telling us the URL was never confirmed,
-/// not a runtime defect worth 1.1 GB of somebody's bandwidth to rediscover. They
-/// come back separately so the report can name them instead of silently
-/// shrinking the run: an unexplained absence reads as coverage.
-fn selected_specs() -> (Vec<ModelSpec>, Vec<ModelSpec>) {
+/// Returns `(runnable, notes)`, where each note is `(id, why it was left out)`.
+/// Two things get left out, and **both are reported by name rather than quietly
+/// dropped** — an unexplained absence reads as coverage, which is how a suite
+/// starts lying about what it proved:
+///
+/// * **Placeholder checksums.** Those entries are *documented* to fetch hundreds
+///   of MB and then be refused by their own gate. That is the catalog saying
+///   "this URL was never confirmed", not a runtime defect worth 1.1 GB of
+///   somebody's bandwidth to rediscover.
+/// * **Big models.** See [`MAX_DEFAULT_ARTIFACT_BYTES`].
+fn selected_specs() -> (Vec<ModelSpec>, Vec<(String, String)>) {
     let only = std::env::var(ONLY).ok().filter(|s| !s.is_empty());
-    let (unverified, runnable) = Catalog::builtin()
-        .into_iter()
-        .filter(|s| {
-            !s.artifacts.is_empty()
-                && s.artifacts.iter().all(|a| a.filename.to_ascii_lowercase().ends_with(".gguf"))
-        })
-        .filter(|s| only.as_ref().is_none_or(|id| &s.id == id))
-        .partition(|s: &ModelSpec| s.artifacts.iter().any(kopitiam_models::Artifact::is_placeholder));
-    (runnable, unverified)
+    // An explicitly named model is never filtered for size: the caller asked for
+    // that one specifically, and silently doing nothing would be the worst
+    // possible answer to an explicit request.
+    let named = only.is_some();
+    let include_big = named || gate_value_means_on(std::env::var(INCLUDE_BIG).ok().as_deref());
+
+    let mut runnable = Vec::new();
+    let mut notes = Vec::new();
+
+    for spec in Catalog::builtin() {
+        if spec.artifacts.is_empty()
+            || !spec.artifacts.iter().all(|a| a.filename.to_ascii_lowercase().ends_with(".gguf"))
+        {
+            continue; // not chat weights (e.g. the Tesseract `.traineddata` entries)
+        }
+        if !only.as_ref().is_none_or(|id| &spec.id == id) {
+            continue; // narrowed away by KOPITIAM_NETFETCH_ONLY — not worth a note
+        }
+        if spec.artifacts.iter().any(kopitiam_models::Artifact::is_placeholder) {
+            notes.push((
+                spec.id.clone(),
+                "catalog checksum is still the placeholder — record a real sha256 \
+                 (or give it an `hf:` source) to include it"
+                    .to_string(),
+            ));
+            continue;
+        }
+        let bytes: u64 = spec.artifacts.iter().map(|a| a.size_bytes).sum();
+        if !include_big && bytes > MAX_DEFAULT_ARTIFACT_BYTES {
+            notes.push((
+                spec.id.clone(),
+                format!(
+                    "{} MB is over the {} MB default cap — set {INCLUDE_BIG}=1, or \
+                     {ONLY}={} to run just this one",
+                    bytes / (1024 * 1024),
+                    MAX_DEFAULT_ARTIFACT_BYTES / (1024 * 1024),
+                    spec.id
+                ),
+            ));
+            continue;
+        }
+        runnable.push(spec);
+    }
+    (runnable, notes)
 }
 
 fn extra_paths() -> Vec<PathBuf> {
@@ -400,13 +476,9 @@ fn real_models_survive_fetch_load_tokenize_and_generate() {
 
     let mut outcomes = Vec::new();
 
-    let (runnable, unverified) = selected_specs();
-    for spec in unverified {
-        println!(
-            "  NOTE  {:<34} catalog checksum is still the placeholder — not fetched.\n\
-             {:<40}Record a real sha256 (or give it an `hf:` source) to include it.",
-            spec.id, ""
-        );
+    let (runnable, notes) = selected_specs();
+    for (id, why) in &notes {
+        println!("  NOTE  {id:<34} not run: {why}");
     }
 
     for spec in runnable {
