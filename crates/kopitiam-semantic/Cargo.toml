@@ -11,6 +11,7 @@ description = "Rust knowledge providers (cargo metadata, rust-analyzer, rustdoc 
 anyhow.workspace = true
 cargo_metadata.workspace = true
 kopitiam-ontology.workspace = true
+percent-encoding.workspace = true
 rustdoc-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
