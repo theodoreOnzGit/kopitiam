@@ -362,7 +362,7 @@ where
         Command::Prime(args) => handle_prime(host, args),
         Command::Setup { cmd } => handle_setup::<H>(cmd),
         Command::Onboard(args) => handle_onboard(host, args.output.as_deref()),
-        Command::Store { cmd } => commands::store::handle(json, cmd, backend),
+        Command::Store { cmd } => commands::store::handle(json, cmd, repo.as_deref(), backend),
         Command::Upgrade(args) => commands::upgrade::handle(json, args.background, backend),
         cmd => {
             let runtime = host.build_runtime(RuntimeBuildArgs {
@@ -566,6 +566,7 @@ fn store_cmd_name(cmd: &commands::store::StoreCmd) -> &'static str {
     match cmd {
         commands::store::StoreCmd::Unlock(_) => "unlock",
         commands::store::StoreCmd::Fsck(_) => "fsck",
+        commands::store::StoreCmd::Migrate(_) => "migrate",
     }
 }
 

@@ -167,6 +167,7 @@ impl From<CommandError> for Error {
             },
             CommandError::Validation(err) => Error::from(err),
             CommandError::Filter(err) => Error::from(err),
+            CommandError::Sync(err) => Error::Sync(err),
         }
     }
 }
