@@ -130,15 +130,35 @@ impl RenderMarkdown for Paragraph {
 }
 
 impl RenderMarkdown for List {
+    /// Renders a (possibly nested) list. Each item is indented by two spaces per
+    /// nesting level ([`List::depth`]) and marked with `- ` (unordered) or an
+    /// `N. ` counter (ordered). An ordered list restarts its numbering within
+    /// each nested sub-list, exactly as Markdown renders it, by keeping a
+    /// per-depth counter that is discarded whenever the indent steps back out.
+    ///
+    /// A flat list (`depths` empty) is unaffected: every item is depth 0, so the
+    /// output is byte-identical to the pre-nesting `- item` / `1. item` form.
     fn render(&self) -> String {
+        // counters[d] = items already emitted at depth d in the current branch.
+        let mut counters: Vec<usize> = Vec::new();
         self.items
             .iter()
             .enumerate()
             .map(|(i, item)| {
+                let depth = self.depth(i);
+                // Drop any deeper counters (a sub-list ended); the counter at
+                // `depth` is preserved so siblings keep counting up.
+                counters.truncate(depth + 1);
+                if counters.len() <= depth {
+                    counters.resize(depth + 1, 0);
+                }
+                counters[depth] += 1;
+
+                let indent = "  ".repeat(depth);
                 if self.ordered {
-                    format!("{}. {item}", i + 1)
+                    format!("{indent}{}. {item}", counters[depth])
                 } else {
-                    format!("- {item}")
+                    format!("{indent}- {item}")
                 }
             })
             .collect::<Vec<_>>()
@@ -234,20 +254,53 @@ mod tests {
 
     #[test]
     fn ordered_list_numbers_items() {
-        let list = List {
-            ordered: true,
-            items: vec!["First".to_string(), "Second".to_string()],
-        };
+        let list = List::flat(true, vec!["First".to_string(), "Second".to_string()]);
         assert_eq!(list.render(), "1. First\n2. Second");
     }
 
     #[test]
     fn unordered_list_uses_dashes() {
+        let list = List::flat(false, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(list.render(), "- A\n- B");
+    }
+
+    #[test]
+    fn nested_unordered_list_indents_by_depth() {
+        // Task #16: two-level nested bullet list renders with two-space indents
+        // per level.
         let list = List {
             ordered: false,
-            items: vec!["A".to_string(), "B".to_string()],
+            items: vec![
+                "Top one".to_string(),
+                "Nested a".to_string(),
+                "Nested b".to_string(),
+                "Top two".to_string(),
+            ],
+            depths: vec![0, 1, 1, 0],
         };
-        assert_eq!(list.render(), "- A\n- B");
+        assert_eq!(
+            list.render(),
+            "- Top one\n  - Nested a\n  - Nested b\n- Top two"
+        );
+    }
+
+    #[test]
+    fn nested_ordered_list_restarts_numbering_per_sublist() {
+        // The sub-list numbering restarts at 1 and the parent resumes at 3.
+        let list = List {
+            ordered: true,
+            items: vec![
+                "First".to_string(),
+                "Second".to_string(),
+                "Sub of second".to_string(),
+                "Third".to_string(),
+            ],
+            depths: vec![0, 0, 1, 0],
+        };
+        assert_eq!(
+            list.render(),
+            "1. First\n2. Second\n  1. Sub of second\n3. Third"
+        );
     }
 
     #[test]

@@ -61,10 +61,23 @@ use std::path::PathBuf;
 use kopitiam_ai::{EchoAdapter, LocalAdapter, ModelAdapter};
 use kopitiam_models::{Catalog, ModelSpec, ModelStore};
 
-/// The catalog id used when nothing is configured. Small (~350 MB),
-/// Apache-2.0, the sensible default first pull — matches
-/// `kopitiam_models::Catalog::builtin`'s own "sensible default" entry.
-pub const DEFAULT_MODEL_ID: &str = "qwen2.5-0.5b-instruct-q4_0";
+/// The catalog id used when nothing is configured — SmolLM2-360M-Instruct
+/// (q8_0). Small, permissively licensed, the sensible default first pull.
+///
+/// This is a **re-export of the single source of truth**,
+/// [`kopitiam_models::DEFAULT_MODEL_ID`], not a re-hardcoded literal: the
+/// catalog crate decides what "default" means (it flipped Qwen2.5-0.5B →
+/// SmolLM2-360M), and both [`select_adapter`] and `kopitiam models` follow it
+/// automatically by referencing this const.
+///
+/// TODO(runtime): verify SmolLM2 (a LLaMA-arch model) actually *infers*
+/// correctly through the Qwen runtime. `QwenConfig::from_metadata` does not
+/// gate on architecture, and Qwen2 carries QKV biases that Llama lacks — so
+/// SmolLM2 loading successfully through the Qwen loader is NOT proof it decodes
+/// correctly. May need a dedicated Llama path. This flip changes only which id
+/// is the default; it does NOT touch the forward pass. See the `#[ignore]`d
+/// `smollm2_default_infers_through_the_runtime` stub below.
+pub const DEFAULT_MODEL_ID: &str = kopitiam_models::DEFAULT_MODEL_ID;
 
 /// Env var holding an explicit path to a `.gguf` (bring-your-own). Highest
 /// priority — when set, the model store is not consulted.
@@ -303,6 +316,31 @@ mod tests {
     #[test]
     fn default_model_id_is_in_the_catalog() {
         assert!(Catalog::find(DEFAULT_MODEL_ID).is_some());
+    }
+
+    /// The CLI's default id must stay a re-export of the catalog crate's single
+    /// source of truth, never a re-hardcoded literal that could silently drift.
+    /// With the flip, that source of truth is SmolLM2-360M-Instruct.
+    #[test]
+    fn default_id_tracks_the_models_crate_source_of_truth() {
+        assert_eq!(DEFAULT_MODEL_ID, kopitiam_models::DEFAULT_MODEL_ID);
+        assert_eq!(DEFAULT_MODEL_ID, "smollm2-360m-instruct-q8_0");
+    }
+
+    /// End-to-end runtime check for the SmolLM2 default — DELIBERATELY IGNORED.
+    ///
+    /// SmolLM2-360M is a LLaMA-architecture model, but the loader routes it
+    /// through the Qwen runtime (`QwenConfig::from_metadata` does not gate on
+    /// architecture). Qwen2 has QKV biases that Llama does not, so a successful
+    /// *load* is not proof of a correct *inference*. This stub marks the gap:
+    /// un-ignore it once there is a way to assert SmolLM2 decodes a known prompt
+    /// to sane tokens through whatever path (Qwen today, or a future Llama one).
+    /// It is NOT run in CI and this task does NOT touch the forward pass.
+    #[test]
+    #[ignore = "TODO(runtime): verify SmolLM2 (Llama-arch) inference through the Qwen loader; may need a Llama path"]
+    fn smollm2_default_infers_through_the_runtime() {
+        // Intentionally empty: a placeholder for the real end-to-end assertion.
+        // Kept as a compiled, addressable reminder rather than only a comment.
     }
 
     /// A BYO env path wins outright and is passed through verbatim, without

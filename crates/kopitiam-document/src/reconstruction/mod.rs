@@ -66,6 +66,16 @@ pub fn reconstruct(pages: &[Page]) -> Document {
     let pages = pages.as_slice();
 
     let body_font_size = estimate_body_font_size(pages);
+    // Cluster the document's heading font sizes once, up front, so heading levels
+    // are assigned by size *rank* across the whole document rather than a fixed
+    // per-line ratio (task #16, marker's SectionHeaderProcessor). Built from a
+    // page-level line grouping -- column splitting does not change a line's font
+    // size, so the tiers are the same either way.
+    let all_lines: Vec<Line> = pages
+        .iter()
+        .flat_map(|page| group_lines(&page.spans))
+        .collect();
+    let heading_scale = headings::HeadingScale::build(all_lines.iter(), body_font_size);
     let mut citations = Vec::new();
     let mut pages_blocks: Vec<Vec<Block>> = Vec::with_capacity(pages.len());
 
@@ -73,7 +83,7 @@ pub fn reconstruct(pages: &[Page]) -> Document {
         let mut page_blocks = Vec::new();
         for column_spans in split_columns(page) {
             let lines = group_lines(&column_spans);
-            for block in build_blocks(&lines, body_font_size) {
+            for block in build_blocks(&lines, body_font_size, &heading_scale) {
                 if let Block::Paragraph(paragraph) = &block {
                     citations.extend(citations::detect(&paragraph.text));
                 }
@@ -136,6 +146,14 @@ pub fn reconstruct_preordered(pages: &[Page]) -> Document {
     let pages = pages.as_slice();
 
     let body_font_size = estimate_body_font_size(pages);
+    // Same adaptive heading-size clustering as `reconstruct` (task #16). Each
+    // span is already one line here, so the tiers come straight from the
+    // per-span lines.
+    let all_lines: Vec<Line> = pages
+        .iter()
+        .flat_map(|page| page.spans.iter().map(|span| build_line(&[span])))
+        .collect();
+    let heading_scale = headings::HeadingScale::build(all_lines.iter(), body_font_size);
     let mut citations = Vec::new();
     let mut pages_blocks: Vec<Vec<Block>> = Vec::with_capacity(pages.len());
 
@@ -146,7 +164,7 @@ pub fn reconstruct_preordered(pages: &[Page]) -> Document {
         let lines: Vec<Line> = page.spans.iter().map(|span| build_line(&[span])).collect();
 
         let mut page_blocks = Vec::new();
-        for block in build_blocks(&lines, body_font_size) {
+        for block in build_blocks(&lines, body_font_size, &heading_scale) {
             if let Block::Paragraph(paragraph) = &block {
                 citations.extend(citations::detect(&paragraph.text));
             }
@@ -246,7 +264,11 @@ fn merge_page_breaks(pages_blocks: Vec<Vec<Block>>) -> (Vec<Block>, Vec<usize>) 
     (blocks, block_pages)
 }
 
-fn build_blocks(lines: &[Line], body_font_size: f32) -> Vec<Block> {
+fn build_blocks(
+    lines: &[Line],
+    body_font_size: f32,
+    heading_scale: &headings::HeadingScale,
+) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut i = 0;
 
@@ -263,7 +285,7 @@ fn build_blocks(lines: &[Line], body_font_size: f32) -> Vec<Block> {
             continue;
         }
 
-        if let Some(level) = headings::heading_level(&lines[i], body_font_size) {
+        if let Some(level) = headings::heading_level(&lines[i], body_font_size, heading_scale) {
             blocks.push(Block::Heading(Heading {
                 level,
                 text: lines[i].text.trim().to_string(),
@@ -988,7 +1010,7 @@ mod tests {
             line_with_cells(vec![cell("Reviews", 0.0), cell("7", 60.0)]),
         ];
 
-        let blocks = build_blocks(&lines, 10.0);
+        let blocks = build_blocks(&lines, 10.0, &headings::HeadingScale::empty());
 
         assert!(
             matches!(&blocks[0], Block::Table(t)
@@ -1010,6 +1032,104 @@ mod tests {
         assert!(
             tail.contains("Subtotal across both columns"),
             "ragged subtotal row must survive as normal text, got {tail:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_assigns_adaptive_heading_levels_from_font_tiers() {
+        // Task #16: three distinct heading font sizes over a 10pt body must come
+        // out as H1/H2/H3 by descending-size rank, through the whole pipeline --
+        // NOT two H1s the way the old fixed ">=1.6 => H1" ladder would produce
+        // for the 18pt and 24pt lines.
+        let page = Page {
+            number: 1,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![
+                span("Biggest Section Title", 50.0, 760.0, 160.0, 24.0),
+                span("A middle heading", 50.0, 730.0, 120.0, 18.0),
+                span("The smallest heading", 50.0, 705.0, 110.0, 14.0),
+                // Body lines establish 10pt as the modal body size.
+                span("First body sentence of ordinary prose here.", 50.0, 680.0, 300.0, 10.0),
+                span("Second body sentence of ordinary prose here.", 50.0, 666.0, 300.0, 10.0),
+            ],
+        };
+
+        let document = reconstruct(&[page]);
+        let levels: Vec<usize> = document
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Heading(h) => Some(h.level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            levels,
+            vec![1, 2, 3],
+            "three font tiers must map to H1/H2/H3 by rank, got {levels:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_infers_nested_list_from_x_indentation() {
+        // Task #16: a 2-level bullet list nested by left-edge indentation comes
+        // through the pipeline with per-item depths, and the flat top items keep
+        // depth 0.
+        let page = Page {
+            number: 1,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![
+                span("- Top item one", 50.0, 700.0, 100.0, 10.0),
+                span("- Nested item a", 80.0, 686.0, 100.0, 10.0),
+                span("- Nested item b", 80.0, 672.0, 100.0, 10.0),
+                span("- Top item two", 50.0, 658.0, 100.0, 10.0),
+            ],
+        };
+
+        let document = reconstruct(&[page]);
+        let list = document
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::List(list) => Some(list),
+                _ => None,
+            })
+            .expect("the bullet run must reconstruct as a List");
+        assert!(!list.ordered);
+        assert_eq!(
+            list.items,
+            vec!["Top item one", "Nested item a", "Nested item b", "Top item two"]
+        );
+        assert_eq!(list.depths, vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn reconstruct_leaves_a_lone_dash_paragraph_as_prose() {
+        // Task #16: a single dash-led line is ambiguous with prose and must NOT
+        // become a one-item list through the pipeline.
+        let page = Page {
+            number: 1,
+            width: 600.0,
+            height: 800.0,
+            spans: vec![span(
+                "- The quarterly figures were revised upward after the audit closed.",
+                50.0,
+                700.0,
+                400.0,
+                10.0,
+            )],
+        };
+
+        let document = reconstruct(&[page]);
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|b| !matches!(b, Block::List(_))),
+            "a lone dash-led line must not become a list, got {:?}",
+            document.blocks
         );
     }
 

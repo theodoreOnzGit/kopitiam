@@ -40,6 +40,8 @@ KOPITIAM.
 | [oneDNN](https://github.com/oneapi-src/oneDNN) | Apache-2.0 | Linear algebra and kernel optimization, operator fusion |
 | [ONNX](https://github.com/onnx/onnx) | Apache-2.0 | Model interchange format, for possible future ONNX support |
 | [Neovim](https://github.com/neovim/neovim) | Apache-2.0, plus Vim-licensed portions | Editor architecture, the `vim.*` API surface, and modal-editing semantics, for `kopitiam-neovim` (`kvim`) |
+| [transformers](https://github.com/huggingface/transformers) (HuggingFace) | Apache-2.0 | The reference **model implementations** (LLaMA-shaped architectures, attention / RoPE / RMSNorm layouts, tokenizer configs) studied for `kopitiam-runtime`'s from-scratch inference. A read-only reference clone is vendored at **`crates/kopitiam-runtime/vendor/transformers`** — gitignored, never built, linked, or shipped |
+| [lazygit](https://github.com/jesseduffield/lazygit) (Jesse Duffield) | MIT | **UI reference** for the CLI's git-panel workflow — how a mature terminal git UI lays out status / staging / branch / log panes and their keybindings. Studied for the panel UX only, not for code (lazygit is Go). A read-only reference clone is vendored at **`apps/cli/vendor/lazygit`** — gitignored, never built or shipped |
 | [Helix](https://github.com/helix-editor/helix) | MPL-2.0 | Modal-editor **infrastructure and feature-completeness reference** for `kvim` — how a mature Rust editor wires LSP lifecycle, incremental syntax, a command palette, and buffer/window management. **kvim is vim-modeled**, so Helix's selection-first keymap is studied for *what* mature editors do, never for *how* kvim binds keys. Clean-room study only: no Helix code is copied, and MPL-2.0 governs any file that ever were — none is. |
 | [Language Server Protocol specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/) | CC-BY-4.0 (spec text) | The **snippet syntax grammar** implemented clean-room by `kopitiam-snippet` (`$1`, `${1:…}`, `${1\|a,b\|}`, `$VAR`, escapes, mirrors). Only the published *grammar* is followed; **no code is copied** from LuaSnip, vsnip, or VS Code. This is a specification reference, not a source-code reference. |
 | [Lua](https://www.lua.org/) 5.1 (PUC-Rio) — the [Lua 5.1 Reference Manual](https://www.lua.org/manual/5.1/) | MIT | The **Lua 5.1 language** implemented clean-room by `kopitiam-lua` (`kopitiam-lua` is a pure-Rust Lua 5.1 interpreter; see `crates/kopitiam-lua`). The interpreter and its pattern matcher (`pattern.rs`, following the reference manual §5.4.1) are written from the *specification*, not ported from PUC-Rio's `lstrlib.c`/reference implementation. This is a language-specification reference, not a source-code reference; provenance is also named at the point of use. |
@@ -183,25 +185,35 @@ their copyright notices are retained, and the crate's rustdoc says so.
 
 | Project | License | Fork commit | KOPITIAM crate | Why forked |
 | --- | --- | --- | --- | --- |
-| [rmux](https://github.com/helvesec/rmux) | MIT OR Apache-2.0 | — | `kmux` | Terminal multiplexer, already Rust, but it does not run on Android. Forked to add Android/Termux support alongside Linux, macOS and Windows. Upstream copyright: **"The RMUX Authors"**. |
-| [beads-rs](https://github.com/delightful-ai/beads-rs) | MIT | `d98da23` | `kopitiam-bds` | The `bd` issue tracker KOPITIAM uses for its own work items (every AID is filed as a `bd` issue), already Rust, but upstream v0.1.26 / 0.2.0-alpha does not build on Windows (~19 errors: Unix-only deps and a Unix-domain-socket-only daemon IPC layer). Forked to add Windows and Android/Termux support. Upstream copyright: **© 2025 Darin Kishore**. |
+| [rmux](https://github.com/helvesec/rmux) | MIT OR Apache-2.0 | — | `kmux` (binary `kmux`) | Terminal multiplexer, already Rust, but it does not run on Android. Forked to add Android/Termux support alongside Linux, macOS and Windows. Now **collapsed into a single publishable `kmux` crate** (see below). Upstream copyright: **"The RMUX Authors"**. |
+| [beads-rs](https://github.com/delightful-ai/beads-rs) | MIT | `d98da23` | `kopi-beans` (binary `bn`) | The `bd`-style issue tracker KOPITIAM uses for its own work items (every AID is filed as an issue), already Rust, but upstream v0.1.26 / 0.2.0-alpha does not build on Windows (~19 errors: Unix-only deps and a Unix-domain-socket-only daemon IPC layer). Forked to add Windows and Android/Termux support, then **collapsed into a single publishable `kopi-beans` crate and made fully pure-Rust** (see below). Binary renamed `bd` → `bn`. Upstream copyright: **© 2025 Darin Kishore**. |
 
 ### What the rmux fork actually consists of
 
 Recorded plainly, because "fork" is doing a lot of work in that table row.
 
-**The whole of rmux was taken**, not a subset: all twelve of its crates
-(`rmux-core`, `rmux-os`, `rmux-pty`, `rmux-ipc`, `rmux-proto`, `rmux-types`,
-`rmux-client`, `rmux-server`, `rmux-sdk`, `rmux-render-core`, `rmux-web-crypto`,
-`ratatui-rmux`) plus its top-level binary — roughly 325k lines. They live under
-`crates/kmux/crates/`, keeping their upstream names so that diffs
-against upstream remain readable. **The overwhelming majority of the code in
-`kmux` was written by The RMUX Authors, not by KOPITIAM.**
+**The whole of rmux was taken**, not a subset — roughly 325k lines. It was
+originally forked as its twelve upstream crates nested under
+`crates/kmux/crates/`, keeping their upstream names so that diffs against
+upstream stayed readable. **The overwhelming majority of the code in `kmux` was
+written by The RMUX Authors, not by KOPITIAM.**
+
+**Single-crate collapse (for crates.io).** To publish `kmux` to crates.io
+without squatting upstream rmux's sub-crate names, the ten sub-crates the `kmux`
+binary actually needs (`rmux-core`, `rmux-os`, `rmux-pty`, `rmux-ipc`,
+`rmux-proto`, `rmux-types`, `rmux-client`, `rmux-server`, `rmux-sdk`,
+`rmux-web-crypto`) were folded into **one self-contained `kmux` crate** as the
+intra-crate modules `core` / `os` / `pty` / `ipc` / `proto` / `types` / `client`
+/ `server` / `sdk` / `web_crypto`. `ratatui-rmux` and `rmux-render-core`, which
+the binary never linked, were dropped. Cross-crate paths (`rmux_core::X`) became
+`crate::core::X`; the sub-crate manifests were unioned into one; the former
+`rmux-server` build script (tunnel-preset codegen) merged into this crate's
+`build.rs`. Upstream dependency pins were carried verbatim. The reasoning behind
+the collapse is recorded in **AID-0053**.
 
 * Upstream's `LICENSE-MIT` and `LICENSE-APACHE` ship unmodified in
-  `crates/kmux/`, and `crates/kmux/NOTICE` records the fork.
-* Every forked sub-crate's rustdoc names The RMUX Authors and its original
-  license.
+  `crates/kmux/`, and `crates/kmux/NOTICE` records the fork **and the collapse**.
+* The folded modules' rustdoc names The RMUX Authors and the original license.
 * The fork is distributed under **AGPL-3.0-only** as part of KOPITIAM, which the
   permissive upstream licenses allow so long as their notices travel with the
   code. **This does not relicense rmux**, which remains available from its
@@ -216,23 +228,50 @@ Bionic-specific PTY/signal/locale paths) and the `kmux` binary rename. See
 
 ### What the beads-rs fork actually consists of
 
-The same "fork" caveats apply to `kopitiam-bds`, and are recorded in full in
-`crates/kopitiam-bds/NOTICE`.
+The same "fork" caveats apply to `kopi-beans` (binary `bn`), and are recorded in
+full in `crates/kopi-beans/NOTICE`.
 
 **The whole of beads-rs was taken**, not a subset: the top package plus every
-nested crate under `crates/kopitiam-bds/crates/` (beads-core, beads-api,
-beads-bootstrap, beads-surface, beads-macros, beads-cli, beads-git, beads-daemon,
-beads-daemon-core, beads-http), forked from upstream `main` at commit
-`d98da231` (post-dates the tagged v0.1.26; reports itself as `0.2.0-alpha`).
-**The overwhelming majority of this code was written by the beads-rs author,
-Darin Kishore, not by KOPITIAM.**
+nested sub-crate (beads-core, beads-api, beads-bootstrap, beads-surface,
+beads-macros, beads-cli, beads-git, beads-daemon, beads-daemon-core), forked from
+upstream `main` at commit `d98da231` (post-dates the tagged v0.1.26; reports
+itself as `0.2.0-alpha`). **The overwhelming majority of this code was written by
+the beads-rs author, Darin Kishore, not by KOPITIAM.**
 
-* Upstream's `LICENSE-MIT` ships unmodified in `crates/kopitiam-bds/`, and
-  `crates/kopitiam-bds/NOTICE` records the fork, the commit, and every change.
-* The top package is renamed `beads-rs` → `kopitiam-bds` (`publish = false`);
-  the library keeps the upstream crate name `beads_rs` and every sub-crate keeps
-  its upstream name (with a `-kopitiam.1` suffix) so diffs and future merges
-  against upstream stay readable — mirroring `kmux`.
+**Single-crate collapse (for crates.io).** The fork began as the former
+multi-crate `kopitiam-bds` (top package plus nine path-dependency sub-crates).
+To publish to crates.io without squatting upstream's crate names, those
+sub-crates were folded into **one self-contained `kopi-beans` crate** as the
+intra-crate modules `core` / `api` / `bootstrap` / `surface` / `macros` /
+`cli_surface` / `git` / `daemon` / `daemon_core`, and the binary was renamed
+`bd` → `bn`. The library keeps the upstream lib name `beads_rs`
+(`[lib] name = "beads_rs"`) so folded source and future upstream merges stay
+undisturbed, while the published **package** name `kopi-beans` squats none of
+upstream's crate names. `beads-macros` is *declarative* macros (not a proc-macro),
+so it folds in as an ordinary module. Not carried into the collapsed crate: the
+`tests/` integration suites, the dev-only `beads-http` (axum/tokio) transport,
+the `fuzz` crate, and the `beads_stateright_models` model-checking harness;
+inline `#[cfg(test)]` unit tests within the folded modules **are** carried. The
+collapse convention is recorded in **AID-0053**.
+
+**Now fully pure-Rust and C-free** — which is what makes it cleanly publishable.
+The original fork still pulled two bundled-C dependencies (`rusqlite`'s bundled
+SQLite, `git2`'s libgit2); both were removed:
+
+* **`rusqlite` (bundled C SQLite) → a pure-Rust `MemoryWalIndex`.** The index
+  layer is now pure Rust with no libsqlite3.
+* **`git2` / libgit2 → `gitoxide` (`gix`).** The git integration is ported to the
+  pure-Rust `gix` (MIT OR Apache-2.0). The tree now contains none of `git2` /
+  `libgit2-sys` / `openssl-sys` / `libz-sys`, so `bn` cross-compiles to
+  Termux/Android with no NDK. **One gap is gated, not hidden:** `gix` 0.86
+  exposes no high-level push, so `bn`'s push path is gated pending a
+  `gix-protocol` / `gix-transport` send-pack shim; fetch and `file://` /
+  `git://` / `ssh` round-trips work. See "Notable shipped Rust dependencies"
+  below for the `gix` credit.
+
+* Upstream's `LICENSE-MIT` ships unmodified in `crates/kopi-beans/`, and
+  `crates/kopi-beans/NOTICE` records the fork, the commit, the collapse, and
+  every change.
 * The fork is distributed under **AGPL-3.0-only** as part of KOPITIAM, which the
   permissive upstream MIT license allows so long as its notice travels with the
   code. **This does not relicense beads-rs**, which remains available from its
@@ -240,10 +279,11 @@ Darin Kishore, not by KOPITIAM.**
 * KOPITIAM's contributions are concentrated in **Windows support** (the reason
   for the fork: a cross-platform Unix-domain-socket alias, Win32 process
   liveness / `LockFileEx` store locking / `CreateProcessW` daemon spawn, `cfg`
-  gating of POSIX signals and `nix`/`libc`/`signal-hook`) and the Android/Termux
-  code path (`cfg(unix)` covers `target_os = "android"`). Upstream's
-  release/packaging/CI scripts, the `fuzz` crate, and the `stateright`
-  model-checking harness were not carried into the fork's build.
+  gating of POSIX signals and `nix`/`libc`/`signal-hook`), the Android/Termux
+  code path (`cfg(unix)` covers `target_os = "android"`), and the pure-Rust
+  `rusqlite`/`git2` removals above. Upstream's release/packaging/CI scripts, the
+  `fuzz` crate, and the `stateright` model-checking harness were not carried into
+  the fork's build.
 
 ---
 
@@ -264,6 +304,7 @@ enumerated here; their provenance is the Cargo lockfile.)
 | [lopdf](https://crates.io/crates/lopdf) | MIT | Low-level PDF object / content-stream walking for font-style recovery (`kopitiam-pdf`), `kopitiam-plot` vector paths |
 | [zune-jpeg](https://crates.io/crates/zune-jpeg) (+ `zune-core`) | MIT OR Apache-2.0 OR Zlib | Pure-Rust JPEG decoder substituting for MuPDF's libjpeg on the DCTDecode image path (see "Pure-Rust substitutions" above, AID-0052) |
 | [miniz_oxide](https://crates.io/crates/miniz_oxide) | MIT OR Zlib OR Apache-2.0 | Pure-Rust DEFLATE/zlib behind PDF FlateDecode, substituting for MuPDF's zlib |
+| [gitoxide](https://crates.io/crates/gix) (`gix`) | MIT OR Apache-2.0 | Pure-Rust Git, substituting for `git2`/libgit2 in the `kopi-beans` fork — no libgit2-sys / openssl-sys / libz-sys, so `bn` cross-compiles to Termux/Android with no NDK. `gix` 0.86 has no high-level push, so the push path is gated on a `gix-protocol`/`gix-transport` send-pack shim (see the beads-rs fork section) |
 | [nucleo](https://crates.io/crates/nucleo) / [nucleo-matcher](https://crates.io/crates/nucleo-matcher) | MPL-2.0 | Fuzzy matching/ranking by the Helix authors — kvim's telescope-replacement pickers and the CLI/TUI PDF finder. MPL-2.0 is file-level copyleft, one-way compatible with AGPLv3; used unmodified as a dependency, so its files stay under MPL-2.0 |
 | [ratatui-image](https://crates.io/crates/ratatui-image) | MIT | The PDF viewer's image mode: graphics-protocol detection (kitty / sixel / iTerm2) with a Unicode half-block fallback for Termux. Taken with only the `crossterm` feature — the `chafa` C-linking features are deliberately left off |
 | [portable-pty](https://crates.io/crates/portable-pty) / [vt100](https://crates.io/crates/vt100) | MIT | kvim's `:term` emulator — pty spawn + ANSI/VT parsing, both pure Rust (see AID-0049) |

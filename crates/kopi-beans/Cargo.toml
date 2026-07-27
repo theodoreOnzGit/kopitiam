@@ -10,10 +10,12 @@
 # sub-crates are now the intra-crate modules core/api/bootstrap/surface/macros/
 # cli_surface/git/daemon/daemon_core.
 #
-# Dependency versions are pinned here deliberately (thiserror 1, uuid v5, git2
-# 0.20, ...) exactly as the upstream fork pinned them; this crate does NOT inherit
-# KOPITIAM's root workspace dependency set (mirrors how crates/kmux keeps the rmux
-# fork's own pins).
+# Dependency versions are pinned here deliberately (thiserror 1, uuid v5, gix,
+# ...) exactly as the upstream fork pinned them, EXCEPT the two C-toolchain deps
+# that were replaced with pure-Rust equivalents: rusqlite -> a pure-Rust
+# MemoryWalIndex, and git2/libgit2 -> gitoxide (gix). See NOTICE. This crate does
+# NOT inherit KOPITIAM's root workspace dependency set (mirrors how crates/kmux
+# keeps the rmux fork's own pins).
 [package]
 name = "kopi-beans"
 version = "0.1.0"

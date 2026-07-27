@@ -190,10 +190,10 @@ mod tests {
             Block::Paragraph(Paragraph {
                 text: "A digital twin mirrors a physical asset.".to_string(),
             }),
-            Block::List(List {
-                ordered: false,
-                items: vec!["sensor feeds".to_string(), "a model".to_string()],
-            }),
+            Block::List(List::flat(
+                false,
+                vec!["sensor feeds".to_string(), "a model".to_string()],
+            )),
         ])
     }
 
