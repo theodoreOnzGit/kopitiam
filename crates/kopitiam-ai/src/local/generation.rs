@@ -14,6 +14,63 @@
 /// default explicitly.
 pub(crate) const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 
+/// The sampling defaults a local chat runs with.
+///
+/// # These numbers are ollama's, not ours
+///
+/// Every value below is transcribed from **ollama's `DefaultOptions()`**
+/// (`crates/kopitiam-runtime/vendor/ollama/api/types.go:1124`, MIT), which is
+/// the reference implementation for exactly this decision and has been proven
+/// against far more models than this project will ever test:
+///
+/// ```text
+/// Temperature:   0.8
+/// TopK:          40
+/// TopP:          0.9
+/// RepeatLastN:   64
+/// RepeatPenalty: 1.1
+/// Seed:          -1     // random; see the divergence note below
+/// ```
+///
+/// # Why sampling at all — the bug that forced this
+///
+/// The local adapter used to call `kopitiam_runtime::generate`, which is
+/// **greedy argmax with no repetition penalty**. On a small instruct model
+/// that degenerates, and not subtly: asked "hello", SmolLM2-360M-Instruct
+/// answered
+///
+/// ```text
+/// "I'm a bot, I'm a bot, I'm a chatbot, I'm a chatbot, I'm a chatbot, ..."
+/// ```
+///
+/// for the full 256-token budget, because the loop never made `<|im_end|>` the
+/// argmax so end-of-turn was never reached. Nothing was wrong with the weights,
+/// the tokenizer, the ChatML template or the EOS id — all four were verified
+/// individually, and raw completion answered "The capital of France is" with
+/// " Paris." correctly throughout. Greedy decoding alone caused it. The
+/// repetition penalty is what breaks the loop; temperature/top-k/top-p keep the
+/// distribution sane while it does.
+///
+/// # Where we deliberately differ from ollama, and why
+///
+/// **`seed`.** ollama defaults to `Seed: -1`, i.e. fresh entropy per request.
+/// We pin a fixed seed instead, because `kopitiam_runtime::SamplingConfig`
+/// makes seeding mandatory on purpose (see its docs) and this project values a
+/// reproducible answer over a varied one: a bug report that cannot be
+/// reproduced is barely a bug report. A caller wanting variation sets the seed
+/// itself.
+pub(crate) fn default_sampling() -> kopitiam_runtime::SamplingConfig {
+    kopitiam_runtime::SamplingConfig {
+        temperature: 0.8,
+        top_k: Some(40),
+        top_p: Some(0.9),
+        min_p: None,
+        repeat_penalty: 1.1,
+        repeat_last_n: 64,
+        seed: 0,
+    }
+}
+
 /// Resolves [`crate::CompletionRequest::max_tokens`] into the `usize`
 /// `kopitiam_runtime::GenerationConfig::max_new_tokens` expects, applying
 /// [`DEFAULT_MAX_NEW_TOKENS`] when the caller did not set one.
