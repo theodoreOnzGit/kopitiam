@@ -127,6 +127,7 @@ mod weights;
 mod test_support;
 
 pub mod traits;
+pub mod vision;
 
 pub use bridge::{load_matmul_weight, load_matmul_weight_opt, load_tensor_f32, load_tensor_f32_opt, tensor_from_entry};
 pub use config::QwenConfig;
