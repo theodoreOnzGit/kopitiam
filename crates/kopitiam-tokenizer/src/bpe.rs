@@ -41,10 +41,18 @@ use kopitiam_core::{Error, Result};
 pub struct BpeTokenizer {
     vocab: Vocab,
     /// `byte_ids[b as usize]` is the vocab id of the single-byte token for
-    /// raw byte `b`. Precomputed once at construction (rather than doing a
+    /// raw byte `b`, or `None` when this vocab simply never got a token for
+    /// that byte. Precomputed once at construction (rather than doing a
     /// `vocab.id_of(&[b])` hash lookup per input byte) since every encode
     /// call starts by mapping raw bytes to ids.
-    byte_ids: [u32; 256],
+    ///
+    /// **Why `Option` and not a flat `[u32; 256]`.** The textbook says a
+    /// byte-level BPE vocab must carry all 256 bytes as base tokens, and this
+    /// crate used to enforce exactly that. Real published weights say
+    /// otherwise, so we sked and had to relax it — see
+    /// [`BpeTokenizer::missing_byte_tokens`] for the full story and for which
+    /// bytes are actually reachable from valid UTF-8 input.
+    byte_ids: [Option<u32>; 256],
     merges: MergeTable,
     /// Whether to prepend a single space to the input before
     /// pre-tokenizing, if it does not already start with one. See
@@ -58,11 +66,12 @@ impl BpeTokenizer {
     /// Builds a tokenizer directly from a dense, id-ordered vocab and an
     /// ordered merge list -- no JSON, no byte-to-unicode mapping involved.
     ///
-    /// `vocab_entries[i]` is the raw-byte token for id `i`. Every one of
-    /// the 256 possible single bytes must appear somewhere in
-    /// `vocab_entries` as its own one-byte token, or this returns
-    /// [`Error::MalformedModel`] -- that completeness is what makes
-    /// byte-level BPE total (every input is encodable, no `<UNK>`).
+    /// `vocab_entries[i]` is the raw-byte token for id `i`. Ideally every
+    /// one of the 256 possible single bytes appears somewhere in
+    /// `vocab_entries` as its own one-byte token -- that completeness is
+    /// what makes byte-level BPE total (every input encodable, no `<UNK>`).
+    /// A vocab with holes is accepted anyway, because real shipped models
+    /// have them; see [`BpeTokenizer::missing_byte_tokens`].
     pub fn from_vocab_and_merges(
         vocab_entries: Vec<Vec<u8>>,
         merge_pairs: Vec<(Vec<u8>, Vec<u8>)>,
@@ -77,16 +86,12 @@ impl BpeTokenizer {
     pub(crate) fn from_vocab(vocab: Vocab, merge_pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Self> {
         let merges = MergeTable::build(&merge_pairs, |b| vocab.id_of(b))?;
 
-        let mut byte_ids = [0u32; 256];
+        // A missing single-byte token is NOT an error -- see
+        // `missing_byte_tokens` for why refusing here was wrong.
+        let mut byte_ids = [None; 256];
         for b in 0u16..=255 {
             let b = b as u8;
-            byte_ids[b as usize] = vocab.id_of(&[b]).ok_or_else(|| Error::MalformedModel {
-                format: "bpe-vocab",
-                reason: format!(
-                    "byte-level vocab has no single-byte token for byte {b:#04x}; \
-                     byte-level BPE requires all 256 bytes as base tokens"
-                ),
-            })?;
+            byte_ids[b as usize] = vocab.id_of(&[b]);
         }
 
         Ok(Self {
@@ -148,10 +153,73 @@ impl BpeTokenizer {
         self.vocab.id_of(token)
     }
 
+    /// The raw bytes this vocab has **no** single-byte token for, ascending.
+    ///
+    /// # Why a byte-level vocab can have holes at all
+    ///
+    /// Textbook byte-level BPE carries all 256 bytes as base tokens, which is
+    /// what makes it total: any input at all is encodable, never mind valid
+    /// UTF-8 or not, so no `<UNK>` is needed. This crate used to *enforce*
+    /// that in [`BpeTokenizer::from_vocab`], returning
+    /// [`Error::MalformedModel`] on the first missing byte.
+    ///
+    /// That check was too strict, and it blocked a real model. SmolLM2-360M-Instruct
+    /// as HuggingFaceTB actually ships it (`smollm2-360m-instruct-q8_0.gguf`,
+    /// 49152 tokens) is missing **21** of the 256:
+    ///
+    /// ```text
+    /// 0x04 0x06 0x13 0x14 0x16 0x1d 0xc0 0xc1 0xf1 0xf2 0xf5..=0xff
+    /// ```
+    ///
+    /// and it carries no SentencePiece-style `<0xNN>` byte-fallback spelling
+    /// for them either, so there is genuinely nothing to fall back on — the
+    /// tokens were never trained because those bytes never showed up in the
+    /// corpus. `kopitiam models inspect <file.gguf>` prints exactly this
+    /// verdict for any GGUF, which is how the diagnosis was made.
+    ///
+    /// # What a hole actually costs you (the precise part)
+    ///
+    /// [`Tokenizer::encode`] takes a `&str`, so its input is **always valid
+    /// UTF-8**. Of the 21 bytes above, **13 cannot occur in valid UTF-8 at
+    /// all** — `0xc0` / `0xc1` are the forbidden overlong lead bytes, and
+    /// `0xf5..=0xff` are above the largest legal lead byte `0xf4`. Those are
+    /// unreachable, so their absence costs nothing, full stop.
+    ///
+    /// The 8 remaining reachable ones are `0x04 0x06 0x13 0x14 0x16 0x1d`
+    /// (C0 controls EOT, ACK, DC3, DC4, SYN, GS) and `0xf1` / `0xf2` (lead
+    /// bytes for U+40000..=U+BFFFF, planes 4-11, which Unicode leaves entirely
+    /// unassigned). So in practice only six rare control characters are
+    /// affected.
+    ///
+    /// For those, [`Tokenizer::encode`] **drops the byte** rather than
+    /// failing (see [`BpeTokenizer::chunk_to_symbols`]). Be clear-eyed about
+    /// what that means: `decode(encode(s)) == s` holds for every `s` that
+    /// contains none of the 8 reachable bytes, and for any `s` that does
+    /// contain one, that byte is silently gone from the round trip. Refusing
+    /// to build the tokenizer instead would trade that narrow, documented
+    /// lossiness for "this model cannot be used at all" — a far worse deal
+    /// for a model whose only sin is not having seen an EOT character.
+    ///
+    /// Callers who need to know: this method is the supported way to find out.
+    #[must_use]
+    pub fn missing_byte_tokens(&self) -> Vec<u8> {
+        (0u16..=255)
+            .filter(|&b| self.byte_ids[b as usize].is_none())
+            .map(|b| b as u8)
+            .collect()
+    }
+
     /// Maps a pre-tokenized chunk's raw UTF-8 bytes to their base
     /// (single-byte) vocab ids.
+    ///
+    /// A byte this vocab has no token for is **dropped**, not substituted:
+    /// there is no `<UNK>` in byte-level BPE to substitute *with*, and
+    /// inventing one would put an id into the stream that the model was never
+    /// trained on — worse than a missing control character.
+    /// [`BpeTokenizer::missing_byte_tokens`] documents which bytes this can
+    /// bite, and why the answer is "almost never".
     fn chunk_to_symbols(&self, chunk: &str) -> Vec<u32> {
-        chunk.bytes().map(|b| self.byte_ids[b as usize]).collect()
+        chunk.bytes().filter_map(|b| self.byte_ids[b as usize]).collect()
     }
 
     /// Repeatedly merges the highest-priority (lowest-rank) adjacent pair
@@ -251,7 +319,7 @@ mod tests {
 
     /// A tiny hand-built vocab/merges pair standing in for a trained BPE
     /// model. Base bytes 'a', 'b', 'c' (plus every other byte, since
-    /// byte-level BPE requires all 256), and two merges: `("a","b")` ->
+    /// this is the complete-alphabet case), and two merges: `("a","b")` ->
     /// `"ab"` (rank 0, highest priority) and `("ab","c")` -> `"abc"`
     /// (rank 1).
     fn tiny_tokenizer() -> BpeTokenizer {
@@ -356,5 +424,57 @@ mod tests {
         let tok = tiny_tokenizer();
         let s = "abcabc hello world";
         assert_eq!(tok.decode(&tok.encode(s).unwrap()).unwrap(), s);
+    }
+
+    /// Same tiny vocab as [`tiny_tokenizer`], but with the single-byte tokens
+    /// for `holes` left out — a scale model of what SmolLM2-360M actually
+    /// ships. The merges still refer only to bytes that ARE present, exactly
+    /// as a real trained merge list would.
+    fn tokenizer_missing_bytes(holes: &[u8]) -> BpeTokenizer {
+        let vocab: Vec<Vec<u8>> = (0u16..=255)
+            .map(|b| b as u8)
+            // Keep the id space dense: a hole becomes a harmless multi-byte
+            // filler token rather than shifting every later id.
+            .map(|b| if holes.contains(&b) { vec![b, b] } else { vec![b] })
+            .collect();
+        BpeTokenizer::from_vocab_and_merges(vocab, Vec::new()).expect("holes must not be fatal")
+    }
+
+    /// The regression this whole change exists for: a vocab with holes used
+    /// to be rejected outright with `MalformedModel`, which took a perfectly
+    /// usable SmolLM2-360M out of service. Building must now succeed.
+    #[test]
+    fn a_vocab_missing_some_single_byte_tokens_still_builds() {
+        let tok = tokenizer_missing_bytes(&[0x04, 0x06, 0xff]);
+        assert_eq!(tok.missing_byte_tokens(), vec![0x04, 0x06, 0xff]);
+    }
+
+    #[test]
+    fn a_complete_vocab_reports_no_missing_bytes() {
+        assert!(tiny_tokenizer().missing_byte_tokens().is_empty());
+    }
+
+    /// Ordinary text must be completely unaffected by the holes — that is the
+    /// claim that makes tolerating them acceptable rather than merely lenient.
+    #[test]
+    fn text_that_avoids_the_holes_round_trips_exactly() {
+        let tok = tokenizer_missing_bytes(&[0x04, 0x06, 0x1d]);
+        let s = "the capital of France is";
+        assert_eq!(tok.decode(&tok.encode(s).unwrap()).unwrap(), s);
+    }
+
+    /// And when the text DOES contain a hole byte, pin the documented
+    /// behaviour precisely: that byte alone disappears, everything around it
+    /// survives, and no bogus id is invented in its place.
+    #[test]
+    fn a_hole_byte_is_dropped_and_its_neighbours_survive() {
+        let tok = tokenizer_missing_bytes(&[0x04]);
+        let with_hole = tok.encode("ab\u{4}c").unwrap();
+        let without = tok.encode("abc").unwrap();
+        assert_eq!(
+            with_hole, without,
+            "byte 0x04 should vanish, leaving the surrounding text encoded identically"
+        );
+        assert_eq!(tok.decode(&with_hole).unwrap(), "abc");
     }
 }

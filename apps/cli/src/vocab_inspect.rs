@@ -29,6 +29,14 @@
 //! **which** bytes are missing, whether any BYTE-type tokens exist, and what
 //! the token-type histogram looks like.
 //!
+//! # It worked: how the real case was settled (2026-07-27)
+//!
+//! Run against the actual `smollm2-360m-instruct-q8_0.gguf`, this command said
+//! 21 bytes absent, **zero** `<0xNN>` spellings, so explanation (2). The check
+//! was relaxed accordingly (see [`kopitiam_tokenizer::BpeTokenizer::missing_byte_tokens`]),
+//! and that model now runs end to end. Explanation (1) is still live for other
+//! files, which is why both verdicts stay.
+//!
 //! # Deliberately read-only and deliberately cheap
 //!
 //! It reads metadata only — it never builds a tokenizer, never loads weights,
@@ -111,8 +119,10 @@ impl VocabReport {
             ),
             (false, true) => format!(
                 "vocabulary is genuinely incomplete: {} byte(s) absent and NO `<0xNN>` \
-                 spellings anywhere, so the file really has no token for them. The \
-                 all-256 requirement is too strict for this model; tolerate holes.",
+                 spellings anywhere, so the file really has no token for them. This is \
+                 TOLERATED — the tokenizer builds and the model runs; those bytes are \
+                 dropped on encode. Nothing to fix unless one of them is reachable from \
+                 valid UTF-8 and you care (see BpeTokenizer::missing_byte_tokens).",
                 self.missing_bytes.len()
             ),
         }
