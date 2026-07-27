@@ -3290,6 +3290,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "kopitiam-ontology",
+ "percent-encoding",
  "rustdoc-types",
  "serde",
  "serde_json",
