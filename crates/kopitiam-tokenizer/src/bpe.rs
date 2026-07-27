@@ -160,8 +160,8 @@ impl BpeTokenizer {
     /// Textbook byte-level BPE carries all 256 bytes as base tokens, which is
     /// what makes it total: any input at all is encodable, never mind valid
     /// UTF-8 or not, so no `<UNK>` is needed. This crate used to *enforce*
-    /// that in [`BpeTokenizer::from_vocab`], returning
-    /// [`Error::MalformedModel`] on the first missing byte.
+    /// that at construction, returning [`Error::MalformedModel`] on the first
+    /// missing byte.
     ///
     /// That check was too strict, and it blocked a real model. SmolLM2-360M-Instruct
     /// as HuggingFaceTB actually ships it (`smollm2-360m-instruct-q8_0.gguf`,
@@ -192,7 +192,7 @@ impl BpeTokenizer {
     /// affected.
     ///
     /// For those, [`Tokenizer::encode`] **drops the byte** rather than
-    /// failing (see [`BpeTokenizer::chunk_to_symbols`]). Be clear-eyed about
+    /// failing (see `chunk_to_symbols`). Be clear-eyed about
     /// what that means: `decode(encode(s)) == s` holds for every `s` that
     /// contains none of the 8 reachable bytes, and for any `s` that does
     /// contain one, that byte is silently gone from the round trip. Refusing
@@ -217,7 +217,8 @@ impl BpeTokenizer {
     /// inventing one would put an id into the stream that the model was never
     /// trained on — worse than a missing control character.
     /// [`BpeTokenizer::missing_byte_tokens`] documents which bytes this can
-    /// bite, and why the answer is "almost never".
+    /// bite, and why the answer is "almost never" — read that before assuming
+    /// this line is lossy in any way that matters.
     fn chunk_to_symbols(&self, chunk: &str) -> Vec<u32> {
         chunk.bytes().filter_map(|b| self.byte_ids[b as usize]).collect()
     }
