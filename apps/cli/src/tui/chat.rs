@@ -29,7 +29,8 @@ use ratatui::{
 use crate::adapter::SelectedAdapter;
 
 use super::Transition;
-use super::theme::{DIM, GOLD, STEAM, TAN, USER};
+use super::model_picker::short_status;
+use super::theme::{CHILLI, DIM, GOLD, STEAM, TAN, USER};
 
 /// The chat view's state: the model history, the composing input line, the live
 /// reply being streamed, and scroll bookkeeping.
@@ -38,6 +39,22 @@ pub struct ChatView {
     status: String,
     is_local: bool,
     max_tokens: Option<u32>,
+
+    /// The last model-switch result, shown at the tail of the transcript. Kept
+    /// as a field (not pushed into `history`) on purpose: it is a note about the
+    /// session, not a turn, so it must never be sent to the model as context.
+    switch_note: Option<String>,
+
+    /// The adapter's **full** multi-line [`SelectedAdapter::notice`], shown at
+    /// the top of the transcript whenever the stub is answering.
+    ///
+    /// The header only has room for one squeezed line, and that is where the
+    /// old bug lived: a `.gguf` that was found but rejected by the loader looked
+    /// exactly like having no model at all, with the loader's actual error
+    /// dropped at the UI boundary. Keeping the whole notice here means the
+    /// reason (the failing path, the parser's complaint, the three ways to fix
+    /// it) is on screen where the user already is.
+    stub_notice: Option<String>,
 
     /// The running conversation sent to the model. Seeded with the system
     /// persona; the [`Role::System`] entry is never displayed.
@@ -63,6 +80,8 @@ impl ChatView {
             status: short_status(selected),
             is_local: selected.is_local(),
             max_tokens,
+            switch_note: None,
+            stub_notice: stub_notice(selected),
             history: vec![Message::system(system)],
             input: String::new(),
             live_reply: None,
@@ -77,10 +96,31 @@ impl ChatView {
         self.stream.is_some()
     }
 
+    /// Take on a model the user just picked in [`super::model_picker`], keeping
+    /// the whole transcript.
+    ///
+    /// Only the *presentation* of which model is answering changes here — the
+    /// adapter itself lives on [`super::App`], and the next [`ChatView::submit`]
+    /// borrows whatever is there by then. Two consequences worth being exact
+    /// about: (1) a reply already streaming finishes on the OLD model, because
+    /// its worker thread holds its own `Arc`s to those weights; (2) the history
+    /// carries over unchanged, so the new model sees the previous turns as
+    /// context — switching does not start a fresh conversation.
+    pub fn adopt_adapter(&mut self, selected: &SelectedAdapter, note: String) {
+        self.status = short_status(selected);
+        self.is_local = selected.is_local();
+        self.stub_notice = stub_notice(selected);
+        self.switch_note = Some(note);
+        // Scroll back down so the note is actually seen, not left off-screen.
+        self.stick_to_bottom = true;
+        self.scroll = 0;
+    }
+
     /// The footer hint pairs for the chat view.
     pub fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
         vec![
             ("Enter", "send"),
+            ("Ctrl-P", "pick model"),
             ("PgUp/PgDn", "scroll"),
             ("Esc", "home"),
             ("Ctrl-C", "quit"),
@@ -88,11 +128,16 @@ impl ChatView {
     }
 
     /// Handle one key. Returns the router [`Transition`] the parent should
-    /// apply: `Esc` goes home, `Ctrl-C` quits, everything else stays.
+    /// apply: `Esc` goes home, `Ctrl-C` quits, `Ctrl-P` opens the model picker,
+    /// everything else stays.
+    ///
+    /// `Ctrl-P` (and not a bare `m`) because every unmodified printable char is
+    /// typing — a plain letter must go into the message, never into a command.
     pub fn on_key(&mut self, key: KeyEvent, selected: &SelectedAdapter) -> Transition {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => return Transition::Quit,
+            KeyCode::Char('p') if ctrl => return Transition::OpenModelPicker,
             KeyCode::Esc => return Transition::Home,
             KeyCode::Enter => self.submit(selected),
             KeyCode::Backspace if !self.is_streaming() => {
@@ -154,6 +199,7 @@ impl ChatView {
             return;
         };
         let mut finished = false;
+        let mut ended_without_done = false;
         loop {
             match rx.try_recv() {
                 Ok(StreamChunk::Token(token)) => {
@@ -174,15 +220,24 @@ impl ChatView {
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
+                // The sender is gone and no `Done`/`Error` ever arrived — the
+                // generation thread died or was dropped mid-flight. Without a
+                // marker this finalises as a blank assistant turn, which reads
+                // as "the model replied with nothing" instead of "the model
+                // stopped". Say which one it was.
                 Err(TryRecvError::Disconnected) => {
                     finished = true;
+                    ended_without_done = true;
                     break;
                 }
             }
         }
 
         if finished {
-            let reply = self.live_reply.take().unwrap_or_default();
+            let mut reply = self.live_reply.take().unwrap_or_default();
+            if ended_without_done {
+                reply.push_str("\n[stream ended without a Done — the generation thread stopped]");
+            }
             self.history.push(Message {
                 role: Role::Assistant,
                 content: reply,
@@ -277,6 +332,15 @@ impl ChatView {
         )));
         out.push(Line::default());
 
+        // When the stub is answering, say why right here — not just in the
+        // squeezed header line. See `stub_notice`.
+        if let Some(notice) = &self.stub_notice {
+            for wrapped in wrap(notice, width) {
+                out.push(Line::from(Span::styled(wrapped, Style::default().fg(CHILLI))));
+            }
+            out.push(Line::default());
+        }
+
         for message in &self.history {
             match message.role {
                 Role::System => continue,
@@ -289,6 +353,17 @@ impl ChatView {
             let mut shown = reply.clone();
             shown.push('▌');
             push_turn(&mut out, "kopi-o", GOLD, &shown, width);
+        }
+
+        // The model-switch note sits at the tail, after the last turn, so it
+        // reads as "from here on, different model" — which is exactly true.
+        if let Some(note) = &self.switch_note {
+            for wrapped in wrap(&format!("— {note}"), width) {
+                out.push(Line::from(Span::styled(
+                    wrapped,
+                    Style::default().fg(STEAM).add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
 
         out
@@ -373,24 +448,62 @@ fn push_word(
     *current_len = chunk_len;
 }
 
-/// A compact one-line status for the header, derived from the full
-/// [`SelectedAdapter::notice`].
-fn short_status(selected: &SelectedAdapter) -> String {
-    if selected.is_local() {
-        selected
-            .notice()
-            .lines()
-            .next()
-            .unwrap_or("local model on CPU")
-            .to_string()
-    } else {
-        "echo stub — no .gguf yet (run `kopitiam models pull`)".to_string()
-    }
+/// The full stub explanation to show in the transcript, or `None` when a real
+/// model is answering and there is nothing to explain.
+///
+/// [`SelectedAdapter::notice`] already words both stub cases properly (which
+/// file failed and why, or the three routes to getting weights) — the job here
+/// is only to stop throwing it away, which is exactly what the UI used to do.
+fn stub_notice(selected: &SelectedAdapter) -> Option<String> {
+    (!selected.is_local()).then(|| selected.notice())
 }
+
+// The header's one-line status now comes from [`super::model_picker::short_status`]
+// — it lives next to the picker because it has to tell "no model on disk" apart
+// from "model found but won't load", which is the distinction the picker exists
+// to resolve, and it points at the `Ctrl-P` this view now offers.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::{FallbackReason, SelectedAdapter};
+    use kopitiam_ai::EchoAdapter;
+
+    /// A stub-backed adapter — enough to build a [`ChatView`] in a test without
+    /// any weights on disk.
+    fn echo() -> SelectedAdapter {
+        SelectedAdapter::Echo {
+            adapter: EchoAdapter,
+            reason: FallbackReason::NoModelOnDisk {
+                model_id: "test-model".into(),
+                expected_store_path: std::path::PathBuf::from("/nowhere/x.gguf"),
+            },
+        }
+    }
+
+    /// A stub that got a file and could not load it — the case the UI used to
+    /// render identically to "no model at all".
+    fn load_failed() -> SelectedAdapter {
+        SelectedAdapter::Echo {
+            adapter: EchoAdapter,
+            reason: FallbackReason::LoadFailed {
+                source: std::path::PathBuf::from("/cache/broken.gguf"),
+                error: "bad GGUF magic".into(),
+            },
+        }
+    }
+
+    /// Flatten rendered lines back to plain text, so a test can assert on what
+    /// the user actually sees without reaching into ratatui's span structure.
+    fn rendered(view: &ChatView, width: usize) -> String {
+        view.transcript_lines(width)
+            .iter()
+            .map(|line| {
+                line.spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn wrap_breaks_on_word_boundaries_within_width() {
@@ -415,5 +528,109 @@ mod tests {
     #[test]
     fn wrap_zero_width_is_a_noop_not_a_panic() {
         assert_eq!(wrap("anything", 0), vec!["anything".to_string()]);
+    }
+
+    /// `Ctrl-P` must reach the router as a picker request, not get typed into
+    /// the message. This is the entry point of the whole model-selection flow.
+    #[test]
+    fn ctrl_p_asks_the_router_for_the_model_picker() {
+        let selected = echo();
+        let mut view = ChatView::new("sys".into(), None, &selected);
+
+        let transition =
+            view.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &selected);
+
+        assert!(matches!(transition, Transition::OpenModelPicker));
+        assert!(view.input.is_empty(), "Ctrl-P must not land in the input line");
+    }
+
+    /// A plain `p` is still just typing — the modifier is what makes it a
+    /// command, and getting this backwards would make the chat unusable.
+    #[test]
+    fn a_bare_p_is_still_typed_into_the_message() {
+        let selected = echo();
+        let mut view = ChatView::new("sys".into(), None, &selected);
+
+        view.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()), &selected);
+
+        assert_eq!(view.input, "p");
+    }
+
+    /// Adopting a new model keeps the transcript and only re-labels who is
+    /// answering — switching model must never wipe the conversation.
+    #[test]
+    fn adopting_a_model_keeps_the_history_and_updates_the_status() {
+        let selected = echo();
+        let mut view = ChatView::new("sys".into(), None, &selected);
+        view.history.push(Message::user("earlier turn"));
+        let before = view.history.len();
+
+        view.adopt_adapter(&selected, "switched to whatever".into());
+
+        assert_eq!(view.history.len(), before, "the transcript survives a switch");
+        assert_eq!(view.switch_note.as_deref(), Some("switched to whatever"));
+        assert!(!view.is_local);
+        // The note is shown to the user but never sent to the model.
+        assert!(!view.history.iter().any(|m| m.content.contains("switched to")));
+        assert!(rendered(&view, 80).contains("switched to whatever"));
+    }
+
+    /// The loader's real complaint must reach the screen. Before this, every
+    /// stub case rendered "no .gguf yet" and the error was dropped at the UI
+    /// boundary — a broken model was indistinguishable from a missing one.
+    #[test]
+    fn a_failed_load_shows_the_loaders_own_error_in_the_transcript() {
+        let broken = load_failed();
+        let view = ChatView::new("sys".into(), None, &broken);
+
+        let text = rendered(&view, 100);
+        assert!(text.contains("broken.gguf"), "which file: {text}");
+        assert!(text.contains("bad GGUF magic"), "and the loader's reason: {text}");
+
+        // ...and a working model explains nothing, because there is nothing to
+        // explain — the stub notice only appears for the stub.
+        assert_eq!(stub_notice(&broken).is_some(), true);
+        let text = rendered(&ChatView::new("sys".into(), None, &echo()), 100);
+        assert!(text.contains("kopitiam models pull"), "the no-model routes: {text}");
+    }
+
+    /// A generation thread that dies without sending `Done` must not finalise as
+    /// a blank assistant turn — that looks like the model answered with nothing.
+    #[test]
+    fn a_stream_that_dies_without_done_is_marked_not_left_blank() {
+        let selected = echo();
+        let mut view = ChatView::new("sys".into(), None, &selected);
+
+        let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
+        tx.send(StreamChunk::Token("half a rep".into())).unwrap();
+        drop(tx); // the worker died mid-flight
+        view.stream = Some(rx);
+        view.live_reply = Some(String::new());
+
+        view.drain_stream();
+
+        let last = view.history.last().expect("the reply was finalised");
+        assert_eq!(last.role, Role::Assistant);
+        assert!(last.content.contains("half a rep"), "keep what did arrive: {last:?}");
+        assert!(last.content.contains("stream ended without a Done"), "{last:?}");
+        assert!(!view.is_streaming(), "the turn is over");
+    }
+
+    /// A clean `Done` must NOT get the marker — it only means an abnormal end.
+    #[test]
+    fn a_clean_stream_is_finalised_without_the_marker() {
+        let selected = echo();
+        let mut view = ChatView::new("sys".into(), None, &selected);
+
+        let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
+        tx.send(StreamChunk::Token("all done".into())).unwrap();
+        tx.send(StreamChunk::Done).unwrap();
+        view.stream = Some(rx);
+        view.live_reply = Some(String::new());
+
+        view.drain_stream();
+
+        let last = view.history.last().unwrap();
+        assert_eq!(last.content, "all done");
     }
 }

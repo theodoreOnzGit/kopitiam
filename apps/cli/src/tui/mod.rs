@@ -18,6 +18,8 @@
 //! * [`home`], [`convert`], [`explorer`], [`chat`], [`commands`] — the views,
 //!   each a self-contained state struct with `on_key` → [`Transition`] and
 //!   `render`.
+//! * [`models`] — acquiring models (pull + verify); [`model_picker`] — choosing
+//!   which already-on-disk model the chat talks to (`Ctrl-P` in chat).
 //!
 //! # How keys flow
 //!
@@ -45,6 +47,7 @@ mod git;
 mod git_ops;
 mod home;
 mod logic;
+mod model_picker;
 mod models;
 mod theme;
 /// `pub(crate)` so the standalone `kopitiam view` command ([`crate::view`]) can
@@ -70,7 +73,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::adapter::{SelectedAdapter, select_adapter};
+use crate::adapter::{SelectedAdapter, select_adapter, select_adapter_for};
 
 use chat::ChatView;
 use commands::{CommandPane, PlanPrompt};
@@ -78,6 +81,7 @@ use convert::{ConvertFolderState, ConvertPdfState};
 use explorer::ExplorerState;
 use git::GitView;
 use home::HomeState;
+use model_picker::ModelPickerView;
 use models::ModelsView;
 use viewer::ViewerState;
 
@@ -137,6 +141,12 @@ pub enum Transition {
     /// Pull a model by catalog id with its sha auto-resolved (from the Models
     /// view). Runs on the normal terminal so the download can stream progress.
     PullModel(String),
+    /// Open the model picker (from chat's `Ctrl-P`).
+    OpenModelPicker,
+    /// Switch the chat to the model this [`model_picker::LoadPlan`] names,
+    /// labelled `label` in the note the user sees. The router does the loading —
+    /// the picker only chooses.
+    SelectModel { plan: model_picker::LoadPlan, label: String },
 }
 
 /// A blocking action that needs the terminal handed over: it suspends the TUI,
@@ -166,6 +176,9 @@ enum View {
     Plan(PlanPrompt),
     Git(Box<GitView>),
     Models(ModelsView),
+    /// Choosing which on-disk model the chat uses. A detour from [`View::Chat`]
+    /// — `Esc` returns there with the transcript intact.
+    ModelPicker(ModelPickerView),
 }
 
 /// The whole app: the current view, the persistent home + chat state, the
@@ -177,7 +190,19 @@ struct App {
     chat: Option<ChatView>,
     /// Selected lazily alongside `chat` (a model load can be slow, so it is
     /// deferred until the user actually opens chat).
+    ///
+    /// **`None` means "re-select on next entry to chat"**, and that is load-
+    /// bearing, not just laziness: a successful `models pull` sets this back to
+    /// `None` so the freshly downloaded weights are actually picked up. Before
+    /// that, the first `Echo` selection was cached for the whole session and no
+    /// pull could ever dislodge it — chat kept insisting there was no model
+    /// while the `.gguf` sat on disk, and only restarting the TUI helped.
     adapter: Option<SelectedAdapter>,
+    /// The catalog id to re-select with, when set. Written by a successful pull
+    /// (you pulled it, you want it) and by an explicit pick in the model picker,
+    /// so a later re-selection lands on the same model instead of falling back
+    /// to whatever the environment's default is.
+    preferred_model: Option<String>,
     system: String,
     max_tokens: Option<u32>,
     cwd: PathBuf,
@@ -229,6 +254,7 @@ impl App {
             home: HomeState::new(),
             chat: None,
             adapter: None,
+            preferred_model: None,
             system,
             max_tokens,
             cwd,
@@ -289,6 +315,7 @@ impl App {
             View::Plan(state) => state.on_key(key),
             View::Git(state) => state.on_key(key),
             View::Models(state) => state.on_key(key),
+            View::ModelPicker(state) => state.on_key(key),
             View::Chat => {
                 // Chat needs the shared adapter; both are guaranteed present
                 // because entering chat initialises them.
@@ -322,7 +349,53 @@ impl App {
                 self.pending = Some(Pending::PullModel(id));
                 self.view = View::Home;
             }
+            Transition::OpenModelPicker => {
+                // Copy the active path out before building the view: the picker
+                // needs to know what is in use, but it must not hold a borrow of
+                // `self.adapter` while we assign `self.view`.
+                let active = self
+                    .adapter
+                    .as_ref()
+                    .and_then(model_picker::active_source)
+                    .map(std::path::Path::to_path_buf);
+                self.view = View::ModelPicker(ModelPickerView::new(active.as_deref()));
+            }
+            Transition::SelectModel { plan, label } => self.switch_model(plan, &label),
         }
+    }
+
+    /// Carry out the user's model pick, then go back to chat.
+    ///
+    /// Runs **inline**, blocking the render loop for as long as the load takes
+    /// (parsing the GGUF, building the model and tokenizer — seconds for a small
+    /// model, longer for a big one). Deliberately so: it matches what
+    /// [`App::ensure_chat`] already does on first entry to chat, it needs no
+    /// terminal handoff (a load prints nothing, unlike a download), and a
+    /// background load would mean an adapter swap racing an in-flight turn. The
+    /// cost is a visibly frozen frame on a large `.gguf` — the thing to change
+    /// if that ever gets annoying is to run the load on a worker thread and poll
+    /// it from the main loop, the same shape [`chat::ChatView::drain_stream`]
+    /// already uses for tokens.
+    ///
+    /// A model that will not load is NOT an error here: [`model_picker::load_plan`]
+    /// falls back to the echo stub, and the note in the transcript says exactly
+    /// which file failed and why. Chat always stay usable.
+    fn switch_model(&mut self, plan: model_picker::LoadPlan, label: &str) {
+        let selected = model_picker::load_plan(&plan);
+        let note = model_picker::switch_note(label, &selected);
+        // Remember an explicitly picked catalog id, so a later cache
+        // invalidation re-selects what the user chose, not the env default.
+        if let model_picker::LoadPlan::ById(id) = &plan {
+            self.preferred_model = Some(id.clone());
+        }
+        if self.chat.is_none() {
+            self.chat = Some(ChatView::new(self.system.clone(), self.max_tokens, &selected));
+        }
+        if let Some(chat) = self.chat.as_mut() {
+            chat.adopt_adapter(&selected, note);
+        }
+        self.adapter = Some(selected);
+        self.view = View::Chat;
     }
 
     /// Enter the view (or arm the blocking action) for `route`.
@@ -353,15 +426,43 @@ impl App {
         };
     }
 
-    /// Lazily select the adapter and build the chat view on first use.
+    /// Select the adapter (if the cache is cold) and build the chat view on
+    /// first use.
+    ///
+    /// Two cases have to be kept apart, and conflating them was the original
+    /// "chat never sees my model" bug:
+    ///
+    /// * **No adapter yet** — select one. That happens on first entry, and again
+    ///   after anything invalidates the cache (a successful pull).
+    /// * **A chat view already exists** — do NOT rebuild it, that would throw
+    ///   away the transcript. Instead tell it about the newly selected adapter
+    ///   so its header stops claiming the old state.
+    ///
+    /// Selection is synchronous, so this call blocks the whole UI while a
+    /// several-hundred-MB GGUF is parsed and dequantized. That freeze is a known
+    /// wart, not a bug being fixed here (it needs a spinner + worker thread,
+    /// which is interactive behaviour that cannot be verified headless).
     fn ensure_chat(&mut self) {
-        if self.adapter.is_none() {
-            self.adapter = Some(select_adapter());
-        }
-        if self.chat.is_none()
-            && let Some(adapter) = self.adapter.as_ref()
-        {
-            self.chat = Some(ChatView::new(self.system.clone(), self.max_tokens, adapter));
+        let reselected = if self.adapter.is_none() {
+            self.adapter = Some(match self.preferred_model.as_deref() {
+                Some(id) => select_adapter_for(id),
+                None => select_adapter(),
+            });
+            true
+        } else {
+            false
+        };
+
+        let Some(adapter) = self.adapter.as_ref() else { return };
+        match self.chat.as_mut() {
+            None => {
+                self.chat = Some(ChatView::new(self.system.clone(), self.max_tokens, adapter))
+            }
+            Some(chat) if reselected => {
+                let label = self.preferred_model.as_deref().unwrap_or("the local model");
+                chat.adopt_adapter(adapter, model_picker::switch_note(label, adapter));
+            }
+            Some(_) => {}
         }
     }
 
@@ -401,9 +502,17 @@ impl App {
                 notice
             }
             Pending::PullModel(id) => {
-                let notice = models::run_pull(&id);
+                let outcome = models::run_pull(&id);
+                // THE fix for "pull a model, chat still says there is none": the
+                // adapter chosen earlier in this session is now stale, so drop
+                // it and remember what was just pulled. The next entry to chat
+                // re-selects (see `ensure_chat`) and keeps the transcript.
+                if outcome.pulled {
+                    self.adapter = None;
+                    self.preferred_model = Some(id);
+                }
                 pause_for_enter();
-                notice
+                outcome.notice
             }
         };
 
@@ -437,6 +546,7 @@ impl App {
             View::Plan(state) => state.footer_hints(),
             View::Git(state) => state.footer_hints(),
             View::Models(state) => state.footer_hints(),
+            View::ModelPicker(state) => state.footer_hints(),
             View::Chat => self.chat.as_ref().map(ChatView::footer_hints).unwrap_or_default(),
         };
 
@@ -450,6 +560,7 @@ impl App {
             View::Plan(state) => state.render(frame, body),
             View::Git(state) => state.render(frame, body),
             View::Models(state) => state.render(frame, body),
+            View::ModelPicker(state) => state.render(frame, body),
             View::Chat => {
                 if let Some(chat) = self.chat.as_mut() {
                     chat.render(frame, body);
@@ -597,6 +708,83 @@ mod tests {
         let mut app = app();
         app.apply(Transition::OpenViewFile(PathBuf::from("/x/y/paper.pdf")));
         assert!(matches!(app.view, View::Viewer(_)));
+    }
+
+    /// The picker opens as its own view. Built straight from a transition (not
+    /// by walking into chat first) so the test never calls `select_adapter`,
+    /// which would try to load real weights off whatever machine runs it.
+    #[test]
+    fn the_model_picker_opens_as_its_own_view() {
+        let mut app = app();
+        app.apply(Transition::OpenModelPicker);
+        assert!(matches!(app.view, View::ModelPicker(_)));
+    }
+
+    /// Esc in the picker lands back in chat, not Home — and chat's state is
+    /// created if it wasn't already, so the view is never empty.
+    #[test]
+    fn esc_from_the_picker_returns_to_chat() {
+        let mut app = app();
+        app.apply(Transition::OpenModelPicker);
+        app.apply(Transition::Open(Route::Chat));
+        assert!(matches!(app.view, View::Chat));
+        assert!(app.chat.is_some());
+    }
+
+    /// Picking a `.gguf` that cannot load must still leave a usable chat on the
+    /// echo stub with the failure explained — never a crash, never a dead view.
+    #[test]
+    fn selecting_an_unloadable_model_lands_in_chat_on_the_stub() {
+        let mut app = app();
+        app.apply(Transition::SelectModel {
+            plan: model_picker::LoadPlan::ByPath(PathBuf::from("/no/such/model.gguf")),
+            label: "model.gguf".into(),
+        });
+        assert!(matches!(app.view, View::Chat));
+        assert!(app.chat.is_some(), "chat is created if the switch happens before first entry");
+        let adapter = app.adapter.as_ref().expect("an adapter was installed");
+        assert!(!adapter.is_local(), "a bad path must degrade to the echo stub");
+    }
+
+    /// An explicitly picked catalog id is remembered, so a later cache
+    /// invalidation re-selects the user's choice and not the env default.
+    #[test]
+    fn picking_a_catalog_model_is_remembered_for_the_next_reselect() {
+        let mut app = app();
+        app.apply(Transition::SelectModel {
+            plan: model_picker::LoadPlan::ById("smollm2-1.7b-instruct-q4_k_m".into()),
+            label: "SmolLM2 1.7B".into(),
+        });
+        assert_eq!(app.preferred_model.as_deref(), Some("smollm2-1.7b-instruct-q4_k_m"));
+    }
+
+    /// The regression this whole cache-invalidation dance exists for: a cached
+    /// adapter from earlier in the session must be dropped when a pull lands, so
+    /// the next entry to chat actually re-selects. Chat state (the transcript)
+    /// must survive that.
+    #[test]
+    fn a_successful_pull_invalidates_the_cached_adapter_but_keeps_the_chat() {
+        let mut app = app();
+        // Stand in for "chat was opened earlier and cached a stub adapter".
+        app.adapter = Some(crate::adapter::SelectedAdapter::Echo {
+            adapter: kopitiam_ai::EchoAdapter,
+            reason: crate::adapter::FallbackReason::NoModelOnDisk {
+                model_id: "whatever".into(),
+                expected_store_path: PathBuf::from("/nowhere.gguf"),
+            },
+        });
+        app.chat = Some(ChatView::new(
+            DEFAULT_SYSTEM_PROMPT.to_string(),
+            None,
+            app.adapter.as_ref().unwrap(),
+        ));
+
+        // What `run_suspended` does on a successful pull.
+        app.adapter = None;
+        app.preferred_model = Some("smollm2-360m-instruct-q8_0".into());
+
+        assert!(app.adapter.is_none(), "the stale adapter must be dropped");
+        assert!(app.chat.is_some(), "but the transcript must not be thrown away");
     }
 
     #[test]

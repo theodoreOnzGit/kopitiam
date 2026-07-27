@@ -198,16 +198,35 @@ impl Default for ModelsView {
     }
 }
 
+/// What a pull did: the one-line notice for the home menu, plus whether weights
+/// actually landed on disk.
+///
+/// `pulled` exists because the router must know, without string-matching the
+/// notice, whether to throw away its cached adapter — a successful pull is the
+/// exact moment "chat has no model" stops being true. Parsing the human notice
+/// for that would be a bug waiting to happen the first time somebody rewords it.
+pub(super) struct PullOutcome {
+    pub notice: String,
+    pub pulled: bool,
+}
+
+impl PullOutcome {
+    /// A pull that never got as far as downloading anything.
+    fn failed(notice: impl Into<String>) -> Self {
+        Self { notice: notice.into(), pulled: false }
+    }
+}
+
 /// Pull a model by id on the normal terminal (called from the router's
 /// suspend→run→restore path), with the sha AUTO-RESOLVED from the hub. Mirrors
-/// `kopitiam models pull` exactly and returns a one-line notice for the home menu.
-pub fn run_pull(id: &str) -> String {
+/// `kopitiam models pull` exactly.
+pub(super) fn run_pull(id: &str) -> PullOutcome {
     let Some(spec) = Catalog::find(id) else {
-        return format!("unknown model id '{id}'");
+        return PullOutcome::failed(format!("unknown model id '{id}'"));
     };
     let store = match ModelStore::with_default_root() {
         Ok(store) => store,
-        Err(e) => return format!("model store unavailable: {e}"),
+        Err(e) => return PullOutcome::failed(format!("model store unavailable: {e}")),
     };
     println!("Pulling {} ({}) with sha auto-resolved from HuggingFace...\n", spec.display_name, spec.id);
 
@@ -221,9 +240,12 @@ pub fn run_pull(id: &str) -> String {
             for path in &acquired.artifact_paths {
                 println!("  {}", path.display());
             }
-            format!("pulled {} — verified", spec.id)
+            PullOutcome {
+                notice: format!("pulled {} — verified, chat will use it now", spec.id),
+                pulled: true,
+            }
         }
-        Err(e) => format!("pull failed: {e}"),
+        Err(e) => PullOutcome::failed(format!("pull failed: {e}")),
     }
 }
 
@@ -303,7 +325,9 @@ fn total_size(spec: &ModelSpec) -> u64 {
     spec.artifacts.iter().map(|a| a.size_bytes).sum()
 }
 
-fn family_label(arch: &Architecture) -> String {
+/// `pub(super)` so the model picker ([`super::model_picker`]) label its rows with
+/// the exact same family string — one spelling of "Qwen2", not two that can drift.
+pub(super) fn family_label(arch: &Architecture) -> String {
     match arch {
         Architecture::Qwen2 => "Qwen2".into(),
         Architecture::Llama => "Llama".into(),
@@ -314,7 +338,8 @@ fn family_label(arch: &Architecture) -> String {
 }
 
 /// Decimal (SI) human byte formatting — presentation only, mirrors the CLI's.
-fn human_bytes(bytes: u64) -> String {
+/// `pub(super)` so [`super::model_picker`] size its rows identically.
+pub(super) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
