@@ -116,6 +116,40 @@ impl SyntheticModelSpec {
             ..Self::default()
         }
     }
+
+    /// A SmolLM2/LLaMA-shaped spec — the architecture family
+    /// `kopitiam-models`' current `DEFAULT_MODEL_ID`
+    /// (`SmolLM2-360M-Instruct`) belongs to, as opposed to the Qwen2 the
+    /// runtime was first written against. It differs from
+    /// [`SyntheticModelSpec::default`] (a Qwen2 spec) in exactly the three
+    /// arch-load-bearing ways SmolLM2 differs from Qwen2:
+    ///
+    /// * `architecture: "llama"` — so every hyperparameter KV is namespaced
+    ///   `llama.*`, not `qwen2.*`, and the loader's arch dispatch
+    ///   ([`kopitiam_loader::gguf`]'s `build_metadata`) has to key off
+    ///   `general.architecture` to find any of them.
+    /// * `with_qkv_bias: false` — LLaMA has no Q/K/V projection biases,
+    ///   where Qwen2 does; the bias tensors are simply absent from the file.
+    /// * `tie_embeddings: true` — SmolLM2-360M reuses `token_embd` as its LM
+    ///   head rather than shipping a separate `output.weight`.
+    ///
+    /// `rope_theta`/`norm_eps` are set to SmolLM2-360M's actual values
+    /// (`100000.0` / `1e-5`, differing from the Qwen defaults) so a test can
+    /// additionally confirm the *rope*- and *norm*-namespaced `llama.*` keys
+    /// resolve, not only the count/size ones. The head geometry stays the
+    /// default toy GQA shape (not SmolLM2's real 960-hidden/15-head
+    /// geometry): what this fixture exercises is arch dispatch plus
+    /// bias/tied-embedding handling, not any particular head count.
+    pub(crate) fn llama_tied_no_bias() -> Self {
+        Self {
+            architecture: "llama",
+            with_qkv_bias: false,
+            tie_embeddings: true,
+            rope_theta: 100_000.0,
+            norm_eps: 1e-5,
+            ..Self::default()
+        }
+    }
 }
 
 /// A deterministic, dependency-free PRNG (xorshift64*) used only to fill
