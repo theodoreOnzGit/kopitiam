@@ -361,6 +361,51 @@ fn generate_something(
         return Err("generate produced no text at all".into());
     }
     println!("        prompt {prompt:?} -> {:?}", first_line(&out));
+
+    canonical_completion(model, tokenizer)
+}
+
+/// Asserts the model completes a **canonical** sentence correctly.
+///
+/// # Why this one assertion, when the rest of this file refuses to pin output
+///
+/// Everything above deliberately checks only that the chain *runs* — for a
+/// quantized model there is no single right answer, and pinning one would break
+/// on every upstream requant. That principle is right, and it also left a hole
+/// big enough to walk through: a model can fetch, load, tokenize, build weights
+/// and emit decodable tokens while producing complete nonsense. That is not
+/// hypothetical — it is what sent a whole session hunting an imaginary
+/// pre-tokenizer bug, because "PASS reached generate" was compatible with
+/// gibberish.
+///
+/// `"The quick brown fox jumps over the lazy"` → `"dog"` is the narrowest
+/// assertion that closes it. It is not a fact the model has to *know*, like a
+/// capital city; it is the most over-represented sentence completion in English
+/// text, which every language model worth loading finishes — a 360M one does,
+/// greedily, in five tokens. So it discriminates "the weights are being applied
+/// correctly" from "the weights are mush" without discriminating on model
+/// quality, size, or quant level.
+///
+/// Deliberately greedy (`generate`, not a sampler): a temperature-driven miss
+/// would make this flaky, and the property under test is what the model
+/// considers *most likely*, not what it happens to roll.
+fn canonical_completion(
+    model: &kopitiam_runtime::QwenModel,
+    tokenizer: &kopitiam_tokenizer::BpeTokenizer,
+) -> Result<(), String> {
+    let prompt = "The quick brown fox jumps over the lazy";
+    let cfg = kopitiam_runtime::GenerationConfig { max_new_tokens: 5, ..Default::default() };
+    let out = kopitiam_runtime::generate(model, tokenizer, prompt, &cfg, |_, _| {})
+        .map_err(|e| format!("canonical completion: {e}"))?;
+    println!("        canonical {prompt:?} -> {:?}", first_line(&out));
+    if !out.to_ascii_lowercase().contains("dog") {
+        return Err(format!(
+            "canonical completion failed: {prompt:?} should continue with \"dog\", got {:?}. \
+             The chain runs but the weights are not being applied correctly — check \
+             dequantization, RoPE and attention before blaming the model's size",
+            first_line(&out)
+        ));
+    }
     Ok(())
 }
 
