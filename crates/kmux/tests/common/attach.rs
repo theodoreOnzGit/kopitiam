@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use rmux_pty::{PtyPair, TerminalSize};
+use kmux::pty::{PtyPair, TerminalSize};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::process::{kill_process, Pid, Signal};
 use rustix::termios::{

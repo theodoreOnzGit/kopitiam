@@ -8,8 +8,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rmux_client::{connect, ensure_server_running, INTERNAL_DAEMON_FLAG};
-use rmux_proto::{NewSessionRequest, NewSessionResponse, Request, Response, SessionName};
+use kmux::client::{connect, ensure_server_running, INTERNAL_DAEMON_FLAG};
+use kmux::proto::{NewSessionRequest, NewSessionResponse, Request, Response, SessionName};
 
 use common::{
     env_lock, stderr, terminate_child, unique_socket_path, wait_for_socket, write_hidden_launcher,

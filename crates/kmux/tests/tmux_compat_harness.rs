@@ -13,7 +13,7 @@ use common::{
     DEFAULT_TMUX_COMPAT_TERM, FROZEN_TMUX_ENV, FROZEN_TMUX_REFERENCE_REL_PATH,
     PTY_SERIALIZATION_NOTE, TMUX_COMPAT_PREREQUISITES_NOTE,
 };
-use rmux_client::{connect_or_absent, ConnectResult};
+use kmux::client::{connect_or_absent, ConnectResult};
 
 #[test]
 fn tmux_compat_harness_uses_distinct_socket_paths_under_one_temp_root() -> Result<(), Box<dyn Error>>

@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use rmux_pty::{
+use kmux::pty::{
     write_windows_console_key, ChildCommand, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
 use windows_sys::Win32::System::Console::{
@@ -175,7 +175,7 @@ fn wait_for_needle_or_terminate(
     }
 }
 
-fn read_until_io(io: &rmux_pty::PtyIo, needle: &[u8]) -> io::Result<bool> {
+fn read_until_io(io: &kmux::pty::PtyIo, needle: &[u8]) -> io::Result<bool> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {

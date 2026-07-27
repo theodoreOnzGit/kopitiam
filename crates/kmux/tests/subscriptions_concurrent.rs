@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_core::events::SubscriptionLimits;
-use rmux_proto::{
+use kmux::core::events::SubscriptionLimits;
+use kmux::proto::{
     encode_frame, ErrorResponse, FrameDecoder, KillPaneRequest, ListPanesRequest,
     NewSessionExtRequest, NewSessionRequest, PaneOutputCursorRequest, PaneOutputLagResponse,
     PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneSnapshotRequest,
@@ -17,7 +17,7 @@ use rmux_proto::{
     SubscribePaneOutputRequest, SubscribePaneOutputResponse, TerminalSize,
     UnsubscribePaneOutputRequest,
 };
-use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
+use kmux::server::{DaemonConfig, ServerDaemon, ServerHandle};
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 const LAG_OUTPUT_EVENT_TARGET: usize = 8;
@@ -616,7 +616,7 @@ fn wait_for_cursor_after_lag(
     connection: &mut Connection,
     subscription_id: PaneOutputSubscriptionId,
     mut resume_sequence: u64,
-) -> Result<(u64, rmux_proto::PaneOutputCursorResponse), Box<dyn Error>> {
+) -> Result<(u64, kmux::proto::PaneOutputCursorResponse), Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         let response =

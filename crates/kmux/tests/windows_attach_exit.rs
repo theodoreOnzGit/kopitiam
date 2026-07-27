@@ -11,7 +11,7 @@ use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rmux_pty::{
+use kmux::pty::{
     write_windows_console_key, ChildCommand, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
 use windows_sys::Win32::Foundation::{
@@ -1838,7 +1838,7 @@ fn send_attach_ctrl_c_and_wait_for_marker(
     label: &str,
     target: &str,
     attach: &SpawnedPty,
-    io: &rmux_pty::PtyIo,
+    io: &kmux::pty::PtyIo,
     marker: &str,
 ) -> Result<ControlKeyOutcome, Box<dyn Error>> {
     let marker_command = format!("\r\nWrite-Output {marker}\r\n");
@@ -2127,7 +2127,7 @@ fn wait_for_needle_or_terminate(
     }
 }
 
-fn read_until_io(io: &rmux_pty::PtyIo, needle: &[u8]) -> io::Result<(bool, Vec<u8>)> {
+fn read_until_io(io: &kmux::pty::PtyIo, needle: &[u8]) -> io::Result<(bool, Vec<u8>)> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {

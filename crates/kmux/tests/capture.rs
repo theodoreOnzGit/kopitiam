@@ -9,7 +9,7 @@ use common::{
     assert_success, stderr, stdout, terminate_child, CliHarness, FrozenTmuxBinary,
     TmuxCompatHarness, TmuxCompatRun, TmuxCompatRunConfig, FROZEN_TMUX_ENV,
 };
-use rmux_proto::DEFAULT_MAX_FRAME_LENGTH;
+use kmux::proto::DEFAULT_MAX_FRAME_LENGTH;
 
 #[test]
 fn capture_pane_prints_unattached_transcript() -> Result<(), Box<dyn Error>> {

@@ -8,10 +8,10 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_client::{
+use kmux::client::{
     connect, ensure_server_running, socket_path_for_label, Connection, INTERNAL_DAEMON_FLAG,
 };
-use rmux_proto::{KillServerRequest, ListSessionsRequest, Request, Response};
+use kmux::proto::{KillServerRequest, ListSessionsRequest, Request, Response};
 
 const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
 const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";

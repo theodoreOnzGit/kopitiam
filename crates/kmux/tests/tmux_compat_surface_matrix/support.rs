@@ -14,9 +14,9 @@ pub(super) use crate::common::{
     CapturedCommand, EnvironmentOverrides, FrozenTmuxBinary, TmuxCompatHarness, TmuxCompatRun,
     TmuxCompatRunConfig, FROZEN_TMUX_ENV,
 };
-pub(super) use rmux_core::{input::InputParser, Screen};
-pub(super) use rmux_proto::TerminalSize as ScreenTerminalSize;
-pub(super) use rmux_pty::{PtyPair, TerminalSize as PtyTerminalSize};
+pub(super) use kmux::core::{input::InputParser, Screen};
+pub(super) use kmux::proto::TerminalSize as ScreenTerminalSize;
+pub(super) use kmux::pty::{PtyPair, TerminalSize as PtyTerminalSize};
 
 pub(super) const TMUX_COMPAT_TIMEOUT: Duration = Duration::from_secs(3);
 

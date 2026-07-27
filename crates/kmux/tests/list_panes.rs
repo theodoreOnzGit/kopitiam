@@ -6,7 +6,7 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use common::{assert_success, stderr, stdout, AttachedSession, CliHarness};
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 
 #[test]
 fn list_panes_all_sessions_prints_all_panes_across_session_windows() -> Result<(), Box<dyn Error>> {

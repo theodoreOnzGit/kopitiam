@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use common::acquire_empty_socket_path_lock;
 use common::{assert_success, read_until_contains, stderr, stdout, AttachedSession, CliHarness};
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);

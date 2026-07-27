@@ -6,7 +6,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use common::{assert_success, read_until_contains, terminate_child, AttachedSession, CliHarness};
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 

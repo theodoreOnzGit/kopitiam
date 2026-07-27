@@ -18,11 +18,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rmux_client::{
+use kmux::client::{
     connect_or_absent, default_socket_path, ClientError, ConnectResult, Connection,
     INTERNAL_DAEMON_FLAG,
 };
-use rmux_proto::{ListSessionsRequest, Response, TerminalSize};
+use kmux::proto::{ListSessionsRequest, Response, TerminalSize};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::termios::{tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, SpecialCodeIndex};
 
@@ -120,7 +120,7 @@ fn probe_hidden_daemon_readiness(connection: &mut Connection) -> Result<(), Clie
     })?;
     match response {
         Response::ListSessions(_) => Ok(()),
-        other => Err(ClientError::Protocol(rmux_proto::RmuxError::Server(
+        other => Err(ClientError::Protocol(kmux::proto::RmuxError::Server(
             format!("unexpected readiness response: {other:?}"),
         ))),
     }

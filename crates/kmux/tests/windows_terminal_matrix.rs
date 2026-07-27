@@ -8,7 +8,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_pty::{ChildCommand, SpawnedPty, TerminalSize};
+use kmux::pty::{ChildCommand, SpawnedPty, TerminalSize};
 
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;

@@ -9,9 +9,9 @@ use common::{
     assert_success, drain_attach_output, drain_attach_output_bytes, read_until_contains,
     read_until_contains_all, terminate_child, AttachedSession, CliHarness,
 };
-use rmux_core::{input::InputParser, Screen};
-use rmux_proto::TerminalSize as ScreenTerminalSize;
-use rmux_pty::TerminalSize;
+use kmux::core::{input::InputParser, Screen};
+use kmux::proto::TerminalSize as ScreenTerminalSize;
+use kmux::pty::TerminalSize;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 

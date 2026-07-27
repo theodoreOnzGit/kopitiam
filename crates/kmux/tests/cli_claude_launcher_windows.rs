@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_pty::{ChildCommand, SpawnedPty, TerminalSize};
+use kmux::pty::{ChildCommand, SpawnedPty, TerminalSize};
 
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;
@@ -343,7 +343,7 @@ fn wait_for_needles_or_terminate(
 }
 
 fn read_until_needles(
-    io: &rmux_pty::PtyIo,
+    io: &kmux::pty::PtyIo,
     needles: &[Vec<u8>],
     timeout: Duration,
 ) -> io::Result<(bool, Vec<u8>)> {

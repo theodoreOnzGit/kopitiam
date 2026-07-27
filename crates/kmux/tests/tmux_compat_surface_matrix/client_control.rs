@@ -255,17 +255,17 @@ fn tmux_compat_control_mode_guard_tuple_and_exit_framing_when_frozen_tmux_is_ava
         eof_rmux.stdout
     );
     assert!(
-        !eof_rmux.stdout.contains(rmux_proto::CONTROL_CONTROL_START),
+        !eof_rmux.stdout.contains(kmux::proto::CONTROL_CONTROL_START),
         "plain -C must not emit the -CC DCS prefix: {:?}",
         eof_rmux.stdout
     );
     assert!(
-        !eof_rmux.stdout.contains(rmux_proto::CONTROL_CONTROL_END),
+        !eof_rmux.stdout.contains(kmux::proto::CONTROL_CONTROL_END),
         "plain -C must not emit the -CC DCS suffix: {:?}",
         eof_rmux.stdout
     );
     assert!(
-        !eof_tmux.stdout.contains(rmux_proto::CONTROL_CONTROL_START),
+        !eof_tmux.stdout.contains(kmux::proto::CONTROL_CONTROL_START),
         "tmux plain -C must not emit the -CC DCS prefix: {:?}",
         eof_tmux.stdout
     );
@@ -381,17 +381,17 @@ fn tmux_compat_control_mode_guard_tuple_and_exit_framing_when_frozen_tmux_is_ava
 
     // Plain `-C` must not wrap either transcript in the `-CC` DCS envelope.
     assert!(
-        !cmd_rmux.stdout.contains(rmux_proto::CONTROL_CONTROL_START),
+        !cmd_rmux.stdout.contains(kmux::proto::CONTROL_CONTROL_START),
         "plain -C command transcript must not contain DCS prefix: {:?}",
         cmd_rmux.stdout
     );
     assert!(
-        !cmd_rmux.stdout.contains(rmux_proto::CONTROL_CONTROL_END),
+        !cmd_rmux.stdout.contains(kmux::proto::CONTROL_CONTROL_END),
         "plain -C command transcript must not contain DCS suffix: {:?}",
         cmd_rmux.stdout
     );
     assert!(
-        !cmd_tmux.stdout.contains(rmux_proto::CONTROL_CONTROL_START),
+        !cmd_tmux.stdout.contains(kmux::proto::CONTROL_CONTROL_START),
         "tmux plain -C command transcript must not contain DCS prefix: {:?}",
         cmd_tmux.stdout
     );

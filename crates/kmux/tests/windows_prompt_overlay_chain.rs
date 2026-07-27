@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rmux_pty::{
+use kmux::pty::{
     write_windows_console_key, ChildCommand, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
 use windows_sys::Win32::System::Console::LEFT_CTRL_PRESSED;
@@ -218,7 +218,7 @@ fn is_transient_windows_attach_error(error: &(dyn Error + 'static)) -> bool {
 }
 
 fn wait_for_output_containing_all(
-    io: &rmux_pty::PtyIo,
+    io: &kmux::pty::PtyIo,
     needles: &[&str],
     timeout: Duration,
 ) -> Result<String, Box<dyn Error>> {

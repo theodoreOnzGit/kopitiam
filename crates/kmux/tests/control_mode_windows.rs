@@ -6,7 +6,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
+use kmux::proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
 
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;

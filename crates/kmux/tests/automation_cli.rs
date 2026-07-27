@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{assert_success, stderr, stdout, AttachedSession, CliHarness};
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 use serde_json::Value;
 
 #[test]
