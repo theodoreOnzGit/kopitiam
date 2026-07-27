@@ -160,6 +160,19 @@ pub fn load_matmul_weight_opt(model: &LoadedModel, name: &str) -> Result<Option<
 /// [`load_matmul_weight_opt`] encode the load-time half of the invariant
 /// [`kopitiam_tensor::has_fused_matmul_kernel`] anchors.
 fn keep_quantized_or_dequantize(tensor: Tensor) -> Result<Tensor> {
+    // Debug escape hatch: force every matmul weight to `f32`, bypassing the
+    // fused quantized kernels entirely.
+    //
+    // This exists because "the model answers nonsense" has two very different
+    // causes — a wrong *forward pass* or a wrong *quantized kernel* — and
+    // reading code cannot tell them apart. Running the identical model both
+    // ways can: if `f32` is right and quantized is wrong, the kernel is at
+    // fault; if both are wrong the same way, it is not. Costs a lot of memory
+    // (weights expand ~4x from Q4/Q8) and is slower, so it is strictly a
+    // diagnostic, never a runtime mode.
+    if std::env::var_os("KOPITIAM_FORCE_F32_WEIGHTS").is_some() {
+        return tensor.to_dtype(DType::F32);
+    }
     if kopitiam_tensor::has_fused_matmul_kernel(tensor.dtype()) {
         Ok(tensor)
     } else {
