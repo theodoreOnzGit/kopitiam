@@ -1273,6 +1273,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -1423,6 +1424,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn connect_with_autostart_does_not_chmod_custom_socket_parent() {
         let temp = TempDir::new().expect("temp dir");
         let custom_parent = temp.path().join("shared");
@@ -1454,6 +1456,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn connect_with_autostart_restricts_default_socket_parent() {
         let temp = TempDir::new().expect("temp dir");
         let runtime_dir = temp.path().join("runtime");

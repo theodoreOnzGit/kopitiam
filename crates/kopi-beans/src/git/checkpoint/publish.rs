@@ -413,10 +413,15 @@ fn push_refs(repo: &Repository, refspecs: &[String]) -> Result<(), CheckpointPub
         Err(_) => return Ok(()),
     };
 
-    // Push is GATED: gix 0.86 has no high-level push (upstream #306). A send-pack
-    // shim over gix-protocol/gix-transport is a follow-up. Do NOT shell out.
+    // Local (file://) remotes push in-process via gix (object copy + ref update);
+    // network remotes remain gated. A non-fast-forward or locked remote ref is
+    // retryable, so it is surfaced as `NonFastForward` for the publish retry loop.
+    // We never shell out to git.
     match repo.push_refspecs(&url, refspecs) {
         Ok(()) => Ok(()),
+        Err(e) if is_non_fast_forward(&e.to_string()) => {
+            Err(CheckpointPublishError::NonFastForward)
+        }
         Err(e) => Err(CheckpointPublishError::Git(e)),
     }
 }
@@ -849,7 +854,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix push is gated (send-pack shim pending) -- TODO: re-enable once push lands"]
     fn publish_checkpoint_merges_on_non_fast_forward_and_converges() {
         let tmp = TempDir::new().unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -925,7 +929,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix push is gated (send-pack shim pending) -- TODO: re-enable once push lands"]
     fn publish_checkpoint_returns_too_many_retries_when_limit_exceeded() {
         let tmp = TempDir::new().unwrap();
         let remote_dir = tmp.path().join("remote");

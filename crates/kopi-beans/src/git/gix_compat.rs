@@ -13,9 +13,16 @@
 //! - Object/tree/commit/ref plumbing is a faithful translation.
 //! - **Fetch** is implemented over `gix`'s blocking network client
 //!   (`remote.connect(Fetch) -> prepare_fetch -> receive`).
-//! - **Push** is GATED: gix 0.86 exposes no high-level push (upstream #306),
-//!   so [`Repository::push_refspecs`] returns [`ErrorCode::PushUnsupported`].
-//!   A send-pack shim over `gix-protocol`/`gix-transport` is a follow-up.
+//! - **Push** is implemented for **local** remotes (a filesystem path or a
+//!   `file://` URL): [`Repository::push_refspecs`] copies the objects the target
+//!   repo lacks into its object database and updates the destination refs with
+//!   fast-forward + lock semantics, entirely in-process via gix (no `git`
+//!   subprocess, no network protocol). **Network** transports
+//!   (`http(s)`/`ssh`/`git`/scp-like) remain GATED and return
+//!   [`ErrorCode::PushUnsupported`]: gix 0.86 exposes no high-level push and no
+//!   `gix-protocol` send-pack helper (upstream #306), so a protocol push cannot
+//!   be built without a `[patch.crates-io]` (which would not survive
+//!   `cargo publish`).
 //! - Remote *configuration* (create/read `remote.<name>.url`) is managed by
 //!   this shim directly against the on-disk git config, so a freshly opened
 //!   handle observes remotes added through it without a reload.
@@ -819,11 +826,24 @@ impl Repository {
     ///
     /// Fetches `refspec` from `url` into the local object db + tracking ref.
     pub fn fetch_refspec(&self, url: &str, refspec: &str) -> Result<(), Error> {
+        // Remote-tracking refs are force-updated by convention (the configured
+        // fetch refspec this shim writes is `+refs/heads/*:refs/remotes/<name>/*`).
+        // gix honours the per-refspec force marker, so a refspec passed without a
+        // leading `+` would refuse a non-fast-forward tracking-ref update and leave
+        // the tracking ref stale. Normalise to a forced fetch to match git/libgit2.
+        let forced_refspec = if refspec.starts_with('+') {
+            refspec.to_owned()
+        } else {
+            format!("+{refspec}")
+        };
         let remote = self
             .gix
             .remote_at(url)
             .map_err(other)?
-            .with_refspecs(Some(BStr::new(refspec.as_bytes())), gix::remote::Direction::Fetch)
+            .with_refspecs(
+                Some(BStr::new(forced_refspec.as_bytes())),
+                gix::remote::Direction::Fetch,
+            )
             .map_err(other)?;
         let connection = remote
             .connect(gix::remote::Direction::Fetch)
@@ -838,13 +858,79 @@ impl Repository {
         Ok(())
     }
 
-    /// GATED push. gix 0.86 has no high-level push (upstream #306); a send-pack
-    /// shim is a follow-up. Returns [`ErrorCode::PushUnsupported`].
-    pub fn push_refspecs(&self, _url: &str, _refspecs: &[String]) -> Result<(), Error> {
-        Err(Error::new(
-            ErrorCode::PushUnsupported,
-            "push over gix not yet implemented — gix 0.86 has no high-level push; send-pack shim pending",
-        ))
+    /// Push `refspecs` to the remote at `url`.
+    ///
+    /// **Local** remotes (a filesystem path or a `file://` URL) are pushed in
+    /// process: the objects the target repo lacks are copied into its object
+    /// database and each destination ref is updated with fast-forward + lock
+    /// semantics. No `git` subprocess is spawned and no network protocol runs.
+    ///
+    /// **Network** remotes (`http(s)`/`ssh`/`git`/scp-like `user@host:path`)
+    /// return [`ErrorCode::PushUnsupported`]: gix 0.86 has no high-level push or
+    /// `gix-protocol` send-pack helper (upstream #306).
+    pub fn push_refspecs(&self, url: &str, refspecs: &[String]) -> Result<(), Error> {
+        match local_repo_path(url) {
+            Some(path) => self.local_push(&path, refspecs),
+            None => Err(Error::new(
+                ErrorCode::PushUnsupported,
+                format!(
+                    "push to non-local remote '{url}' is unsupported: gix 0.86 has no high-level \
+                     push / send-pack (upstream #306); only local (file://) push is implemented"
+                ),
+            )),
+        }
+    }
+
+    /// Push every refspec to a local (on-disk) target repository.
+    fn local_push(&self, remote_path: &Path, refspecs: &[String]) -> Result<(), Error> {
+        for spec in refspecs {
+            self.push_one_refspec(remote_path, spec)?;
+        }
+        Ok(())
+    }
+
+    /// Apply one `[+]<src>:<dst>` refspec against the on-disk target repo.
+    fn push_one_refspec(&self, remote_path: &Path, spec: &str) -> Result<(), Error> {
+        let (force, src, dst) = parse_refspec(spec)?;
+
+        let remote = open_local_repo(remote_path)?;
+
+        // Empty source ("`:dst`") means: delete `dst` on the remote.
+        if src.is_empty() {
+            return push_delete_ref(&remote, dst);
+        }
+
+        let new_oid = self.resolve_push_source(src)?;
+        let old_oid = remote_ref_target(&remote, dst);
+
+        // Copy every object reachable from `new_oid` that the remote lacks. Done
+        // first so the remote can compute ancestry against its existing tip.
+        copy_missing_objects(&self.gix, &remote, new_oid)?;
+
+        // Re-open so the ancestry check + ref update observe the just-written
+        // loose objects through a fresh odb view.
+        let remote = open_local_repo(remote_path)?;
+
+        if !force
+            && let Some(old) = old_oid
+            && old != new_oid
+            && !is_fast_forward(&remote, old, new_oid)
+        {
+            return Err(Error::other(format!(
+                "failed to push ref '{dst}': non-fast-forward update rejected (fetch first)"
+            )));
+        }
+
+        write_remote_ref(&remote, dst, new_oid, old_oid)
+    }
+
+    /// Resolve a push source (a ref name, or a raw hex object id) to an [`Oid`]
+    /// in *this* (local) repository.
+    fn resolve_push_source(&self, src: &str) -> Result<Oid, Error> {
+        match self.find_gix_reference(src) {
+            Ok(mut r) => r.peel_to_id().map(|id| Oid(id.detach())).map_err(other),
+            Err(_) => Oid::from_str(src),
+        }
     }
 
     // ---- graph -----------------------------------------------------------
@@ -979,6 +1065,221 @@ impl Repository {
 // helpers
 // =============================================================================
 
+// ---- push helpers -----------------------------------------------------------
+
+/// Decide whether `url` names a **local** (on-disk) repository, returning its
+/// filesystem path if so. Network schemes (`http(s)`/`ssh`/`git`) and scp-like
+/// `user@host:path` return `None`.
+fn local_repo_path(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        // `file://<authority>/<path>` or `file:///<path>` (empty authority).
+        let path_part = match rest.find('/') {
+            Some(idx) => &rest[idx..], // keep the leading '/'
+            None => rest,
+        };
+        let trimmed = path_part.trim_start_matches('/');
+        #[cfg(windows)]
+        {
+            // `file:///C:/repo` -> `C:/repo`; otherwise keep the rooted path.
+            if trimmed.as_bytes().get(1) == Some(&b':') {
+                return Some(PathBuf::from(trimmed));
+            }
+            return Some(PathBuf::from(path_part));
+        }
+        #[cfg(not(windows))]
+        {
+            return Some(PathBuf::from(format!("/{trimmed}")));
+        }
+    }
+    // Any explicit `scheme://` is a network remote.
+    if url.contains("://") {
+        return None;
+    }
+    // A bare path that resolves to a directory is local; scp-like `user@host:path`
+    // does not resolve to a directory and so is treated as a network remote.
+    let path = Path::new(url);
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Open a local repository as a push target, tolerating lenient config.
+fn open_local_repo(path: &Path) -> Result<gix::Repository, Error> {
+    gix::open_opts(path, Repository::lenient_open_options()).map_err(|e| {
+        Error::other(format!(
+            "open push target '{}': {}",
+            path.display(),
+            chain_message(&e)
+        ))
+    })
+}
+
+/// Split `[+]<src>:<dst>` into `(force, src, dst)`. A colon-less spec pushes a
+/// ref to the same name on the remote.
+fn parse_refspec(spec: &str) -> Result<(bool, &str, &str), Error> {
+    let (force, body) = match spec.strip_prefix('+') {
+        Some(rest) => (true, rest),
+        None => (false, spec),
+    };
+    let (src, dst) = match body.split_once(':') {
+        Some((s, d)) => (s, d),
+        None => (body, body),
+    };
+    if dst.is_empty() {
+        return Err(Error::other(format!(
+            "invalid refspec '{spec}': empty destination"
+        )));
+    }
+    Ok((force, src, dst))
+}
+
+/// Current target of `name` on the remote, if the ref exists and resolves.
+fn remote_ref_target(remote: &gix::Repository, name: &str) -> Option<Oid> {
+    let mut reference = remote.find_reference(name).ok()?;
+    reference.peel_to_id().ok().map(|id| Oid(id.detach()))
+}
+
+/// Copy every object reachable from `tip` that `remote` lacks from `local` into
+/// `remote`'s object database. Relies on git connectivity: if the remote already
+/// has an object it has that object's full closure, so traversal is pruned there.
+fn copy_missing_objects(
+    local: &gix::Repository,
+    remote: &gix::Repository,
+    tip: Oid,
+) -> Result<(), Error> {
+    use gix::objs::{CommitRefIter, Kind, TagRefIter, TreeRefIter, Write, tree::EntryKind};
+
+    let hash = gix::hash::Kind::Sha1;
+    let mut stack: Vec<gix::ObjectId> = vec![tip.inner()];
+    let mut seen: std::collections::HashSet<gix::ObjectId> = std::collections::HashSet::new();
+
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if remote.has_object(oid) {
+            continue;
+        }
+        let obj = local
+            .find_object(oid)
+            .map_err(|e| Error::other(format!("read object {oid} for push: {e}")))?;
+        let kind = obj.kind;
+        match kind {
+            Kind::Commit => {
+                let mut it = CommitRefIter::from_bytes(&obj.data, hash);
+                if let Ok(tree) = it.tree_id() {
+                    stack.push(tree);
+                }
+                for parent in CommitRefIter::from_bytes(&obj.data, hash).parent_ids() {
+                    stack.push(parent);
+                }
+            }
+            Kind::Tag => {
+                if let Ok(target) = TagRefIter::from_bytes(&obj.data, hash).target_id() {
+                    stack.push(target);
+                }
+            }
+            Kind::Tree => {
+                for entry in TreeRefIter::from_bytes(&obj.data, hash) {
+                    let entry =
+                        entry.map_err(|e| Error::other(format!("decode tree {oid}: {e}")))?;
+                    // Skip gitlink (submodule) entries: the remote never has them.
+                    if entry.mode.kind() == EntryKind::Commit {
+                        continue;
+                    }
+                    stack.push(entry.oid.to_owned());
+                }
+            }
+            Kind::Blob => {}
+        }
+        remote
+            .objects
+            .write_buf(kind, &obj.data)
+            .map_err(|e| Error::other(format!("write object {oid} to push target: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Is advancing `old` to `new` a fast-forward (i.e. is `old` an ancestor of
+/// `new`)? Computed on the receiving repo, which — after [`copy_missing_objects`]
+/// — has both objects and their history.
+fn is_fast_forward(remote: &gix::Repository, old: Oid, new: Oid) -> bool {
+    if old == new {
+        return true;
+    }
+    match remote.merge_base(old.inner(), new.inner()) {
+        Ok(base) => base.detach() == old.inner(),
+        Err(_) => false,
+    }
+}
+
+/// Update `name` on the remote to `new`, constraining on the previously observed
+/// value so a concurrent move (or a held `.lock`) is surfaced.
+fn write_remote_ref(
+    remote: &gix::Repository,
+    name: &str,
+    new: Oid,
+    old: Option<Oid>,
+) -> Result<(), Error> {
+    use gix::refs::Target;
+    use gix::refs::transaction::PreviousValue;
+    let constraint = match old {
+        Some(old) => PreviousValue::MustExistAndMatch(Target::Object(old.inner())),
+        None => PreviousValue::MustNotExist,
+    };
+    remote
+        .reference(name, new.inner(), constraint, "push: update reference")
+        .map(|_| ())
+        .map_err(|e| map_push_ref_edit_err(name, e))
+}
+
+/// Delete `name` on the remote.
+fn push_delete_ref(remote: &gix::Repository, name: &str) -> Result<(), Error> {
+    use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+    let full: gix::refs::FullName = name
+        .try_into()
+        .map_err(|e| Error::other(format!("invalid ref name '{name}': {e}")))?;
+    let edit = RefEdit {
+        change: Change::Delete {
+            expected: PreviousValue::Any,
+            log: RefLog::AndReference,
+        },
+        name: full,
+        deref: false,
+    };
+    remote
+        .edit_reference(edit)
+        .map(|_| ())
+        .map_err(|e| map_push_ref_edit_err(name, e))
+}
+
+/// Map a remote ref-edit failure into a git-2-shaped [`Error`]. Lock contention
+/// and previous-value mismatches are normalised to messages the sync/publish
+/// retry classifiers (`is_retryable_push_error_message`, `is_non_fast_forward`)
+/// recognise, so a locked or moved remote ref is retried rather than fatal.
+fn map_push_ref_edit_err(dst: &str, e: gix::reference::edit::Error) -> Error {
+    let msg = chain_message(&e);
+    let lower = msg.to_lowercase();
+    if lower.contains("lock") {
+        Error::locked(format!(
+            "cannot lock ref '{dst}': failed to lock file: {msg}"
+        ))
+    } else if lower.contains("expected")
+        || lower.contains("existing value")
+        || lower.contains("should have content")
+        || lower.contains("supposed to exist")
+    {
+        // Previous-value constraint failed: the remote ref moved under us.
+        Error::other(format!(
+            "failed to update ref '{dst}': non-fast-forward (fetch first): {msg}"
+        ))
+    } else {
+        Error::other(format!("failed to update ref '{dst}': {msg}"))
+    }
+}
+
 fn map_ref_edit_err(e: gix::reference::edit::Error) -> Error {
     let msg = e.to_string();
     let lower = msg.to_lowercase();
@@ -1028,6 +1329,9 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     }
 }
 
-/// Push-gated error surfaced to sync/publish callers as a convenience.
+/// Message for the still-gated case: push to a *network* remote. Local (file://)
+/// push is implemented; only `http(s)`/`ssh`/`git`/scp-like remotes are gated,
+/// because gix 0.86 has no high-level push / `gix-protocol` send-pack (upstream
+/// #306).
 pub const PUSH_UNSUPPORTED_MSG: &str =
-    "push over gix not yet implemented — gix 0.86 has no high-level push; send-pack shim pending";
+    "push to non-local remote unsupported: gix 0.86 has no high-level push / send-pack (upstream #306)";
