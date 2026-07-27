@@ -7,7 +7,7 @@ use super::ExitFailure;
 
 const RMUX_USAGE: &str = "usage: kmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
 const RMUX_LONG_OPTION_USAGE: &str = "usage: kmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
-const RMUX_LONG_HELP: &str = "usage: kmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.";
+const RMUX_LONG_HELP: &str = "usage: kmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nKMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `kmux list-commands` for the tmux-compatible command surface.";
 
 pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> {
     let mut index = 0;
@@ -33,7 +33,7 @@ pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> 
             let flag = char::from(flag);
             return Some(ExitFailure::new(
                 1,
-                format!("rmux: unknown option -- {flag}\n{RMUX_USAGE}"),
+                format!("kmux: unknown option -- {flag}\n{RMUX_USAGE}"),
             ));
         }
         if short_option_consumes_next_argument(&bytes) {

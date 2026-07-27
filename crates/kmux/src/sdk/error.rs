@@ -15,7 +15,7 @@ use crate::sdk::{PaneId, SessionName};
 
 const PROTOCOL_HINT: &str =
     "check the request and daemon state, then retry after correcting the request";
-const TRANSPORT_HINT: &str = "verify the rmux daemon is running and the endpoint is reachable";
+const TRANSPORT_HINT: &str = "verify the kmux daemon is running and the endpoint is reachable";
 
 /// SDK facade error type for daemon-backed operations.
 ///
@@ -130,7 +130,7 @@ impl RmuxError {
             } => Self::unsupported(
                 diagnostics::FEATURE_PROTOCOL_WIRE_VERSION,
                 format!(
-                    "upgrade the rmux daemon or use an SDK that supports wire version {got} \
+                    "upgrade the kmux daemon or use an SDK that supports wire version {got} \
                      (supported range {minimum}..={maximum})"
                 ),
             ),
@@ -143,7 +143,7 @@ impl RmuxError {
                 Self::unsupported(
                     feature,
                     format!(
-                        "upgrade the rmux daemon or use a command advertised by the negotiated \
+                        "upgrade the kmux daemon or use a command advertised by the negotiated \
                          command inventory before sending `{command}`"
                     ),
                 )
@@ -276,7 +276,7 @@ impl From<crate::proto::ErrorResponse> for RmuxError {
 
 impl From<io::Error> for RmuxError {
     fn from(error: io::Error) -> Self {
-        Self::transport("communicate with rmux daemon", error)
+        Self::transport("communicate with kmux daemon", error)
     }
 }
 
@@ -384,13 +384,13 @@ impl fmt::Display for RmuxError {
             Self::Protocol { source } => {
                 write!(
                     formatter,
-                    "rmux protocol error: {source}\nhint: {PROTOCOL_HINT}"
+                    "kmux protocol error: {source}\nhint: {PROTOCOL_HINT}"
                 )
             }
             Self::Transport { operation, source } => {
                 write!(
                     formatter,
-                    "rmux transport error while {operation}: {source}\nhint: {TRANSPORT_HINT}"
+                    "kmux transport error while {operation}: {source}\nhint: {TRANSPORT_HINT}"
                 )
             }
             Self::Collect { source } => source.fmt(formatter),

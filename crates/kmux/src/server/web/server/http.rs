@@ -21,7 +21,7 @@ pub(super) async fn read_http_request(stream: &mut TcpStream) -> io::Result<Http
         if buffer.len() > HTTP_READ_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "HTTP request headers exceed rmux web limit",
+                "HTTP request headers exceed kmux web limit",
             ));
         }
         if buffer.windows(4).any(|window| window == b"\r\n\r\n") {

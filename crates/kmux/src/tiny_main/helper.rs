@@ -40,7 +40,7 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
         }
         let error = command.exec();
         Err(format!(
-            "failed to exec private rmux helper '{}': {error}",
+            "failed to exec private kmux helper '{}': {error}",
             helper.display()
         ))
     }
@@ -52,7 +52,7 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
         }
         let status = command.status().map_err(|error| {
             format!(
-                "failed to run private rmux helper '{}': {error}",
+                "failed to run private kmux helper '{}': {error}",
                 helper.display()
             )
         })?;
@@ -70,7 +70,7 @@ fn run_full_helper_with_piped_output(mut command: Command) -> Result<i32, String
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
         format!(
-            "failed to run private rmux helper '{}': {error}",
+            "failed to run private kmux helper '{}': {error}",
             command.get_program().to_string_lossy()
         )
     })?;
@@ -116,7 +116,7 @@ where
 fn join_output_thread(thread: thread::JoinHandle<io::Result<()>>) -> Result<(), String> {
     thread
         .join()
-        .map_err(|_| "private rmux helper output thread panicked".to_owned())?
+        .map_err(|_| "private kmux helper output thread panicked".to_owned())?
         .map_err(|error| error.to_string())
 }
 
@@ -150,7 +150,7 @@ pub(super) fn full_helper_path() -> Result<PathBuf, String> {
         return Ok(path);
     }
 
-    Err("private rmux helper not found under libexec/rmux; rebuild or reinstall rmux".to_owned())
+    Err("private kmux helper not found under libexec/kmux; rebuild or reinstall kmux".to_owned())
 }
 
 #[cfg(not(windows))]

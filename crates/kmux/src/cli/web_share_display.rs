@@ -82,7 +82,7 @@ fn render_created_share_with_style(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                " RMUX web-share ",
+                " KMUX web-share ",
                 Style::default().fg(Color::Black).bg(Color::LightGreen),
             ));
         frame.render_widget(outer, area);
@@ -449,7 +449,7 @@ fn plain_url_capacity(width: u16, cards: &[ShareCard<'_>], link_mode: LinkMode) 
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, created: &WebShareCreatedResponse) {
-    let stop_command = format!("rmux web-share stop {}", created.share_id);
+    let stop_command = format!("kmux web-share stop {}", created.share_id);
     let frontend = frontend_label(created);
     let text = if area.width < 100 {
         Text::from(vec![
@@ -586,7 +586,7 @@ fn fallback_output(created: &WebShareCreatedResponse) -> String {
 }
 
 fn too_narrow_output(created: &WebShareCreatedResponse, width: u16) -> String {
-    let mut output = format!("RMUX web-share\n\nterminal too narrow ({width} cols)\n\n");
+    let mut output = format!("KMUX web-share\n\nterminal too narrow ({width} cols)\n\n");
     output.push_str(&fallback_output(created));
     output
 }

@@ -549,12 +549,12 @@ impl fmt::Display for AutoStartError {
         match self {
             Self::Client(error) => write!(formatter, "{error}"),
             Self::BinaryPath(error) => {
-                write!(formatter, "failed to resolve rmux binary path: {error}")
+                write!(formatter, "failed to resolve kmux binary path: {error}")
             }
             Self::Launch { path, error } => {
                 write!(
                     formatter,
-                    "failed to launch hidden rmux daemon '{}': {error}",
+                    "failed to launch hidden kmux daemon '{}': {error}",
                     path.display()
                 )
             }
@@ -563,7 +563,7 @@ impl fmt::Display for AutoStartError {
                 message,
             } => write!(
                 formatter,
-                "rmux: {message} on '{}'.\nrmux: run `{}` to stop it, then retry.",
+                "kmux: {message} on '{}'.\nkmux: run `{}` to stop it, then retry.",
                 socket_path.display(),
                 incompatible_daemon_kill_server_command(socket_path)
             ),
@@ -572,7 +572,7 @@ impl fmt::Display for AutoStartError {
                 waited,
             } => write!(
                 formatter,
-                "timed out after {}s waiting for rmux server socket '{}'. \
+                "timed out after {}s waiting for kmux server socket '{}'. \
                  The hidden daemon may have exited before creating the socket; run `{}` to surface startup errors.",
                 waited.as_secs(),
                 socket_path.display(),
@@ -712,10 +712,10 @@ fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
         .as_deref()
         .is_some_and(|default_path| default_path == socket_path)
     {
-        return "rmux kill-server".to_owned();
+        return "kmux kill-server".to_owned();
     }
 
-    format!("rmux -S {} kill-server", shell_quote_path(socket_path))
+    format!("kmux -S {} kill-server", shell_quote_path(socket_path))
 }
 
 fn diagnostic_start_server_command(socket_path: &Path) -> String {
@@ -724,10 +724,10 @@ fn diagnostic_start_server_command(socket_path: &Path) -> String {
         .as_deref()
         .is_some_and(|default_path| default_path == socket_path)
     {
-        return "rmux start-server".to_owned();
+        return "kmux start-server".to_owned();
     }
 
-    format!("rmux -S {} start-server", shell_quote_path(socket_path))
+    format!("kmux -S {} start-server", shell_quote_path(socket_path))
 }
 
 fn probe_server_readiness(connection: &mut Connection) -> Result<(), ClientError> {

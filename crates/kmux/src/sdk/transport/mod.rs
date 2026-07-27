@@ -23,7 +23,7 @@ use state::{allocate_bounded_atomic_id, mix_sdk_wait_owner_id};
 
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 const READ_BUFFER_SIZE: usize = 8192;
-const TRANSPORT_SHUTDOWN_OPERATION: &str = "shut down rmux SDK transport";
+const TRANSPORT_SHUTDOWN_OPERATION: &str = "shut down kmux SDK transport";
 
 #[derive(Clone)]
 pub(crate) struct TransportClient {
@@ -502,7 +502,7 @@ fn fail_transport(
 
 fn request_operation(request: &Request) -> String {
     format!(
-        "complete `{}` request/response exchange with rmux daemon",
+        "complete `{}` request/response exchange with kmux daemon",
         request.command_name()
     )
 }

@@ -405,7 +405,7 @@ fn subscription_mismatch_error(
     got: PaneOutputSubscriptionId,
 ) -> RmuxError {
     RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-        "rmux daemon sent subscription id {} in `{command}` response for subscription {}",
+        "kmux daemon sent subscription id {} in `{command}` response for subscription {}",
         got.as_u64(),
         expected.as_u64()
     )))

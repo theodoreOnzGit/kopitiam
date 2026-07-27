@@ -151,7 +151,7 @@ impl PendingCall {
         if !response.is_armed_ack_for(expected_wait_id) {
             if !response.removed {
                 return Err(TransportFailure::invalid_data(format!(
-                    "rmux daemon sent SDK wait armed ack id {} for pending wait id {}",
+                    "kmux daemon sent SDK wait armed ack id {} for pending wait id {}",
                     response.wait_id.as_u64(),
                     expected_wait_id.as_u64()
                 )));

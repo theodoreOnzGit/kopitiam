@@ -438,7 +438,7 @@ fn probe_connected_server_reports_incompatible_wire_version() {
     assert!(matches!(error, AutoStartError::IncompatibleDaemon { .. }));
     let message = error.to_string();
     assert!(message.contains("running daemon from an older release uses incompatible protocol 1"));
-    assert!(message.contains("rmux -S /tmp/rmux-probe-wire-v1.sock kill-server"));
+    assert!(message.contains("kmux -S /tmp/rmux-probe-wire-v1.sock kill-server"));
     server_thread
         .join()
         .expect("probe server thread should exit");
@@ -450,7 +450,7 @@ fn incompatible_daemon_command_is_simple_for_default_socket() {
 
     assert_eq!(
         incompatible_daemon_kill_server_command(&default_socket),
-        "rmux kill-server"
+        "kmux kill-server"
     );
 }
 
@@ -458,7 +458,7 @@ fn incompatible_daemon_command_is_simple_for_default_socket() {
 fn incompatible_daemon_command_targets_non_default_socket() {
     assert_eq!(
         incompatible_daemon_kill_server_command(Path::new("/tmp/rmux-custom/default")),
-        "rmux -S /tmp/rmux-custom/default kill-server"
+        "kmux -S /tmp/rmux-custom/default kill-server"
     );
 }
 

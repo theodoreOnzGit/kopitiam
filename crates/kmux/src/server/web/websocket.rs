@@ -225,7 +225,7 @@ async fn read_frame_without_timeout(
     if len > CLIENT_FRAME_LIMIT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "websocket frame exceeds rmux web limit",
+            "websocket frame exceeds kmux web limit",
         ));
     }
     if opcode == OPCODE_CLOSE && len == 1 {

@@ -116,7 +116,7 @@ impl TraceSession {
             .collect::<::core::result::Result<Vec<_>, _>>()
             .map_err(|error| {
                 RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-                    "failed to encode rmux trace event: {error}"
+                    "failed to encode kmux trace event: {error}"
                 )))
             })?
             .join("\n");
@@ -174,11 +174,11 @@ fn timestamp_ms() -> u128 {
 }
 
 fn trace_io_error(error: std::io::Error) -> RmuxError {
-    RmuxError::transport("write rmux trace", error)
+    RmuxError::transport("write kmux trace", error)
 }
 
 fn lock_error<T>(error: std::sync::PoisonError<T>) -> RmuxError {
     RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-        "rmux trace lock poisoned: {error}"
+        "kmux trace lock poisoned: {error}"
     )))
 }

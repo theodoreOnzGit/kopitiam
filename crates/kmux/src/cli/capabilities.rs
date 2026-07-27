@@ -100,13 +100,13 @@ fn parse_capabilities_format(arguments: &[OsString]) -> Result<CapabilitiesForma
             Some(other) => {
                 return Err(ExitFailure::new(
                     1,
-                    format!("rmux capabilities: unknown argument '{other}'"),
+                    format!("kmux capabilities: unknown argument '{other}'"),
                 ));
             }
             None => {
                 return Err(ExitFailure::new(
                     1,
-                    "rmux capabilities: arguments must be valid UTF-8",
+                    "kmux capabilities: arguments must be valid UTF-8",
                 ));
             }
         }
@@ -122,7 +122,7 @@ fn set_format(
     if current.is_some_and(|current| current != next) {
         return Err(ExitFailure::new(
             1,
-            "rmux capabilities: choose only one of --human or --json",
+            "kmux capabilities: choose only one of --human or --json",
         ));
     }
     *current = Some(next);
@@ -131,7 +131,7 @@ fn set_format(
 
 fn render_human() -> String {
     let mut output = String::new();
-    output.push_str("rmux capabilities\n");
+    output.push_str("kmux capabilities\n");
     output.push_str(&format!("version: {}\n", env!("CARGO_PKG_VERSION")));
     output.push_str(&format!(
         "binary_contract_version: {BINARY_CONTRACT_VERSION}\n"

@@ -383,7 +383,7 @@ fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
     if args.web_port.is_some() || args.web_frontend.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "rmux was built without web-share support",
+            "kmux was built without web-share support",
         ));
     }
 

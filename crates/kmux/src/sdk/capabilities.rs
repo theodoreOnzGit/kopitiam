@@ -66,7 +66,7 @@ async fn negotiated_capabilities_requiring(
         }
         Response::Error(error) => Err(error.into()),
         response => Err(RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-            "rmux daemon sent `{}` response for capability handshake",
+            "kmux daemon sent `{}` response for capability handshake",
             response.command_name()
         )))),
     }
@@ -125,7 +125,7 @@ fn unsupported_handshake_error(detail: &str) -> RmuxError {
     RmuxError::unsupported(
         FEATURE_PROTOCOL_CAPABILITIES,
         format!(
-            "upgrade the rmux daemon to one that advertises `{CAPABILITY_HANDSHAKE}` before using SDK capability negotiation; {detail}"
+            "upgrade the kmux daemon to one that advertises `{CAPABILITY_HANDSHAKE}` before using SDK capability negotiation; {detail}"
         ),
     )
 }

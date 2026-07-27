@@ -442,7 +442,7 @@ pub(super) fn prepare_socket_path_safe(
                     path: socket_path.to_path_buf(),
                     source: io::Error::new(
                         io::ErrorKind::AddrInUse,
-                        "another rmux daemon is already answering this endpoint",
+                        "another kmux daemon is already answering this endpoint",
                     ),
                 });
             }

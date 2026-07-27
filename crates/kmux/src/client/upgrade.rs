@@ -101,10 +101,10 @@ pub(crate) fn warn_stale_active_daemon(stale: &StaleDaemon, socket_path: &Path) 
         .as_deref()
         .unwrap_or("an older release");
     let client_version = client_version();
-    eprintln!("rmux: daemon is {daemon}, client is v{client_version}.");
-    eprintln!("rmux: Existing sessions or clients are still running on the old daemon.");
+    eprintln!("kmux: daemon is {daemon}, client is v{client_version}.");
+    eprintln!("kmux: Existing sessions or clients are still running on the old daemon.");
     eprintln!(
-        "rmux: Run `{}` when you are ready to restart them with v{client_version}.",
+        "kmux: Run `{}` when you are ready to restart them with v{client_version}.",
         kill_server_command(socket_path)
     );
 }
@@ -229,7 +229,7 @@ fn is_unsupported_wire_version(error: &ClientError) -> bool {
 }
 
 fn kill_server_command(socket_path: &Path) -> String {
-    format!("rmux -S {} kill-server", shell_quote_path(socket_path))
+    format!("kmux -S {} kill-server", shell_quote_path(socket_path))
 }
 
 #[cfg(test)]

@@ -15,5 +15,5 @@ fn trace(kind: &str, detail: &str) {
     if env::var_os(TINY_TRACE_ENV).is_none() {
         return;
     }
-    let _ = writeln!(io::stderr().lock(), "rmux tiny: {kind}: {detail}");
+    let _ = writeln!(io::stderr().lock(), "kmux tiny: {kind}: {detail}");
 }
