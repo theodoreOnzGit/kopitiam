@@ -248,11 +248,42 @@ fn resolve_path(store: &ModelStore, spec: &ModelSpec, byo_path: Option<PathBuf>)
 /// The caller should print [`SelectedAdapter::notice`] so the user knows
 /// which rung of the Offline-First pipeline actually answered.
 pub fn select_adapter() -> SelectedAdapter {
+    select_adapter_for(&configured_model_id())
+}
+
+/// The catalog id the environment asks for: `KOPITIAM_MODEL` if set and
+/// non-empty, else [`DEFAULT_MODEL_ID`].
+///
+/// Split out so a caller that wants to *offer a choice* (the TUI's model picker)
+/// can show what the default would be without having to re-implement the
+/// precedence rule and drift from it.
+pub fn configured_model_id() -> String {
+    std::env::var(MODEL_ID_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string())
+}
+
+/// Like [`select_adapter`], but for an **explicitly chosen** catalog id rather
+/// than whatever the environment says.
+///
+/// # Why this exists
+///
+/// `select_adapter` reads the model id from the environment, which is fine for
+/// a one-shot CLI process but wrong for a long-lived UI: the TUI can pull *any*
+/// catalog model, yet chat would only ever look for the env/default id. Pull the
+/// 1.7B and chat still reports "no .gguf yet" while the file sits on disk —
+/// the model is there, nothing is looking at it.
+///
+/// A caller holding a user's chosen id passes it here. `KOPITIAM_MODEL_GGUF`
+/// (bring-your-own explicit path) still wins over the catalog id, exactly as it
+/// does for `select_adapter`, because an explicit path is the most specific
+/// thing the user can say.
+pub fn select_adapter_for(model_id: &str) -> SelectedAdapter {
     let byo_path = std::env::var_os(MODEL_PATH_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
-    let model_id =
-        std::env::var(MODEL_ID_ENV).unwrap_or_else(|_| DEFAULT_MODEL_ID.to_string());
+    let model_id = model_id.to_string();
 
     // If the store root can't even be resolved (no HOME / XDG_CACHE_HOME) and
     // there's no BYO path either, there is nowhere to look — that's just the
