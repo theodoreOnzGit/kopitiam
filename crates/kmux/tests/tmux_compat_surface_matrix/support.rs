@@ -342,7 +342,7 @@ pub(super) fn spawn_rmux_attached_client_with(
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("TERM", "xterm-256color")
-        .env_remove("RMUX");
+        .env_remove("KMUX");
     for (name, value) in environment {
         command.env(name, value);
     }
@@ -402,7 +402,7 @@ pub(super) fn spawn_rmux_attached_input_client(
         .env("TERM", "xterm-256color")
         .env("LC_ALL", "C.UTF-8")
         .env("LC_CTYPE", "C.UTF-8")
-        .env_remove("RMUX")
+        .env_remove("KMUX")
         .args(["attach-session", "-t", session_name]);
     PtyAttachedClient::spawn(command)
 }
@@ -853,7 +853,7 @@ pub(super) fn run_rmux_control_mode_with(
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("TERM", "xterm-256color")
-        .env_remove("RMUX");
+        .env_remove("KMUX");
     for (name, value) in environment {
         command.env(name, value);
     }

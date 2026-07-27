@@ -54,7 +54,14 @@ const INTERNAL_VIEWER_COMMAND: &str = "__latex-view";
 /// Environment variables that would make a nested `kmux` refuse to build or
 /// attach a session. Cleared before every child `kmux` invocation, mirroring
 /// `cli/claude_launcher.rs`.
-const OUTER_MUX_ENV: &[&str] = &["RMUX", "TMUX", "RMUX_PANE", "TMUX_PANE"];
+const OUTER_MUX_ENV: &[&str] = &[
+    "KMUX",
+    "TMUX",
+    "KMUX_PANE",
+    "TMUX_PANE",
+    "RMUX",
+    "RMUX_PANE",
+];
 
 /// How often the watcher samples the `.tex` file's modification time.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);

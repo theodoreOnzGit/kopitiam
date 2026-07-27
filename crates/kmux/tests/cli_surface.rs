@@ -1581,8 +1581,8 @@ fn foreign_socket_pane_hint_is_ignored_for_nested_targets() -> Result<(), Box<dy
     let output = harness.run_with(
         &["-S", &socket, "split-window", "-d", "sleep 30"],
         |command| {
-            command.env("RMUX", &foreign_rmux);
-            command.env("RMUX_PANE", "%0");
+            command.env("KMUX", &foreign_rmux);
+            command.env("KMUX_PANE", "%0");
             command.env("TMUX_PANE", "%0");
         },
     )?;
@@ -1925,7 +1925,7 @@ fn rmux_environment_default_socket_is_used_when_no_socket_flag_is_given(
     let rmux_env = format!("{},1,0", harness.socket_path().display());
 
     let output = harness.run_with(&["has-session", "-t", "alpha"], |command| {
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
 
     assert_success(&output);
@@ -1941,7 +1941,7 @@ fn rmux_environment_socket_is_used_when_no_socket_flag_is_given() -> Result<(), 
     let rmux_env = format!("{},1,0", rmux_socket.display());
 
     let output = harness.run_with(&["has-session", "-t", "alpha"], |command| {
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
 
     assert_eq!(output.status.code(), Some(1));
@@ -1975,7 +1975,7 @@ fn socket_path_flag_overrides_socket_name_and_rmux_environment() -> Result<(), B
             "alpha",
         ],
         |command| {
-            command.env("RMUX", &rmux_env);
+            command.env("KMUX", &rmux_env);
         },
     )?;
 
@@ -2117,7 +2117,7 @@ fn attach_session_inside_tmux_uses_switch_client_semantics() -> Result<(), Box<d
 
     let rmux_env = format!("{},1,0", harness.socket_path().display());
     let output = harness.run_with(&["attach-session", "-t", "alpha"], |command| {
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
 
     assert_eq!(output.status.code(), Some(1));
@@ -2147,7 +2147,7 @@ fn nested_attach_session_with_different_socket_name_uses_requested_server(
     let output = harness.run_with(
         &["-L", "other", "attach-session", "-t", "beta"],
         |command| {
-            command.env("RMUX", &rmux_env);
+            command.env("KMUX", &rmux_env);
             command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
         },
     )?;
@@ -2196,7 +2196,7 @@ fn attach_session_inside_tmux_rejects_unavailable_attach_only_flags_before_conne
         (&["attach-session"][..], "requires -t"),
     ] {
         let output = harness.run_with(args, |command| {
-            command.env("RMUX", &rmux_env);
+            command.env("KMUX", &rmux_env);
         })?;
 
         assert_eq!(output.status.code(), Some(1));
@@ -2233,7 +2233,7 @@ fn switch_client_can_control_the_sole_active_attach_from_another_process(
 
     let rmux_env = format!("{},1,0", harness.socket_path().display());
     let switched = harness.run_with(&["switch-client", "-t", "beta"], |command| {
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
     assert_success(&switched);
 
@@ -2281,7 +2281,7 @@ fn new_session_without_detach_creates_then_attempts_nested_switch() -> Result<()
 
     let rmux_env = format!("{},1,0", harness.socket_path().display());
     let output = harness.run_with(&["new-session", "-s", "alpha"], |command| {
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
 
     assert_eq!(output.status.code(), Some(1));
@@ -2517,7 +2517,7 @@ fn command_free_invocation_routes_to_default_new_session() -> Result<(), Box<dyn
     let rmux_env = format!("{},1,0", harness.socket_path().display());
 
     let output = harness.run_with(&[], |command| {
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
 
     assert_eq!(output.status.code(), Some(1));
@@ -2534,7 +2534,7 @@ fn command_free_invocation_auto_starts_default_new_session() -> Result<(), Box<d
 
     let output = harness.run_with(&[], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
-        command.env("RMUX", &rmux_env);
+        command.env("KMUX", &rmux_env);
     })?;
 
     assert_eq!(output.status.code(), Some(1));

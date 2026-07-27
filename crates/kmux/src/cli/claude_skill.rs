@@ -206,9 +206,9 @@ fn backup_path_candidates(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
             .and_then(|name| name.to_str())
             .unwrap_or("SKILL.md");
         let suffix = if index == 0 {
-            "rmux-backup".to_owned()
+            "kmux-backup".to_owned()
         } else {
-            format!("rmux-backup.{index}")
+            format!("kmux-backup.{index}")
         };
         path.with_file_name(format!("{file_name}.{suffix}"))
     })

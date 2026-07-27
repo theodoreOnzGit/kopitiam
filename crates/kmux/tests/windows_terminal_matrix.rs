@@ -314,7 +314,7 @@ fn apply_profile_env_to_command(command: &mut Command, profile: TerminalProfile)
         .env("LC_ALL", "C")
         .env("LC_CTYPE", "")
         .env("LANG", "")
-        .env_remove("RMUX")
+        .env_remove("KMUX")
         .env_remove("TMUX");
 }
 
@@ -330,7 +330,7 @@ fn apply_inherited_env_without_multiplexer_markers(mut command: ChildCommand) ->
 }
 
 fn is_multiplexer_env_name(name: &OsStr) -> bool {
-    env_name_eq_ignore_ascii_case(name, "RMUX") || env_name_eq_ignore_ascii_case(name, "TMUX")
+    env_name_eq_ignore_ascii_case(name, "KMUX") || env_name_eq_ignore_ascii_case(name, "TMUX")
 }
 
 fn env_name_eq_ignore_ascii_case(name: &OsStr, expected: &str) -> bool {
@@ -450,7 +450,7 @@ impl Drop for RmuxServerGuard<'_> {
             .arg("-L")
             .arg(&self.label)
             .arg("kill-server")
-            .env_remove("RMUX")
+            .env_remove("KMUX")
             .env_remove("TMUX")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -487,7 +487,7 @@ fn run_rmux_output<const N: usize>(
         .arg(label)
         .args(args)
         .env("LC_ALL", "C")
-        .env_remove("RMUX")
+        .env_remove("KMUX")
         .env_remove("TMUX")
         .output()?)
 }
@@ -539,7 +539,7 @@ struct MultiplexerEnvGuard {
 impl MultiplexerEnvGuard {
     fn with_fake_outer() -> Self {
         Self {
-            _rmux: EnvVarGuard::set("RMUX", INHERITED_RMUX),
+            _rmux: EnvVarGuard::set("KMUX", INHERITED_RMUX),
             _tmux: EnvVarGuard::set("TMUX", INHERITED_TMUX),
         }
     }

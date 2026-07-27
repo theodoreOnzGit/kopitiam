@@ -131,7 +131,7 @@ where
 
 fn shared_startup_lock_dir(parent: &Path, owner_uid: u32) -> PathBuf {
     parent
-        .join(format!("rmux-{owner_uid}"))
+        .join(format!("kmux-{owner_uid}"))
         .join("startup-locks")
 }
 
@@ -175,7 +175,7 @@ fn is_default_owner_socket_directory(parent: &Path, owner_uid: u32) -> bool {
     parent
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == format!("rmux-{owner_uid}"))
+        .is_some_and(|name| name == format!("kmux-{owner_uid}"))
 }
 
 fn startup_lock_path_in_dir(socket_path: &Path, lock_dir: &Path) -> PathBuf {

@@ -63,7 +63,7 @@ impl CrossPlatformHarness {
         command.env("XDG_CONFIG_HOME", self.tmpdir.join("xdg"));
         command.env("RMUX_TMPDIR", &self.tmpdir);
         command.env("RMUX_DISABLE_TMUX_FALLBACK", "1");
-        command.env_remove("RMUX");
+        command.env_remove("KMUX");
         command.env_remove("TMUX");
         command.env_remove("RMUX_INTERNAL_BINARY_PATH");
         Ok(command.output()?)

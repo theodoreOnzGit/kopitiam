@@ -38,17 +38,24 @@ const AGENT_TEAMS_ENV: &str = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS";
 const DISABLE_TMUX_SHIM_ENV: &str = "RMUX_DISABLE_TMUX_SHIM";
 #[cfg(any(unix, windows))]
 const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
-const CLAUDE_MAIN_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_MAIN_SOCKET";
-const CLAUDE_SWARM_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_SWARM_SOCKET";
+const CLAUDE_MAIN_SOCKET_ENV: &str = "KMUX_INTERNAL_CLAUDE_MAIN_SOCKET";
+const CLAUDE_SWARM_SOCKET_ENV: &str = "KMUX_INTERNAL_CLAUDE_SWARM_SOCKET";
 #[cfg(windows)]
 const CLAUDE_GIT_BASH_PATH_ENV: &str = "CLAUDE_CODE_GIT_BASH_PATH";
 #[cfg(any(unix, windows))]
 const DIRECT_LAUNCH_ENV: &str = "RMUX_CLAUDE_DIRECT";
 #[cfg(any(unix, windows))]
-const OUTER_MUX_ENV: &[&str] = &["RMUX", "TMUX", "RMUX_PANE", "TMUX_PANE"];
-const INTERNAL_RUNNER_COMMAND: &str = "__rmux-internal-claude-runner";
+const OUTER_MUX_ENV: &[&str] = &[
+    "KMUX",
+    "TMUX",
+    "KMUX_PANE",
+    "TMUX_PANE",
+    "RMUX",
+    "RMUX_PANE",
+];
+const INTERNAL_RUNNER_COMMAND: &str = "__kmux-internal-claude-runner";
 #[cfg(any(unix, windows))]
-const MAIN_SESSION: &str = "rmux-claude";
+const MAIN_SESSION: &str = "kmux-claude";
 #[cfg(any(unix, windows))]
 const MAIN_WINDOW: &str = "claude";
 #[cfg(any(unix, windows))]
@@ -134,7 +141,7 @@ fn prepare_claude_leader_environment_impl(
             format!("kmux claude: failed to resolve private tmux socket: {error}"),
         )
     })?;
-    let pane = env::var_os("RMUX_PANE")
+    let pane = env::var_os("KMUX_PANE")
         .or_else(|| env::var_os("TMUX_PANE"))
         .unwrap_or_else(|| OsString::from("%0"));
     command
@@ -310,12 +317,12 @@ fn run_attached(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
             format!("kmux claude: failed to resolve current kmux binary: {error}"),
         )
     })?;
-    let runtime_dir = create_runtime_dir("rmux-claude")?;
+    let runtime_dir = create_runtime_dir("kmux-claude")?;
     let main_socket = runtime_dir
         .file_name()
         .and_then(OsStr::to_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("rmux-claude-{}", process::id()));
+        .unwrap_or_else(|| format!("kmux-claude-{}", process::id()));
     let pid_file = runtime_dir.join("claude.pid");
 
     #[cfg(windows)]
@@ -984,7 +991,7 @@ fn install_windows_tmux_shim_in_dir(
     match install_windows_tmux_shim(source, &shim) {
         Ok(()) => Ok(PrivateTmuxShim::persistent(dir)),
         Err(primary_error) => {
-            let fallback_dir = create_windows_temporary_dir("rmux-claude-shim")?;
+            let fallback_dir = create_windows_temporary_dir("kmux-claude-shim")?;
             let fallback_shim = fallback_dir.join(tmux_file_name());
             install_windows_tmux_shim(source, &fallback_shim).map_err(|fallback_error| {
                 let _ = fs::remove_dir_all(&fallback_dir);
@@ -1113,8 +1120,8 @@ fn cleanup_stale_windows_claude_temp_dirs_with_root(root: &Path) {
 #[cfg(windows)]
 fn stale_windows_claude_temp_dir_pid(name: &str) -> Option<u32> {
     let rest = name
-        .strip_prefix("rmux-claude-shim-")
-        .or_else(|| name.strip_prefix("rmux-claude-"))?;
+        .strip_prefix("kmux-claude-shim-")
+        .or_else(|| name.strip_prefix("kmux-claude-"))?;
     let pid = rest.split('-').next()?;
     (!pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| pid.parse().ok())
@@ -1670,8 +1677,8 @@ mod tests {
     fn windows_claude_temp_cleanup_removes_dead_pid_dirs_only() {
         let root = unique_test_dir("claude-cleanup");
         fs::create_dir_all(&root).expect("test root");
-        let dead = root.join("rmux-claude-999999-abc-0");
-        let live = root.join(format!("rmux-claude-{}-abc-0", std::process::id()));
+        let dead = root.join("kmux-claude-999999-abc-0");
+        let live = root.join(format!("kmux-claude-{}-abc-0", std::process::id()));
         fs::create_dir_all(&dead).expect("dead dir");
         fs::create_dir_all(&live).expect("live dir");
 
@@ -1686,14 +1693,14 @@ mod tests {
     #[test]
     fn stale_windows_claude_temp_dir_pid_parses_known_prefixes() {
         assert_eq!(
-            stale_windows_claude_temp_dir_pid("rmux-claude-123-a-0"),
+            stale_windows_claude_temp_dir_pid("kmux-claude-123-a-0"),
             Some(123)
         );
         assert_eq!(
-            stale_windows_claude_temp_dir_pid("rmux-claude-shim-456-a-0"),
+            stale_windows_claude_temp_dir_pid("kmux-claude-shim-456-a-0"),
             Some(456)
         );
-        assert_eq!(stale_windows_claude_temp_dir_pid("rmux-claude-x-a-0"), None);
+        assert_eq!(stale_windows_claude_temp_dir_pid("kmux-claude-x-a-0"), None);
     }
 
     #[cfg(windows)]
@@ -1714,7 +1721,7 @@ mod tests {
     #[cfg(windows)]
     fn unique_test_dir(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
-            "rmux-claude-launcher-{label}-{}",
+            "kmux-claude-launcher-{label}-{}",
             std::process::id()
         ))
     }
@@ -1722,7 +1729,7 @@ mod tests {
     #[cfg(unix)]
     fn unique_test_dir(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
-            "rmux-claude-launcher-{label}-{}",
+            "kmux-claude-launcher-{label}-{}",
             std::process::id()
         ))
     }

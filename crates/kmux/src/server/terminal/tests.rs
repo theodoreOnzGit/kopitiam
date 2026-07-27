@@ -142,14 +142,14 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
     let socket_path = temp_socket_path();
     let expected_rmux = expected_mux_env(&socket_path, 7);
     assert_eq!(
-        profile.environment_value("RMUX"),
+        profile.environment_value("KMUX"),
         Some(expected_rmux.as_str())
     );
     assert_eq!(
         profile.environment_value("TMUX"),
         Some(expected_rmux.as_str())
     );
-    assert_eq!(profile.environment_value("RMUX_PANE"), Some("%3"));
+    assert_eq!(profile.environment_value("KMUX_PANE"), Some("%3"));
     assert_eq!(profile.environment_value("TMUX_PANE"), Some("%3"));
     assert_eq!(profile.environment_value("FOO"), Some("bar"));
     let expected_cwd = std::env::temp_dir();
@@ -353,7 +353,7 @@ fn run_shell_profile_exports_tmux_env_for_plugin_children() {
     .expect("detached run-shell profile");
     let expected_detached = expected_mux_env(&socket_path, 0);
     assert_eq!(
-        detached_profile.environment_value("RMUX"),
+        detached_profile.environment_value("KMUX"),
         Some(expected_detached.as_str())
     );
     assert_eq!(
@@ -374,7 +374,7 @@ fn run_shell_profile_exports_tmux_env_for_plugin_children() {
     .expect("targeted run-shell profile");
     let expected_targeted = expected_mux_env(&socket_path, 7);
     assert_eq!(
-        targeted_profile.environment_value("RMUX"),
+        targeted_profile.environment_value("KMUX"),
         Some(expected_targeted.as_str())
     );
     assert_eq!(
@@ -404,7 +404,7 @@ fn run_shell_profile_exports_absolute_mux_env_for_relative_socket() -> Result<()
     let expected_rmux = expected_mux_env(socket_path.as_path(), 0);
 
     assert_eq!(
-        profile.environment_value("RMUX"),
+        profile.environment_value("KMUX"),
         Some(expected_rmux.as_str())
     );
     assert_eq!(
@@ -428,9 +428,9 @@ fn run_shell_profile_replaces_reserved_names_case_insensitively() {
             ("term", "legacy-term"),
             ("term_program", "legacy-program"),
             ("term_program_version", "legacy-version"),
-            ("rmux", "legacy-rmux"),
+            ("kmux", "legacy-kmux"),
             ("tmux", "legacy-tmux"),
-            ("rmux_pane", "%old"),
+            ("kmux_pane", "%old"),
             ("tmux_pane", "%old"),
         ]
         .into_iter()
@@ -468,23 +468,23 @@ fn run_shell_profile_replaces_reserved_names_case_insensitively() {
         Some(env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
-        profile.environment_value("RMUX"),
+        profile.environment_value("KMUX"),
         Some(expected_tmux.as_str())
     );
     assert_eq!(
         profile.environment_value("TMUX"),
         Some(expected_tmux.as_str())
     );
-    assert_eq!(profile.environment_value("RMUX_PANE"), None);
+    assert_eq!(profile.environment_value("KMUX_PANE"), None);
     assert_eq!(profile.environment_value("TMUX_PANE"), None);
 
     for name in [
         "term",
         "term_program",
         "term_program_version",
-        "rmux",
+        "kmux",
         "tmux",
-        "rmux_pane",
+        "kmux_pane",
         "tmux_pane",
     ] {
         assert!(

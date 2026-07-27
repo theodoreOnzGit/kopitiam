@@ -151,12 +151,12 @@ fn requester_environment_context_from_map(
         return RequesterEnvironmentContext::default();
     }
     let pane_id = environment
-        .get("RMUX_PANE")
+        .get("KMUX_PANE")
         .or_else(|| environment.get("TMUX_PANE"))
         .and_then(|pane| pane.strip_prefix('%'))
         .and_then(|pane| pane.parse::<u32>().ok());
     let source_depth = environment
-        .get("RMUX_SOURCE_DEPTH")
+        .get("KMUX_SOURCE_DEPTH")
         .and_then(|depth| depth.parse::<usize>().ok());
     RequesterEnvironmentContext {
         pane_id,
@@ -179,7 +179,7 @@ fn environment_rmux_socket_matches(
     environment: &HashMap<String, String>,
     server_socket_path: &Path,
 ) -> bool {
-    let Some(value) = environment.get("RMUX") else {
+    let Some(value) = environment.get("KMUX") else {
         return false;
     };
     let Some(inherited_socket) = rmux_socket_path_from_env(value) else {
@@ -436,11 +436,11 @@ mod tests {
         ));
         let mut environment = HashMap::new();
         environment.insert(
-            "RMUX".to_owned(),
+            "KMUX".to_owned(),
             format!("{},123,0", socket_path.display()),
         );
-        environment.insert("RMUX_PANE".to_owned(), "%42".to_owned());
-        environment.insert("RMUX_SOURCE_DEPTH".to_owned(), "3".to_owned());
+        environment.insert("KMUX_PANE".to_owned(), "%42".to_owned());
+        environment.insert("KMUX_SOURCE_DEPTH".to_owned(), "3".to_owned());
 
         assert_eq!(
             requester_environment_context_from_map(&environment, &socket_path),

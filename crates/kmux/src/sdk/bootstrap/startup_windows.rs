@@ -7,7 +7,7 @@
 //! owns that check, layered on top of the existing `rmux-ipc` Windows pipe
 //! contract:
 //!
-//! * Endpoint names stay `\\.\pipe\rmux-{SID}-il-{integrity}-{label}`. This
+//! * Endpoint names stay `\\.\pipe\kmux-{SID}-il-{integrity}-{label}`. This
 //!   module never invents new pipe names.
 //! * The same `IdentityResolver`/SID values that scope the pipe ACL also
 //!   scope the mutex's discretionary ACL, so a peer running under a
@@ -56,10 +56,10 @@ use name::{startup_mutex_name, validate_pipe_name};
 use probe::{probe_blocking, probe_responsive, wait_for_daemon, wait_for_daemon_blocking};
 
 const PIPE_PREFIX: &str = r"\\.\pipe\";
-const STARTUP_MUTEX_PREFIX: &str = r"Local\rmux-startup-";
+const STARTUP_MUTEX_PREFIX: &str = r"Local\kmux-startup-";
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const PROBE_IO_TIMEOUT: Duration = Duration::from_millis(250);
-const PROBE_SESSION_NAME: &str = "__rmux_startup_probe__";
+const PROBE_SESSION_NAME: &str = "__kmux_startup_probe__";
 
 /// Default deadline a startup owner waits for the launched daemon to bind.
 pub const DEFAULT_STARTUP_DEADLINE: Duration = Duration::from_secs(5);

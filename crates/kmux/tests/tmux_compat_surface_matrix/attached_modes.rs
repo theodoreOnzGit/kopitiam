@@ -25,7 +25,7 @@ fn tmux_compat_nested_attach_session_inside_tmux_uses_switch_client_surface(
     let nested_tmux = format!("{},1,0", harness.rmux_socket_path().display());
     let nested_attach = harness.run_rmux_with(
         &["attach-session", "-t", "alpha"],
-        &config.clone().with_env("RMUX", nested_tmux.as_str()),
+        &config.clone().with_env("KMUX", nested_tmux.as_str()),
     )?;
     assert_eq!(nested_attach.status_code, Some(1));
     assert!(!nested_attach.timed_out);

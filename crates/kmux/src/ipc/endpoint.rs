@@ -25,17 +25,17 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const DEFAULT_SOCKET_LABEL: &str = "default";
-const RMUX_ENV: &str = "RMUX";
+const KMUX_ENV: &str = "KMUX";
 const TMUX_ENV: &str = "TMUX";
-const RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_MAIN_SOCKET";
-const RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_SWARM_SOCKET";
+const KMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV: &str = "KMUX_INTERNAL_CLAUDE_MAIN_SOCKET";
+const KMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV: &str = "KMUX_INTERNAL_CLAUDE_SWARM_SOCKET";
 #[cfg(windows)]
 const CLAUDE_SWARM_SOCKET_PREFIX: &str = "claude-swarm-";
 #[cfg(unix)]
 const RMUX_TMPDIR_ENV: &str = "RMUX_TMPDIR";
 #[cfg(unix)]
 const TMUX_TMPDIR_ENV: &str = "TMUX_TMPDIR";
-const SOCKET_DIR_PREFIX: &str = "rmux";
+const SOCKET_DIR_PREFIX: &str = "kmux";
 #[cfg(windows)]
 const PIPE_PREFIX: &str = r"\\.\pipe\";
 
@@ -205,7 +205,7 @@ pub fn resolve_endpoint(
     if let Some(socket_name) = socket_name {
         return endpoint_for_label(socket_name);
     }
-    if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(RMUX_ENV).as_deref()) {
+    if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(KMUX_ENV).as_deref()) {
         return Ok(LocalEndpoint::from_path(socket_path));
     }
     if let Some(socket_path) =
@@ -217,11 +217,11 @@ pub fn resolve_endpoint(
 }
 
 fn claude_swarm_socket_redirect(socket_name: &OsStr) -> Option<io::Result<LocalEndpoint>> {
-    let main_socket = std::env::var_os(RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV)?;
+    let main_socket = std::env::var_os(KMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV)?;
     if main_socket.is_empty() {
         return None;
     }
-    let swarm_socket = std::env::var_os(RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV)?;
+    let swarm_socket = std::env::var_os(KMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV)?;
     if socket_name == swarm_socket.as_os_str() {
         return Some(endpoint_for_label(main_socket));
     }
@@ -261,7 +261,7 @@ pub fn resolve_tmux_compatible_endpoint(
         }
         return endpoint_for_label(socket_name);
     }
-    if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(RMUX_ENV).as_deref()) {
+    if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(KMUX_ENV).as_deref()) {
         return Ok(LocalEndpoint::from_path(socket_path));
     }
     if let Some(socket_path) = socket_path_from_tmux_env(std::env::var_os(TMUX_ENV).as_deref()) {
@@ -290,7 +290,7 @@ fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
 
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        "Windows -S requires an explicit \\\\.\\pipe\\rmux-... endpoint; use -L for labels",
+        "Windows -S requires an explicit \\\\.\\pipe\\kmux-... endpoint; use -L for labels",
     ))
 }
 
@@ -609,7 +609,7 @@ mod tests {
         let path_string = path.to_string_lossy();
 
         assert!(path_string.ends_with("/default"));
-        assert!(path_string.contains("/rmux-"));
+        assert!(path_string.contains("/kmux-"));
     }
 
     #[cfg(target_os = "linux")]
@@ -691,9 +691,12 @@ mod tests {
             .into_path();
         let path = path.to_string_lossy();
 
-        assert!(path.starts_with(r"\\.\pipe\rmux-S-"));
+        assert!(path.starts_with(r"\\.\pipe\kmux-S-"));
         assert!(path.contains("-il-"));
         assert!(path.ends_with("-default"));
+        // The fork must never reuse rmux's default pipe, or its daemon would
+        // collide with a concurrently running rmux-daemon that already owns it.
+        assert!(!path.starts_with(r"\\.\pipe\rmux-S-"));
     }
 
     #[cfg(windows)]
@@ -764,9 +767,9 @@ mod tests {
     #[test]
     fn resolve_endpoint_uses_rmux_owned_tmux_env_when_no_cli_endpoint_is_set() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let _rmux = EnvGuard::remove(RMUX_ENV);
+        let _rmux = EnvGuard::remove(KMUX_ENV);
         let tmux_socket = format!(
-            "/tmp/rmux-{}/custom,123,0",
+            "/tmp/kmux-{}/custom,123,0",
             crate::os::identity::real_user_id()
         );
         let expected = PathBuf::from(tmux_socket.split(',').next().expect("socket path"));
@@ -783,7 +786,7 @@ mod tests {
     #[test]
     fn resolve_endpoint_ignores_foreign_tmux_env_when_no_cli_endpoint_is_set() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let _rmux = EnvGuard::remove(RMUX_ENV);
+        let _rmux = EnvGuard::remove(KMUX_ENV);
         let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/tmux-1000/default,123,0"));
 
         let path = resolve_endpoint(None, None)
@@ -798,7 +801,7 @@ mod tests {
     #[test]
     fn tmux_compatible_resolve_endpoint_uses_tmux_env_when_no_cli_endpoint_is_set() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let _rmux = EnvGuard::remove(RMUX_ENV);
+        let _rmux = EnvGuard::remove(KMUX_ENV);
         let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/rmux-1000/custom,123,0"));
 
         let path = resolve_tmux_compatible_endpoint(None, None)
@@ -812,7 +815,7 @@ mod tests {
     #[test]
     fn tmux_compatible_resolve_endpoint_prefers_rmux_env_over_tmux_env() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let _rmux = EnvGuard::set(RMUX_ENV, OsStr::new("/tmp/rmux-1000/native,123,0"));
+        let _rmux = EnvGuard::set(KMUX_ENV, OsStr::new("/tmp/rmux-1000/native,123,0"));
         let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/rmux-1000/tmux,123,0"));
 
         let path = resolve_tmux_compatible_endpoint(None, None)
@@ -827,11 +830,11 @@ mod tests {
     fn tmux_compatible_resolve_endpoint_redirects_claude_swarm_socket_only() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _main = EnvGuard::set(
-            RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV,
+            KMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV,
             OsStr::new("rmux-claude-test"),
         );
         let _swarm = EnvGuard::set(
-            RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV,
+            KMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV,
             OsStr::new("claude-swarm-test"),
         );
 
@@ -858,11 +861,11 @@ mod tests {
     fn tmux_compatible_resolve_endpoint_redirects_windows_claude_child_pid_socket() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _main = EnvGuard::set(
-            RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV,
+            KMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV,
             OsStr::new("rmux-claude-test"),
         );
         let _swarm = EnvGuard::set(
-            RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV,
+            KMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV,
             OsStr::new("claude-swarm-parent-pid"),
         );
 
@@ -946,7 +949,7 @@ mod tests {
     #[test]
     fn windows_socket_path_rejects_foreign_sid_pipe() {
         let integrity = current_integrity_label().expect("current integrity");
-        let path = format!(r"\\.\pipe\rmux-S-1-0-0-il-{integrity}-default");
+        let path = format!(r"\\.\pipe\kmux-S-1-0-0-il-{integrity}-default");
 
         let error = endpoint_for_socket_path(Path::new(&path))
             .expect_err("foreign SID pipe should be rejected");

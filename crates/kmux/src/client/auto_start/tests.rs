@@ -467,14 +467,14 @@ fn probe_connected_server_waits_for_reentrant_startup_source_clients() {
     let _guard = AUTO_START_ENV_LOCK
         .lock()
         .expect("auto-start env lock must not be poisoned");
-    let original_rmux = std::env::var_os("RMUX");
-    let original_depth = std::env::var_os("RMUX_SOURCE_DEPTH");
+    let original_rmux = std::env::var_os("KMUX");
+    let original_depth = std::env::var_os("KMUX_SOURCE_DEPTH");
     let socket = PathBuf::from(format!(
         "/tmp/rmux-reentrant-source-{}.sock",
         std::process::id()
     ));
-    std::env::set_var("RMUX", format!("{},123,0", socket.display()));
-    std::env::set_var("RMUX_SOURCE_DEPTH", "1");
+    std::env::set_var("KMUX", format!("{},123,0", socket.display()));
+    std::env::set_var("KMUX_SOURCE_DEPTH", "1");
 
     let (client, mut server) = UnixStream::pair().expect("create unix stream pair");
     let server_thread = std::thread::spawn(move || {
@@ -506,8 +506,8 @@ fn probe_connected_server_waits_for_reentrant_startup_source_clients() {
         .join()
         .expect("probe server thread should exit");
 
-    restore_env("RMUX", original_rmux);
-    restore_env("RMUX_SOURCE_DEPTH", original_depth);
+    restore_env("KMUX", original_rmux);
+    restore_env("KMUX_SOURCE_DEPTH", original_depth);
 }
 
 fn restore_env(name: &str, value: Option<std::ffi::OsString>) {

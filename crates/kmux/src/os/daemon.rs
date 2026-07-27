@@ -411,7 +411,7 @@ fn unique_startup_ready_event_name() -> OsString {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     OsString::from(format!(
-        r"Local\rmux-startup-ready-{}-{sequence}-{timestamp:x}",
+        r"Local\kmux-startup-ready-{}-{sequence}-{timestamp:x}",
         process::id()
     ))
 }

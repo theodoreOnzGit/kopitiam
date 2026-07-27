@@ -125,7 +125,7 @@ fn short_option_takes_no_argument(flag: u8) -> bool {
 }
 
 pub(super) fn infer_client_utf8_from_env() -> bool {
-    if std::env::var_os("RMUX").is_some() {
+    if std::env::var_os("KMUX").is_some() {
         return true;
     }
 
@@ -212,12 +212,12 @@ mod utf8_env_tests {
     #[test]
     fn client_utf8_detection_skips_empty_locale_variables_like_tmux() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let _tmux = EnvVarGuard::capture("RMUX");
+        let _tmux = EnvVarGuard::capture("KMUX");
         let _lc_all = EnvVarGuard::capture("LC_ALL");
         let _lc_ctype = EnvVarGuard::capture("LC_CTYPE");
         let _lang = EnvVarGuard::capture("LANG");
 
-        std::env::remove_var("RMUX");
+        std::env::remove_var("KMUX");
         std::env::set_var("LC_ALL", "");
         std::env::set_var("LC_CTYPE", "");
         std::env::set_var("LANG", "en_US.UTF-8");
@@ -228,12 +228,12 @@ mod utf8_env_tests {
     #[test]
     fn rmux_environment_forces_client_utf8_even_without_utf8_locale() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let _tmux = EnvVarGuard::capture("RMUX");
+        let _tmux = EnvVarGuard::capture("KMUX");
         let _lc_all = EnvVarGuard::capture("LC_ALL");
         let _lc_ctype = EnvVarGuard::capture("LC_CTYPE");
         let _lang = EnvVarGuard::capture("LANG");
 
-        std::env::set_var("RMUX", "/tmp/rmux-1000/default,123,0");
+        std::env::set_var("KMUX", "/tmp/rmux-1000/default,123,0");
         std::env::set_var("LC_ALL", "C");
         std::env::remove_var("LC_CTYPE");
         std::env::remove_var("LANG");
@@ -244,12 +244,12 @@ mod utf8_env_tests {
     #[test]
     fn ascii_locale_without_rmux_does_not_enable_client_utf8() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let _tmux = EnvVarGuard::capture("RMUX");
+        let _tmux = EnvVarGuard::capture("KMUX");
         let _lc_all = EnvVarGuard::capture("LC_ALL");
         let _lc_ctype = EnvVarGuard::capture("LC_CTYPE");
         let _lang = EnvVarGuard::capture("LANG");
 
-        std::env::remove_var("RMUX");
+        std::env::remove_var("KMUX");
         std::env::set_var("LC_ALL", "C");
         std::env::remove_var("LC_CTYPE");
         std::env::remove_var("LANG");

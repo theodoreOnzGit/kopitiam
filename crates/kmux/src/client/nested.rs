@@ -50,7 +50,7 @@ impl StdError for NestedContextError {}
 #[must_use]
 pub fn detect_context() -> ClientContext {
     detect_context_from_env(
-        std::env::var_os("RMUX").as_deref(),
+        std::env::var_os("KMUX").as_deref(),
         std::env::var_os("TMUX").as_deref(),
     )
 }
@@ -59,7 +59,7 @@ pub fn detect_context() -> ClientContext {
 #[must_use]
 pub fn detect_parent() -> ClientContextParent {
     detect_parent_from_env(
-        std::env::var_os("RMUX").as_deref(),
+        std::env::var_os("KMUX").as_deref(),
         std::env::var_os("TMUX").as_deref(),
     )
 }
@@ -200,26 +200,26 @@ mod tests {
     #[test]
     fn require_nested_context_reads_env() {
         let _guard = RMUX_ENV_LOCK.lock().expect("rmux env lock");
-        let original = std::env::var_os("RMUX");
+        let original = std::env::var_os("KMUX");
         let original_tmux = std::env::var_os("TMUX");
 
-        std::env::remove_var("RMUX");
+        std::env::remove_var("KMUX");
         std::env::remove_var("TMUX");
         assert_eq!(super::detect_context(), ClientContext::Outside);
         assert_eq!(require_nested_context(), Err(NestedContextError));
 
-        std::env::set_var("RMUX", "/tmp/rmux-1000/default,1,0");
+        std::env::set_var("KMUX", "/tmp/rmux-1000/default,1,0");
         assert_eq!(super::detect_context(), ClientContext::Nested);
         assert_eq!(require_nested_context(), Ok(()));
 
-        std::env::remove_var("RMUX");
+        std::env::remove_var("KMUX");
         std::env::set_var("TMUX", "/tmp/rmux-1000/default,1,0");
         assert_eq!(super::detect_context(), ClientContext::Nested);
         assert_eq!(require_nested_context(), Ok(()));
 
         match original {
-            Some(value) => std::env::set_var("RMUX", value),
-            None => std::env::remove_var("RMUX"),
+            Some(value) => std::env::set_var("KMUX", value),
+            None => std::env::remove_var("KMUX"),
         }
         match original_tmux {
             Some(value) => std::env::set_var("TMUX", value),

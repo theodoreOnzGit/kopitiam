@@ -237,7 +237,7 @@ impl TerminalProfile {
             std::process::id(),
             session_id
         );
-        set_environment_value(&mut resolved, "RMUX".to_owned(), mux_env.clone());
+        set_environment_value(&mut resolved, "KMUX".to_owned(), mux_env.clone());
         set_environment_value(&mut resolved, "TMUX".to_owned(), mux_env);
         crate::server::tmux_shim::apply_tmux_shim_environment(&mut resolved, socket_path);
 
@@ -259,7 +259,7 @@ impl TerminalProfile {
 
         if let Some(pane_id) = pane_id {
             let pane_env = format!("%{}", pane_id.as_u32());
-            set_environment_value(&mut resolved, "RMUX_PANE".to_owned(), pane_env.clone());
+            set_environment_value(&mut resolved, "KMUX_PANE".to_owned(), pane_env.clone());
             set_environment_value(&mut resolved, "TMUX_PANE".to_owned(), pane_env);
         }
 
@@ -326,7 +326,7 @@ impl TerminalProfile {
         } else {
             environment.apply_to_process_environment(session_name, &mut resolved);
         }
-        remove_environment_value(&mut resolved, "RMUX_PANE");
+        remove_environment_value(&mut resolved, "KMUX_PANE");
         remove_environment_value(&mut resolved, "TMUX_PANE");
 
         let mut suppressed = environment
@@ -365,12 +365,12 @@ impl TerminalProfile {
             std::process::id(),
             mux_session_id
         );
-        set_environment_value(&mut resolved, "RMUX".to_owned(), mux_env.clone());
+        set_environment_value(&mut resolved, "KMUX".to_owned(), mux_env.clone());
         set_environment_value(&mut resolved, "TMUX".to_owned(), mux_env);
         crate::server::tmux_shim::apply_tmux_shim_environment(&mut resolved, socket_path);
         if let Some(pane_id) = pane_id {
             let pane_env = format!("%{}", pane_id.as_u32());
-            set_environment_value(&mut resolved, "RMUX_PANE".to_owned(), pane_env.clone());
+            set_environment_value(&mut resolved, "KMUX_PANE".to_owned(), pane_env.clone());
             set_environment_value(&mut resolved, "TMUX_PANE".to_owned(), pane_env);
         }
 
@@ -391,7 +391,7 @@ impl TerminalProfile {
             cwd.to_string_lossy().into_owned(),
         );
 
-        suppressed.insert("RMUX_PANE".to_owned());
+        suppressed.insert("KMUX_PANE".to_owned());
         suppressed.insert("TMUX_PANE".to_owned());
         #[cfg(windows)]
         suppressed.insert(CLIENT_SHELL_ENV.to_owned());
@@ -423,7 +423,7 @@ impl TerminalProfile {
         let value = depth.to_string();
         set_raw_environment_value(
             Arc::make_mut(&mut self.raw_environment),
-            OsString::from("RMUX_SOURCE_DEPTH"),
+            OsString::from("KMUX_SOURCE_DEPTH"),
             OsString::from(value),
         );
         self

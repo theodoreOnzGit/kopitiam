@@ -112,7 +112,7 @@ pub(super) fn run_attach_session(
 }
 
 fn inherited_rmux_socket_matches(socket_path: &Path) -> bool {
-    inherited_rmux_socket_matches_from_env(std::env::var_os("RMUX").as_deref(), socket_path)
+    inherited_rmux_socket_matches_from_env(std::env::var_os("KMUX").as_deref(), socket_path)
 }
 
 fn inherited_rmux_socket_matches_from_env(rmux: Option<&OsStr>, socket_path: &Path) -> bool {

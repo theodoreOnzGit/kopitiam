@@ -33,10 +33,10 @@ fn create_test_dir(path: &std::path::Path) {
 
 #[tokio::test]
 async fn startup_lock_path_uses_sibling_filename() {
-    let socket = PathBuf::from("/tmp/rmux-1000/default");
+    let socket = PathBuf::from("/tmp/kmux-1000/default");
     assert_eq!(
         startup_lock_path(&socket),
-        PathBuf::from("/tmp/rmux-1000/default.startup-lock")
+        PathBuf::from("/tmp/kmux-1000/default.startup-lock")
     );
 }
 
@@ -60,7 +60,7 @@ fn shared_sticky_parent_uses_private_lock_directory() {
     let prepared = prepare_socket_parent(&socket, &tmp, owner_uid)
         .expect("sticky shared parent should be accepted");
 
-    let lock_dir = tmp.join(format!("rmux-{owner_uid}")).join("startup-locks");
+    let lock_dir = tmp.join(format!("kmux-{owner_uid}")).join("startup-locks");
     assert!(
         prepared.lock_path.starts_with(&lock_dir),
         "lock path should live under private lock dir: {:?}",
@@ -97,7 +97,7 @@ fn shared_sticky_parent_symlink_uses_private_lock_directory() {
     let prepared = prepare_socket_parent(&socket, &tmp, owner_uid)
         .expect("symlink to sticky shared parent should be accepted");
 
-    let lock_dir = tmp.join(format!("rmux-{owner_uid}")).join("startup-locks");
+    let lock_dir = tmp.join(format!("kmux-{owner_uid}")).join("startup-locks");
     assert!(
         prepared.lock_path.starts_with(&lock_dir),
         "lock path should live under private lock dir through the symlink: {:?}",
@@ -129,7 +129,7 @@ fn custom_socket_parent_accepts_terminal_symlink_to_shared_sticky_parent() {
     let prepared = prepare_socket_parent(&socket, &link, owner_uid)
         .expect("terminal symlink to sticky shared parent should be accepted");
 
-    let lock_dir = link.join(format!("rmux-{owner_uid}")).join("startup-locks");
+    let lock_dir = link.join(format!("kmux-{owner_uid}")).join("startup-locks");
     assert!(
         prepared.lock_path.starts_with(&lock_dir),
         "lock path should live under private lock dir through custom symlink: {:?}",
@@ -175,7 +175,7 @@ fn assert_private_lock_path(
 ) {
     let owner_uid = real_user_id();
     let root = fs::canonicalize("/tmp").expect("private lock root");
-    let lock_dir = root.join(format!("rmux-{owner_uid}")).join("startup-locks");
+    let lock_dir = root.join(format!("kmux-{owner_uid}")).join("startup-locks");
     assert!(
         prepared.lock_path.starts_with(&lock_dir),
         "group-writable custom parents must use private lock dir: {:?}",

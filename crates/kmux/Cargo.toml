@@ -15,7 +15,7 @@
 # relicensed AGPL-3.0-only). See NOTICE for the record of the collapse.
 [package]
 name = "kmux"
-version = "0.1.0"
+version = "0.1.1"
 # NOT `edition.workspace = true`. KOPITIAM's root workspace is edition 2024; the
 # folded rmux source is edition 2021. Pinning the edition here avoids silently
 # pulling the upstream code into a newer edition; moving it is its own task.

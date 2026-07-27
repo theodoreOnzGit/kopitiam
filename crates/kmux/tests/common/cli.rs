@@ -149,7 +149,7 @@ impl CliHarness {
         command.env("RMUX_DISABLE_TMUX_FALLBACK", "1");
         command.env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
         command.env_remove(BINARY_OVERRIDE_ENV);
-        command.env_remove("RMUX");
+        command.env_remove("KMUX");
         command.env_remove("TMUX");
         command
     }

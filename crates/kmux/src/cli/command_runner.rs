@@ -247,14 +247,14 @@ fn inherited_pane_id(socket_path: &Path) -> Option<String> {
     if !rmux_env_socket_matches(socket_path) {
         return None;
     }
-    std::env::var("RMUX_PANE")
+    std::env::var("KMUX_PANE")
         .ok()
         .or_else(|| std::env::var("TMUX_PANE").ok())
         .filter(|value| value.starts_with('%'))
 }
 
 fn rmux_env_socket_matches(socket_path: &Path) -> bool {
-    let Some(inherited_socket) = std::env::var("RMUX")
+    let Some(inherited_socket) = std::env::var("KMUX")
         .ok()
         .and_then(|value| rmux_socket_path_from_env(&value))
     else {

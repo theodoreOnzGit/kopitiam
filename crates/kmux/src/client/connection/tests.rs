@@ -152,9 +152,9 @@ fn default_socket_path_matches_server_path_when_rmux_tmpdir_is_unresolved() {
 #[test]
 fn resolve_socket_path_prefers_socket_path_over_socket_name_and_rmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::set_var("RMUX", "/tmp/from-rmux,1,0");
+    std::env::set_var("KMUX", "/tmp/from-rmux,1,0");
     std::env::remove_var("TMUX");
 
     let path = super::resolve_socket_path(
@@ -165,8 +165,8 @@ fn resolve_socket_path_prefers_socket_path_over_socket_name_and_rmux_env() {
 
     assert_eq!(path, PathBuf::from("/tmp/from-flag"));
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -177,17 +177,17 @@ fn resolve_socket_path_prefers_socket_path_over_socket_name_and_rmux_env() {
 #[test]
 fn resolve_socket_path_uses_rmux_env_before_default_label() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::set_var("RMUX", "/tmp/rmux-1000/from-rmux,1,0");
+    std::env::set_var("KMUX", "/tmp/rmux-1000/from-rmux,1,0");
     std::env::remove_var("TMUX");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
 
     assert_eq!(path, PathBuf::from("/tmp/rmux-1000/from-rmux"));
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -198,17 +198,17 @@ fn resolve_socket_path_uses_rmux_env_before_default_label() {
 #[test]
 fn resolve_socket_path_uses_rmux_env_before_tmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::set_var("RMUX", "/tmp/rmux-1000/from-rmux,1,0");
+    std::env::set_var("KMUX", "/tmp/rmux-1000/from-rmux,1,0");
     std::env::set_var("TMUX", "/tmp/rmux-1000/from-tmux,1,0");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
 
     assert_eq!(path, PathBuf::from("/tmp/rmux-1000/from-rmux"));
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -219,17 +219,17 @@ fn resolve_socket_path_uses_rmux_env_before_tmux_env() {
 #[test]
 fn resolve_socket_path_accepts_rmux_env_without_tmux_suffix() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::set_var("RMUX", "/tmp/rmux-1000/from-rmux");
+    std::env::set_var("KMUX", "/tmp/rmux-1000/from-rmux");
     std::env::remove_var("TMUX");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
 
     assert_eq!(path, PathBuf::from("/tmp/rmux-1000/from-rmux"));
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -240,18 +240,18 @@ fn resolve_socket_path_accepts_rmux_env_without_tmux_suffix() {
 #[test]
 fn resolve_socket_path_ignores_tmux_env_and_uses_default() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
     std::env::set_var("TMUX", "/tmp/explicit-rmux.sock,1,0");
-    std::env::remove_var("RMUX");
+    std::env::remove_var("KMUX");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
     let default = super::default_socket_path().expect("default socket path");
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -262,9 +262,9 @@ fn resolve_socket_path_ignores_tmux_env_and_uses_default() {
 #[test]
 fn resolve_socket_path_ignores_tmux_env_without_suffix() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::remove_var("RMUX");
+    std::env::remove_var("KMUX");
     std::env::set_var("TMUX", "/tmp/explicit-rmux.sock");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
@@ -272,8 +272,8 @@ fn resolve_socket_path_ignores_tmux_env_without_suffix() {
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -284,9 +284,9 @@ fn resolve_socket_path_ignores_tmux_env_without_suffix() {
 #[test]
 fn resolve_socket_path_ignores_empty_rmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::set_var("RMUX", "");
+    std::env::set_var("KMUX", "");
     std::env::remove_var("TMUX");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
@@ -294,8 +294,8 @@ fn resolve_socket_path_ignores_empty_rmux_env() {
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),
@@ -306,9 +306,9 @@ fn resolve_socket_path_ignores_empty_rmux_env() {
 #[test]
 fn resolve_socket_path_ignores_nonempty_malformed_rmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
-    let original_rmux = std::env::var_os("RMUX");
+    let original_rmux = std::env::var_os("KMUX");
     let original_tmux = std::env::var_os("TMUX");
-    std::env::set_var("RMUX", "malformed-rmux-value");
+    std::env::set_var("KMUX", "malformed-rmux-value");
     std::env::remove_var("TMUX");
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
@@ -316,8 +316,8 @@ fn resolve_socket_path_ignores_nonempty_malformed_rmux_env() {
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        Some(value) => std::env::set_var("KMUX", value),
+        None => std::env::remove_var("KMUX"),
     }
     match original_tmux {
         Some(value) => std::env::set_var("TMUX", value),

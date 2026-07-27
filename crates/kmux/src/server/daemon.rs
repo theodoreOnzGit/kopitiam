@@ -451,7 +451,7 @@ fn windows_protocol_probe(endpoint: &LocalEndpoint) -> io::Result<bool> {
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let request = Request::HasSession(HasSessionRequest {
-        target: SessionName::new("__rmux_probe__").map_err(io::Error::other)?,
+        target: SessionName::new("__kmux_probe__").map_err(io::Error::other)?,
     });
     let frame = encode_frame(&request).map_err(io::Error::other)?;
     stream.write_all(&frame)?;

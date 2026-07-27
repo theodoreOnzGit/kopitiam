@@ -196,7 +196,7 @@ fn send_keys_should_use_tiny(args: &[OsString]) -> bool {
 }
 
 fn source_file_should_use_tiny(args: &[OsString]) -> bool {
-    if std::env::var_os("RMUX").is_some_and(|value| !value.is_empty())
+    if std::env::var_os("KMUX").is_some_and(|value| !value.is_empty())
         || std::env::var_os("TMUX").is_some_and(|value| !value.is_empty())
         || has_queue_separator(args)
     {
@@ -1111,7 +1111,7 @@ fn readme_benchmark_shapes_stay_on_tiny_direct_paths() {
         &["rmux", "source-file", "/tmp/rmux-source.conf"],
         "source-file",
     );
-    if std::env::var_os("RMUX").is_none() && std::env::var_os("TMUX").is_none() {
+    if std::env::var_os("KMUX").is_none() && std::env::var_os("TMUX").is_none() {
         assert_tiny_direct(&["rmux", "attach-session", "-t", "bench"], "attach-session");
     }
 }

@@ -485,7 +485,7 @@ fn client_environment_infers_utf8(client_environment: Option<&HashMap<String, St
         return false;
     };
     if client_environment
-        .get("RMUX")
+        .get("KMUX")
         .is_some_and(|value| !value.is_empty())
     {
         return true;

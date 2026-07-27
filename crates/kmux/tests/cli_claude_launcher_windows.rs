@@ -110,7 +110,7 @@ fn run_attached_probe(
     if mode == FakeClaudeMode::CreateMateThroughTmuxInheritance {
         assert!(
             fake_log.contains("tmux_env=\\\\.\\pipe\\")
-                && fake_log.contains("rmux-claude")
+                && fake_log.contains("kmux-claude")
                 && fake_log.contains("tmux_pane_env=%"),
             "Windows Claude lead should receive tmux-compatible in-pane env; log: {}; output: {}",
             fake_log,

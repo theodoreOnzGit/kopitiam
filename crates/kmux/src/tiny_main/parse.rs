@@ -1064,12 +1064,12 @@ fn current_working_directory_string() -> Option<String> {
 }
 
 fn nested_multiplexer_context() -> bool {
-    env::var_os("RMUX").is_some_and(|value| !value.is_empty())
+    env::var_os("KMUX").is_some_and(|value| !value.is_empty())
         || env::var_os("TMUX").is_some_and(|value| !value.is_empty())
 }
 
 fn infer_client_utf8_from_env() -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG", "RMUX"]
+    ["LC_ALL", "LC_CTYPE", "LANG", "KMUX"]
         .into_iter()
         .filter_map(env::var_os)
         .any(|value| {
