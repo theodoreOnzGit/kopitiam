@@ -75,15 +75,21 @@ do NOT open files blind. The whole point of these commands is to spend a few
 dozen tokens on coordinates and skeletons instead of thousands on file bodies.
 The loop is **measure → skeleton → coordinates → read only the slice you need**:
 
-**1. `kopitiam tokens <path>` BEFORE you read anything.** It prints a
+**1. `kopitiam tokens <path>...` BEFORE you read anything.** It prints a
 deterministic BPE token estimate for a file or a whole directory (no
 rust-analyzer, instant). Let the number decide read-vs-outline: a 2k-token file
 you can afford to read; a 130k-token directory you must *not* — target its call
 sites instead.
 
+Takes **many paths in one call**, so budgeting a few places at once costs one
+invocation, not one each. Naming the same file twice (directly, or once
+directly and once through its parent directory) counts it **once** — the grand
+total never double-counts.
+
 ```bash
 kopitiam tokens crates/kopitiam-document/src/reconstruction   # a directory: total to budget against
 kopitiam tokens apps/cli/src/main.rs                          # one file: is it cheap enough to read whole?
+kopitiam tokens apps/cli/src/ocr_fallback.rs crates/kopitiam-ocr/src   # several at once: one budget for the job
 kopitiam tokens --json src/ | jq '.total'                     # gate programmatically, no prose parsing
 ```
 
@@ -157,7 +163,7 @@ Convert a PDF into semantic Markdown.
 
 Runs the full Document Engine pipeline: `kopitiam-pdf` extracts text per page, `kopitiam-document` reconstructs paragraph/heading/table structure across page breaks and columns, and `kopitiam-markdown` renders the result. A validation report comparing extracted vs. rendered word counts is printed alongside the output, as a cheap sanity check that the reconstruction did not silently drop content.
 
-Usage: kopitiam.exe pdf2md [OPTIONS] <INPUT>
+Usage: kopitiam pdf2md [OPTIONS] <INPUT>
 
 Arguments:
   <INPUT>
@@ -216,7 +222,7 @@ Scan a Rust project's real tooling and report what the Semantic Runtime learned 
 
 This is the first Semantic Runtime command: it runs the `kopitiam-semantic` knowledge providers (cargo metadata always, rust-analyzer optionally, rustdoc JSON when a nightly toolchain is available) against a project, merges everything they report into a `kopitiam-knowledge` graph, and prints a summary. See `apps/cli/src/scan.rs` for the full explanation of why this command exists and where it is headed.
 
-Usage: kopitiam.exe scan [OPTIONS]
+Usage: kopitiam scan [OPTIONS]
 
 Options:
       --root <ROOT>
@@ -247,7 +253,7 @@ Rename a symbol using a live rust-analyzer, previewing the change as a diff unle
 
 See `apps/cli/src/rename.rs` for the full explanation, including why this is safe-by-default.
 
-Usage: kopitiam.exe rename [OPTIONS] --line <LINE> --character <CHARACTER> --new-name <NEW_NAME> <FILE>
+Usage: kopitiam rename [OPTIONS] --line <LINE> --character <CHARACTER> --new-name <NEW_NAME> <FILE>
 
 Arguments:
   <FILE>
@@ -284,7 +290,7 @@ List or apply rust-analyzer's code actions (quick fixes and refactorings) at a f
 
 See `apps/cli/src/code_actions.rs` for the full explanation.
 
-Usage: kopitiam.exe code-actions [OPTIONS] --line <LINE> --character <CHARACTER> <FILE>
+Usage: kopitiam code-actions [OPTIONS] --line <LINE> --character <CHARACTER> <FILE>
 
 Arguments:
   <FILE>
@@ -318,7 +324,7 @@ Deterministic, mechanical refactors over a directory — token-max Task II-8.
 
 `refactor add-derive <Derive> --filter <pattern>` adds a derive to every matching `struct`/`enum`/`union`, previewing a diff unless `--apply` is given. Reuses `rename`'s `edit::{FileEdit, diff, write_file_edits}` machinery, no rust-analyzer needed. See `apps/cli/src/refactor.rs`.
 
-Usage: kopitiam.exe refactor <COMMAND>
+Usage: kopitiam refactor <COMMAND>
 
 Commands:
   add-derive  Add a derive to every matching type definition across a directory, previewing the change as a diff unless `--apply` is given
@@ -336,7 +342,7 @@ Options:
 ```text
 Add a derive to every matching type definition across a directory, previewing the change as a diff unless `--apply` is given
 
-Usage: kopitiam.exe refactor add-derive [OPTIONS] --filter <FILTER> <DERIVE>
+Usage: kopitiam refactor add-derive [OPTIONS] --filter <FILTER> <DERIVE>
 
 Arguments:
   <DERIVE>  The derive to add, e.g. `Clone`, `PartialEq`, or a path like `serde::Serialize`
@@ -358,7 +364,7 @@ Print this project's persisted session memory (`.kopitiam/state.redb`).
 
 See `apps/cli/src/status.rs`: this is the read side of the state `scan` writes, proving persistence survives across process restarts.
 
-Usage: kopitiam.exe status [OPTIONS]
+Usage: kopitiam status [OPTIONS]
 
 Options:
       --root <ROOT>
@@ -384,7 +390,7 @@ The adapter is chosen at runtime by `crate::adapter::select_adapter`: a real on-
 
 See `apps/cli/src/plan.rs`: the first `kopitiam-workflow` command, proving the full `load state -> collect facts -> build context -> invoke model -> validate -> persist` pipeline end to end.
 
-Usage: kopitiam.exe plan [OPTIONS] <TASK>
+Usage: kopitiam plan [OPTIONS] <TASK>
 
 Arguments:
   <TASK>
@@ -409,7 +415,7 @@ Talk to the AI layer. `ai chat` opens an interactive, streamed chat with the loc
 
 This is the maintainer's testable AI interface — `temp_ai_design.md` §10.6 phase 1 (chat over `LocalAdapter`, streamed token-by-token, no tools). See `apps/cli/src/ai.rs`, whose `chat_loop` is factored over `Read`/`Write` so the streamed loop is testable headlessly.
 
-Usage: kopitiam.exe ai <COMMAND>
+Usage: kopitiam ai <COMMAND>
 
 Commands:
   chat  Chat with the local model, streamed token by token
@@ -429,7 +435,7 @@ Chat with the local model, streamed token by token.
 
 Type a line, press enter, watch the reply stream in. `/quit` (or `/exit`, or an EOF / Ctrl-D) ends the session. With no local `.gguf` on disk this echoes your line back via the deterministic stub, so it runs even with no weights and no network.
 
-Usage: kopitiam.exe ai chat [OPTIONS]
+Usage: kopitiam ai chat [OPTIONS]
 
 Options:
       --system <SYSTEM>
@@ -453,7 +459,7 @@ Open the KOPITIAM chat TUI: a full-screen, kopitiam-themed terminal interface ov
 
 A ratatui front-end onto `crate::adapter::select_adapter` — a real on-CPU `kopitiam_ai::LocalAdapter` when a `.gguf` is present, otherwise the deterministic `EchoAdapter`, so it always runs offline. Tokens stream live into the transcript by polling the adapter's `Receiver<StreamChunk>`; no business logic lives in the UI. This is the runnable slice of `temp_ai_design.md`'s "full ratatui" phase.
 
-Usage: kopitiam.exe tui [OPTIONS]
+Usage: kopitiam tui [OPTIONS]
 
 Options:
       --system <SYSTEM>
@@ -477,7 +483,7 @@ Open a PDF in an on-screen terminal viewer, rendering pages as images.
 
 A standalone, interactive image viewer over the ported MuPDF rasteriser (`kopitiam_pdf::mupdf::rasterize_page` — real glyph outlines, vector, colour and images) displayed through `ratatui-image`, which auto-detects the terminal's graphics protocol (kitty / sixel / iTerm2) and falls back to Unicode half-blocks under Termux. Keys: j/k or arrows or PgUp/PgDn to page, `g` to go to a page, `+`/`-` to zoom, `r`/`i` to toggle the reflow (Markdown) view, `q` to quit. This is what `kmux latex` shells out to for its live preview. See `apps/cli/src/view.rs`; the page-rendering path is shared with `kopitiam tui`'s image mode (no forked viewer logic).
 
-Usage: kopitiam.exe view [OPTIONS] <PDF>
+Usage: kopitiam view [OPTIONS] <PDF>
 
 Arguments:
   <PDF>
@@ -507,7 +513,7 @@ Go and get, then check, the local model weights the AI layer runs on.
 
 Group of four actions — `list`, `pull`, `path`, `verify` — over the `kopitiam-models` model store. `pull` is the autofetch path (download plus SHA-256 verify from the catalog); a user who already got the file can drop it where `path` say and skip the network (bring-your-own). This keeps `CLAUDE.md`'s Offline-First promise real: no local weights, no local model. See `apps/cli/src/models.rs` for the full story.
 
-Usage: kopitiam.exe models <COMMAND>
+Usage: kopitiam models <COMMAND>
 
 Commands:
   list    List every model in the built-in catalog, and whether got already locally or not
@@ -530,7 +536,7 @@ List every model in the built-in catalog, and whether got already locally or not
 
 Read `kopitiam_models::Catalog::builtin()` for the catalog and check each entry against the default model store, so the `present?` column show what is really on disk right now (whether `pull` fetch it or you dropped it in by hand).
 
-Usage: kopitiam.exe models list
+Usage: kopitiam models list
 
 Options:
   -h, --help
@@ -546,7 +552,7 @@ Go and get a model by downloading and verifying its artifacts (autofetch).
 
 This is the network path: it resolve the id in the catalog, then hand the whole download-and-verify job to `kopitiam_models::ensure_available`, streaming live progress to the terminal. If you already got the weights on disk, no need this one — see `kopitiam models path` for the bring-your-own flow.
 
-Usage: kopitiam.exe models pull <ID>
+Usage: kopitiam models pull <ID>
 
 Arguments:
   <ID>
@@ -566,7 +572,7 @@ Print the on-disk artifact path(s) for a model id.
 
 Also doubles up as the bring-your-own guide: these are the exact paths the store is expecting, so putting each artifact there make the model available without ever running `pull`. Exit nonzero if the model not present yet, and point you to `kopitiam models pull`.
 
-Usage: kopitiam.exe models path <ID>
+Usage: kopitiam models path <ID>
 
 Arguments:
   <ID>
@@ -586,7 +592,7 @@ Check that a present model's artifacts still match their catalog checksums.
 
 Useful after a bring-your-own copy, or to catch a corrupted or truncated download. Hand everything to `kopitiam_models::ModelStore::verify`.
 
-Usage: kopitiam.exe models verify <ID>
+Usage: kopitiam models verify <ID>
 
 Arguments:
   <ID>
@@ -606,7 +612,7 @@ Print a file's items-only skeleton (declarations + line numbers, no bodies) — 
 
 A ~10x-smaller orientation pass than reading the whole file. See `apps/cli/src/outline.rs`; the real work is `kopitiam_semantic::outline`.
 
-Usage: kopitiam.exe outline [OPTIONS] <FILE>
+Usage: kopitiam outline [OPTIONS] <FILE>
 
 Arguments:
   <FILE>
@@ -640,7 +646,7 @@ Options:
 ```text
 List every reference/call site of a symbol as `file:line:character` coordinates — token-max Task II-1. See `apps/cli/src/semq.rs`
 
-Usage: kopitiam.exe refs [OPTIONS] --file <FILE> <SYMBOL>
+Usage: kopitiam refs [OPTIONS] --file <FILE> <SYMBOL>
 
 Arguments:
   <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
@@ -661,7 +667,7 @@ Options:
 ```text
 Print where a symbol is defined plus its signature — token-max Task II-1
 
-Usage: kopitiam.exe def [OPTIONS] --file <FILE> <SYMBOL>
+Usage: kopitiam def [OPTIONS] --file <FILE> <SYMBOL>
 
 Arguments:
   <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
@@ -682,7 +688,7 @@ Options:
 ```text
 Print a symbol's signature alone — token-max Task II-1
 
-Usage: kopitiam.exe sig [OPTIONS] --file <FILE> <SYMBOL>
+Usage: kopitiam sig [OPTIONS] --file <FILE> <SYMBOL>
 
 Arguments:
   <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
@@ -703,7 +709,7 @@ Options:
 ```text
 List a function's callers (call sites + enclosing function), recursed to `--depth` — token-max Task II-1
 
-Usage: kopitiam.exe callers [OPTIONS] --file <FILE> <SYMBOL>
+Usage: kopitiam callers [OPTIONS] --file <FILE> <SYMBOL>
 
 Arguments:
   <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
@@ -725,7 +731,7 @@ Options:
 ```text
 List the functions a function calls, recursed to `--depth` — token-max Task II-1
 
-Usage: kopitiam.exe callees [OPTIONS] --file <FILE> <SYMBOL>
+Usage: kopitiam callees [OPTIONS] --file <FILE> <SYMBOL>
 
 Arguments:
   <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
@@ -747,7 +753,7 @@ Options:
 ```text
 List a trait's `impl` sites — token-max Task II-1
 
-Usage: kopitiam.exe impls [OPTIONS] --file <FILE> <SYMBOL>
+Usage: kopitiam impls [OPTIONS] --file <FILE> <SYMBOL>
 
 Arguments:
   <SYMBOL>  The symbol (or, for `impls`, trait) name to resolve
@@ -770,7 +776,7 @@ Run `cargo check` and report one deduplicated line per distinct diagnostic, sort
 
 The dedup is the win: one bad type produces the same diagnostic across every target, and this collapses them. See `apps/cli/src/diagnostics.rs`.
 
-Usage: kopitiam.exe check [OPTIONS]
+Usage: kopitiam check [OPTIONS]
 
 Options:
       --root <ROOT>
@@ -798,7 +804,7 @@ Options:
 ```text
 Run `cargo test` and report each failure as `name — assertion @ file:line`, not the full captured stdout — token-max Task II-4
 
-Usage: kopitiam.exe test [OPTIONS]
+Usage: kopitiam test [OPTIONS]
 
 Options:
       --root <ROOT>        Directory to run `cargo test` in. Defaults to the current directory [default: .]
@@ -817,11 +823,13 @@ Estimate the BPE token cost of a file or directory, so an agent chooses read-vs-
 
 A thin shell over `kopitiam_tokenizer::estimate_tokens`. See `apps/cli/src/tokens.rs`.
 
-Usage: kopitiam.exe tokens [OPTIONS] <PATH>
+Usage: kopitiam tokens [OPTIONS] <PATHS>...
 
 Arguments:
-  <PATH>
-          File or directory to estimate. A directory is walked recursively and every readable UTF-8 file is summed; unreadable or non-UTF-8 files (binaries) are skipped, not counted
+  <PATHS>...
+          One or more files / directories to estimate. Can pass many in one go — `tokens src/a.rs crates/b/src` — so you sizing up a few places at once don't need one call each. A directory is walked recursively and every readable UTF-8 file is summed; unreadable or non-UTF-8 files (binaries) are skipped, not counted.
+          
+          Overlapping paths are safe: the same file named twice (directly, or once directly and once via a parent directory) is counted **once**, so the grand total never double-counts. Files come out in the order you named their path, and sorted within each directory, so output stay deterministic.
 
 Options:
       --json
@@ -843,7 +851,7 @@ Translate a converted Markdown document end to end — token-max Tasks III-4..7.
 
 Segments the document (`kopitiam_document::segments`), reuses cached translations from the `.kopitiam` translation memory, drafts cache-misses with the local model and routes each (`kopitiam_ai::draft_and_route`), applies a `--glossary` deterministically, and writes aligned bilingual output with per-segment anchors. See `apps/cli/src/translate.rs`.
 
-Usage: kopitiam.exe translate [OPTIONS] <INPUT>
+Usage: kopitiam translate [OPTIONS] <INPUT>
 
 Arguments:
   <INPUT>
@@ -889,7 +897,7 @@ Print (and cache) a compact per-crate architecture digest — token-max Task II-
 
 `cargo metadata` → crate → responsibility → workspace-internal deps, persisted in `.kopitiam/state.redb` and regenerated only when a manifest hash changes. See `apps/cli/src/digest.rs`.
 
-Usage: kopitiam.exe digest [OPTIONS]
+Usage: kopitiam digest [OPTIONS]
 
 Options:
       --root <ROOT>
@@ -916,7 +924,7 @@ Code-translation (porting) helpers — token-max Tasks III-1 / III-3.
 
 `port status` surfaces the machine-maintained port ledger and `port skeleton <file>` emits Rust signature stubs, as thin wrappers over the committed `scripts/port-ledger.sh` / `scripts/skeleton-gen.sh`. See `apps/cli/src/port.rs`.
 
-Usage: kopitiam.exe port <COMMAND>
+Usage: kopitiam port <COMMAND>
 
 Commands:
   status    Show the port ledger (`scripts/port-ledger.sh --report`), or the raw `docs/port-ledger.json` with `--json`
@@ -935,7 +943,7 @@ Options:
 ```text
 Show the port ledger (`scripts/port-ledger.sh --report`), or the raw `docs/port-ledger.json` with `--json`
 
-Usage: kopitiam.exe port status [OPTIONS]
+Usage: kopitiam port status [OPTIONS]
 
 Options:
       --root <ROOT>  Where to start looking for the kopitiam repo root (the directory holding `scripts/port-ledger.sh`). Defaults to the current directory; the root is found by walking up from here [default: .]
@@ -950,7 +958,7 @@ Options:
 ```text
 Generate Rust signature stubs for a vendored source file (`scripts/skeleton-gen.sh <file>`)
 
-Usage: kopitiam.exe port skeleton [OPTIONS] <FILE>
+Usage: kopitiam port skeleton [OPTIONS] <FILE>
 
 Arguments:
   <FILE>  The vendored source file to generate signature stubs for
@@ -970,7 +978,7 @@ Route high-volume, low-judgment work to the local model — token-max Task II-6.
 
 `preprocess summarize <file>` compresses and `preprocess triage <query> <candidate>...` filters, both over `kopitiam_ai`'s preprocess helpers with a `DropReport` of what was set aside. See `apps/cli/src/preprocess.rs`.
 
-Usage: kopitiam.exe preprocess <COMMAND>
+Usage: kopitiam preprocess <COMMAND>
 
 Commands:
   summarize  Compress a file to at most `--lines N` lines via the local model
@@ -989,7 +997,7 @@ Options:
 ```text
 Compress a file to at most `--lines N` lines via the local model
 
-Usage: kopitiam.exe preprocess summarize [OPTIONS] <FILE>
+Usage: kopitiam preprocess summarize [OPTIONS] <FILE>
 
 Arguments:
   <FILE>  The file to compress
@@ -1007,7 +1015,7 @@ Options:
 ```text
 Keep only the candidates plausibly relevant to a query (conservative: keeps all on an unusable reply)
 
-Usage: kopitiam.exe preprocess triage [OPTIONS] <QUERY> [CANDIDATES]...
+Usage: kopitiam preprocess triage [OPTIONS] <QUERY> [CANDIDATES]...
 
 Arguments:
   <QUERY>          What the candidates are being filtered for relevance to
@@ -1027,7 +1035,7 @@ Run the `kopi-beans` task ledger via its `bn` binary — issue #30.
 
 An arm's-length passthrough: every argument after `bn` is forwarded verbatim to the `bn` binary on `PATH` (`kopitiam bn create "x" -t task` runs `bn create "x" -t task`), with stdin/stdout/stderr inherited and the child's exit code propagated. `kopitiam` takes no `kopi-beans` dependency and stays pure-Rust; if `bn` is not installed the command prints an install hint and exits non-zero. Non-interactive. See `apps/cli/src/bn.rs`.
 
-Usage: kopitiam.exe bn [ARGS]...
+Usage: kopitiam bn [ARGS]...
 
 Arguments:
   [ARGS]...

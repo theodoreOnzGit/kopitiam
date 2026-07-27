@@ -1,9 +1,11 @@
 //! The `tokens` subcommand: token accounting — token-max Task II-7.
 //!
-//! `tokens <path>` estimates how many BPE tokens a file (or every file under a
-//! directory) would cost an LLM to read, so an agent can choose *read vs.
+//! `tokens <path>...` estimates how many BPE tokens a file (or every file under
+//! a directory) would cost an LLM to read, so an agent can choose *read vs.
 //! outline* informed rather than blind (`kopitiam_token_max.md` §0.7, §11
-//! II-7). It is the second measurement axis Part I asked for (bytes/lines vs.
+//! II-7). Takes **many paths at once** — sizing up three places shouldn't cost
+//! three invocations — and counts any file named more than once only once, so
+//! the grand total stay honest. It is the second measurement axis Part I asked for (bytes/lines vs.
 //! tokens, §268): a wide table is cheap in bytes but expensive in tokens; a CJK
 //! document is the reverse.
 //!
@@ -23,10 +25,19 @@ use serde::Serialize;
 /// Options for `kopitiam tokens`.
 #[derive(Args, Debug)]
 pub struct TokensArgs {
-    /// File or directory to estimate. A directory is walked recursively and
-    /// every readable UTF-8 file is summed; unreadable or non-UTF-8 files
-    /// (binaries) are skipped, not counted.
-    pub path: PathBuf,
+    /// One or more files / directories to estimate. Can pass many in one go —
+    /// `tokens src/a.rs crates/b/src` — so you sizing up a few places at once
+    /// don't need one call each. A directory is walked recursively and every
+    /// readable UTF-8 file is summed; unreadable or non-UTF-8 files (binaries)
+    /// are skipped, not counted.
+    ///
+    /// Overlapping paths are safe: the same file named twice (directly, or once
+    /// directly and once via a parent directory) is counted **once**, so the
+    /// grand total never double-counts. Files come out in the order you named
+    /// their path, and sorted within each directory, so output stay
+    /// deterministic.
+    #[arg(required = true, num_args = 1..)]
+    pub paths: Vec<PathBuf>,
 
     /// Emit machine-readable JSON: a per-file breakdown — each with its total
     /// and a per-line token count (`estimate_tokens_by_line`) — plus the grand
@@ -70,7 +81,7 @@ struct TokensReport {
 
 /// Runs `kopitiam tokens`: collect the target files, estimate each, report.
 pub fn run(args: TokensArgs) -> Result<()> {
-    let contents = collect_files(&args.path)?;
+    let contents = collect_all(&args.paths)?;
     let report = build_report(contents, args.json || args.by_line);
 
     if args.json {
@@ -81,12 +92,17 @@ pub fn run(args: TokensArgs) -> Result<()> {
     Ok(())
 }
 
-/// Gathers `(display_path, content)` for every UTF-8 file at `path`: just the
-/// one file if `path` is a file, or every readable UTF-8 file under it if it is
-/// a directory (walked recursively, sorted by path for deterministic output).
-/// Non-UTF-8 / unreadable files under a directory are silently skipped; a
-/// single explicit file that cannot be read is a hard error (the user named it).
-fn collect_files(path: &Path) -> Result<Vec<(String, String)>> {
+/// Expands one user-given path into the concrete files it names: just itself if
+/// it a file, or every file underneath if it a directory (walked recursively,
+/// sorted so the output stay deterministic run to run).
+///
+/// The `bool` carries *how* the file got here, and that changes the error rule
+/// downstream: `true` means the user named this file themselves, `false` means a
+/// directory sweep picked it up. An explicitly named file that cannot be read is
+/// a hard error (the user asked for it, so staying quiet would hide a typo);
+/// one merely swept up is skipped, because a directory full of `.png` shouldn't
+/// abort the scan.
+fn expand(path: &Path) -> Vec<(PathBuf, bool)> {
     if path.is_dir() {
         let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(path)
             .sort_by_file_name()
@@ -96,20 +112,46 @@ fn collect_files(path: &Path) -> Result<Vec<(String, String)>> {
             .map(walkdir::DirEntry::into_path)
             .collect();
         paths.sort();
-        let mut out = Vec::new();
-        for p in paths {
-            // A directory sweep skips binaries and unreadable files rather than
-            // aborting the whole scan on the first one.
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                out.push((to_slash(&p), text));
+        paths.into_iter().map(|p| (p, false)).collect()
+    } else {
+        vec![(path.to_path_buf(), true)]
+    }
+}
+
+/// Gathers `(display_path, content)` across every path the user named, reading
+/// each distinct file exactly once.
+///
+/// Dedup matters for the total to mean anything: `tokens src src/lib.rs` names
+/// `lib.rs` twice — once directly, once through its parent — and without dedup
+/// the grand total would quietly count it twice and overstate the read cost,
+/// which is the one number this command exists to get right.
+///
+/// The key is the **canonicalised** path, so two different spellings of one file
+/// (`./a.rs` vs `a.rs`, or a symlink and its target) collapse together.
+/// Canonicalising can fail — broken symlink, no permission — and then we fall
+/// back to the path as given. That fallback direction is deliberate: worst case
+/// we treat one file as two and overcount slightly, never the reverse where a
+/// file the user explicitly asked about silently vanishes from the report.
+fn collect_all(paths: &[PathBuf]) -> Result<Vec<(String, String)>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for input in paths {
+        for (p, explicit) in expand(input) {
+            let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            match std::fs::read_to_string(&p) {
+                Ok(text) => out.push((to_slash(&p), text)),
+                Err(e) => {
+                    if explicit {
+                        return Err(e).with_context(|| format!("reading {}", p.display()));
+                    }
+                }
             }
         }
-        Ok(out)
-    } else {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Ok(vec![(to_slash(path), text)])
     }
+    Ok(out)
 }
 
 /// Normalise a path to forward-slash form for stable output on BOTH Windows
@@ -181,9 +223,31 @@ mod tests {
     #[test]
     fn parses_a_bare_path() {
         let cli = TestCli::try_parse_from(["t", "src/lib.rs"]).unwrap();
-        assert_eq!(cli.args.path, PathBuf::from("src/lib.rs"));
+        assert_eq!(cli.args.paths, vec![PathBuf::from("src/lib.rs")]);
         assert!(!cli.args.json);
         assert!(!cli.args.by_line);
+    }
+
+    #[test]
+    fn parses_several_paths_in_one_go() {
+        // The whole point of multi-path: one call instead of one per target.
+        let cli = TestCli::try_parse_from(["t", "src/lib.rs", "crates/x/src", "README.md"]).unwrap();
+        assert_eq!(
+            cli.args.paths,
+            vec![
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("crates/x/src"),
+                PathBuf::from("README.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn at_least_one_path_is_required() {
+        // Bare `kopitiam tokens` must fail loudly, not silently estimate nothing
+        // and print a confident "Total: 0 tokens".
+        assert!(TestCli::try_parse_from(["t"]).is_err());
+        assert!(TestCli::try_parse_from(["t", "--json"]).is_err());
     }
 
     #[test]
@@ -241,6 +305,50 @@ mod tests {
         assert_eq!(files[0]["path"], "f.rs");
         assert!(files[0]["tokens"].as_u64().is_some());
         assert!(files[0]["by_line"].as_array().is_some());
+    }
+
+    #[test]
+    fn overlapping_paths_count_each_file_once() {
+        // `tokens <dir> <dir>/a.rs` names a.rs twice — once directly, once via
+        // its parent. Without dedup the grand total silently doubles it, which
+        // would break the one number this command exists to report.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+        let both = collect_all(&[dir.path().to_path_buf(), dir.path().join("a.rs")]).unwrap();
+        assert_eq!(both.len(), 2, "a.rs must not appear twice");
+
+        // And the total matches the directory sweep on its own.
+        let sweep = collect_all(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(
+            build_report(both, false).total_tokens,
+            build_report(sweep, false).total_tokens
+        );
+    }
+
+    #[test]
+    fn separate_paths_are_all_collected_in_argument_order() {
+        // Two unrelated dirs: every file shows up, and the caller's ordering is
+        // preserved so the output is stable and diffable.
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        std::fs::write(one.path().join("first.rs"), "fn first() {}\n").unwrap();
+        std::fs::write(two.path().join("second.rs"), "fn second() {}\n").unwrap();
+
+        let got = collect_all(&[one.path().to_path_buf(), two.path().to_path_buf()]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].0.ends_with("first.rs"), "argument order preserved");
+        assert!(got[1].0.ends_with("second.rs"));
+    }
+
+    #[test]
+    fn an_explicitly_named_missing_file_is_a_hard_error() {
+        // The user named it, so a typo must surface — not be quietly skipped and
+        // folded into a confident-looking total.
+        let dir = tempfile::tempdir().unwrap();
+        let err = collect_all(&[dir.path().join("nope.rs")]).unwrap_err();
+        assert!(err.to_string().contains("nope.rs"), "error names the file");
     }
 
     #[test]

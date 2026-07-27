@@ -91,6 +91,15 @@ emit_cmd() {
 
 	# shellcheck disable=SC2086
 	help_txt="$("$bin" $path --help 2>&1)"
+	# Clap prints argv[0]'s FILE NAME in every `Usage:` line, so a Windows build
+	# says `kopitiam.exe` and a Linux/Termux one says `kopitiam` — same command,
+	# different bytes. Without this normalisation the determinism self-check
+	# below only holds *per platform*: regenerating on Windows then on Linux
+	# rewrites every Usage line, and the committed skill churns back and forth
+	# between the maintainer's box and any agent's. Force the platform-neutral
+	# spelling so regeneration is byte-identical everywhere. Same spirit as
+	# CLAUDE.md "Cross-platform paths" (forward slashes regardless of OS).
+	help_txt="${help_txt//kopitiam.exe/kopitiam}"
 	nested="$(list_subcommands "$help_txt")"
 
 	if [ -n "$nested" ]; then
@@ -202,15 +211,21 @@ do NOT open files blind. The whole point of these commands is to spend a few
 dozen tokens on coordinates and skeletons instead of thousands on file bodies.
 The loop is **measure → skeleton → coordinates → read only the slice you need**:
 
-**1. `kopitiam tokens <path>` BEFORE you read anything.** It prints a
+**1. `kopitiam tokens <path>...` BEFORE you read anything.** It prints a
 deterministic BPE token estimate for a file or a whole directory (no
 rust-analyzer, instant). Let the number decide read-vs-outline: a 2k-token file
 you can afford to read; a 130k-token directory you must *not* — target its call
 sites instead.
 
+Takes **many paths in one call**, so budgeting a few places at once costs one
+invocation, not one each. Naming the same file twice (directly, or once
+directly and once through its parent directory) counts it **once** — the grand
+total never double-counts.
+
 ```bash
 kopitiam tokens crates/kopitiam-document/src/reconstruction   # a directory: total to budget against
 kopitiam tokens apps/cli/src/main.rs                          # one file: is it cheap enough to read whole?
+kopitiam tokens apps/cli/src/ocr_fallback.rs crates/kopitiam-ocr/src   # several at once: one budget for the job
 kopitiam tokens --json src/ | jq '.total'                     # gate programmatically, no prose parsing
 ```
 
