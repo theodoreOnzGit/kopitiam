@@ -98,6 +98,12 @@ zune-jpeg = "0.5"
 cargo_metadata = "0.23"
 rustdoc-types = "0.60"
 url = "2"
+# Already in the tree as `url`'s own dependency, so this costs no extra compile.
+# Declared directly because `uri_to_path` needs to percent-decode a `file:` URI
+# path itself when the platform's `to_file_path()` refuses it — see
+# `kopitiam-semantic::lsp_types::uri_to_path`. Hand-rolling a decoder there
+# would be a UTF-8 bug waiting to happen.
+percent-encoding = "2"
 similar = "3"
 redb = "4"
 tantivy = "0.26"

@@ -399,11 +399,60 @@ fn parse_position(
     Some(Position { line, character })
 }
 
-/// Resolves a `file://` URI to a real path. Returns `None` (dropping the
-/// entry) rather than erroring for a non-`file` URI — some servers can return
-/// `untitled:`/`jdt:` URIs for virtual documents this crate cannot open.
+/// Resolves a `file:` URI to a real path.
+///
+/// Returns `None` — dropping the entry — for a URI that is **not** `file:`:
+/// servers legitimately answer with `untitled:`, `jdt:` and friends for virtual
+/// documents this crate cannot open, and there is nothing sensible to do with
+/// those but skip them.
+///
+/// # Why this is not simply `Url::to_file_path()`
+///
+/// Because `to_file_path()` is platform-conditional, and it bites in exactly one
+/// direction. On Windows it requires the first path segment to be a drive
+/// letter, so `file:///tmp/lib.rs` — a perfectly ordinary URI from a Linux or
+/// Termux server — comes back `Err` and the location **silently disappears**,
+/// indistinguishable from the `jdt:` case that is supposed to disappear. The
+/// user sees "no definition found" and gets no hint that a path convention was
+/// the problem. Measured, not guessed:
+///
+/// ```text
+/// on Windows:  "file:///tmp/lib.rs"       -> Err   (this bug)
+///              "file:///C:/tmp/lib.rs"    -> C:\tmp\lib.rs
+///              "file:///c%3A/tmp/lib.rs"  -> c:\tmp\lib.rs
+/// ```
+///
+/// That asymmetry is not hypothetical here: KOPITIAM targets Windows **and**
+/// Termux, and a language server need not run on the same platform as the
+/// client (WSL, a container, a remote workspace all produce foreign-looking
+/// `file:` URIs). So when a genuine `file:` URI defeats this platform's
+/// converter, fall back to percent-decoding the URI path and keeping the
+/// server's own spelling, rather than throwing the location away. A path that
+/// looks foreign is still something the user can read, act on, and report; a
+/// vanished result is not.
+///
+/// A non-empty host (`file://server/share/x`, a UNC path) is left to
+/// `to_file_path()` alone — Windows can represent it and other platforms
+/// cannot, and the fallback would silently drop the host and produce a
+/// confidently wrong local path, which is worse than admitting defeat.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    url::Url::parse(uri).ok()?.to_file_path().ok()
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    if let Ok(path) = url.to_file_path() {
+        return Some(path);
+    }
+    match url.host_str() {
+        None | Some("") | Some("localhost") => {}
+        // UNC / remote: see the doc comment. Do not guess.
+        Some(_) => return None,
+    }
+    let decoded = percent_encoding::percent_decode_str(url.path()).decode_utf8().ok()?;
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(decoded.as_ref()))
 }
 
 /// The latest pushed diagnostics per document URI.
@@ -471,6 +520,82 @@ mod tests {
     /// the wire→`char` conversion is that line's actual text, not its number.
     fn lines_from<'a>(entries: &'a [(&'a str, &'a str)]) -> impl FnMut(&str, u32) -> Option<String> + 'a {
         move |uri, _line| entries.iter().find(|(u, _)| *u == uri).map(|(_, text)| text.to_string())
+    }
+
+    // ---- `file:` URI -> path, on every platform ------------------------
+    //
+    // These exist because the whole definition/references suite used to be
+    // Linux-only by accident: it hardcoded `file:///tmp/...`, which on Windows
+    // makes `Url::to_file_path()` return `Err` (no drive letter), so all seven
+    // tests failed by producing ZERO locations. The parsing was never wrong.
+    // Nothing below asserts a platform-specific *spelling* unless it is
+    // deliberately checking that platform's conversion.
+
+    #[test]
+    fn a_unix_style_file_uri_resolves_on_every_platform() {
+        // The actual bug. A Linux/Termux server (or WSL, or a container) sends
+        // this to whatever client asked; on Windows it used to vanish.
+        assert_eq!(
+            uri_to_path("file:///tmp/lib.rs"),
+            Some(PathBuf::from("/tmp/lib.rs")),
+            "a unix-style file: URI must survive on every platform, not silently \
+             disappear on the ones whose native converter rejects it"
+        );
+    }
+
+    #[test]
+    fn a_windows_drive_file_uri_resolves_on_every_platform() {
+        let path = uri_to_path("file:///C:/tmp/lib.rs").expect("a drive-letter file: URI resolves");
+        // Windows converts to a native path; elsewhere the drive letter is just
+        // another path segment. Both are "did not throw it away", which is the
+        // property under test.
+        #[cfg(windows)]
+        assert_eq!(path, PathBuf::from("C:\\tmp\\lib.rs"));
+        #[cfg(not(windows))]
+        assert_eq!(path, PathBuf::from("/C:/tmp/lib.rs"));
+    }
+
+    #[test]
+    fn a_percent_encoded_drive_letter_is_decoded() {
+        // Some servers encode the colon. If we ever hand-rolled the decoding
+        // and forgot this, paths would silently gain a literal "%3A".
+        let path = uri_to_path("file:///c%3A/tmp/lib.rs").expect("percent-encoded drive resolves");
+        assert!(
+            !path.to_string_lossy().contains("%3A"),
+            "the %3A must be decoded to ':', got {path:?}"
+        );
+    }
+
+    #[test]
+    fn a_percent_encoded_space_is_decoded_in_the_fallback() {
+        // Exercises the fallback branch specifically (no drive letter), where
+        // the decoding is ours rather than `url`'s.
+        assert_eq!(
+            uri_to_path("file:///tmp/my%20project/lib.rs"),
+            Some(PathBuf::from("/tmp/my project/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn a_non_file_uri_is_still_dropped() {
+        // The behaviour the fallback must NOT weaken: virtual documents have no
+        // path and are meant to disappear. Dropping must be about the scheme,
+        // never about which platform happens to be running.
+        assert_eq!(uri_to_path("jdt://contents/Foo.class"), None);
+        assert_eq!(uri_to_path("untitled:Untitled-1"), None);
+        assert_eq!(uri_to_path("not a uri at all"), None);
+    }
+
+    #[test]
+    fn a_remote_host_file_uri_is_not_guessed_into_a_local_path() {
+        // `file://server/share/x` is a UNC path. Windows can represent it and
+        // other platforms cannot; the fallback must not strip the host and
+        // hand back a confidently wrong local "/share/x".
+        let got = uri_to_path("file://server/share/x.rs");
+        #[cfg(windows)]
+        assert_eq!(got, Some(PathBuf::from("\\\\server\\share\\x.rs")));
+        #[cfg(not(windows))]
+        assert_eq!(got, None, "must refuse rather than invent a local path");
     }
 
     // ---- definition/references shape handling --------------------------
