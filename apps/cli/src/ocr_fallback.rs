@@ -46,6 +46,8 @@ use kopitiam_ocr::{
 use kopitiam_pdf::mupdf::{PdfDocument, Pixmap, rasterize_page};
 use kopitiam_pdf::{Page, TextSpan};
 
+use crate::ocr_route::{Engine, HeuristicRouter, PageRouter, RoutePlan};
+
 /// Below this many non-whitespace *extracted* characters, a page is treated as
 /// scanned (image-only) and becomes eligible for the OCR fallback.
 ///
@@ -132,6 +134,14 @@ pub fn is_low_text_page(page: &Page) -> bool {
 
 /// Whether `page` should be OCR'd under `mode`: never for `Off`, always for `On`,
 /// and only when [`is_low_text_page`] for `Auto`.
+///
+/// **Retained as the reference oracle, not as production code.** The pipeline
+/// now routes through [`crate::ocr_route::HeuristicRouter`]; this is the
+/// original decision kept so a test can assert the router still agrees with it
+/// exactly. That equivalence is worth a permanent guard, because a divergence
+/// would be invisible — the pipeline would just quietly start OCRing a
+/// different set of pages, with no error and no output that looks wrong.
+#[cfg(test)]
 pub fn should_ocr_page(mode: OcrMode, page: &Page) -> bool {
     match mode {
         OcrMode::Off => false,
@@ -241,14 +251,51 @@ pub fn ocr_lines_to_spans(lines: &[String]) -> Vec<TextSpan> {
 ///
 /// This is the testable core: with a fake [`PageOcr`] it exercises the trigger,
 /// mode, and merge without any real OCR.
+///
+/// **Test-only convenience.** Production goes through [`run_ocr_fallback`],
+/// which routes once and reuses the plan; this wrapper exists so the many
+/// trigger/mode/merge tests can stay written in terms of a mode rather than
+/// having to build a plan by hand.
+#[cfg(test)]
 pub fn apply_ocr_fallback(
     pages: &mut [Page],
     mode: OcrMode,
     ocr: &dyn PageOcr,
 ) -> anyhow::Result<OcrSummary> {
+    let plan = HeuristicRouter.route(pages, mode);
+    apply_route_plan(pages, &plan, ocr)
+}
+
+/// Applies an already-computed [`RoutePlan`]: OCR exactly the pages it routed to
+/// [`Engine::Tesseract`], leave the rest to their text layer.
+///
+/// Taking the plan as a parameter (rather than deciding inline) is what lets the
+/// routing decision be inspected, diffed and eventually made by a smarter
+/// router, without this function changing at all.
+///
+/// # Two different "page indexes" meet here — do not conflate them
+///
+/// * `RoutePlan` dispatches are keyed by **position in the `pages` slice**,
+///   because that is all a router is given.
+/// * The recognizer addresses pages by **document index**, derived from
+///   `page.number - 1`.
+///
+/// These coincide only when `pages` is the whole document in order. With a
+/// subset — `pdf2md --pages 5-9` — slice position 0 is document page 4, and
+/// using one where the other belongs would silently OCR (and splice) the WRONG
+/// page: no error, just text from elsewhere in the document appearing on a page
+/// that never had it. So the plan is consulted by slice position, and the
+/// recognizer is always called with `page.number - 1`.
+pub fn apply_route_plan(
+    pages: &mut [Page],
+    plan: &RoutePlan,
+    ocr: &dyn PageOcr,
+) -> anyhow::Result<OcrSummary> {
     let mut summary = OcrSummary::default();
-    for page in pages.iter_mut() {
-        if !should_ocr_page(mode, page) {
+    for (slot, page) in pages.iter_mut().enumerate() {
+        // A page with no dispatch is left alone: a router that declined to say
+        // anything about a page has not asked for it to be rewritten.
+        if plan.dispatches.get(slot).map(|d| d.engine) != Some(Engine::Tesseract) {
             continue;
         }
         // The rasterizer indexes pages 0-based; the mupdf extractor numbers them
@@ -291,15 +338,18 @@ pub fn run_ocr_fallback(
     if mode == OcrMode::Off {
         return Ok(OcrSummary::default());
     }
-    if !pages.iter().any(|page| should_ocr_page(mode, page)) {
+    // Route once, up front, and reuse the same plan for the early-exit check and
+    // the work itself — deciding twice invites the two answers to drift.
+    let plan = HeuristicRouter.route(pages, mode);
+    if plan.pages_for(Engine::Tesseract).is_empty() {
         // No scanned page: never load models or rasterize (no cost, and the
         // output is identical to the pre-OCR pipeline).
         return Ok(OcrSummary::default());
     }
     let store = ModelStore::with_default_root()
         .context("could not locate the local model store for OCR")?;
-    let engine = TesseractPageOcr::new(input, langs, &store)?;
-    apply_ocr_fallback(pages, mode, &engine)
+    let recognizer = TesseractPageOcr::new(input, langs, &store)?;
+    apply_route_plan(pages, &plan, &recognizer)
 }
 
 /// The real recognizer: an opened [`PdfDocument`] plus one loaded

@@ -25,3 +25,19 @@ scripts/token-harness.corpus
 # `vendor/` (no leading slash) matches a directory named `vendor` at ANY depth,
 # so every reference dropin (crates/*/vendor, apps/*/vendor, ...) is ignored.
 vendor/
+
+# ---------------------------------------------------------------------------
+# Model weights and anything else fetched from the network
+# ---------------------------------------------------------------------------
+# Never commit weights. They are hundreds of MB, they are somebody else's
+# redistribution to make, and git cannot store them usefully — a .gguf is
+# already-compressed binary, so every re-fetch is a fresh unmergeable blob in
+# history forever. The netfetch tests pull into the XDG model store, but a
+# stray copy in the worktree (a hand-dropped BYO file, a `--out` typo) must not
+# be committable by accident.
+*.gguf
+*.GGUF
+*.safetensors
+*.traineddata
+# Scratch dir the netfetch tests use when pointed away from the XDG store.
+/.netfetch-models/

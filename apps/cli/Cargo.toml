@@ -37,6 +37,10 @@ kopitiam-resource = { workspace = true }
 # transitive crates, since the tokenizer's own deps — regex, serde_json,
 # kopitiam-core — are all already in the tree).
 kopitiam-tokenizer = { workspace = true }
+# `kopitiam models inspect`: reads a GGUF's embedded vocabulary metadata
+# (tokens / merges / token_type) WITHOUT building a tokenizer or loading
+# weights, so it still works on exactly the model that is failing to load.
+kopitiam-loader = { workspace = true }
 kopitiam-knowledge = { workspace = true }
 kopitiam-index = { workspace = true }
 kopitiam-workspace = { workspace = true }

@@ -4,6 +4,158 @@
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
 
+> ## ✅ LATEST — 2026-07-27 (Mon ~17:00 SGT, maintainer's Windows box — **SmolLM2 RUNS**)
+>
+> **The chat bug is FIXED and proven on real weights.** Ran on the maintainer's
+> own machine, which *can* reach HuggingFace (the earlier container could not):
+>
+> ```text
+> PASS  smollm2-360m-instruct-q8_0     reached generate   -> " Paris."
+> PASS  smollm2-1.7b-instruct-q4_k_m   reached generate   -> " Paris, the city of light, the"
+> ```
+>
+> Full chain each time: fetch → load-gguf → tokenizer → weights → generate.
+> Both pulled + sha256-verified against the catalog pins (which were correct —
+> the LFS oid on the hub matches).
+>
+> **Root cause, settled by evidence not by guessing.** `kopitiam models inspect`
+> on the real 386 MB file: 21 single-byte tokens absent, **zero** `<0xNN>`
+> spellings. So it was verdict (2) — our all-256 check was too strict, NOT a
+> loader that fails to decode byte-tokens. Fix: `BpeTokenizer::byte_ids` is now
+> `[Option<u32>; 256]`, holes tolerated, unmapped bytes dropped at encode, new
+> `missing_byte_tokens()` exposes which. **13 of the 21 cannot occur in valid
+> UTF-8 at all** (`0xc0`/`0xc1`, `0xf5..=0xff`), leaving 6 rare C0 controls and
+> 2 unassigned-plane lead bytes as the entire real cost. → **AID-0054**.
+>
+> **Three bugs in the netfetch harness itself, found by running it:**
+> 1. **It lied.** Its own gate-guard test did `remove_var(KOPITIAM_NETFETCH)`
+>    in-process; libtest runs tests as threads, so it yanked the gate out from
+>    under the real run. The full suite printed `SKIPPED` and reported **green
+>    with the gate set** — exactly the silent-green its module docs promise to
+>    prevent. Now tested as a pure function, no shared state touched.
+> 2. **`KOPITIAM_NETFETCH_PATHS` split on a hardcoded `:`**, tearing
+>    `C:\models\x.gguf` into `C` + `\models\x.gguf`. Now `std::env::split_paths`
+>    (platform separator: `:` unix, `;` windows).
+> 3. **The default run would have burned 1.1 GB to fail.** Qwen/Llama entries
+>    still carry placeholder checksums *by design*, so they download then get
+>    refused by their own gate. Now split off and reported as `NOTE`, not run.
+>    New `Artifact::is_placeholder()` + `PLACEHOLDER_SHA256` made public for it.
+>
+> **No-egress boxes now skip gracefully (maintainer's instruction).** The Claude
+> Code container and the institute proxy both 403 `huggingface.co`. A model whose
+> bytes cannot be obtained is `SKIP` (green), not `FAIL`; only a model actually
+> *obtained* and then broken turns it red. When everything skips, the report says
+> in as many words that the run proved nothing — loud, not fatal. Also:
+> already-present weights are exercised with **no network at all** (uses
+> `ensure_available`, not `_resolving`, which used to hit the hub unconditionally
+> and would have failed an offline box holding correct weights).
+>
+> Both paths verified for real, not argued: dead-proxy + empty store → `SKIP` and
+> exit 0; dead-proxy + `KOPITIAM_NETFETCH_PATHS=C:\...\smollm2-360m...gguf` →
+> `PASS reached generate`, zero network.
+>
+> **Trade-off written down, not hidden:** a catalog URL that 404s also surfaces as
+> `Error::Http`, so it gets skipped rather than failed. We cannot separate the two
+> without pattern-matching ureq's `Display`, which is not a contract — so the SKIP
+> line prints the full underlying error instead.
+>
+> **Default run is small-models-only now (maintainer's call).** It was 409 s; it
+> is 9.85 s. Cap is `MAX_DEFAULT_ARTIFACT_BYTES = 512 MB`, drawn from measurement:
+> 360M Q8_0 is 386 MB / ~10 s, 1.7B Q4_K_M is 1.01 GB / ~453 s — 2.7× the file
+> for **45×** the wall clock, because the cost is the CPU forward pass, and
+> Termux has a fraction of these cores. Not a ban: `KOPITIAM_NETFETCH_BIG=1`
+> includes everything, and `KOPITIAM_NETFETCH_ONLY=<id>` runs that model whatever
+> its size (explicit beats default). Everything left out is printed **by name**
+> with the reason — an unexplained absence reads as coverage.
+>
+> ### Workspace suite: what is actually red on this box, and why (all pre-existing)
+>
+> **None of it is this session's work** — the diff touches zero files in `kmux`,
+> `kopi-beans` or `kopitiam-semantic`, and the only `kopitiam-neovim` edit is a
+> `#[cfg(unix)]` that *removes* a test on Windows. Two mechanical notes first:
+> `cargo test --workspace` stops at the **first failing crate**, so everything
+> after `kmux` alphabetically never runs — use `--no-fail-fast`. And do not pipe
+> cargo through `Select-Object -First N` in PowerShell: it closes the pipe and
+> **kills cargo mid-run** (cost me two bogus runs this session).
+>
+> Excluding the two vendored forks: **120 test targets, 3 red, ~2900 green.**
+>
+> | Failing | Count | Why — all environmental |
+> |---|---|---|
+> | `gguf_tokenizer::tests::*` (kopitiam-runtime) | 3 | `Io NotFound`. **There is NO `vendor/` directory on this box at all** — the earlier note claiming "present on the maintainer's box" was WRONG. `vendor/` is gitignored shallow clones; absent here, absent in containers. |
+> | `lsp_types::tests::definition_*` (kopitiam-semantic) | 7 | `index out of bounds: len is 0`, every parse yields 0 results. Smells like `file:///C:/...` URI handling on Windows. **A genuine cross-platform bug worth a bead** — not environmental noise, just not mine. |
+> | `providers::csharp::compile_remove_globs_*` | 1 | `Excluded\**\*.cs` — backslash as a glob separator on Windows. |
+> | `providers::python::a_non_executable_file_*` | 1 | Windows has no executable bit, so *everything* looks executable. |
+> | `providers::rust_analyzer::collects_symbols_*` | 1 | rust-analyzer times out; it stood down here ("project too big for full analysis on this device"). |
+> | kvim `termemu::*`, `ui::app::*`, `lsp::install::*`, `editor::shell`, `gf` | ~17 | PTY / real-terminal / installed-binary assumptions on Windows. |
+> | `kmux` (4 targets) | ~6 | `ConPTY executable not found on PATH: pwsh.exe` (PowerShell 7 not installed), Windows daemon spawn, mouse-border resize. `queued_background_if_shell_...` is **flaky** — failed one run, passed the next. Same family as known `bd-2wo`. |
+> | `kopi-beans` | ~11 | tombstone should-panics, symlink export (Windows symlinks need privilege), WAL executor. |
+>
+> Beads worth filing from that table: the `lsp_types` Windows-URI bug (real), the
+> Windows-vs-unix assumptions in `providers::{csharp,python}`, and
+> environment-guarding the kmux/kvim PTY tests so a stock Windows box can go
+> green. `bd` is still not on PATH here, hence recorded rather than filed.
+>
+> **Also fixed en route (pre-existing, blocking the gates):**
+> `kopitiam-neovim`'s `an_unreadable_directory_renders_an_honest_error_row` used
+> `std::os::unix::fs::PermissionsExt` ungated — on Windows that did not skip, it
+> failed to **compile**, so `clippy --workspace --all-targets` could not run at
+> all on this box. Now `#[cfg(unix)]`. Plus 4 mechanical clippy lints in the
+> in-flight TUI checkpoint's test code.
+>
+> **STILL OWED: a Linux run.** Everything above is Windows. The maintainer chose
+> **Termux** as the Linux proof (WSL Ubuntu here has no C compiler and sudo wants
+> a password). Commands to run there are at the end of this block. Nothing in the
+> change is platform-specific by inspection — `split_paths` is platform-defined,
+> the store already resolves `$HOME/.cache` on unix — but that is an argument, not
+> a test run, and this whole session is a lesson in the difference.
+>
+> Termux, once the branch is pulled:
+> ```bash
+> cargo test --release -p kopitiam-tokenizer
+> KOPITIAM_NETFETCH=1 KOPITIAM_NETFETCH_ONLY=smollm2-360m-instruct-q8_0 \
+>   cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
+> ```
+> Use the 360M, not the 1.7B — the 1.7B forward pass took ~7 min on a 14-core
+> ThinkPad and wants ~1 GB resident.
+>
+> Everything below is older — read it for background, not for current state.
+
+> ## 2026-07-27 (Mon, netfetch harness + real-model blocker) — SUPERSEDED by the block above
+>
+> **Cannot fetch models in the agent environment — org egress policy.** Both
+> `curl huggingface.co` and `kopitiam models pull` get `CONNECT ... 403` from the
+> proxy (crates.io etc. are on the bypass list; HF is not). This is policy, not a
+> bug, and not something to work around. So the SmolLM2/Gemma end-to-end run the
+> maintainer asked for **must happen on a box that can reach HuggingFace** — the
+> maintainer will run it locally.
+>
+> **What shipped so the local run is one command:**
+> * `crates/kopitiam-runtime/tests/netfetch_end_to_end.rs` — real-weights E2E,
+>   gated behind `KOPITIAM_NETFETCH=1` (off by default: needs network + hundreds
+>   of MB). Exercises fetch → load-gguf → tokenizer → weights → generate and
+>   reports WHICH stage each model died at (not just pass/fail). Catalog models
+>   plus `KOPITIAM_NETFETCH_PATHS=/path/to/gemma.gguf` for a hand-dropped Gemma
+>   (Gemma is not in the catalog yet — add it, or use the paths hatch).
+> * `.gitignore` now excludes `*.gguf` / `*.safetensors` / `*.traineddata` so a
+>   fetched or BYO weight can never be committed by accident.
+> * Run it: `KOPITIAM_NETFETCH=1 cargo test --release -p kopitiam-runtime \
+>   --test netfetch_end_to_end -- --nocapture` (`--nocapture` — the per-stage
+>   report IS the output).
+>
+> **Known-bad on a FRESH clone (not a regression):** three
+> `gguf_tokenizer::tests::*` fail because the vendored `ggml-vocab-qwen2.gguf`
+> under `crates/kopitiam-ai/vendor/` is a gitignored shallow clone and is absent
+> on a fresh container. Present on the maintainer's box. Do not "fix" these.
+>
+> **The actual chat bug is still open** (see `models inspect`, commit 896f5c9):
+> SmolLM2-360M loads but its tokenizer rejects byte 0x04. Two opposite fixes
+> (loader-decodes-`<0xNN>` vs check-too-strict); run
+> `kopitiam models inspect <the .gguf>` on the real file — its verdict line says
+> which. The netfetch test will then confirm the fix end to end.
+>
+> Everything below is older — read it for background, not for current state.
+
 > ## ✅ LATEST — 2026-07-27 (Mon, ~07:30 SGT)
 >
 > **Governance change: the NUS working-hours restriction is GONE.** KOPITIAM is

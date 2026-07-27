@@ -23,3 +23,11 @@ kopitiam-tokenizer.workspace = true
 # the release build.
 [dev-dependencies]
 tempfile.workspace = true
+# `tests/netfetch_end_to_end.rs` only: fetches REAL published weights so the
+# whole chain (fetch -> load -> tokenize -> generate) is exercised against what
+# HuggingFace actually ships, not against synthetic fixtures built the way this
+# code already expects. Gated behind KOPITIAM_NETFETCH so an ordinary
+# `cargo test` never touches the network. Dev-only, so nothing shipped depends
+# on it and the layering (`runtime` knows nothing of model acquisition) holds.
+kopitiam-models = { workspace = true }
+kopitiam-tokenizer = { workspace = true }

@@ -2947,6 +2947,7 @@ dependencies = [
  "kopitiam-document",
  "kopitiam-index",
  "kopitiam-knowledge",
+ "kopitiam-loader",
  "kopitiam-markdown",
  "kopitiam-models",
  "kopitiam-neovim",
@@ -3260,6 +3261,7 @@ version = "0.2.4"
 dependencies = [
  "kopitiam-core",
  "kopitiam-loader",
+ "kopitiam-models",
  "kopitiam-tensor",
  "kopitiam-tokenizer",
  "tempfile",

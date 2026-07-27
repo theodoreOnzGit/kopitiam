@@ -232,7 +232,7 @@ mod tests {
 
         let skeleton =
             TestCli::try_parse_from(["p", "skeleton", "src/foo.c", "--report"]).unwrap();
-        assert!(matches!(skeleton.command, PortAction::Skeleton(a) if a.report && a.file == PathBuf::from("src/foo.c")));
+        assert!(matches!(skeleton.command, PortAction::Skeleton(a) if a.report && a.file == *Path::new("src/foo.c")));
     }
 
     #[test]

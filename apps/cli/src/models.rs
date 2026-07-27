@@ -106,6 +106,19 @@ enum ModelsCommand {
         /// Catalog id of the model to check (see `kopitiam models list`).
         id: String,
     },
+
+    /// Look inside a `.gguf`'s embedded vocabulary and say why a tokenizer
+    /// built from it would fail.
+    ///
+    /// Reads metadata ONLY — never builds a tokenizer, never loads weights,
+    /// never dequantizes — so it still work on exactly the model that refuse
+    /// to load. A diagnostic that need the broken thing to work first is no
+    /// diagnostic lah.
+    ///
+    /// Point it at the `file:` path from a load failure, or at whatever
+    /// `kopitiam models path <id>` prints. See `apps/cli/src/vocab_inspect.rs`
+    /// for what the verdict line means.
+    Inspect(crate::vocab_inspect::InspectArgs),
 }
 
 /// Runs `kopitiam models`: dispatch to whichever action you chose.
@@ -122,6 +135,10 @@ pub fn run(args: ModelsArgs) -> Result<ExitCode> {
         }
         ModelsCommand::Pull { id } => {
             pull(&id)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        ModelsCommand::Inspect(args) => {
+            crate::vocab_inspect::run(args)?;
             Ok(ExitCode::SUCCESS)
         }
         ModelsCommand::Path { id } => path(&id),

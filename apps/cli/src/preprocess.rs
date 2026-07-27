@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn parses_summarize_and_triage() {
         let s = TestCli::try_parse_from(["p", "summarize", "f.txt", "--lines", "3"]).unwrap();
-        assert!(matches!(s.command, PreprocessAction::Summarize(a) if a.lines == 3 && a.file == PathBuf::from("f.txt")));
+        assert!(matches!(s.command, PreprocessAction::Summarize(a) if a.lines == 3 && a.file == *std::path::Path::new("f.txt")));
 
         let t = TestCli::try_parse_from(["p", "triage", "digital twin", "hit a", "hit b"]).unwrap();
         assert!(matches!(t.command, PreprocessAction::Triage(a) if a.query == "digital twin" && a.candidates.len() == 2));
