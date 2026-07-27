@@ -264,3 +264,24 @@ gix = { version = "0.86", default-features = false, features = [
 # `[patch.crates-io]` stub is needed (removing it is what makes kopi-beans
 # publishable: patches don't survive `cargo publish`). The optional dep is
 # still never compiled (worktree-mutation is off).
+
+# ---------------------------------------------------------------------------
+# Build profiles
+# ---------------------------------------------------------------------------
+
+[profile.release]
+# CLAUDE.md mandates `--release` for every build/test/run in this workspace, so
+# the release profile IS the development loop — not just what ships. Cargo's
+# default release profile disables incremental compilation, which means every
+# touched crate recompiles from scratch: across 31 members with wgpu and tantivy
+# in the tree that turns a one-line edit into minutes of rebuild, and it is why
+# `cargo test --release --workspace` felt so slow.
+#
+# Turning incremental back on trades a little runtime optimisation quality (the
+# compiler splits work into more codegen units, so cross-unit inlining suffers
+# slightly) for a large cut in rebuild time. That is the right trade here
+# because the profile's dominant use is the edit-test loop. If a release ever
+# needs the last few percent of runtime speed, build it with
+# `CARGO_INCREMENTAL=0 cargo build --release`, which overrides this without
+# editing the manifest.
+incremental = true
