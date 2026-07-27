@@ -116,6 +116,13 @@ pub fn run_refs(args: Locator) -> Result<()> {
     if args.no_lsp {
         return refs_syntactic(&args);
     }
+    // P1: on a large workspace, DEFAULT to the instant textual search rather
+    // than waiting out a rust-analyzer index that will not finish (`--lsp` skips
+    // this and forces rust-analyzer, hard-failing on timeout).
+    if !args.lsp && syntactic::prefer_syntactic_default(&args.root) {
+        eprintln!("large workspace: syntactic refs; --lsp for rust-analyzer");
+        return refs_syntactic(&args);
+    }
     syntactic::with_fallback(
         args.lsp,
         || refs_via_ra(&args),

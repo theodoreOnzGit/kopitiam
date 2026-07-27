@@ -227,6 +227,7 @@ kopitiam tokens crates/kopitiam-document/src/reconstruction   # a directory: tot
 kopitiam tokens apps/cli/src/main.rs                          # one file: is it cheap enough to read whole?
 kopitiam tokens apps/cli/src/ocr_fallback.rs crates/kopitiam-ocr/src   # several at once: one budget for the job
 kopitiam tokens --json src/ | jq '.total'                     # gate programmatically, no prose parsing
+kopitiam tokens src/ --tree                                   # per-directory rollup: find the heavy subtree in one call
 ```
 
 **2. `kopitiam outline <file>` instead of reading the file for orientation.**
@@ -255,7 +256,22 @@ kopitiam callers --file src/tables.rs try_table --depth 2                       
 
 Then read only the coordinates that matter — never the whole file to find them.
 
-**4. `kopitiam check --compact` / `test --compact` instead of raw cargo
+**4. `kopitiam slice <file> <A-B>` to READ only the lines you need.** This is
+the last step of the loop: once `outline`/`refs` hand back `file:line`
+coordinates, slice the exact range instead of reading the whole file (and
+instead of shelling `sed`). It prints the lines with a `(~N tokens)` cost so the
+read stays budget-aware. `--grep <pat>` fuses grep-then-slice — it prints each
+match's ±context neighbourhood as merged slices, so you grep and read only the
+hit windows in ONE call. Ranges accept `A-B`, a bare `A`, `A-` (to EOF), or
+`-B`; `--json` for the machine form.
+
+```bash
+kopitiam slice src/tables.rs 120-145                 # read exactly the function outline pointed you at
+kopitiam slice src/tables.rs --grep try_table        # each hit + context, merged, in one call
+kopitiam slice src/tables.rs 120-145 --json          # {file, slices:[{start,end,tokens,lines}], total_tokens}
+```
+
+**5. `kopitiam check --compact` / `test --compact` instead of raw cargo
 output.** `check --compact` collapses cargo's diagnostics to one deduplicated
 line per distinct problem, sorted by file (one bad type stops spamming forty
 identical errors); `test --compact` reports each failure as
@@ -268,20 +284,26 @@ kopitiam test  --compact          # failures as name — assertion @ file:line
 kopitiam check --json | jq length # zero == clean, gate on it
 ```
 
-**On a large workspace, `outline`/`refs`/`def`/`sig`/`callers`/`callees`/`impls`
-try rust-analyzer first** and wait for it to index (default **180 s**,
-overridable with the `KOPITIAM_RA_TIMEOUT_SECS` env var) before falling back.
-On a workspace too big for rust-analyzer to index in bounded time — kopitiam's
-own tree is one — that wait is wasted. Pass **`--no-lsp`** (alias `--syntactic`)
-to skip rust-analyzer entirely and answer from a deterministic, dependency-free
-scan: instant, and the guaranteed path. It is textual (grep-grade) rather than
-semantic, so `refs`/`callers` hits are labelled `(syntactic, not semantic —
-verify)`; use `--lsp` to *require* rust-analyzer and fail instead of falling
-back when you need semantic precision.
+**On a large workspace, `outline` and `refs` DEFAULT to the instant syntactic
+scan** — kopitiam's own tree is large enough that rust-analyzer cannot index in
+bounded time, so waiting for it is wasted. They print a one-line stderr note
+(`large workspace: syntactic outline; --lsp for rust-analyzer`) and answer
+immediately from a deterministic, dependency-free scan. That scan is textual
+(grep-grade) rather than semantic, so `refs` hits are labelled
+`(syntactic, not semantic — verify)`. Pass **`--lsp`** to *require* rust-analyzer
+(real signatures / semantic references) and fail hard on timeout instead of
+answering syntactically; on a small workspace rust-analyzer is tried first
+automatically. `--no-lsp` (alias `--syntactic`) always forces the scan.
+
+The other semantic queries — `def`/`sig`/`callers`/`callees`/`impls` — have no
+syntactic fallback (a definition/signature/call-graph answer needs real
+resolution), so they always use rust-analyzer and wait for its index (default
+**180 s**, overridable with `KOPITIAM_RA_TIMEOUT_SECS`).
 
 ```bash
-kopitiam outline --no-lsp src/foo.rs                 # instant skeleton, no rust-analyzer
-kopitiam refs --no-lsp --file src/tables.rs try_table   # instant textual call sites, verify each
+kopitiam outline src/foo.rs                          # instant syntactic skeleton on a large workspace
+kopitiam refs --file src/tables.rs try_table         # instant textual call sites, verify each
+kopitiam outline --lsp src/foo.rs                    # require rust-analyzer (real signatures), fail hard on timeout
 KOPITIAM_RA_TIMEOUT_SECS=20 kopitiam def --file src/tables.rs try_table  # shorten the RA wait
 ```
 

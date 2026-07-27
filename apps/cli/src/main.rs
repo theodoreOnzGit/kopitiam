@@ -37,6 +37,7 @@ mod refactor;
 mod rename;
 mod scan;
 mod semq;
+mod slice;
 mod status;
 mod syntactic;
 mod tokens;
@@ -287,6 +288,15 @@ enum Command {
     /// `apps/cli/src/tokens.rs`.
     Tokens(tokens::TokensArgs),
 
+    /// Print an inclusive, 1-based line range of a file with its token cost —
+    /// the READ step of the `tokens → outline → refs → read` loop (follow-up P2).
+    ///
+    /// `slice <file> <A-B>` prints lines A..=B (also `A`, `A-`, `-B`);
+    /// `slice <file> --grep <pat>` prints each match's ±context neighbourhood as
+    /// merged slices, so an agent greps and reads only the hit windows in one
+    /// call. See `apps/cli/src/slice.rs`.
+    Slice(slice::SliceArgs),
+
     /// Translate a converted Markdown document end to end — token-max Tasks
     /// III-4..7.
     ///
@@ -442,6 +452,10 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Tokens(args) => {
             tokens::run(args)?;
+            ExitCode::SUCCESS
+        }
+        Command::Slice(args) => {
+            slice::run(args)?;
             ExitCode::SUCCESS
         }
         Command::Translate(args) => {

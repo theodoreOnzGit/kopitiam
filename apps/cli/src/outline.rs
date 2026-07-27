@@ -53,11 +53,14 @@ pub struct OutlineArgs {
 
 /// Runs `kopitiam outline`.
 ///
-/// Default behaviour tries rust-analyzer first (real signatures, the server's
-/// own symbol tree) and, on timeout/unavailability, falls back automatically to
-/// the syntactic item scan ([`syntactic::outline_file`]) with a stderr note.
-/// `--no-lsp`/`--syntactic` forces the scan; `--lsp` forces rust-analyzer and
-/// makes a failure a hard, non-zero exit rather than a silent empty outline.
+/// Default behaviour is workspace-size aware (P1): on a **large** workspace
+/// (where rust-analyzer will not index in bounded time) it goes straight to the
+/// instant syntactic item scan with a stderr note; on a **small** workspace it
+/// tries rust-analyzer first (real signatures, the server's own symbol tree)
+/// and, on timeout/unavailability, falls back automatically to the syntactic
+/// scan ([`syntactic::outline_file`]). `--no-lsp`/`--syntactic` forces the scan;
+/// `--lsp` forces rust-analyzer regardless of workspace size and makes a failure
+/// a hard, non-zero exit rather than a silent empty outline.
 pub fn run(args: OutlineArgs) -> Result<()> {
     let outline = resolve_outline(&args)?;
     emit(&outline, args.json);
@@ -67,6 +70,15 @@ pub fn run(args: OutlineArgs) -> Result<()> {
 /// Produces the [`Outline`] per the `--no-lsp`/`--lsp` policy above.
 fn resolve_outline(args: &OutlineArgs) -> Result<Outline> {
     if args.no_lsp {
+        return syntactic::outline_file(&args.file);
+    }
+
+    // P1: on a large workspace rust-analyzer will not index in bounded time, so
+    // DEFAULT to the instant syntactic scan (rust-analyzer stays opt-in via
+    // `--lsp`, which skips this branch and keeps its full-timeout, fail-hard
+    // semantics). A one-line stderr note keeps `--json` stdout clean.
+    if !args.lsp && syntactic::prefer_syntactic_default(&args.root) {
+        eprintln!("large workspace: syntactic outline; --lsp for rust-analyzer");
         return syntactic::outline_file(&args.file);
     }
 

@@ -116,6 +116,61 @@ pub fn with_fallback<T>(
 }
 
 // ---------------------------------------------------------------------------
+// Large-workspace detection (P1): default to syntactic when rust-analyzer
+// will not index in a bounded time.
+// ---------------------------------------------------------------------------
+
+/// The `.rs`-file count at (or above) which a workspace is treated as **large**
+/// — big enough that rust-analyzer routinely fails to finish its initial index
+/// inside a comfortable wait — so the navigation defaults flip to the instant
+/// syntactic path (rust-analyzer becomes an explicit `--lsp` opt-in).
+///
+/// A single small crate is well under this; kopitiam's own multi-crate tree is
+/// far over it (≈1.7k `.rs` files). The count is *capped* at this value so the
+/// probe is O(threshold), not O(workspace).
+pub const LARGE_WORKSPACE_RS_FILES: usize = 50;
+
+/// Counts `.rs` files under `root`, stopping the walk as soon as `limit` is
+/// reached (so a huge tree costs a bounded, early-terminating walk rather than a
+/// full traversal). `target/`, `vendor/`, and dot-directories are pruned — the
+/// same blast radius [`grep_symbol`] uses — so build artifacts and vendored
+/// third-party code do not inflate the count.
+pub fn count_rs_files_capped(root: &Path, limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+        if e.depth() == 0 {
+            return true;
+        }
+        let name = e.file_name().to_string_lossy();
+        !(e.file_type().is_dir() && (name == "target" || name == "vendor" || name.starts_with('.')))
+    });
+    for entry in walker.filter_map(std::result::Result::ok) {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|e| e.to_str()) == Some("rs")
+        {
+            count += 1;
+            if count >= limit {
+                break;
+            }
+        }
+    }
+    count
+}
+
+/// Whether the navigation commands (`outline`, `refs`) should DEFAULT to the
+/// syntactic path on `root` — i.e. `root` is a [large workspace](LARGE_WORKSPACE_RS_FILES)
+/// where waiting out a rust-analyzer index is wasted time.
+///
+/// This decides only the *unforced* default: `--lsp` still forces rust-analyzer
+/// (and hard-fails on timeout), `--no-lsp`/`--syntactic` still forces the scan.
+pub fn prefer_syntactic_default(root: &Path) -> bool {
+    count_rs_files_capped(root, LARGE_WORKSPACE_RS_FILES) >= LARGE_WORKSPACE_RS_FILES
+}
+
+// ---------------------------------------------------------------------------
 // Single-file syntactic outline.
 // ---------------------------------------------------------------------------
 
@@ -727,6 +782,49 @@ mod tests {
     fn with_fallback_prefers_the_primary_on_success() {
         let out: Result<i32> = with_fallback(false, || Ok(3), "note", || Ok(7));
         assert_eq!(out.unwrap(), 3, "a working RA path is used as-is");
+    }
+
+    // ---- large-workspace detection (P1) ------------------------------------
+
+    #[test]
+    fn count_rs_files_caps_and_prunes_noise_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        std::fs::write(root.join("src/b.rs"), "").unwrap();
+        std::fs::write(root.join("notes.txt"), "").unwrap(); // non-rs ignored
+        // `.rs` files under pruned directories must NOT be counted.
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/gen.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::write(root.join("vendor/dep.rs"), "").unwrap();
+
+        // Only the two real source files count (a high cap sees the true total).
+        assert_eq!(count_rs_files_capped(root, 100), 2);
+        // The cap is an upper bound: an early stop never over-counts.
+        assert_eq!(count_rs_files_capped(root, 1), 1);
+        // A zero limit is a no-op.
+        assert_eq!(count_rs_files_capped(root, 0), 0);
+    }
+
+    #[test]
+    fn prefer_syntactic_default_flips_on_a_large_workspace() {
+        // A tiny workspace (a handful of files) keeps rust-analyzer-first.
+        let small = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(small.path().join("src")).unwrap();
+        for i in 0..3 {
+            std::fs::write(small.path().join(format!("src/f{i}.rs")), "fn f() {}\n").unwrap();
+        }
+        assert!(!prefer_syntactic_default(small.path()), "a small crate stays RA-first");
+
+        // A workspace with >= the threshold `.rs` files defaults to syntactic.
+        let large = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(large.path().join("src")).unwrap();
+        for i in 0..LARGE_WORKSPACE_RS_FILES {
+            std::fs::write(large.path().join(format!("src/f{i}.rs")), "fn f() {}\n").unwrap();
+        }
+        assert!(prefer_syntactic_default(large.path()), "a large tree defaults to syntactic");
     }
 
     // ---- outline scan ------------------------------------------------------
