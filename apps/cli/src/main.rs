@@ -29,6 +29,7 @@ mod diagnostics;
 mod digest;
 mod models;
 mod ocr_fallback;
+mod ocr_route;
 mod outline;
 mod ra_guard;
 mod plan;
@@ -50,6 +51,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+
+// Brought into scope so `HeuristicRouter::route` resolves at the `--ocr-plan`
+// call site; the trait is the seam a future vision router implements.
+use crate::ocr_route::PageRouter;
 
 /// Which text-extraction engine [`Command::Pdf2md`] drives.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -144,6 +149,16 @@ enum Command {
         /// pull …` command to fetch it.
         #[arg(long, value_name = "LANGS", default_value = ocr_fallback::DEFAULT_OCR_LANGS)]
         ocr_lang: String,
+
+        /// Print the OCR routing plan to stderr before converting: one line per
+        /// page saying which engine will read it and why.
+        ///
+        /// Answers the pipeline's most common "is this a bug?" question — a page
+        /// came back thin, but was OCR never asked, asked and declined, or asked
+        /// and found nothing? The plan is a stable, diffable value, so two
+        /// routers over the same PDF can be compared directly.
+        #[arg(long)]
+        ocr_plan: bool,
     },
 
     /// Scan a Rust project's real tooling and report what the Semantic
@@ -419,6 +434,7 @@ fn run() -> anyhow::Result<ExitCode> {
             split_by_heading_level,
             ocr,
             ocr_lang,
+            ocr_plan,
         } => {
             pdf2md(
                 &input,
@@ -431,6 +447,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     index,
                     pages: pages.as_deref(),
                     split_by_heading_level,
+                    ocr_plan,
                 },
             )?;
             ExitCode::SUCCESS
@@ -546,6 +563,8 @@ struct Pdf2mdOptions<'a> {
     index: bool,
     pages: Option<&'a str>,
     split_by_heading_level: Option<usize>,
+    /// Print the OCR routing plan to stderr before converting.
+    ocr_plan: bool,
 }
 
 /// One rendered Markdown artifact to be written to disk: its path, its content,
@@ -631,6 +650,11 @@ fn pdf2md(
     // (no model load, no rasterize) unless a page actually qualifies, so a
     // born-digital PDF's output is unchanged. OCR text counts as real extracted
     // content, keeping the recovery ratio honest (§2.1).
+    if options.ocr_plan {
+        // stderr, so `--report-json` and any piped stdout stay machine-clean.
+        let plan = ocr_route::HeuristicRouter.route(&pages, ocr_mode);
+        eprint!("{}", plan.to_report());
+    }
     let ocr_summary = ocr_fallback::run_ocr_fallback(input, &mut pages, ocr_mode, ocr_langs)?;
 
     // The mupdf engine already returns spans in true reading order (columns
