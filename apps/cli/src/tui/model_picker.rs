@@ -454,11 +454,24 @@ fn walk_gguf(dir: &Path, known: &[PathBuf], depth_left: usize, out: &mut Vec<Pat
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // `symlink_metadata` does NOT follow the link, which is the point: a
+        // symlinked directory inside the store would otherwise be descended into
+        // as if it were part of the store. Two ways that bites — a link pointing
+        // at, say, `$HOME` silently surfaces unrelated `.gguf` files as if the
+        // user had put them there, and a link pointing at an ancestor walks the
+        // same tree again. The depth cap bounds the damage either way, so this is
+        // not a hang, but "models appear that the user never placed here" is
+        // confusing enough to be worth one stat call. Symlinked *files* are still
+        // accepted: deliberately pointing at weights elsewhere is a reasonable
+        // thing to do, and it is only directory RECURSION that surprises.
+        let followable_dir = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if followable_dir {
             if depth_left > 0 {
                 walk_gguf(&path, known, depth_left - 1, out);
             }
-        } else if is_gguf(&path) && !known.contains(&path) {
+        } else if path.is_file() && is_gguf(&path) && !known.contains(&path) {
             out.push(path);
         }
     }
@@ -841,7 +854,37 @@ mod tests {
     }
 
     #[test]
-    fn the_loose_scan_respects_its_depth_cap() {
+    fn the_loose_scan_does_not_descend_symlinked_directories() {
+        // A symlinked dir inside the store must not be walked: pointing it at a
+        // home directory would surface unrelated .gguf files as if the user had
+        // put them in the store, and pointing it at an ancestor re-walks the same
+        // tree. Symlinked FILES stay allowed — aiming at weights held elsewhere
+        // is legitimate; only directory recursion surprises.
+        #[cfg(unix)]
+        {
+            let store = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("elsewhere.gguf"), b"x").unwrap();
+            std::os::unix::fs::symlink(outside.path(), store.path().join("linked")).unwrap();
+
+            let found = discover_loose_gguf(store.path(), &[], 3);
+            assert!(
+                found.is_empty(),
+                "must not descend a symlinked directory, but found {found:?}"
+            );
+
+            // The same file reached by a symlinked FILE is still offered.
+            std::os::unix::fs::symlink(
+                outside.path().join("elsewhere.gguf"),
+                store.path().join("direct.gguf"),
+            )
+            .unwrap();
+            let found = discover_loose_gguf(store.path(), &[], 3);
+            assert_eq!(found.len(), 1, "a symlinked .gguf file is still a valid pick");
+        }
+    }
+
+    #[test]    fn the_loose_scan_respects_its_depth_cap() {
         let dir = tempfile::tempdir().unwrap();
         let deep = dir.path().join("a").join("b").join("c").join("too-deep.gguf");
         std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
