@@ -149,7 +149,7 @@ impl PreprocessConfig {
                 self.patch_size, self.image_size
             ));
         }
-        if self.std.iter().any(|s| *s == 0.0) {
+        if self.std.contains(&0.0) {
             return Err("std must be non-zero in every channel (division by zero)".to_string());
         }
         Ok(())
