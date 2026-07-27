@@ -278,15 +278,38 @@ impl GitRepo {
 
         let mut unstaged: BTreeMap<String, ChangeKind> = BTreeMap::new();
         if let Some(workdir) = self.repo.workdir() {
-            for (path, oid) in &index {
-                let full = workdir.join(path);
+            // Iterate the index ENTRIES (not the path->oid map) so each carries its
+            // recorded stat cache. Like `git status`, we trust that cache: when the
+            // working file's size + mtime still match the index, the content is
+            // assumed unchanged and is NEVER read or hashed. Only a stat mismatch
+            // falls back to reading + hashing (and still confirms via the oid, so a
+            // merely `touch`ed file is not falsely reported Modified). Without this,
+            // opening the panel on a large repo read + SHA-1'd every tracked file
+            // on the render thread -- the startup lag.
+            let idx = self.repo.open_index()?;
+            for entry in idx.entries() {
+                if entry.stage() != gix::index::entry::Stage::Unconflicted {
+                    continue;
+                }
+                let path = entry.path(&idx).to_str_lossy().into_owned();
+                let full = workdir.join(&path);
+                let meta = match std::fs::metadata(&full) {
+                    Err(_) => {
+                        unstaged.insert(path, ChangeKind::Deleted);
+                        continue;
+                    }
+                    Ok(meta) => meta,
+                };
+                if stat_unchanged(&meta, &entry.stat) {
+                    continue; // fast path: no read, no hash
+                }
                 match std::fs::read(&full) {
                     Err(_) => {
-                        unstaged.insert(path.clone(), ChangeKind::Deleted);
+                        unstaged.insert(path, ChangeKind::Deleted);
                     }
                     Ok(bytes) => {
-                        if blob_oid(&bytes)? != *oid {
-                            unstaged.insert(path.clone(), ChangeKind::Modified);
+                        if blob_oid(&bytes)? != entry.id {
+                            unstaged.insert(path, ChangeKind::Modified);
                         }
                     }
                 }
@@ -728,6 +751,26 @@ impl GitRepo {
 fn blob_oid(bytes: &[u8]) -> Result<gix::ObjectId> {
     gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)
         .context("hashing worktree file")
+}
+
+/// True when a working file's size + mtime still match the index entry's recorded
+/// stat, so its content is (racily) assumed unchanged and need not be read or
+/// hashed — the same shortcut `git status` takes via the index stat cache. A
+/// mismatch is not conclusive (the caller confirms by hashing); a match is
+/// treated as clean, which is what makes opening the panel cheap on a large repo.
+fn stat_unchanged(meta: &std::fs::Metadata, stat: &gix::index::entry::Stat) -> bool {
+    if meta.len() != u64::from(stat.size) {
+        return false;
+    }
+    let Ok(mtime) = meta.modified() else { return false };
+    let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) else { return false };
+    if dur.as_secs() as u32 != stat.mtime.secs {
+        return false;
+    }
+    // Sub-second precision only when the index actually recorded nanoseconds
+    // (git built without USE_NSEC stores 0 there); don't let a 0 index nsec vs a
+    // nonzero filesystem nsec spuriously force a re-hash.
+    stat.mtime.nsecs == 0 || dur.subsec_nanos() == stat.mtime.nsecs
 }
 
 /// Turn an optional old/new blob pair into diff lines, annotating pure

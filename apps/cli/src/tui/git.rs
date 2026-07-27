@@ -181,6 +181,7 @@ impl GitView {
             Mode::BranchInput => vec![("type", "name"), ("Enter", "create"), ("Esc", "cancel")],
             Mode::Normal => vec![
                 ("Tab", "panel"),
+                ("1/2/3", "jump"),
                 ("j/k", "move"),
                 ("space", "stage"),
                 ("c", "commit"),
@@ -241,6 +242,9 @@ impl GitView {
                 self.mode = Mode::BranchInput;
             }
             KeyCode::Char('d') => self.begin_discard(),
+            KeyCode::Char('1') => self.focus_panel(Panel::Status),
+            KeyCode::Char('2') => self.focus_panel(Panel::Branches),
+            KeyCode::Char('3') => self.focus_panel(Panel::Log),
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 self.notice =
@@ -254,6 +258,14 @@ impl GitView {
             _ => {}
         }
         Transition::Stay
+    }
+
+    /// Jump focus straight to a panel (lazygit's `1`/`2`/`3` shortcuts).
+    fn focus_panel(&mut self, panel: Panel) {
+        if self.focus != panel {
+            self.focus = panel;
+            self.refresh_preview();
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -444,9 +456,9 @@ impl GitView {
             })
             .collect();
         let title = if self.status.is_empty() {
-            " status · clean (untracked not shown) ".to_string()
+            " [1] status · clean (untracked not shown) ".to_string()
         } else {
-            format!(" status · {} changed ", self.status.len())
+            format!(" [1] status · {} changed ", self.status.len())
         };
         self.render_list(frame, area, &title, items, self.sel_status, focused);
     }
@@ -468,7 +480,7 @@ impl GitView {
                 ]))
             })
             .collect();
-        self.render_list(frame, area, " branches ", items, self.sel_branch, focused);
+        self.render_list(frame, area, " [2] branches ", items, self.sel_branch, focused);
     }
 
     fn render_log_panel(&self, frame: &mut Frame, area: Rect) {
@@ -484,7 +496,7 @@ impl GitView {
                 ]))
             })
             .collect();
-        self.render_list(frame, area, " commits ", items, self.sel_log, focused);
+        self.render_list(frame, area, " [3] commits ", items, self.sel_log, focused);
     }
 
     fn render_list(
