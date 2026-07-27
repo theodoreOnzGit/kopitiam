@@ -18,6 +18,30 @@ pub enum StoreCmd {
     Unlock(StoreUnlockArgs),
     /// Offline WAL verification and repair.
     Fsck(StoreFsckArgs),
+    /// Migrate `refs/heads/beads/store` from an older on-disk format to the current one.
+    Migrate(StoreMigrateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct StoreMigrateArgs {
+    /// Show what the migration would do and write nothing. Do this first.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// Migrate the local ref only; do not push. Leaves the shared remote store
+    /// (and every other machine reading it) exactly as it is.
+    #[arg(long = "no-push")]
+    pub no_push: bool,
+
+    /// Proceed even when local and remote store refs have diverged with no
+    /// common ancestor. Refused by default, because migrating across a
+    /// divergence can drop beads that exist on only one side.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Retries when a concurrent push beats us to the remote ref.
+    #[arg(long = "max-retries", value_name = "N", default_value_t = 3)]
+    pub max_retries: usize,
 }
 
 #[derive(Args, Debug)]
@@ -42,7 +66,12 @@ pub struct StoreFsckArgs {
     pub repair: bool,
 }
 
-pub fn handle<B>(json: bool, cmd: StoreCmd, backend: &B) -> std::result::Result<(), B::Error>
+pub fn handle<B>(
+    json: bool,
+    cmd: StoreCmd,
+    repo: Option<&std::path::Path>,
+    backend: &B,
+) -> std::result::Result<(), B::Error>
 where
     B: CliHostBackend,
     B::Error: From<CommandError>,
@@ -50,7 +79,138 @@ where
     match cmd {
         StoreCmd::Unlock(args) => handle_unlock(json, args, backend),
         StoreCmd::Fsck(args) => handle_fsck(json, args, backend),
+        StoreCmd::Migrate(args) => handle_migrate::<B>(json, args, repo),
     }
+}
+
+/// Runs `bn store migrate`.
+///
+/// # Why this one does NOT go through the daemon backend
+///
+/// Every other `store` subcommand asks the daemon to act on a loaded store.
+/// This one cannot, and the reason is not convenience: **the store failing to
+/// load is the exact condition a migration exists to fix.** A store written in
+/// an older format makes every command — `list`, `ready`, `status`, even
+/// `admin doctor` — fail with `unsupported meta format_version`, so routing the
+/// repair through the thing that is broken would make it unreachable precisely
+/// when it is needed. `migrate_store_ref_to_v2` operates directly on the git
+/// refs for the same reason, so this handler just opens the repository and
+/// calls it.
+///
+/// # Why this was missing
+///
+/// The migration itself has been here, fully implemented and tested, the whole
+/// time — it simply had no CLI surface, so the only supported cure for an old
+/// store was unreachable from the command line. This wires it up; it does not
+/// change what the migration does.
+fn handle_migrate<B>(
+    json: bool,
+    args: StoreMigrateArgs,
+    repo: Option<&std::path::Path>,
+) -> std::result::Result<(), B::Error>
+where
+    B: CliHostBackend,
+    B::Error: From<CommandError>,
+{
+    use crate::git::gix_compat::Repository;
+
+    let start = repo.unwrap_or_else(|| std::path::Path::new("."));
+    let repository = Repository::discover(start)
+        .map_err(|err| B::Error::from(CommandError::from(crate::git::SyncError::from(err))))?;
+    let repo_path = repository.workdir().unwrap_or(start).to_path_buf();
+
+    let outcome = crate::git::migrate_store_ref_to_v2(
+        &repository,
+        &repo_path,
+        args.dry_run,
+        args.force,
+        args.no_push,
+        args.max_retries,
+    )
+    .map_err(|err| B::Error::from(CommandError::from(err)))?;
+
+    if json {
+        return print_json(&render_store_migrate_json(&outcome, args.dry_run))
+            .map_err(|err| B::Error::from(CommandError::from(err)));
+    }
+    write_stdout(&render_store_migrate(&outcome, args.dry_run))
+        .map_err(|err| B::Error::from(CommandError::from(err)))?;
+    Ok(())
+}
+
+fn render_store_migrate_json(
+    outcome: &crate::git::MigrateStoreToV2Outcome,
+    dry_run: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": dry_run,
+        "from_effective_version": outcome.from_effective_version,
+        "to_version": crate::core::StoreMetaVersions::STORE_FORMAT_VERSION,
+        "deps_format_before": format!("{:?}", outcome.deps_format_before),
+        "converted_deps": outcome.converted_deps,
+        "added_notes_file": outcome.added_notes_file,
+        "wrote_checksums": outcome.wrote_checksums,
+        "commit": outcome.commit_oid.map(|oid| oid.to_string()),
+        "push": match outcome.push {
+            crate::git::sync::MigratePushDisposition::Pushed => "pushed",
+            crate::git::sync::MigratePushDisposition::SkippedNoPush => "skipped_no_push",
+            crate::git::sync::MigratePushDisposition::SkippedNoRemote => "skipped_no_remote",
+        },
+        "warnings": outcome.warnings,
+    })
+}
+
+pub fn render_store_migrate(
+    outcome: &crate::git::MigrateStoreToV2Outcome,
+    dry_run: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str(if dry_run {
+        "Store migrate (DRY RUN — nothing was written):\n"
+    } else {
+        "Store migrate:\n"
+    });
+    out.push_str(&format!(
+        "  format_version: {} -> {}\n",
+        outcome.from_effective_version,
+        crate::core::StoreMetaVersions::STORE_FORMAT_VERSION
+    ));
+    out.push_str(&format!(
+        "  deps_format_before: {:?}\n",
+        outcome.deps_format_before
+    ));
+    out.push_str(&format!("  converted_deps: {}\n", outcome.converted_deps));
+    out.push_str(&format!(
+        "  added_notes_file: {}\n",
+        outcome.added_notes_file
+    ));
+    out.push_str(&format!("  wrote_checksums: {}\n", outcome.wrote_checksums));
+    match outcome.commit_oid {
+        Some(oid) => out.push_str(&format!("  commit: {oid}\n")),
+        None => out.push_str("  commit: none (nothing to write)\n"),
+    }
+    // On a dry run the disposition is always `SkippedNoPush`, because nothing
+    // was written to push. Saying "SKIPPED (--no-push)" there would credit a
+    // flag the caller may never have passed, and imply a choice was honoured
+    // when in fact nothing happened at all.
+    out.push_str(&format!(
+        "  push: {}\n",
+        match (dry_run, outcome.push) {
+            (true, _) => "nothing pushed (dry run wrote nothing)",
+            (false, crate::git::sync::MigratePushDisposition::Pushed) => "pushed to remote",
+            (false, crate::git::sync::MigratePushDisposition::SkippedNoPush) =>
+                "SKIPPED (--no-push) — remote and other machines untouched",
+            (false, crate::git::sync::MigratePushDisposition::SkippedNoRemote) =>
+                "skipped (no remote configured)",
+        }
+    ));
+    if !outcome.warnings.is_empty() {
+        out.push_str("  warnings:\n");
+        for warning in &outcome.warnings {
+            out.push_str(&format!("    - {warning}\n"));
+        }
+    }
+    out
 }
 
 fn handle_fsck<B>(json: bool, args: StoreFsckArgs, backend: &B) -> std::result::Result<(), B::Error>

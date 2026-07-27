@@ -264,6 +264,14 @@ pub enum CommandError {
 
     #[error(transparent)]
     Filter(#[from] crate::cli_surface::filters::FilterError),
+
+    /// A git store operation failed.
+    ///
+    /// Needed because `store migrate` deliberately does NOT go through the
+    /// daemon backend — see `commands::store::handle_migrate` for why a
+    /// migration that needs the daemon to load the store would be useless.
+    #[error(transparent)]
+    Sync(#[from] crate::git::SyncError),
 }
 
 pub type CommandResult<T> = std::result::Result<T, CommandError>;
