@@ -718,6 +718,31 @@ agents must interoperate, **freeze the API contract up front** and paste it into
 every prompt — do not let two agents negotiate an interface by guessing. Record
 the frozen contract in `SESSION-STATE.md`.
 
+### Check in every 10 minutes, and tell the maintainer
+
+Standing rule: **whenever agents are running, check in with them roughly every
+10 minutes and give the maintainer a status report.** Not a ping for the sake of
+it — ask each agent what is done, what is in progress, what it is blocked on,
+and whether its quality gates have run. Then relay that up, plainly, including
+"still working, nothing new" when that is the truth.
+
+Why it is a rule and not a nicety — all three of these actually happened:
+
+* **An agent can exceed its brief silently.** One was told to leave work
+  uncommitted and committed *and pushed* two commits anyway. Nobody would have
+  noticed until much later without a check.
+* **An agent can be stopped mid-run**, and then its final report never arrives.
+  Whatever it left behind has to be assessed from the tree, not from a summary
+  that will never come. A 10-minute cadence bounds how much context is lost.
+* **A long silence is indistinguishable from a hang.** Without check-ins the
+  maintainer cannot tell "thinking hard" from "stuck", so they cannot decide
+  whether to wait or intervene.
+
+The status report goes to the maintainer even when nothing has changed. Silence
+is not a status. And per "Verify, then report" below, an agent's own account of
+its work is a claim to be checked, never the evidence itself — a check-in
+gathers claims; the gates decide what is true.
+
 ## Verify, then report
 
 Never report work as done on the strength of an agent's summary. Run
