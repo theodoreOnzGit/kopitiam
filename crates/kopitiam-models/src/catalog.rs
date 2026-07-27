@@ -115,6 +115,25 @@ pub struct Artifact {
     pub hf: Option<HfSource>,
 }
 
+impl Artifact {
+    /// Whether this artifact's checksum is still the [`PLACEHOLDER_SHA256`]
+    /// sentinel rather than a real hash.
+    ///
+    /// `true` means acquisition is **documented to fail**: the bytes download,
+    /// the gate rejects them with [`crate::Error::ChecksumMismatch`], and the
+    /// bandwidth is wasted. Anything walking the catalog should check this and
+    /// say so up front instead of finding out the expensive way — that is the
+    /// difference between "unverified entry, skipped" and a mystery failure
+    /// after a 771 MB download.
+    ///
+    /// Note this is *not* the same as an empty `sha256`, which is the legitimate
+    /// "resolve me from the hub" spelling for an [`Artifact::hf`] artifact.
+    #[must_use]
+    pub fn is_placeholder(&self) -> bool {
+        self.sha256 == PLACEHOLDER_SHA256
+    }
+}
+
 /// A catalog entry: one model, everything needed to acquire it and later run it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
@@ -587,11 +606,19 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The 64-zero sentinel used for every catalog checksum until a real pull
-/// records the true value. Kept as one named constant so there is exactly one
-/// place to grep for, and so nobody mistakes it for a real hash. See the big
-/// warning on [`Catalog::builtin`].
-const PLACEHOLDER_SHA256: &str =
+/// The 64-zero sentinel used for a catalog checksum until a real pull records
+/// the true value. Kept as one named constant so there is exactly one place to
+/// grep for, and so nobody mistakes it for a real hash. See the big warning on
+/// [`Catalog::builtin`].
+///
+/// **Public because callers genuinely need to tell a real entry from a
+/// not-yet-verified one.** An entry carrying this is *documented to fail its own
+/// download gate*: it will fetch hundreds of MB and then refuse them with
+/// [`crate::Error::ChecksumMismatch`]. Anything that iterates the catalog —
+/// a UI listing, a test harness, a bulk prefetch — wants to say "unverified,
+/// skipping" rather than burn the bandwidth to rediscover that. Compare with
+/// [`Artifact::is_placeholder`] rather than matching the literal string.
+pub const PLACEHOLDER_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The catalog id of the **default local model**: SmolLM2-360M-Instruct

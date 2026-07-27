@@ -32,6 +32,29 @@
 //! Without the flag every test here prints what it skipped and passes — a silent
 //! skip would let the suite look green while proving nothing.
 //!
+//! # A machine that cannot download is not a broken machine
+//!
+//! Plenty of the places this suite runs are walled off from `huggingface.co`:
+//! the Claude Code container, the institute proxy (`CONNECT ... 403` — crates.io
+//! is on the bypass list, HF is not), any air-gapped box. Turning the gate on
+//! there must **not** paint the run red. A suite that cries wolf on other
+//! people's egress policy is a suite everyone learns to ignore, and an ignored
+//! suite catches nothing.
+//!
+//! So a model whose bytes cannot be obtained is reported `SKIP`, with the
+//! underlying error printed in full, and the run stays green. Only a model that
+//! was actually *obtained* and then broke turns it red. When **everything**
+//! skips, the report says in as many words that the run proved nothing — the
+//! skip is loud, just not fatal. See [`Verdict`] and [`acquire`] for exactly
+//! where that line is drawn, and what it costs.
+//!
+//! Two consequences worth knowing:
+//!
+//! * Weights already in the store are exercised with **no network at all**, so
+//!   a bring-your-own `.gguf` on an air-gapped box tests the full chain fine.
+//! * `KOPITIAM_NETFETCH_PATHS` uses the **platform's** path separator (`:` on
+//!   Unix/Termux, `;` on Windows), so it works on both.
+//!
 //! ```bash
 //! # everything in the catalog that is chat weights
 //! KOPITIAM_NETFETCH=1 cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
@@ -40,9 +63,18 @@
 //! KOPITIAM_NETFETCH=1 KOPITIAM_NETFETCH_ONLY=smollm2-360m-instruct-q8_0 \
 //!   cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
 //!
-//! # a model that is NOT in the catalog (e.g. a Gemma you dropped in by hand)
+//! # a model that is NOT in the catalog (e.g. a Gemma you dropped in by hand).
+//! # Needs no network at all — this is the air-gapped path.
 //! KOPITIAM_NETFETCH=1 KOPITIAM_NETFETCH_PATHS=/path/to/gemma-3-1b-it-Q4_K_M.gguf \
 //!   cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
+//! ```
+//!
+//! On Windows PowerShell the same thing, remembering `;` separates paths there:
+//!
+//! ```powershell
+//! $env:KOPITIAM_NETFETCH=1
+//! $env:KOPITIAM_NETFETCH_PATHS="C:\models\gemma.gguf;C:\models\phi.gguf"
+//! cargo test --release -p kopitiam-runtime --test netfetch_end_to_end -- --nocapture
 //! ```
 //!
 //! `--nocapture` matters: the per-stage report is the output, and a passing test
@@ -60,9 +92,14 @@ use kopitiam_runtime::tokenizer_from_gguf;
 const GATE: &str = "KOPITIAM_NETFETCH";
 /// Restrict the run to one catalog id.
 const ONLY: &str = "KOPITIAM_NETFETCH_ONLY";
-/// Extra `.gguf` paths (`:`-separated) to exercise alongside the catalog —
-/// the escape hatch for a model whose HuggingFace coordinates are not in the
-/// catalog yet.
+/// Extra `.gguf` paths to exercise alongside the catalog — the escape hatch
+/// for a model whose HuggingFace coordinates are not in the catalog yet.
+///
+/// Separated by the **platform's own** `PATH` separator: `:` on Unix/Termux,
+/// `;` on Windows. It cannot be a hardcoded `:`, because that tears
+/// `C:\models\gemma.gguf` into `C` and `\models\gemma.gguf` and then reports
+/// two files that do not exist — which is exactly what it did on the
+/// maintainer's Windows box the first time this hatch was used.
 const EXTRA_PATHS: &str = "KOPITIAM_NETFETCH_PATHS";
 
 /// How far a model got before something broke.
@@ -90,25 +127,59 @@ impl Stage {
     }
 }
 
-/// The outcome for one model: how far it got, and why it stopped.
+/// What became of one model.
+///
+/// Three outcomes, not two, and the third is the whole point of this type:
+/// **"this machine is not allowed to download the weights" is not a bug in
+/// KOPITIAM**, so it must not be reported as one. The Claude Code container and
+/// the institute proxy both refuse `huggingface.co`; a suite that goes red
+/// there is a suite people learn to ignore, and an ignored suite catches
+/// nothing.
+enum Verdict {
+    /// Survived the whole chain.
+    Passed,
+    /// Died at a stage. A real failure — this is what turns the run red.
+    Died(Stage, String),
+    /// Could not obtain the bytes at all. Reported, not failed.
+    NoEgress(String),
+}
+
+/// The outcome for one model: how far it got, and what became of it.
 struct Outcome {
     label: String,
     reached: Stage,
-    failure: Option<(Stage, String)>,
+    verdict: Verdict,
 }
 
 impl Outcome {
-    fn ok(&self) -> bool {
-        self.failure.is_none()
+    /// Only [`Verdict::Died`] is a failure. A skip is deliberately *not* one.
+    fn failed(&self) -> bool {
+        matches!(self.verdict, Verdict::Died(..))
+    }
+
+    fn skipped(&self) -> bool {
+        matches!(self.verdict, Verdict::NoEgress(_))
     }
 
     fn line(&self) -> String {
-        match &self.failure {
-            None => format!("  PASS  {:<34} reached {}", self.label, self.reached.name()),
-            Some((stage, err)) => format!(
+        match &self.verdict {
+            Verdict::Passed => {
+                format!("  PASS  {:<34} reached {}", self.label, self.reached.name())
+            }
+            Verdict::Died(stage, err) => format!(
                 "  FAIL  {:<34} died at {}: {}",
                 self.label,
                 stage.name(),
+                first_line(err)
+            ),
+            // Prints the underlying error in full rather than a tidy "no
+            // network": if the real cause is a wrong catalog URL rather than a
+            // blocked proxy, that must still be visible to a human reading the
+            // output. The run does not go red for it, so the text is the only
+            // signal left — do not tidy it away.
+            Verdict::NoEgress(err) => format!(
+                "  SKIP  {:<34} cannot fetch here: {}",
+                self.label,
                 first_line(err)
             ),
         }
@@ -119,8 +190,22 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s)
 }
 
+/// Whether a given gate value means "on".
+///
+/// Split out as a **pure** function of the value on purpose. The obvious way
+/// to test the gate is to `set_var`/`remove_var` and re-read it — and that is
+/// a trap, because `cargo test` runs every test in this file as threads of one
+/// process, so a guard test clearing `KOPITIAM_NETFETCH` yanks it out from
+/// under the real run happening concurrently. That actually happened: the full
+/// suite printed `SKIPPED` and reported green **with the gate set**, which is
+/// precisely the silent-green outcome this file's module docs promise to
+/// prevent. Testing the pure function touches no shared state, so it cannot.
+fn gate_value_means_on(v: Option<&str>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 fn enabled() -> bool {
-    std::env::var(GATE).is_ok_and(|v| !v.is_empty() && v != "0")
+    gate_value_means_on(std::env::var(GATE).ok().as_deref())
 }
 
 /// Runs the full chain against one on-disk `.gguf`, stopping at the first
@@ -138,7 +223,7 @@ fn exercise(label: &str, path: &Path) -> Outcome {
             return Outcome {
                 label: label.into(),
                 reached,
-                failure: Some((Stage::LoadGguf, e.to_string())),
+                verdict: Verdict::Died(Stage::LoadGguf, e.to_string()),
             };
         }
     };
@@ -154,7 +239,7 @@ fn exercise(label: &str, path: &Path) -> Outcome {
             return Outcome {
                 label: label.into(),
                 reached,
-                failure: Some((Stage::Tokenizer, e.to_string())),
+                verdict: Verdict::Died(Stage::Tokenizer, e.to_string()),
             };
         }
     };
@@ -169,15 +254,64 @@ fn exercise(label: &str, path: &Path) -> Outcome {
             return Outcome {
                 label: label.into(),
                 reached,
-                failure: Some((Stage::Weights, e.to_string())),
+                verdict: Verdict::Died(Stage::Weights, e.to_string()),
             };
         }
     };
     reached = Stage::Weights;
 
     match generate_something(&qwen, &tokenizer) {
-        Ok(()) => Outcome { label: label.into(), reached: Stage::Generate, failure: None },
-        Err(e) => Outcome { label: label.into(), reached, failure: Some((Stage::Generate, e)) },
+        Ok(()) => Outcome {
+            label: label.into(),
+            reached: Stage::Generate,
+            verdict: Verdict::Passed,
+        },
+        Err(e) => Outcome {
+            label: label.into(),
+            reached,
+            verdict: Verdict::Died(Stage::Generate, e),
+        },
+    }
+}
+
+/// Gets one catalog model onto disk, telling "cannot download here" apart from
+/// "downloaded and it is wrong".
+///
+/// Two things are going on, and both matter:
+///
+/// **Already-present weights never touch the network.** `ensure_available`
+/// verifies the on-disk bytes against the catalog sha256 locally and only
+/// downloads when the file is missing or wrong. Its `_resolving` sibling, by
+/// contrast, re-resolves the sha256 from the hub *first, unconditionally* — so
+/// using that one would make an offline box fail even with correct weights
+/// already sitting in the store. We only pay for that extra defence-in-depth
+/// when we are actually about to download.
+///
+/// **Only [`kopitiam_models::Error::Http`] becomes a skip.** That variant means
+/// the bytes could not be obtained — blocked proxy, no DNS, dead TLS. Everything
+/// else means we *did* get bytes, or did not need any, and something is really
+/// wrong: a `ChecksumMismatch` is a corrupt download or a silently re-quantized
+/// upstream, an `Io` is a broken disk, a `NotFound` is a bad catalog id. Those
+/// stay failures. The cost of this split is honest and worth writing down: a
+/// catalog URL that 404s also surfaces as `Http`, so it will be skipped rather
+/// than failed. We cannot tell the two apart from here without pattern-matching
+/// ureq's `Display` text, which is not a contract — so instead the skip line
+/// prints the full error, and a 404 stays visible to anyone reading the output.
+fn acquire(
+    store: &ModelStore,
+    spec: &ModelSpec,
+    fetcher: &kopitiam_models::HttpFetcher,
+) -> Result<PathBuf, Verdict> {
+    let path = store.artifact_path(spec, &spec.artifacts[0]);
+    let result = if path.is_file() {
+        kopitiam_models::ensure_available(store, spec, fetcher)
+    } else {
+        kopitiam_models::ensure_available_resolving(store, spec, fetcher, None)
+    };
+    match result {
+        Ok(_) => Ok(path),
+        Err(kopitiam_models::Error::Http(e)) => Err(Verdict::NoEgress(e)),
+        Err(e) => Err(Verdict::Died(Stage::Fetch, e.to_string())),
     }
 }
 
@@ -218,23 +352,34 @@ fn generate_something(
 
 /// Catalog entries that are chat weights (single `.gguf` artifact), honouring
 /// `KOPITIAM_NETFETCH_ONLY`.
-fn selected_specs() -> Vec<ModelSpec> {
+///
+/// Returns `(runnable, unverified)`. Entries whose checksum is still the
+/// placeholder sentinel are split off rather than run, because they are
+/// *documented* to fetch hundreds of MB and then be refused by their own
+/// checksum gate — that is the catalog telling us the URL was never confirmed,
+/// not a runtime defect worth 1.1 GB of somebody's bandwidth to rediscover. They
+/// come back separately so the report can name them instead of silently
+/// shrinking the run: an unexplained absence reads as coverage.
+fn selected_specs() -> (Vec<ModelSpec>, Vec<ModelSpec>) {
     let only = std::env::var(ONLY).ok().filter(|s| !s.is_empty());
-    Catalog::builtin()
+    let (unverified, runnable) = Catalog::builtin()
         .into_iter()
         .filter(|s| {
             !s.artifacts.is_empty()
                 && s.artifacts.iter().all(|a| a.filename.to_ascii_lowercase().ends_with(".gguf"))
         })
         .filter(|s| only.as_ref().is_none_or(|id| &s.id == id))
-        .collect()
+        .partition(|s: &ModelSpec| s.artifacts.iter().any(kopitiam_models::Artifact::is_placeholder));
+    (runnable, unverified)
 }
 
 fn extra_paths() -> Vec<PathBuf> {
-    std::env::var(EXTRA_PATHS)
-        .ok()
+    // `split_paths` uses the platform separator and, on Windows, also strips
+    // the quotes people put around paths with spaces. Doing it by hand with a
+    // literal `:` is what broke `C:\...` — see [`EXTRA_PATHS`].
+    std::env::var_os(EXTRA_PATHS)
         .into_iter()
-        .flat_map(|v| v.split(':').map(PathBuf::from).collect::<Vec<_>>())
+        .flat_map(|v| std::env::split_paths(&v).collect::<Vec<_>>())
         .filter(|p| !p.as_os_str().is_empty())
         .collect()
 }
@@ -255,21 +400,23 @@ fn real_models_survive_fetch_load_tokenize_and_generate() {
 
     let mut outcomes = Vec::new();
 
-    for spec in selected_specs() {
+    let (runnable, unverified) = selected_specs();
+    for spec in unverified {
+        println!(
+            "  NOTE  {:<34} catalog checksum is still the placeholder — not fetched.\n\
+             {:<40}Record a real sha256 (or give it an `hf:` source) to include it.",
+            spec.id, ""
+        );
+    }
+
+    for spec in runnable {
         let label = spec.id.clone();
         // Fetch is its own stage: "cannot even download it" and "downloaded but
         // will not load" are completely different problems and must not be
         // reported as the same failure.
-        match kopitiam_models::ensure_available_resolving(&store, &spec, &fetcher, None) {
-            Ok(_) => {
-                let path = store.artifact_path(&spec, &spec.artifacts[0]);
-                outcomes.push(exercise(&label, &path));
-            }
-            Err(e) => outcomes.push(Outcome {
-                label,
-                reached: Stage::Fetch,
-                failure: Some((Stage::Fetch, e.to_string())),
-            }),
+        match acquire(&store, &spec, &fetcher) {
+            Ok(path) => outcomes.push(exercise(&label, &path)),
+            Err(verdict) => outcomes.push(Outcome { label, reached: Stage::Fetch, verdict }),
         }
     }
 
@@ -279,10 +426,15 @@ fn real_models_survive_fetch_load_tokenize_and_generate() {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         if !path.is_file() {
+            // A hand-named path that is not there is the user's typo, not an
+            // egress problem — they said "test THIS file". Stays a failure.
             outcomes.push(Outcome {
                 label,
                 reached: Stage::Fetch,
-                failure: Some((Stage::Fetch, format!("no such file: {}", path.display()))),
+                verdict: Verdict::Died(
+                    Stage::Fetch,
+                    format!("no such file: {}", path.display()),
+                ),
             });
             continue;
         }
@@ -299,7 +451,24 @@ fn real_models_survive_fetch_load_tokenize_and_generate() {
         "{GATE} was set but nothing was selected — check {ONLY}/{EXTRA_PATHS}"
     );
 
-    let failed: Vec<&Outcome> = outcomes.iter().filter(|o| !o.ok()).collect();
+    // Say plainly when nothing was actually proven. The gate being on means
+    // somebody WANTED a real run, so a run that downloaded nothing must not
+    // slip past looking like a success — but it must not go red either, because
+    // "your container has no egress" is not a defect in this codebase.
+    let skipped = outcomes.iter().filter(|o| o.skipped()).count();
+    if skipped == outcomes.len() {
+        println!(
+            "\nNOTE: all {skipped} model(s) skipped — this machine cannot fetch weights.\n\
+             The chain was NOT exercised, so this run proves nothing about the runtime.\n\
+             Run it where huggingface.co is reachable, or drop a .gguf in and point\n\
+             {EXTRA_PATHS} at it (separator: `{}`) to test with no network at all.",
+            if cfg!(windows) { ';' } else { ':' }
+        );
+    } else if skipped > 0 {
+        println!("\nNOTE: {skipped} of {} model(s) skipped — cannot fetch here.", outcomes.len());
+    }
+
+    let failed: Vec<&Outcome> = outcomes.iter().filter(|o| o.failed()).collect();
     assert!(
         failed.is_empty(),
         "{} of {} model(s) did not survive the chain:\n{}",
@@ -314,9 +483,7 @@ fn the_gate_is_off_by_default_so_an_ordinary_test_run_needs_no_network() {
     // Guards the property that makes this file safe to have in the tree at all.
     // If the gate ever defaults on, `cargo test` starts downloading hundreds of
     // MB on somebody's metered Termux connection with no warning.
-    if std::env::var(GATE).is_err() {
-        assert!(!enabled(), "the netfetch gate must be OFF when {GATE} is unset");
-    }
+    assert!(!gate_value_means_on(None), "the netfetch gate must be OFF when {GATE} is unset");
 }
 
 #[test]
@@ -324,11 +491,12 @@ fn an_empty_or_zero_gate_value_does_not_count_as_enabled() {
     // `KOPITIAM_NETFETCH=` (exported but empty) and `=0` are both the shell's
     // usual way of saying "no". Treating either as "yes" would surprise someone
     // trying to turn it off.
+    //
+    // Deliberately does NOT touch the process environment — see
+    // [`gate_value_means_on`] for the concurrent-clobber bug that cost us a
+    // whole run that looked green while proving nothing.
     for v in ["", "0"] {
-        // SAFETY-adjacent note: single-threaded within this test, and the value
-        // is restored immediately; other tests read the gate independently.
-        unsafe { std::env::set_var(GATE, v) };
-        assert!(!enabled(), "{GATE}={v:?} must not enable the netfetch run");
+        assert!(!gate_value_means_on(Some(v)), "{GATE}={v:?} must not enable the netfetch run");
     }
-    unsafe { std::env::remove_var(GATE) };
+    assert!(gate_value_means_on(Some("1")), "{GATE}=1 must enable the netfetch run");
 }

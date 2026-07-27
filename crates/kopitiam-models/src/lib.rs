@@ -101,6 +101,7 @@ mod store;
 
 pub use catalog::{
     Architecture, Artifact, Catalog, CatalogProblem, HfSource, ModelSpec, DEFAULT_MODEL_ID,
+    PLACEHOLDER_SHA256,
 };
 pub use error::Error;
 pub use fetch::{ensure_available, AcquiredModel, Fetcher};
