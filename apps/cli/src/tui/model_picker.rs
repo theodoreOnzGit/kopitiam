@@ -842,7 +842,7 @@ mod tests {
         std::fs::write(&loose, b"x").unwrap();
         std::fs::write(dir.path().join("readme.txt"), b"not a model").unwrap();
 
-        let found = discover_loose_gguf(dir.path(), &[known.clone()], LOOSE_SCAN_DEPTH);
+        let found = discover_loose_gguf(dir.path(), std::slice::from_ref(&known), LOOSE_SCAN_DEPTH);
         assert_eq!(found, vec![loose.clone()], "only the unknown .gguf, case-insensitively");
 
         let choices = choices_for(Some(&store));

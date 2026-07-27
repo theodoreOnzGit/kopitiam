@@ -1013,6 +1013,13 @@ mod tests {
         assert_eq!(p.selected, 0);
     }
 
+    /// Unix-only: there is no `PermissionsExt::from_mode` on Windows, and no
+    /// cheap way to make a directory genuinely unreadable to its own owner
+    /// there either (it takes an ACL deny-ACE, which is a different test). Left
+    /// ungated, this did not merely skip on Windows — it failed to **compile**,
+    /// taking the whole `--all-targets` build of this crate down with it. So the
+    /// gate is load-bearing, not tidiness.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_renders_an_honest_error_row() {
         use std::os::unix::fs::PermissionsExt;

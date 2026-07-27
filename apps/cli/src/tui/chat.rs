@@ -589,7 +589,7 @@ mod tests {
 
         // ...and a working model explains nothing, because there is nothing to
         // explain — the stub notice only appears for the stub.
-        assert_eq!(stub_notice(&broken).is_some(), true);
+        assert!(stub_notice(&broken).is_some());
         let text = rendered(&ChatView::new("sys".into(), None, &echo()), 100);
         assert!(text.contains("kopitiam models pull"), "the no-model routes: {text}");
     }
