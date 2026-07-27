@@ -4,6 +4,41 @@
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
 
+> ## ✅ LATEST — 2026-07-27 (Mon, netfetch harness + real-model blocker)
+>
+> **Cannot fetch models in the agent environment — org egress policy.** Both
+> `curl huggingface.co` and `kopitiam models pull` get `CONNECT ... 403` from the
+> proxy (crates.io etc. are on the bypass list; HF is not). This is policy, not a
+> bug, and not something to work around. So the SmolLM2/Gemma end-to-end run the
+> maintainer asked for **must happen on a box that can reach HuggingFace** — the
+> maintainer will run it locally.
+>
+> **What shipped so the local run is one command:**
+> * `crates/kopitiam-runtime/tests/netfetch_end_to_end.rs` — real-weights E2E,
+>   gated behind `KOPITIAM_NETFETCH=1` (off by default: needs network + hundreds
+>   of MB). Exercises fetch → load-gguf → tokenizer → weights → generate and
+>   reports WHICH stage each model died at (not just pass/fail). Catalog models
+>   plus `KOPITIAM_NETFETCH_PATHS=/path/to/gemma.gguf` for a hand-dropped Gemma
+>   (Gemma is not in the catalog yet — add it, or use the paths hatch).
+> * `.gitignore` now excludes `*.gguf` / `*.safetensors` / `*.traineddata` so a
+>   fetched or BYO weight can never be committed by accident.
+> * Run it: `KOPITIAM_NETFETCH=1 cargo test --release -p kopitiam-runtime \
+>   --test netfetch_end_to_end -- --nocapture` (`--nocapture` — the per-stage
+>   report IS the output).
+>
+> **Known-bad on a FRESH clone (not a regression):** three
+> `gguf_tokenizer::tests::*` fail because the vendored `ggml-vocab-qwen2.gguf`
+> under `crates/kopitiam-ai/vendor/` is a gitignored shallow clone and is absent
+> on a fresh container. Present on the maintainer's box. Do not "fix" these.
+>
+> **The actual chat bug is still open** (see `models inspect`, commit 896f5c9):
+> SmolLM2-360M loads but its tokenizer rejects byte 0x04. Two opposite fixes
+> (loader-decodes-`<0xNN>` vs check-too-strict); run
+> `kopitiam models inspect <the .gguf>` on the real file — its verdict line says
+> which. The netfetch test will then confirm the fix end to end.
+>
+> Everything below is older — read it for background, not for current state.
+
 > ## ✅ LATEST — 2026-07-27 (Mon, ~07:30 SGT)
 >
 > **Governance change: the NUS working-hours restriction is GONE.** KOPITIAM is
