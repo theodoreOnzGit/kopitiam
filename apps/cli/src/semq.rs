@@ -332,10 +332,13 @@ fn connect(root: &Path) -> Result<RustAnalyzerSession> {
 /// of one of them, fail clearly rather than silently ignoring the flag.
 fn reject_no_lsp(args: &Locator, command: &str) -> Result<()> {
     if args.no_lsp {
-        bail!(
+        // A UsageError, not a `bail!`: this is the caller naming a flag that does
+        // not apply, so it deserves one clean line and exit 2 — never the stack
+        // trace a plain anyhow error prints under RUST_BACKTRACE.
+        return Err(crate::usage(format!(
             "`{command}` has no syntactic fallback — only `refs` and `outline` do. \
              Re-run without --no-lsp/--syntactic (rust-analyzer is required here)."
-        );
+        )));
     }
     Ok(())
 }
@@ -837,6 +840,21 @@ mod tests {
         assert!(reject_no_lsp(&with, "def").is_err(), "def has no syntactic fallback");
         let without = LocatorCli::try_parse_from(["t", "s", "--file", "a.rs"]).unwrap().args;
         assert!(reject_no_lsp(&without, "def").is_ok());
+    }
+
+    #[test]
+    fn reject_no_lsp_is_a_usage_error_not_a_crash_report() {
+        // Regression: this used to be a plain `bail!`, so mistyping a flag printed
+        // a dozen frames of stack trace under RUST_BACKTRACE. For a tool whose job
+        // is spending an agent's context carefully, that buried a one-line answer
+        // under noise. Typing it as `UsageError` is what lets `main` keep it to one
+        // line and exit 2 instead of 1.
+        let with = LocatorCli::try_parse_from(["t", "s", "--file", "a.rs", "--no-lsp"]).unwrap().args;
+        let err = reject_no_lsp(&with, "def").unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::UsageError>().is_some(),
+            "must stay a UsageError, or the backtrace dump comes back"
+        );
     }
 
     #[test]

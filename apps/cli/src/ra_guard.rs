@@ -47,7 +47,6 @@
 //! downgrading everyone's answers forever. `Reason::NotApplicable` carries that
 //! same meaning from the budgeter and is honoured here.
 
-use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use kopitiam_resource::clients::{should_run_rust_analyzer, BudgetInputs, RaCoeffs};
@@ -96,52 +95,6 @@ pub fn decide(root: &Path) -> RaGate {
     let verdict =
         should_run_rust_analyzer(cap, weight, RaCoeffs::default(), BudgetInputs::default());
     interpret(verdict, cap)
-}
-
-/// Like [`decide`], but when the budget says stand down it **asks the human
-/// first** — on a real terminal only.
-///
-/// # The agent-safety rule that shapes this
-///
-/// A prompt on stdin is the single most dangerous thing to add to this CLI.
-/// `kopitiam_skill.md` (generated, agent-facing) marks the interactive commands
-/// as ones that "will HANG the session", and every non-interactive caller —
-/// scripts, CI, an AI agent driving the CLI — would deadlock waiting on a
-/// question it cannot see. So the prompt is gated on **stdin actually being a
-/// terminal**: piped, redirected or agent-driven input never asks, it just takes
-/// [`decide`]'s answer. Getting this backwards would break the tool's primary
-/// consumer.
-///
-/// # Why only on stand-down
-///
-/// We do *not* ask when the budget says `Run`. Being asked "start
-/// rust-analyzer?" on every command on a capable desktop is miserable and would
-/// train the user to mash `y`. The question is only worth a human's attention at
-/// the point there is a real decision: the box looks tight, and they may still
-/// want the better answer at the cost of the RAM.
-///
-/// The prompt writes to **stderr**, so `--json` stdout stays machine-clean, and
-/// defaults to **no** on a bare Enter or unreadable input — the safe direction,
-/// since "no" costs a thinner outline while "yes" on a 4 GB tablet can cost the
-/// whole process.
-pub fn decide_interactive(root: &Path) -> RaGate {
-    let gate = decide(root);
-    let RaGate::StandDown(why) = &gate else {
-        return gate;
-    };
-    if !std::io::stdin().is_terminal() {
-        return gate;
-    }
-    eprint!("rust-analyzer stood down: {why}\nStart it anyway? [y/N] ");
-    let _ = std::io::stderr().flush();
-
-    let mut answer = String::new();
-    match std::io::stdin().read_line(&mut answer) {
-        Ok(_) if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") => RaGate::Run,
-        // Anything else — plain Enter, "n", EOF, a read error — keeps the safe
-        // default. Never let a broken stdin turn into "launch the heavy thing".
-        _ => gate,
-    }
 }
 
 /// Turns a budgeter [`Verdict`] into an [`RaGate`], given the capacity reading

@@ -344,12 +344,69 @@ enum Command {
     Bn(bn::BnArgs),
 }
 
-// `main` return `anyhow::Result<ExitCode>` (not `Result<()>`) because one
+/// A mistake in **how the command was invoked** — a flag combination this
+/// subcommand cannot honour — as opposed to something going wrong while doing
+/// the actual work.
+///
+/// # Why the distinction is worth a type
+///
+/// It changes what gets printed. A usage error is the caller's typo, so it earns
+/// exactly ONE line: no error chain, no stack trace. A genuine failure keeps the
+/// full `anyhow` chain (and its backtrace under `RUST_BACKTRACE`), because that
+/// is a bug somebody has to debug.
+///
+/// Dumping a stack trace at someone who mistyped a flag is noise everywhere, but
+/// for *this* tool it is an outright anti-feature: kopitiam exists to spend an
+/// agent's context carefully, and a backtrace costs far more tokens than the
+/// one-line answer it buries. Observed in the wild — `kopitiam def --no-lsp`
+/// answered a simple "that flag doesn't apply here" with a dozen frames of
+/// `__libc_start_main`.
+#[derive(Debug)]
+pub struct UsageError(pub String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// Builds a [`UsageError`] already wrapped as an `anyhow::Error`, so a
+/// subcommand can `return Err(usage(...))` wherever it would have used `bail!`.
+pub fn usage(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UsageError(msg.into()))
+}
+
+/// Process entry point. Runs the CLI, then decides how loudly to fail.
+///
+/// Deliberately returns [`ExitCode`] rather than `anyhow::Result`, because the
+/// `Result` version hands formatting to Rust's `Termination` impl, which prints
+/// `{:?}` — the full chain plus backtrace — for *every* error alike. Owning the
+/// exit path is what lets a usage mistake stay one quiet line.
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            if let Some(usage) = err.downcast_ref::<UsageError>() {
+                // The caller's typo. Exit 2 is the conventional "bad usage"
+                // status, kept distinct from 1 so a script (or an agent) can
+                // tell "you called it wrong" apart from "it went wrong".
+                eprintln!("error: {usage}");
+                return ExitCode::from(2);
+            }
+            eprintln!("Error: {err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// `run` return `anyhow::Result<ExitCode>` (not `Result<()>`) because one
 // subcommand — `models path` — must exit nonzero when a model not present, so
 // it can compose inside shell scripts. Every other arm just report
-// `ExitCode::SUCCESS`; genuine errors still bubble up as `Err` and clap/anyhow
-// print them. `models::run` is the only arm that carry a real exit code.
-fn main() -> anyhow::Result<ExitCode> {
+// `ExitCode::SUCCESS`; genuine errors bubble up as `Err` for `main` to format.
+// `models::run` is the only arm that carry a real exit code.
+fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let code = match cli.command {
         Command::Pdf2md {

@@ -80,7 +80,7 @@ fn resolve_outline(args: &OutlineArgs) -> Result<Outline> {
     // SIGKILLed by the low-memory killer and the CLI just looks frozen. Standing
     // down costs a thinner outline; not standing down can cost the whole process.
     if !args.lsp
-        && let crate::ra_guard::RaGate::StandDown(why) = crate::ra_guard::decide_interactive(&args.root)
+        && let crate::ra_guard::RaGate::StandDown(why) = crate::ra_guard::decide(&args.root)
     {
         eprintln!("rust-analyzer stood down: {why}; syntactic outline (--lsp to force)");
         return syntactic::outline_file(&args.file);
