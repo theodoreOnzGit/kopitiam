@@ -3261,6 +3261,7 @@ version = "0.2.4"
 dependencies = [
  "kopitiam-core",
  "kopitiam-loader",
+ "kopitiam-models",
  "kopitiam-tensor",
  "kopitiam-tokenizer",
  "tempfile",
