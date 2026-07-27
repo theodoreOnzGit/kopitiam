@@ -73,10 +73,25 @@ fn resolve_outline(args: &OutlineArgs) -> Result<Outline> {
         return syntactic::outline_file(&args.file);
     }
 
+    // Resource gate FIRST: ask whether this box can afford rust-analyzer at all
+    // right now (free RAM + cores, via the shared AID-0037 budgeter). This is the
+    // axis the file count below cannot see — the same workspace is comfortable on
+    // a desktop and fatal on a 4 GB tablet, where RA's indexing gets the process
+    // SIGKILLed by the low-memory killer and the CLI just looks frozen. Standing
+    // down costs a thinner outline; not standing down can cost the whole process.
+    if !args.lsp
+        && let crate::ra_guard::RaGate::StandDown(why) = crate::ra_guard::decide(&args.root)
+    {
+        eprintln!("rust-analyzer stood down: {why}; syntactic outline (--lsp to force)");
+        return syntactic::outline_file(&args.file);
+    }
+
     // P1: on a large workspace rust-analyzer will not index in bounded time, so
     // DEFAULT to the instant syntactic scan (rust-analyzer stays opt-in via
     // `--lsp`, which skips this branch and keeps its full-timeout, fail-hard
-    // semantics). A one-line stderr note keeps `--json` stdout clean.
+    // semantics). A one-line stderr note keeps `--json` stdout clean. Kept
+    // alongside the resource gate above, not replaced by it: this one catches
+    // "nobody indexes this in bounded time" even on a box with RAM to spare.
     if !args.lsp && syntactic::prefer_syntactic_default(&args.root) {
         eprintln!("large workspace: syntactic outline; --lsp for rust-analyzer");
         return syntactic::outline_file(&args.file);

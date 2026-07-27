@@ -2952,6 +2952,7 @@ dependencies = [
  "kopitiam-ocr",
  "kopitiam-ontology",
  "kopitiam-pdf",
+ "kopitiam-resource",
  "kopitiam-semantic",
  "kopitiam-tokenizer",
  "kopitiam-workflow",

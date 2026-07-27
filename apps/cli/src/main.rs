@@ -30,6 +30,7 @@ mod digest;
 mod models;
 mod ocr_fallback;
 mod outline;
+mod ra_guard;
 mod plan;
 mod port;
 mod preprocess;

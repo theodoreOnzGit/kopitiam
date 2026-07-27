@@ -20,6 +20,13 @@ kopitiam-document = { workspace = true, features = ["serde"] }
 kopitiam-markdown = { workspace = true }
 kopitiam-ontology = { workspace = true }
 kopitiam-semantic = { workspace = true }
+# The shared preemptive resource budgeter (AID-0037), already used by kvim
+# for exactly this decision. `ra_guard.rs` asks it whether this box can
+# afford to spawn rust-analyzer before spawning it, so a small Termux
+# tablet degrades to the instant syntactic scan instead of being SIGKILLed
+# by the low-memory killer mid-index. One budgeter, two clients — no second
+# copy of the cost model here.
+kopitiam-resource = { workspace = true }
 # `kopitiam tokens` (token-max Task II-7): the dependency-free BPE token
 # estimator (`estimate_tokens`/`estimate_tokens_by_line`). Already a workspace
 # member — this is the only card that adds a CLI dependency, so it is the sole
