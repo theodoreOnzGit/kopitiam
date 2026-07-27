@@ -19,13 +19,13 @@ use common::{
     stderr, stdout, terminate_child, wait_for_socket, AttachedSession, CliHarness,
     BINARY_OVERRIDE_ENV, BINARY_OVERRIDE_TEST_OPT_IN_ENV,
 };
-use rmux_client::INTERNAL_DAEMON_FLAG;
-use rmux_core::command_parser::COMMAND_TABLE;
-use rmux_proto::{
+use kmux::client::INTERNAL_DAEMON_FLAG;
+use kmux::core::command_parser::COMMAND_TABLE;
+use kmux::proto::{
     encode_frame, ErrorResponse, FrameDecoder, Request, Response, RmuxError, CONTROL_CONTROL_END,
     CONTROL_CONTROL_START, RMUX_WIRE_VERSION,
 };
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);

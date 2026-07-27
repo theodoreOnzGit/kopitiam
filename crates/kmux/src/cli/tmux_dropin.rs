@@ -52,7 +52,7 @@ fn parse_doctor(arguments: &[OsString]) -> Result<DropinInvocation, ExitFailure>
         "tmux-dropin" => Ok(DropinInvocation::DoctorTmuxDropin),
         other => Err(ExitFailure::new(
             1,
-            format!("rmux doctor: unknown check '{other}'"),
+            format!("kmux doctor: unknown check '{other}'"),
         )),
     }
 }
@@ -82,13 +82,13 @@ fn single_subcommand<'a>(
     let Some(subcommand) = arguments.first().and_then(|value| value.to_str()) else {
         return Err(ExitFailure::new(
             1,
-            format!("rmux {command}: expected {expected}"),
+            format!("kmux {command}: expected {expected}"),
         ));
     };
     if arguments.len() != 1 {
         return Err(ExitFailure::new(
             1,
-            format!("rmux {command}: expected exactly one argument"),
+            format!("kmux {command}: expected exactly one argument"),
         ));
     }
     Ok(subcommand)
@@ -138,7 +138,7 @@ fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
     let argv0_name = argv0
         .and_then(|value| Path::new(value).file_name())
         .and_then(OsStr::to_str)
-        .unwrap_or("rmux");
+        .unwrap_or("kmux");
     let shim_detected = Path::new(argv0_name)
         .file_stem()
         .and_then(OsStr::to_str)
@@ -150,7 +150,7 @@ fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
     };
 
     let mut output = String::new();
-    output.push_str("rmux tmux-dropin doctor\n");
+    output.push_str("kmux tmux-dropin doctor\n");
     output.push_str(&format!("shim:        {shim}   (argv[0]={argv0_name})\n"));
     if !shim_detected {
         output.push_str("suggested:   ln -s $(command -v kmux) ~/.local/bin/tmux\n");

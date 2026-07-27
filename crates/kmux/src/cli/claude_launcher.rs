@@ -131,7 +131,7 @@ fn prepare_claude_leader_environment_impl(
     let socket_path = kmux::client::socket_path_for_label(main_socket).map_err(|error| {
         ExitFailure::new(
             1,
-            format!("rmux claude: failed to resolve private tmux socket: {error}"),
+            format!("kmux claude: failed to resolve private tmux socket: {error}"),
         )
     })?;
     let pane = env::var_os("RMUX_PANE")
@@ -307,7 +307,7 @@ fn run_attached(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
     let binary = env::current_exe().map_err(|error| {
         ExitFailure::new(
             1,
-            format!("rmux claude: failed to resolve current kmux binary: {error}"),
+            format!("kmux claude: failed to resolve current kmux binary: {error}"),
         )
     })?;
     let runtime_dir = create_runtime_dir("rmux-claude")?;
@@ -350,7 +350,7 @@ fn run_attached(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
         .map_err(|error| {
             ExitFailure::new(
                 1,
-                format!("rmux claude: failed to attach RMUX session: {error}"),
+                format!("kmux claude: failed to attach KMUX session: {error}"),
             )
         });
 
@@ -379,7 +379,7 @@ fn start_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitFail
         .map_err(|error| {
             ExitFailure::new(
                 1,
-                format!("rmux claude: failed to start private RMUX server: {error}"),
+                format!("kmux claude: failed to start private KMUX server: {error}"),
             )
         })?;
     if output.status.success() {
@@ -388,7 +388,7 @@ fn start_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitFail
     Err(ExitFailure::new(
         output.status.code().unwrap_or(1),
         format!(
-            "rmux claude: failed to start private RMUX server{}",
+            "kmux claude: failed to start private KMUX server{}",
             command_output_suffix(&output)
         ),
     ))
@@ -412,7 +412,7 @@ fn configure_windows_claude_default_shell(
         .map_err(|error| {
             ExitFailure::new(
                 1,
-                format!("rmux claude: failed to configure teammate shell: {error}"),
+                format!("kmux claude: failed to configure teammate shell: {error}"),
             )
         })?;
     if output.status.success() {
@@ -422,7 +422,7 @@ fn configure_windows_claude_default_shell(
     Err(ExitFailure::new(
         output.status.code().unwrap_or(1),
         format!(
-            "rmux claude: failed to configure teammate shell '{}'{}",
+            "kmux claude: failed to configure teammate shell '{}'{}",
             bash.display(),
             command_output_suffix(&output)
         ),
@@ -442,7 +442,7 @@ fn shutdown_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitF
         .map_err(|error| {
             ExitFailure::new(
                 1,
-                format!("rmux claude: failed to stop private RMUX server: {error}"),
+                format!("kmux claude: failed to stop private KMUX server: {error}"),
             )
         })?;
     if status.success() {
@@ -450,7 +450,7 @@ fn shutdown_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitF
     } else {
         Err(ExitFailure::new(
             status.code().unwrap_or(1),
-            "rmux claude: failed to stop private RMUX server",
+            "kmux claude: failed to stop private KMUX server",
         ))
     }
 }
@@ -502,7 +502,7 @@ fn start_main_session(
     let status = command.status().map_err(|error| {
         ExitFailure::new(
             1,
-            format!("rmux claude: failed to create attached RMUX session: {error}"),
+            format!("kmux claude: failed to create attached KMUX session: {error}"),
         )
     })?;
     if status.success() {
@@ -510,7 +510,7 @@ fn start_main_session(
     } else {
         Err(ExitFailure::new(
             status.code().unwrap_or(1),
-            "rmux claude: failed to create attached RMUX session",
+            "kmux claude: failed to create attached KMUX session",
         ))
     }
 }
@@ -616,7 +616,7 @@ fn show_teammate_window(binary: &Path, main_socket: &str) -> Result<(), ExitFail
     if !link_status.is_ok_and(|status| status.success()) {
         return Err(ExitFailure::new(
             1,
-            "rmux claude: failed to link teammate window",
+            "kmux claude: failed to link teammate window",
         ));
     }
 
@@ -635,7 +635,7 @@ fn show_teammate_window(binary: &Path, main_socket: &str) -> Result<(), ExitFail
     } else {
         Err(ExitFailure::new(
             1,
-            "rmux claude: failed to select teammate window",
+            "kmux claude: failed to select teammate window",
         ))
     }
 }
@@ -653,7 +653,7 @@ fn write_runner_pid_file(pid_file: &Path) -> Result<(), ExitFailure> {
                 ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to create runner pid directory '{}': {error}",
+                        "kmux claude: failed to create runner pid directory '{}': {error}",
                         parent.display()
                     ),
                 )
@@ -667,7 +667,7 @@ fn write_runner_pid_file(pid_file: &Path) -> Result<(), ExitFailure> {
                 ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to create runner pid file '{}': {error}",
+                        "kmux claude: failed to create runner pid file '{}': {error}",
                         pid_file.display()
                     ),
                 )
@@ -677,7 +677,7 @@ fn write_runner_pid_file(pid_file: &Path) -> Result<(), ExitFailure> {
                 ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to write runner pid file '{}': {error}",
+                        "kmux claude: failed to write runner pid file '{}': {error}",
                         pid_file.display()
                     ),
                 )
@@ -723,7 +723,7 @@ fn write_runner_pid_file_unix(pid_file: &Path) -> Result<(), ExitFailure> {
             ExitFailure::new(
                 1,
                 format!(
-                    "rmux claude: failed to create runner pid file '{}': {error}",
+                    "kmux claude: failed to create runner pid file '{}': {error}",
                     pid_file.display()
                 ),
             )
@@ -733,7 +733,7 @@ fn write_runner_pid_file_unix(pid_file: &Path) -> Result<(), ExitFailure> {
             ExitFailure::new(
                 1,
                 format!(
-                    "rmux claude: failed to write runner pid file '{}': {error}",
+                    "kmux claude: failed to write runner pid file '{}': {error}",
                     pid_file.display()
                 ),
             )
@@ -758,7 +758,7 @@ fn create_secure_runtime_dir(prefix: &str) -> Result<PathBuf, ExitFailure> {
                 return Err(ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to create runtime directory '{}': {error}",
+                        "kmux claude: failed to create runtime directory '{}': {error}",
                         runtime_dir.display()
                     ),
                 ));
@@ -767,7 +767,7 @@ fn create_secure_runtime_dir(prefix: &str) -> Result<PathBuf, ExitFailure> {
     }
     Err(ExitFailure::new(
         1,
-        "rmux claude: failed to create a unique runtime directory",
+        "kmux claude: failed to create a unique runtime directory",
     ))
 }
 
@@ -779,7 +779,7 @@ fn random_hex_128() -> Result<String, ExitFailure> {
         .map_err(|error| {
             ExitFailure::new(
                 1,
-                format!("rmux claude: failed to read OS randomness: {error}"),
+                format!("kmux claude: failed to read OS randomness: {error}"),
             )
         })?;
 
@@ -798,7 +798,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         ExitFailure::new(
             1,
             format!(
-                "rmux claude: failed to inspect {label} '{}': {error}",
+                "kmux claude: failed to inspect {label} '{}': {error}",
                 path.display()
             ),
         )
@@ -807,7 +807,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         return Err(ExitFailure::new(
             1,
             format!(
-                "rmux claude: refusing symlinked {label} '{}'",
+                "kmux claude: refusing symlinked {label} '{}'",
                 path.display()
             ),
         ));
@@ -816,7 +816,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         return Err(ExitFailure::new(
             1,
             format!(
-                "rmux claude: refusing non-directory {label} '{}'",
+                "kmux claude: refusing non-directory {label} '{}'",
                 path.display()
             ),
         ));
@@ -827,7 +827,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         return Err(ExitFailure::new(
             1,
             format!(
-                "rmux claude: refusing {label} '{}' owned by uid {}",
+                "kmux claude: refusing {label} '{}' owned by uid {}",
                 path.display(),
                 metadata.uid()
             ),
@@ -843,7 +843,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         ExitFailure::new(
             1,
             format!(
-                "rmux claude: failed to tighten permissions on {label} '{}': {error}",
+                "kmux claude: failed to tighten permissions on {label} '{}': {error}",
                 path.display()
             ),
         )
@@ -852,7 +852,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         ExitFailure::new(
             1,
             format!(
-                "rmux claude: failed to re-inspect {label} '{}': {error}",
+                "kmux claude: failed to re-inspect {label} '{}': {error}",
                 path.display()
             ),
         )
@@ -863,7 +863,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
         Err(ExitFailure::new(
             1,
             format!(
-                "rmux claude: refusing group/world-accessible {label} '{}'",
+                "kmux claude: refusing group/world-accessible {label} '{}'",
                 path.display()
             ),
         ))
@@ -875,14 +875,14 @@ fn run_claude(mut command: ProcessCommand) -> Result<i32, ExitFailure> {
     let error = command.exec();
     Err(ExitFailure::new(
         1,
-        format!("rmux claude: failed to execute claude: {error}"),
+        format!("kmux claude: failed to execute claude: {error}"),
     ))
 }
 
 #[cfg(not(unix))]
 fn run_claude(mut command: ProcessCommand) -> Result<i32, ExitFailure> {
     let status = command.status().map_err(|error| {
-        ExitFailure::new(1, format!("rmux claude: failed to execute claude: {error}"))
+        ExitFailure::new(1, format!("kmux claude: failed to execute claude: {error}"))
     })?;
     Ok(status.code().unwrap_or(1))
 }
@@ -894,7 +894,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude: failed to create private tmux shim directory '{}': {error}",
+                "kmux claude: failed to create private tmux shim directory '{}': {error}",
                 dir.display()
             ),
         )
@@ -909,7 +909,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
                     ExitFailure::new(
                         1,
                         format!(
-                            "rmux claude: failed to replace private tmux shim '{}': {error}",
+                            "kmux claude: failed to replace private tmux shim '{}': {error}",
                             shim.display()
                         ),
                     )
@@ -918,7 +918,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
                     ExitFailure::new(
                         1,
                         format!(
-                            "rmux claude: failed to create private tmux shim '{}': {error}",
+                            "kmux claude: failed to create private tmux shim '{}': {error}",
                             shim.display()
                         ),
                     )
@@ -929,7 +929,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
             return Err(ExitFailure::new(
                 1,
                 format!(
-                    "rmux claude: '{}' exists and is not a symlink; refusing to overwrite it",
+                    "kmux claude: '{}' exists and is not a symlink; refusing to overwrite it",
                     shim.display()
                 ),
             ));
@@ -939,7 +939,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
                 ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to create private tmux shim '{}': {error}",
+                        "kmux claude: failed to create private tmux shim '{}': {error}",
                         shim.display()
                     ),
                 )
@@ -949,7 +949,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
             return Err(ExitFailure::new(
                 1,
                 format!(
-                    "rmux claude: failed to inspect private tmux shim '{}': {error}",
+                    "kmux claude: failed to inspect private tmux shim '{}': {error}",
                     shim.display()
                 ),
             ));
@@ -966,7 +966,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude: failed to create private tmux shim directory '{}': {error}",
+                "kmux claude: failed to create private tmux shim directory '{}': {error}",
                 dir.display()
             ),
         )
@@ -991,7 +991,7 @@ fn install_windows_tmux_shim_in_dir(
                 ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to refresh private tmux shim '{}' ({}) and failed to create fallback shim '{}' ({})",
+                        "kmux claude: failed to refresh private tmux shim '{}' ({}) and failed to create fallback shim '{}' ({})",
                         shim.display(),
                         primary_error.message(),
                         fallback_shim.display(),
@@ -1014,7 +1014,7 @@ fn install_windows_tmux_shim(source: &Path, shim: &Path) -> Result<(), ExitFailu
                 return Err(ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to replace private tmux shim '{}': {error}",
+                        "kmux claude: failed to replace private tmux shim '{}': {error}",
                         shim.display()
                     ),
                 ));
@@ -1027,7 +1027,7 @@ fn install_windows_tmux_shim(source: &Path, shim: &Path) -> Result<(), ExitFailu
             ExitFailure::new(
                 1,
                 format!(
-                    "rmux claude: failed to create private tmux shim '{}' from '{}': {error}",
+                    "kmux claude: failed to create private tmux shim '{}' from '{}': {error}",
                     shim.display(),
                     source.display()
                 ),
@@ -1039,7 +1039,7 @@ fn install_windows_tmux_shim(source: &Path, shim: &Path) -> Result<(), ExitFailu
 fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
     Err(ExitFailure::new(
         1,
-        "rmux claude is currently supported only on Unix-like systems and Windows",
+        "kmux claude is currently supported only on Unix-like systems and Windows",
     ))
 }
 
@@ -1062,7 +1062,7 @@ fn create_windows_temporary_dir(prefix: &str) -> Result<PathBuf, ExitFailure> {
                 return Err(ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude: failed to create temporary directory '{}': {error}",
+                        "kmux claude: failed to create temporary directory '{}': {error}",
                         dir.display()
                     ),
                 ));
@@ -1071,7 +1071,7 @@ fn create_windows_temporary_dir(prefix: &str) -> Result<PathBuf, ExitFailure> {
     }
     Err(ExitFailure::new(
         1,
-        "rmux claude: failed to create a unique temporary directory",
+        "kmux claude: failed to create a unique temporary directory",
     ))
 }
 
@@ -1131,7 +1131,7 @@ fn windows_tmux_shim_source_binary() -> Result<PathBuf, ExitFailure> {
     let current = env::current_exe().map_err(|error| {
         ExitFailure::new(
             1,
-            format!("rmux claude: failed to resolve current kmux binary: {error}"),
+            format!("kmux claude: failed to resolve current kmux binary: {error}"),
         )
     })?;
     if let Some(path) = env::var_os(PUBLIC_BINARY_OVERRIDE_ENV) {
@@ -1169,7 +1169,7 @@ fn windows_full_helper_candidates(current: &Path) -> Vec<PathBuf> {
 fn private_shim_dir() -> Result<PathBuf, ExitFailure> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ExitFailure::new(1, "rmux claude: HOME is not set"))?;
+        .ok_or_else(|| ExitFailure::new(1, "kmux claude: HOME is not set"))?;
     Ok(PathBuf::from(home)
         .join(".local")
         .join("share")
@@ -1218,7 +1218,7 @@ fn public_rmux_binary() -> Result<PathBuf, ExitFailure> {
     env::current_exe().map_err(|error| {
         ExitFailure::new(
             1,
-            format!("rmux claude: failed to resolve current kmux binary: {error}"),
+            format!("kmux claude: failed to resolve current kmux binary: {error}"),
         )
     })
 }
@@ -1256,7 +1256,7 @@ fn resolve_windows_claude_program() -> Result<WindowsClaudeProgram, ExitFailure>
     resolve_windows_program("claude").ok_or_else(|| {
         ExitFailure::new(
             1,
-            "rmux claude: failed to find claude on PATH; install Claude Code or set PATH",
+            "kmux claude: failed to find claude on PATH; install Claude Code or set PATH",
         )
     })
 }
@@ -1267,7 +1267,7 @@ fn windows_git_bash_path() -> Result<PathBuf, ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude on Windows requires Git Bash for teammate panes; install Git for Windows or set {CLAUDE_GIT_BASH_PATH_ENV}"
+                "kmux claude on Windows requires Git Bash for teammate panes; install Git for Windows or set {CLAUDE_GIT_BASH_PATH_ENV}"
             ),
         )
     })
@@ -1388,7 +1388,7 @@ fn path_with_shim_first_from(
     env::join_paths(paths).map_err(|error| {
         ExitFailure::new(
             1,
-            format!("rmux claude: failed to build PATH with private tmux shim: {error}"),
+            format!("kmux claude: failed to build PATH with private tmux shim: {error}"),
         )
     })
 }
@@ -1410,7 +1410,7 @@ fn shell_quote(value: &OsStr) -> Result<String, ExitFailure> {
     let value = value.to_str().ok_or_else(|| {
         ExitFailure::new(
             1,
-            "rmux claude: attached launcher requires UTF-8 command arguments",
+            "kmux claude: attached launcher requires UTF-8 command arguments",
         )
     })?;
     if value.is_empty() {

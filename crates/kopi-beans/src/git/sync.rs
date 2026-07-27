@@ -633,11 +633,15 @@ impl SyncProcess<Committed> {
             }
         };
 
-        // Push with refspec. Push is GATED: gix 0.86 has no high-level push
-        // (upstream #306); a send-pack shim over gix-protocol/gix-transport is a
-        // follow-up. We never shell out to git.
+        // Push with refspec. Local (file://) remotes push in-process via gix
+        // (object copy + ref update); network remotes remain gated. We never shell
+        // out to git. A non-fast-forward or locked remote ref is a retryable
+        // condition, surfaced as `NonFastForward` so callers can fetch + retry.
         let refspec = "refs/heads/beads/store:refs/heads/beads/store".to_string();
         if let Err(e) = repo.push_refspecs(&url, &[refspec]) {
+            if is_retryable_push_error_message(&e.to_string()) {
+                return Err(SyncError::NonFastForward);
+            }
             return Err(SyncError::Push(e));
         }
 
@@ -1844,9 +1848,9 @@ fn origin_remote_url(repo: &Repository) -> Option<String> {
 }
 
 fn push_store_ref(repo: &Repository) -> Result<bool, SyncError> {
-    // Push is GATED (gix 0.86 has no high-level push; upstream #306). Local-only
-    // repos (no origin) still report a successful no-op; a send-pack shim over
-    // gix-protocol/gix-transport is the follow-up. We never shell out to git.
+    // Push over a local (file://) origin is implemented in-process via gix (object
+    // copy + ref update); network origins remain gated. Local-only repos (no
+    // origin) report a successful no-op. We never shell out to git.
     let url = match repo.find_remote("origin") {
         Ok(remote) => match remote.url() {
             Some(url) => url.to_owned(),
@@ -2437,10 +2441,9 @@ pub fn init_beads_ref(
             &[], // No parents - orphan commit
         )?;
 
-        // Try to push. Push is GATED (gix 0.86 has no high-level push; upstream
-        // #306). Local-only init (no origin) is the common path and succeeds; when
-        // an origin is configured the orphan commit is created locally and the
-        // gated push surfaces as InitFailed. A send-pack shim is the follow-up.
+        // Try to push. Push over a local (file://) origin works in-process via gix;
+        // network origins remain gated and surface as InitFailed. Local-only init
+        // (no origin) is the common path and succeeds. We never shell out to git.
         if let Ok(remote) = repo.find_remote("origin")
             && let Some(url) = remote.url()
         {
@@ -3372,7 +3375,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix push is gated (send-pack shim pending) -- TODO: re-enable once push lands"]
     fn migrate_store_ref_to_v2_retry_still_refuses_unrelated_divergence_without_force() {
         let tmp = TempDir::new().unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -3501,7 +3503,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix push is gated (send-pack shim pending) -- TODO: re-enable once push lands"]
     fn migrate_store_ref_to_v2_retries_true_push_race_and_realigns_local_ref() {
         let tmp = TempDir::new().unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -3981,7 +3982,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix push is gated (send-pack shim pending) -- TODO: re-enable once push lands"]
     fn fetch_fast_forwards_when_remote_ahead() {
         let tmp = TempDir::new().unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -3996,11 +3996,13 @@ mod tests {
         let local_v1 = write_store_commit(&local_repo, None, "local-v1");
         {
             let remote = local_repo.find_remote("origin").unwrap();
-            // Push is gated over gix; this round-trip test is #[ignore]d.
-            let _ = local_repo.push_refspecs(
-                remote.url().unwrap(),
-                &["refs/heads/beads/store:refs/heads/beads/store".to_string()],
-            );
+            // Push over the local (file://) remote seeds the remote ref with local-v1.
+            local_repo
+                .push_refspecs(
+                    remote.url().unwrap(),
+                    &["refs/heads/beads/store:refs/heads/beads/store".to_string()],
+                )
+                .unwrap();
         }
 
         let remote_v2 = write_store_commit(&remote_repo, Some(local_v1), "remote-v2");
@@ -4039,7 +4041,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix push is gated (send-pack shim pending) -- TODO: re-enable once push lands"]
     fn sync_with_retry_reports_divergence() {
         let tmp = TempDir::new().unwrap();
         let remote_dir = tmp.path().join("remote");
@@ -4060,7 +4061,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "gix ref-lock error fidelity differs from libgit-2 -- TODO: restore .lock-path recovery"]
     fn sync_with_retry_respects_max_retries_on_non_fast_forward() {
         use std::fs;
 
@@ -4077,11 +4077,13 @@ mod tests {
         let _base_oid = write_store_commit(&local_repo, None, "base");
         {
             let remote = local_repo.find_remote("origin").unwrap();
-            // Push is gated over gix; this round-trip test is #[ignore]d.
-            let _ = local_repo.push_refspecs(
-                remote.url().unwrap(),
-                &["refs/heads/beads/store:refs/heads/beads/store".to_string()],
-            );
+            // Push over the local (file://) remote seeds the remote ref with base.
+            local_repo
+                .push_refspecs(
+                    remote.url().unwrap(),
+                    &["refs/heads/beads/store:refs/heads/beads/store".to_string()],
+                )
+                .unwrap();
         }
 
         let lock_path = remote_dir.join("refs/heads/beads/store.lock");

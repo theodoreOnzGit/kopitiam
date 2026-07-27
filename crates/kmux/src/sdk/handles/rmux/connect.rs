@@ -34,7 +34,7 @@ pub(super) async fn connect_transport(
 ) -> Result<TransportClient> {
     match endpoint {
         RmuxEndpoint::UnixSocket(path) => {
-            let stream = timeout_io("connect to rmux daemon", timeout, async {
+            let stream = timeout_io("connect to kmux daemon", timeout, async {
                 tokio::net::UnixStream::connect(path).await
             })
             .await?;
@@ -45,7 +45,7 @@ pub(super) async fn connect_transport(
             "use a Unix socket endpoint on Unix SDK builds",
         )),
         RmuxEndpoint::Default => Err(RmuxError::transport(
-            "resolve rmux SDK endpoint",
+            "resolve kmux SDK endpoint",
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "default endpoint was not resolved before connecting",
@@ -334,7 +334,7 @@ fn hidden_daemon_not_found_error(
         .collect::<Vec<_>>()
         .join(", ");
     let mut message = format!(
-        "no rmux hidden daemon binary candidate was available; tried [{candidates}]. \
+        "no kmux hidden daemon binary candidate was available; tried [{candidates}]. \
          Install rmux, ensure kmux-daemon or rmux is on PATH, or set {} to an absolute rmux binary path",
         discovery::SDK_DAEMON_BINARY_ENV
     );
@@ -346,7 +346,7 @@ fn hidden_daemon_not_found_error(
 
 fn startup_error(error: impl fmt::Display) -> RmuxError {
     RmuxError::transport(
-        "connect or start rmux daemon",
+        "connect or start kmux daemon",
         io::Error::other(error.to_string()),
     )
 }
@@ -366,7 +366,7 @@ pub(super) async fn connect_transport(
             "use a Windows named-pipe endpoint on Windows SDK builds",
         )),
         RmuxEndpoint::Default => Err(RmuxError::transport(
-            "resolve rmux SDK endpoint",
+            "resolve kmux SDK endpoint",
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "default endpoint was not resolved before connecting",
@@ -384,16 +384,16 @@ async fn connect_windows_pipe(pipe: &str, timeout: Option<Duration>) -> Result<N
             Err(error) if windows_pipe_connect_retryable(&error) => {
                 if deadline.is_elapsed() {
                     return Err(RmuxError::transport(
-                        "connect to rmux daemon",
+                        "connect to kmux daemon",
                         timeout_error(
-                            "connect to rmux daemon",
+                            "connect to kmux daemon",
                             deadline.requested_timeout().unwrap_or(Duration::MAX),
                         ),
                     ));
                 }
                 tokio::time::sleep(deadline.sleep_for(WINDOWS_CONNECT_RETRY_INTERVAL)).await;
             }
-            Err(error) => return Err(RmuxError::transport("connect to rmux daemon", error)),
+            Err(error) => return Err(RmuxError::transport("connect to kmux daemon", error)),
         }
     }
 }
@@ -417,7 +417,7 @@ pub(super) async fn connect_transport(
 ) -> Result<TransportClient> {
     Err(RmuxError::unsupported(
         "transport.local_ipc",
-        "this target does not support rmux local IPC transports",
+        "this target does not support kmux local IPC transports",
     ))
 }
 

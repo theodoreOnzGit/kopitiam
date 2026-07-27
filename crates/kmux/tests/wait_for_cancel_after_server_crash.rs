@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rmux_sdk::{EnsureSession, RmuxBuilder, RmuxError, SessionName};
-use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
+use kmux::sdk::{EnsureSession, RmuxBuilder, RmuxError, SessionName};
+use kmux::server::{DaemonConfig, ServerDaemon, ServerHandle};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -32,7 +32,7 @@ impl Harness {
         })
     }
 
-    fn rmux(&self) -> rmux_sdk::Rmux {
+    fn rmux(&self) -> kmux::sdk::Rmux {
         RmuxBuilder::new().unix_socket(&self.socket_path).build()
     }
 

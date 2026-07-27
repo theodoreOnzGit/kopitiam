@@ -10,7 +10,7 @@ use common::{
     assert_success, drain_attach_output_bytes, read_until_contains, terminate_child,
     AttachedSession, CliHarness,
 };
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 

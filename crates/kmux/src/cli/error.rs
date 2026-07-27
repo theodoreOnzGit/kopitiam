@@ -101,7 +101,7 @@ impl ExitFailure {
         Self::new(
             1,
             format!(
-                "rmux: running daemon on '{}' uses an incompatible protocol.\nrmux: run `{}` to stop it, then retry.",
+                "kmux: running daemon on '{}' uses an incompatible protocol.\nkmux: run `{}` to stop it, then retry.",
                 socket_path.display(),
                 incompatible_daemon_kill_server_command(socket_path)
             ),
@@ -122,7 +122,7 @@ fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
         .as_deref()
         .is_some_and(|default_path| default_path == socket_path)
     {
-        return "rmux kill-server".to_owned();
+        return "kmux kill-server".to_owned();
     }
 
     format!("kmux -S {} kill-server", shell_quote_path(socket_path))

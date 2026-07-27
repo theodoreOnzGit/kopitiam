@@ -221,7 +221,7 @@ async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
         Response::PaneBroadcastInput(response) => response,
         response => {
             return Err(RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-                "rmux daemon sent `{}` response for `pane broadcast` request",
+                "kmux daemon sent `{}` response for `pane broadcast` request",
                 response.command_name()
             ))));
         }

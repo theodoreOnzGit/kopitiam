@@ -10,6 +10,9 @@ description = "Local-first Semantic Runtime CLI for Rust projects: real cargo/ru
 readme = "README.md"
 keywords = ["rust-analyzer", "semantic", "lsp", "scientific-computing"]
 categories = ["command-line-utilities", "development-tools"]
+# vendor/ holds a ~33MB gitignored lazygit reference drop-in (git-panel UX
+# reference only, never compiled). Keep it out of the published .crate tarball.
+exclude = ["vendor/"]
 
 [dependencies]
 kopitiam-pdf = { workspace = true }
@@ -91,6 +94,16 @@ ratatui-image = { version = "8", default-features = false, features = ["crosster
 # reach for C) -- unneeded because pages are rasterised to raw RGBA in memory,
 # never encoded to or decoded from a file format here.
 image = { version = "0.25", default-features = false }
+# The `kopitiam tui` git panel (#25): a lazygit-style, LOCAL-only git view built
+# straight on the pure-Rust `gitoxide` (`gix`). Uses the SAME workspace `gix`
+# (0.86, C-free features) that `kopi-beans` already resolves, so no new gix copy
+# enters the tree. Feature set is the workspace one: `revision` (pulls in
+# `index`, so `open_index()`/index writes work), `sha1`, and the blocking
+# network client. NOTE: `status`, `blob-diff`, `dirwalk`, and `worktree-mutation`
+# are OFF, so the panel computes status by comparing HEAD-tree/index/worktree
+# itself, diffs with a pure-Rust line differ, and GATES worktree checkout + push
+# (see `tui/git_ops.rs`). No `git` binary is ever shelled out to.
+gix = { workspace = true }
 
 [dev-dependencies]
 # Used by adapter-selection tests to build throwaway model stores in a

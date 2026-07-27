@@ -78,8 +78,8 @@ fn warn_operator_url(created: &WebShareCreatedResponse) {
     let Some(operator_url) = created.operator_url.as_deref() else {
         return;
     };
-    eprintln!("rmux: operator URL (keep private):");
-    eprintln!("rmux:   {operator_url}");
+    eprintln!("kmux: operator URL (keep private):");
+    eprintln!("kmux:   {operator_url}");
 }
 
 fn write_created_share_output(created: &WebShareCreatedResponse) -> Result<(), ExitFailure> {

@@ -5,7 +5,7 @@ mod common;
 use std::{error::Error, fs, time::Duration};
 
 use common::{assert_success, read_until_contains, stderr, stdout, AttachedSession, CliHarness};
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 use serde_json::Value;
 
 #[test]

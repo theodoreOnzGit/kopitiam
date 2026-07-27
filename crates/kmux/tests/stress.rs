@@ -15,16 +15,16 @@ use common::{
     stdout, tty_has_input, unique_tmpdir, wait_for_no_child_processes, CliHarness,
     BINARY_OVERRIDE_ENV,
 };
-use rmux_client::{connect, ClientError};
-use rmux_core::Session;
-use rmux_proto::{
+use kmux::client::{connect, ClientError};
+use kmux::core::Session;
+use kmux::proto::{
     CapturePaneRequest, KillSessionRequest, KillSessionResponse, LayoutName, NewSessionExtRequest,
     NewSessionRequest, PaneTarget, ProcessCommand, Request, ResizePaneAdjustment,
     ResizePaneRequest, Response, SelectLayoutRequest, SelectLayoutResponse, SelectLayoutTarget,
     SendKeysRequest, SendKeysResponse, SplitWindowExtRequest, SplitWindowRequest,
     SplitWindowResponse, SplitWindowTarget, Target, TerminalSize,
 };
-use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
+use kmux::server::{DaemonConfig, ServerDaemon, ServerHandle};
 use support::{
     assert_valid_non_overlapping_geometry, runtime, serialize_test_execution, single_new_tty,
     tty_sizes_by_index, unique_session_name, wait_for_tty_size,
@@ -126,7 +126,7 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
         let split =
             connection.roundtrip(&Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
                 target: SplitWindowTarget::Session(session_name.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
+                direction: kmux::proto::SplitDirection::Vertical,
                 before: false,
                 environment: None,
                 command: None,
@@ -147,7 +147,7 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
         );
         assert_eq!(
             expected_session
-                .split_active_pane_with_direction(rmux_proto::SplitDirection::Vertical)?,
+                .split_active_pane_with_direction(kmux::proto::SplitDirection::Vertical)?,
             expected_index
         );
 
@@ -195,7 +195,7 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
     }))?;
     assert_eq!(
         resized,
-        Response::ResizePane(rmux_proto::ResizePaneResponse {
+        Response::ResizePane(kmux::proto::ResizePaneResponse {
             target: PaneTarget::new(session_name.clone(), 0),
             adjustment: ResizePaneAdjustment::AbsoluteWidth {
                 columns: MAIN_PANE_WIDTH
@@ -392,11 +392,11 @@ fn session_name_rewrites_preserve_server_state() -> Result<(), Box<dyn Error>> {
 }
 
 fn pane_tty_path(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     target: PaneTarget,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let response = connection.roundtrip(&Request::DisplayMessage(
-        rmux_proto::DisplayMessageRequest {
+        kmux::proto::DisplayMessageRequest {
             target: Some(Target::Pane(target)),
             print: true,
             message: Some("#{pane_tty}".to_owned()),
@@ -414,7 +414,7 @@ fn pane_tty_path(
 }
 
 fn wait_for_pane_capture(
-    connection: &mut rmux_client::Connection,
+    connection: &mut kmux::client::Connection,
     target: PaneTarget,
     marker: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -576,7 +576,7 @@ fn shutdown_removes_socket_files_after_all_sessions_are_killed() -> Result<(), B
     for _ in 0..2 {
         let split = connection.roundtrip(&Request::SplitWindow(SplitWindowRequest {
             target: SplitWindowTarget::Session(session_name.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
+            direction: kmux::proto::SplitDirection::Vertical,
             before: false,
             environment: None,
         }))?;

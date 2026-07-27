@@ -7,16 +7,16 @@ use std::time::Duration;
 use common::{
     FrozenTmuxBinary, TmuxCompatHarness, TmuxCompatRun, TmuxCompatRunConfig, FROZEN_TMUX_ENV,
 };
-use rmux_core::formats::{
+use kmux::core::formats::{
     is_known_format_variable_name, is_truthy, render_template, FormatContext, FormatVariable,
     FormatVariables, DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_FORMAT,
     DEFAULT_LIST_SESSIONS_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT, FORMAT_VARIABLES,
 };
-use rmux_core::{OptionStore, Session};
-use rmux_proto::{OptionName, TerminalSize};
+use kmux::core::{OptionStore, Session};
+use kmux::proto::{OptionName, TerminalSize};
 
-fn session_name(value: &str) -> rmux_proto::SessionName {
-    rmux_proto::SessionName::new(value).expect("valid session name")
+fn session_name(value: &str) -> kmux::proto::SessionName {
+    kmux::proto::SessionName::new(value).expect("valid session name")
 }
 
 fn assert_closed_format(value: &str) {
@@ -468,7 +468,7 @@ fn format_consuming_option_defaults_use_only_the_closed_surface() {
 
 #[test]
 fn tmux_format_table_names_sorted_invariant() {
-    use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
+    use kmux::core::formats::TMUX_FORMAT_TABLE_NAMES;
     for pair in TMUX_FORMAT_TABLE_NAMES.windows(2) {
         assert!(
             pair[0] < pair[1],
@@ -482,7 +482,7 @@ fn tmux_format_table_names_sorted_invariant() {
 
 #[test]
 fn is_known_covers_all_192_table_entries() {
-    use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
+    use kmux::core::formats::TMUX_FORMAT_TABLE_NAMES;
     for name in TMUX_FORMAT_TABLE_NAMES {
         assert!(
             is_known_format_variable_name(name),

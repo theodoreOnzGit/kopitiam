@@ -32,7 +32,7 @@ impl TransportFailure {
     pub(super) fn eof() -> Self {
         Self {
             kind: io::ErrorKind::UnexpectedEof,
-            message: "rmux daemon closed the transport".to_owned(),
+            message: "kmux daemon closed the transport".to_owned(),
             protocol_error: None,
         }
     }
@@ -49,7 +49,7 @@ impl TransportFailure {
         Self {
             kind: io::ErrorKind::InvalidData,
             message: format!(
-                "rmux daemon sent `{actual}` response for pending `{expected}` request"
+                "kmux daemon sent `{actual}` response for pending `{expected}` request"
             ),
             protocol_error: None,
         }
@@ -59,7 +59,7 @@ impl TransportFailure {
         Self {
             kind: io::ErrorKind::InvalidData,
             message: format!(
-                "rmux daemon sent unsolicited `{}` response",
+                "kmux daemon sent unsolicited `{}` response",
                 response.command_name()
             ),
             protocol_error: None,
@@ -69,7 +69,7 @@ impl TransportFailure {
     pub(super) fn actor_closed() -> Self {
         Self {
             kind: io::ErrorKind::BrokenPipe,
-            message: "rmux transport actor is closed".to_owned(),
+            message: "kmux transport actor is closed".to_owned(),
             protocol_error: None,
         }
     }
@@ -102,7 +102,7 @@ fn handshake_protocol_error(error: &crate::proto::RmuxError) -> RmuxError {
         crate::proto::RmuxError::Decode(message) => RmuxError::unsupported(
             crate::sdk::diagnostics::FEATURE_PROTOCOL_CAPABILITIES,
             format!(
-                "upgrade the rmux daemon to one that advertises `{}` before using SDK capability negotiation; {message}",
+                "upgrade the kmux daemon to one that advertises `{}` before using SDK capability negotiation; {message}",
                 crate::proto::CAPABILITY_HANDSHAKE
             ),
         ),

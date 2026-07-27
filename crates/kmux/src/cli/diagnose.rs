@@ -180,13 +180,13 @@ fn parse_diagnose_format(arguments: &[OsString]) -> Result<DiagnoseFormat, ExitF
             Some(other) => {
                 return Err(ExitFailure::new(
                     1,
-                    format!("rmux diagnose: unknown argument '{other}'"),
+                    format!("kmux diagnose: unknown argument '{other}'"),
                 ));
             }
             None => {
                 return Err(ExitFailure::new(
                     1,
-                    "rmux diagnose: arguments must be valid UTF-8",
+                    "kmux diagnose: arguments must be valid UTF-8",
                 ));
             }
         }
@@ -202,7 +202,7 @@ fn set_format(
     if current.is_some_and(|current| current != next) {
         return Err(ExitFailure::new(
             1,
-            "rmux diagnose: choose only one of --human or --json",
+            "kmux diagnose: choose only one of --human or --json",
         ));
     }
     *current = Some(next);
@@ -265,7 +265,7 @@ impl DiagnoseReport {
 
     fn render_human(&self) -> String {
         let mut output = String::new();
-        output.push_str("rmux diagnose\n");
+        output.push_str("kmux diagnose\n");
         output.push_str(&format!("version: {}\n", self.version));
         output.push_str(&format!("os: {} ({})\n", self.os_name, self.os_arch));
         output.push_str(&format!("os_version: {}\n", self.os_version));

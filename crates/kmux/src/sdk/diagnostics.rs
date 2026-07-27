@@ -39,7 +39,7 @@ impl Diagnostic {
         Self {
             severity: DiagnosticSeverity::Unsupported,
             feature: Some(feature.into()),
-            message: "unsupported rmux feature".to_owned(),
+            message: "unsupported kmux feature".to_owned(),
             hint: Some(hint.into()),
         }
     }
@@ -104,7 +104,7 @@ pub fn protocol_diagnostic(error: &crate::proto::RmuxError) -> Diagnostic {
         } => Diagnostic::unsupported(
             FEATURE_PROTOCOL_WIRE_VERSION,
             format!(
-                "upgrade the rmux daemon or use an SDK that supports wire version {got} \
+                "upgrade the kmux daemon or use an SDK that supports wire version {got} \
                  (supported range {minimum}..={maximum})"
             ),
         ),
@@ -117,12 +117,12 @@ pub fn protocol_diagnostic(error: &crate::proto::RmuxError) -> Diagnostic {
         crate::proto::RmuxError::UnknownCommand(command) => Diagnostic::unsupported(
             command_feature_id(command),
             format!(
-                "upgrade the rmux daemon or use a command advertised by the negotiated command \
+                "upgrade the kmux daemon or use a command advertised by the negotiated command \
                  inventory before sending `{command}`"
             ),
         ),
         error => Diagnostic::error(
-            format!("rmux protocol error: {error}"),
+            format!("kmux protocol error: {error}"),
             "check the request and daemon state, then retry after correcting the request",
         ),
     }
@@ -150,11 +150,11 @@ pub fn command_feature_id(command: &str) -> String {
 #[must_use]
 pub fn unsupported_capability_hint(feature: &str, supported: &[String]) -> String {
     if supported.is_empty() {
-        return format!("connect to an rmux daemon that advertises capability `{feature}`");
+        return format!("connect to an kmux daemon that advertises capability `{feature}`");
     }
 
     format!(
-        "connect to an rmux daemon that advertises capability `{feature}`; supported capabilities: {}",
+        "connect to an kmux daemon that advertises capability `{feature}`; supported capabilities: {}",
         supported.join(", ")
     )
 }

@@ -145,7 +145,7 @@ impl StartupReadyEvent {
 
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "could not allocate a unique rmux startup readiness event",
+            "could not allocate a unique kmux startup readiness event",
         ))
     }
 

@@ -57,7 +57,7 @@ fn install_skill() -> Result<i32, ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: invalid Claude skill path '{}'",
+                "kmux claude install-skill: invalid Claude skill path '{}'",
                 path.display()
             ),
         )
@@ -66,7 +66,7 @@ fn install_skill() -> Result<i32, ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: failed to create '{}': {error}",
+                "kmux claude install-skill: failed to create '{}': {error}",
                 parent.display()
             ),
         )
@@ -91,7 +91,7 @@ fn install_skill_file(path: &Path) -> Result<InstallSkillStatus, ExitFailure> {
             return Err(ExitFailure::new(
                 1,
                 format!(
-                    "rmux claude install-skill: failed to inspect '{}': {error}",
+                    "kmux claude install-skill: failed to inspect '{}': {error}",
                     path.display()
                 ),
             ));
@@ -107,7 +107,7 @@ fn install_skill_file(path: &Path) -> Result<InstallSkillStatus, ExitFailure> {
         return Err(ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: '{}' is a symlink; refusing to overwrite it",
+                "kmux claude install-skill: '{}' is a symlink; refusing to overwrite it",
                 path.display()
             ),
         ));
@@ -116,7 +116,7 @@ fn install_skill_file(path: &Path) -> Result<InstallSkillStatus, ExitFailure> {
         return Err(ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: '{}' exists and is not a regular file",
+                "kmux claude install-skill: '{}' exists and is not a regular file",
                 path.display()
             ),
         ));
@@ -126,7 +126,7 @@ fn install_skill_file(path: &Path) -> Result<InstallSkillStatus, ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: failed to read '{}': {error}",
+                "kmux claude install-skill: failed to read '{}': {error}",
                 path.display()
             ),
         )
@@ -170,7 +170,7 @@ fn backup_existing_skill(path: &Path, existing: &[u8]) -> Result<PathBuf, ExitFa
                     ExitFailure::new(
                         1,
                         format!(
-                            "rmux claude install-skill: failed to write backup '{}': {error}",
+                            "kmux claude install-skill: failed to write backup '{}': {error}",
                             candidate.display()
                         ),
                     )
@@ -182,7 +182,7 @@ fn backup_existing_skill(path: &Path, existing: &[u8]) -> Result<PathBuf, ExitFa
                 return Err(ExitFailure::new(
                     1,
                     format!(
-                        "rmux claude install-skill: failed to create backup '{}': {error}",
+                        "kmux claude install-skill: failed to create backup '{}': {error}",
                         candidate.display()
                     ),
                 ));
@@ -193,7 +193,7 @@ fn backup_existing_skill(path: &Path, existing: &[u8]) -> Result<PathBuf, ExitFa
     Err(ExitFailure::new(
         1,
         format!(
-            "rmux claude install-skill: failed to choose a backup path for '{}'",
+            "kmux claude install-skill: failed to choose a backup path for '{}'",
             path.display()
         ),
     ))
@@ -220,7 +220,7 @@ fn write_skill_atomic(path: &Path) -> Result<(), ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: failed to write temporary skill '{}': {error}",
+                "kmux claude install-skill: failed to write temporary skill '{}': {error}",
                 temp.display()
             ),
         )
@@ -231,7 +231,7 @@ fn write_skill_atomic(path: &Path) -> Result<(), ExitFailure> {
         ExitFailure::new(
             1,
             format!(
-                "rmux claude install-skill: failed to replace '{}': {error}",
+                "kmux claude install-skill: failed to replace '{}': {error}",
                 path.display()
             ),
         )
@@ -277,7 +277,7 @@ fn user_home() -> Result<PathBuf, ExitFailure> {
         .ok_or_else(|| {
             ExitFailure::new(
                 1,
-                "rmux claude install-skill: USERPROFILE or HOME is not set",
+                "kmux claude install-skill: USERPROFILE or HOME is not set",
             )
         })
 }
@@ -287,7 +287,7 @@ fn user_home() -> Result<PathBuf, ExitFailure> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| ExitFailure::new(1, "rmux claude install-skill: HOME is not set"))
+        .ok_or_else(|| ExitFailure::new(1, "kmux claude install-skill: HOME is not set"))
 }
 
 fn write_stdout(output: &str) -> Result<i32, ExitFailure> {

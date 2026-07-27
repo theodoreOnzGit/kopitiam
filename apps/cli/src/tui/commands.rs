@@ -3,9 +3,9 @@
 //! Two shapes live here:
 //!
 //! * [`CommandPane`] — a scrollable, read-only text pane used by the **Status**
-//!   and **Models** views. These commands are fast and pure, so their output is
-//!   built into a `String` (via the `report`/`list_string` helpers the command
-//!   modules now expose) and shown in-app.
+//!   view. The command is fast and pure, so its output is built into a `String`
+//!   (via the `report` helper the command module exposes) and shown in-app. (The
+//!   Models view is now interactive — see [`super::models`].)
 //! * [`PlanPrompt`] — a one-line task input for the **Plan** view. Plan (and
 //!   Scan) shell out to `cargo`/`rust-analyzer`/`rustdoc`, which are slow and
 //!   stream their own progress, so rather than freeze the TUI those two run via
@@ -40,14 +40,6 @@ impl CommandPane {
         match crate::status::report(root) {
             Ok(text) => Self::ok("kopitiam · status", text),
             Err(err) => Self::error("kopitiam · status", err.to_string()),
-        }
-    }
-
-    /// Build the **Models** pane by invoking [`crate::models::list_string`].
-    pub fn models() -> Self {
-        match crate::models::list_string() {
-            Ok(text) => Self::ok("kopitiam · models", text),
-            Err(err) => Self::error("kopitiam · models", err.to_string()),
         }
     }
 

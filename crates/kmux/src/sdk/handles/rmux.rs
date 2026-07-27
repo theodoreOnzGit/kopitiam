@@ -300,7 +300,7 @@ impl Rmux {
             .await
             .map_err(|error| {
                 RmuxError::transport(
-                    "join rmux command task",
+                    "join kmux command task",
                     io::Error::other(error.to_string()),
                 )
             })?
@@ -334,7 +334,7 @@ impl Rmux {
             }
             Response::Error(error) => Err(error.into()),
             response => Err(RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-                "rmux daemon sent `{}` response for shutdown request",
+                "kmux daemon sent `{}` response for shutdown request",
                 response.command_name()
             )))),
         }
@@ -421,7 +421,7 @@ fn run_binary_command(endpoint: RmuxEndpoint, args: Vec<OsString>) -> Result<Com
     command.args(args);
     let output = command
         .output()
-        .map_err(|error| RmuxError::transport("run rmux command", error))?;
+        .map_err(|error| RmuxError::transport("run kmux command", error))?;
 
     Ok(CommandRun {
         stdout: output.stdout,
@@ -485,7 +485,7 @@ async fn negotiate_shutdown_capability(client: &TransportClient) -> Result<()> {
         }
         Response::Error(error) => Err(error.into()),
         response => Err(RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-            "rmux daemon sent `{}` response for capability handshake",
+            "kmux daemon sent `{}` response for capability handshake",
             response.command_name()
         )))),
     }
@@ -509,7 +509,7 @@ fn unsupported_handshake_error(detail: &str) -> RmuxError {
     RmuxError::unsupported(
         FEATURE_PROTOCOL_CAPABILITIES,
         format!(
-            "upgrade the rmux daemon to one that advertises `{CAPABILITY_HANDSHAKE}` before using SDK daemon shutdown; {detail}"
+            "upgrade the kmux daemon to one that advertises `{CAPABILITY_HANDSHAKE}` before using SDK daemon shutdown; {detail}"
         ),
     )
 }

@@ -196,12 +196,12 @@ impl fmt::Display for StartupError {
         match self {
             Self::InvalidPath { reason, path } => write!(
                 formatter,
-                "rmux startup rejected '{}': {reason}",
+                "kmux startup rejected '{}': {reason}",
                 path.display()
             ),
             Self::SymlinkRejected { path } => write!(
                 formatter,
-                "rmux startup refused to follow symlink at '{}'",
+                "kmux startup refused to follow symlink at '{}'",
                 path.display()
             ),
             Self::Filesystem {
@@ -210,12 +210,12 @@ impl fmt::Display for StartupError {
                 source,
             } => write!(
                 formatter,
-                "rmux startup failed to {operation} '{}': {source}",
+                "kmux startup failed to {operation} '{}': {source}",
                 path.display()
             ),
             Self::Lock { path, source } => write!(
                 formatter,
-                "rmux startup lock '{}' failed: {source}",
+                "kmux startup lock '{}' failed: {source}",
                 path.display()
             ),
             Self::UnsafeOwner {
@@ -224,23 +224,23 @@ impl fmt::Display for StartupError {
                 actual_uid,
             } => write!(
                 formatter,
-                "rmux startup refused '{}': owned by uid {actual_uid} but expected uid {expected_uid}",
+                "kmux startup refused '{}': owned by uid {actual_uid} but expected uid {expected_uid}",
                 path.display()
             ),
             Self::UnsafePermissions { path, mode } => write!(
                 formatter,
-                "rmux startup refused '{}': permissions 0o{mode:04o} grant access beyond the owner",
+                "kmux startup refused '{}': permissions 0o{mode:04o} grant access beyond the owner",
                 path.display()
             ),
             Self::Launcher { source } => {
-                write!(formatter, "rmux startup launcher failed: {source}")
+                write!(formatter, "kmux startup launcher failed: {source}")
             }
             Self::StartupTimeout {
                 socket_path,
                 waited,
             } => write!(
                 formatter,
-                "rmux startup timed out after {}ms waiting for '{}' to answer",
+                "kmux startup timed out after {}ms waiting for '{}' to answer",
                 waited.as_millis(),
                 socket_path.display()
             ),
@@ -250,7 +250,7 @@ impl fmt::Display for StartupError {
                 socket_path,
             } => write!(
                 formatter,
-                "rmux daemon at '{}' reported peer uid {actual_uid} but expected {expected_uid}",
+                "kmux daemon at '{}' reported peer uid {actual_uid} but expected {expected_uid}",
                 socket_path.display()
             ),
         }

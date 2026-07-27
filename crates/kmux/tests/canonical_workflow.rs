@@ -14,7 +14,7 @@ use common::{
     read_until_contains_all, stderr, stdout, verify_fixture_coherence, AttachedSession, CliHarness,
     BINARY_OVERRIDE_ENV, CANONICAL_SESSION_WORKFLOW, WORKFLOW_COLORTERM_PRINT_COMMAND,
 };
-use rmux_pty::TerminalSize;
+use kmux::pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);

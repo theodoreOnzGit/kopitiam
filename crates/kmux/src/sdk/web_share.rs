@@ -143,7 +143,7 @@ fn token_from_url(url: &str) -> Option<&str> {
 
 fn unexpected_response(operation: &str, response: Response) -> RmuxError {
     RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-        "rmux daemon sent `{}` response for {operation}",
+        "kmux daemon sent `{}` response for {operation}",
         response.command_name()
     )))
 }

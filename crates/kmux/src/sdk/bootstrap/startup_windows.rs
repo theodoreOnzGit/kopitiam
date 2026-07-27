@@ -201,48 +201,48 @@ impl fmt::Display for StartupError {
         match self {
             Self::InvalidPipeName { reason, pipe_name } => write!(
                 formatter,
-                "rmux startup rejected pipe '{}': {reason}",
+                "kmux startup rejected pipe '{}': {reason}",
                 pipe_name.display()
             ),
             Self::InvalidMutexName { reason, pipe_name } => write!(
                 formatter,
-                "rmux startup rejected mutex name for '{}': {reason}",
+                "kmux startup rejected mutex name for '{}': {reason}",
                 pipe_name.display()
             ),
             Self::Mutex { pipe_name, source } => write!(
                 formatter,
-                "rmux startup mutex for '{}' failed: {source}",
+                "kmux startup mutex for '{}' failed: {source}",
                 pipe_name.display()
             ),
             Self::MutexTimeout { pipe_name, waited } => write!(
                 formatter,
-                "rmux startup mutex for '{}' timed out after {}ms",
+                "kmux startup mutex for '{}' timed out after {}ms",
                 pipe_name.display(),
                 waited.as_millis()
             ),
             Self::MutexAccessDenied { pipe_name, source } => write!(
                 formatter,
-                "rmux startup mutex for '{}' denied for current user: {source}",
+                "kmux startup mutex for '{}' denied for current user: {source}",
                 pipe_name.display()
             ),
             Self::PipeBusy { pipe_name } => write!(
                 formatter,
-                "rmux pipe '{}' is busy on every instance",
+                "kmux pipe '{}' is busy on every instance",
                 pipe_name.display()
             ),
             Self::PipeNotFound { pipe_name } => write!(
                 formatter,
-                "rmux pipe '{}' is not currently served",
+                "kmux pipe '{}' is not currently served",
                 pipe_name.display()
             ),
             Self::PipeNoData { pipe_name } => write!(
                 formatter,
-                "rmux pipe '{}' closed mid-handshake",
+                "kmux pipe '{}' closed mid-handshake",
                 pipe_name.display()
             ),
             Self::PipeAccessDenied { pipe_name } => write!(
                 formatter,
-                "rmux pipe '{}' denied current user access",
+                "kmux pipe '{}' denied current user access",
                 pipe_name.display()
             ),
             Self::PipeIo {
@@ -251,15 +251,15 @@ impl fmt::Display for StartupError {
                 source,
             } => write!(
                 formatter,
-                "rmux pipe '{}' failed to {operation}: {source}",
+                "kmux pipe '{}' failed to {operation}: {source}",
                 pipe_name.display()
             ),
             Self::Launcher { source } => {
-                write!(formatter, "rmux startup launcher failed: {source}")
+                write!(formatter, "kmux startup launcher failed: {source}")
             }
             Self::StartupTimeout { pipe_name, waited } => write!(
                 formatter,
-                "rmux startup timed out after {}ms waiting for '{}' to answer",
+                "kmux startup timed out after {}ms waiting for '{}' to answer",
                 waited.as_millis(),
                 pipe_name.display()
             ),

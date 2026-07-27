@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rmux_pty::{write_windows_console_mouse_drag, ChildCommand, SpawnedPty, TerminalSize};
+use kmux::pty::{write_windows_console_mouse_drag, ChildCommand, SpawnedPty, TerminalSize};
 
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;

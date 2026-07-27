@@ -32,7 +32,8 @@ const MENU: &[MenuEntry] = &[
     MenuEntry { label: "Scan", blurb: "scan a Rust project's real tooling", route: Some(Route::Scan) },
     MenuEntry { label: "Status", blurb: "show a project's persisted session memory", route: Some(Route::Status) },
     MenuEntry { label: "Plan", blurb: "run the plan workflow over a project", route: Some(Route::Plan) },
-    MenuEntry { label: "Models", blurb: "list the local model catalog", route: Some(Route::Models) },
+    MenuEntry { label: "Git", blurb: "lazygit-style local git panel (status/log/branches/commit)", route: Some(Route::Git) },
+    MenuEntry { label: "Models", blurb: "browse the catalog; pull a model with its sha auto-resolved", route: Some(Route::Models) },
     MenuEntry { label: "Quit", blurb: "leave the kopitiam", route: None },
 ];
 

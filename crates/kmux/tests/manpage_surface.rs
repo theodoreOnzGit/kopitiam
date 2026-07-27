@@ -4,7 +4,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rmux_core::command_parser::COMMAND_TABLE;
+use kmux::core::command_parser::COMMAND_TABLE;
 
 #[test]
 fn rmux_manpage_renders_with_system_formatter() -> Result<(), Box<dyn Error>> {

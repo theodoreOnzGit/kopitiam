@@ -258,7 +258,7 @@ pub(crate) async fn list_session_names(client: &TransportClient) -> Result<Vec<S
 
 pub(crate) fn unexpected_response(expected: &'static str, response: Response) -> RmuxError {
     RmuxError::protocol(crate::proto::RmuxError::Server(format!(
-        "rmux daemon sent `{}` response for `{expected}` request",
+        "kmux daemon sent `{}` response for `{expected}` request",
         response.command_name()
     )))
 }

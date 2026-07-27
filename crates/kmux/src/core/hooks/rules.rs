@@ -37,7 +37,7 @@ pub fn validate_hook_scope(hook: HookName, scope: &ScopeSelector) -> Result<(), 
 pub fn validate_hook_registration(hook: HookName, scope: &ScopeSelector) -> Result<(), RmuxError> {
     if !hook_is_supported_for_registration(hook) {
         return Err(RmuxError::Message(format!(
-            "{} is not supported: rmux does not dispatch this hook",
+            "{} is not supported: kmux does not dispatch this hook",
             hook_name(hook)
         )));
     }

@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_client::INTERNAL_DAEMON_FLAG;
+use kmux::client::INTERNAL_DAEMON_FLAG;
 
 use crate::common::{
     default_socket_path_in, shutdown_rmux_server, terminate_child, unique_tmpdir, wait_for_socket,

@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_proto::{SessionName, TerminalSize};
+use kmux::proto::{SessionName, TerminalSize};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::common::tty_size;
@@ -128,7 +128,7 @@ pub(super) fn wait_for_tty_size(
     }
 }
 
-pub(super) fn assert_valid_non_overlapping_geometry(panes: &[rmux_core::Pane], size: TerminalSize) {
+pub(super) fn assert_valid_non_overlapping_geometry(panes: &[kmux::core::Pane], size: TerminalSize) {
     for pane in panes {
         let geometry = pane.geometry();
         assert!(
@@ -167,7 +167,7 @@ pub(super) fn assert_valid_non_overlapping_geometry(panes: &[rmux_core::Pane], s
     }
 }
 
-fn rectangles_overlap(left: rmux_core::PaneGeometry, right: rmux_core::PaneGeometry) -> bool {
+fn rectangles_overlap(left: kmux::core::PaneGeometry, right: kmux::core::PaneGeometry) -> bool {
     let left_end_x = left.x().saturating_add(left.cols());
     let left_end_y = left.y().saturating_add(left.rows());
     let right_end_x = right.x().saturating_add(right.cols());

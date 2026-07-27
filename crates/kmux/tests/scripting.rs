@@ -7,7 +7,7 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use common::{assert_success, read_until_contains, stderr, stdout, AttachedSession, CliHarness};
-use rmux_proto::TerminalSize;
+use kmux::proto::TerminalSize;
 
 #[test]
 fn foreground_run_shell_suppresses_stdout_like_tmux() -> Result<(), Box<dyn Error>> {

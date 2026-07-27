@@ -173,6 +173,112 @@ mod tests {
         assert!(logits.to_vec_f32().unwrap().iter().all(|v| v.is_finite()));
     }
 
+    /// SmolLM2-360M (`kopitiam-models`' current `DEFAULT_MODEL_ID`) is a
+    /// *LLaMA*-architecture GGUF, not the Qwen2 this runtime was first
+    /// written against. It differs in exactly three load-bearing ways, all
+    /// of which this test proves are handled end to end:
+    ///
+    /// 1. `general.architecture` is `"llama"`, so every hyperparameter KV is
+    ///    namespaced `llama.*` — the loader's arch dispatch must read the
+    ///    architecture string and resolve `llama.block_count`,
+    ///    `llama.rope.freq_base`, `llama.attention.layer_norm_rms_epsilon`,
+    ///    etc. from it (not from a hard-coded `qwen2.` prefix).
+    /// 2. It has no Q/K/V projection biases — the bias tensors are absent
+    ///    from the file and must load as `None`, not error or read garbage.
+    /// 3. It ties its LM head to the token embedding table — there is no
+    ///    separate `output.weight`, so the head must fall back to
+    ///    `token_embd`.
+    ///
+    /// A Qwen-assuming loader would break on all three (miss every
+    /// hyperparameter, fail to find `attn_q.bias`, or fail to find
+    /// `output.weight`). This asserts each is resolved and that a full
+    /// forward pass then produces finite, correctly-shaped logits.
+    #[test]
+    fn llama_arch_smollm2_shaped_model_loads_and_runs_end_to_end() {
+        let spec = SyntheticModelSpec::llama_tied_no_bias();
+        let bytes = build(&spec);
+        let path = write_temp_gguf(&bytes, "model-llama-smollm2");
+        let loaded = kopitiam_loader::load_model(&path).unwrap();
+
+        // (1) Arch dispatch: the loader read `general.architecture` and then
+        // resolved every `llama.*`-namespaced hyperparameter through it --
+        // counts/sizes *and* the rope/norm keys under deeper sub-namespaces.
+        assert_eq!(loaded.metadata().architecture.as_deref(), Some("llama"));
+        assert_eq!(loaded.metadata().n_layers, Some(spec.n_layers as u64));
+        assert_eq!(loaded.metadata().n_heads, Some(spec.n_heads as u64));
+        assert_eq!(loaded.metadata().rope_theta, Some(spec.rope_theta));
+
+        let model = QwenModel::from_loaded_model(&loaded).unwrap();
+        // The rope/norm values really flowed through from `llama.*` keys
+        // into the resolved config (not silent defaults -- both differ from
+        // the 10000.0 / 1e-6 fallbacks `QwenConfig` would use if the keys
+        // had not resolved).
+        assert_eq!(model.config().rope_theta, 100_000.0);
+        assert_eq!(model.config().norm_eps, 1e-5);
+
+        // (2) LLaMA has no QKV bias: every layer's Q/K/V bias must be absent.
+        for (i, layer) in model.weights.layers.iter().enumerate() {
+            assert!(
+                layer.bq.is_none() && layer.bk.is_none() && layer.bv.is_none(),
+                "layer {i}: a LLaMA-arch model must load with no Q/K/V bias"
+            );
+        }
+
+        // (3) Tied embeddings: no separate output.weight in the file, so the
+        // LM head is the token embedding table itself.
+        assert!(loaded.tensor("output.weight").is_none(), "SmolLM2 ties its LM head; no output.weight should exist");
+        assert_eq!(
+            model.weights.output_weight.to_vec_f32().unwrap(),
+            model.weights.token_embd.to_vec_f32().unwrap(),
+            "a tied LM head must equal the token embedding table"
+        );
+
+        // (4) A full forward pass produces finite, correctly-shaped logits,
+        // and greedy sampling composes with it -- the same acceptance bar
+        // the Qwen end-to-end test holds, now on the LLaMA path.
+        let mut cache = model.new_cache();
+        let prompt = [2u32, 5, 9, 1];
+        let logits = model.forward(&prompt, &mut cache).unwrap();
+        assert_eq!(logits.shape().dims(), &[prompt.len(), model.vocab_size()]);
+        assert!(logits.to_vec_f32().unwrap().iter().all(|v| v.is_finite()), "LLaMA-path logits must be finite");
+        let next = greedy_argmax(&logits.to_vec_f32().unwrap()[(prompt.len() - 1) * model.vocab_size()..]);
+        assert!((next as usize) < model.vocab_size());
+    }
+
+    /// The architecture string is *only* a metadata-routing key: it selects
+    /// which `<arch>.*` hyperparameter names the loader reads, and nothing in
+    /// the forward pass branches on it. Two models identical in every value
+    /// but their `general.architecture` (`"llama"` vs `"qwen2"`) -- both
+    /// bias-free and both tied, so the tensor sets are byte-for-byte the same
+    /// -- must therefore produce bit-identical logits. This is what "add the
+    /// LLaMA path without disturbing the Qwen path" means concretely: there
+    /// is one forward pass, selected by which tensors are present, not by a
+    /// hard-coded architecture branch that could drift between the two.
+    #[test]
+    fn llama_and_qwen2_arch_with_identical_weights_produce_bit_identical_logits() {
+        let base = SyntheticModelSpec { with_qkv_bias: false, tie_embeddings: true, ..SyntheticModelSpec::default() };
+        let llama = SyntheticModelSpec { architecture: "llama", ..base.clone() };
+        let qwen2 = SyntheticModelSpec { architecture: "qwen2", ..base };
+
+        let m_llama = load_from_spec(&llama, "arch-eq-llama");
+        let m_qwen2 = load_from_spec(&qwen2, "arch-eq-qwen2");
+
+        let prompt = [1u32, 4, 2, 7];
+        let mut c_llama = m_llama.new_cache();
+        let mut c_qwen2 = m_qwen2.new_cache();
+        let l_llama = m_llama.forward(&prompt, &mut c_llama).unwrap().to_vec_f32().unwrap();
+        let l_qwen2 = m_qwen2.forward(&prompt, &mut c_qwen2).unwrap().to_vec_f32().unwrap();
+
+        assert_eq!(l_llama.len(), l_qwen2.len());
+        for (i, (a, b)) in l_llama.iter().zip(&l_qwen2).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "logit {i} differs across architecture string ({a} vs {b}) -- the arch string must not affect compute"
+            );
+        }
+    }
+
     /// The KV-cache correctness property named explicitly in this crate's
     /// task brief: decoding token-by-token *with* the cache must produce
     /// bitwise-identical logits to a single forward pass over the whole

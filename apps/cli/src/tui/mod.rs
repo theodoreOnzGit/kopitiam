@@ -41,8 +41,11 @@ mod chat;
 mod commands;
 mod convert;
 mod explorer;
+mod git;
+mod git_ops;
 mod home;
 mod logic;
+mod models;
 mod theme;
 /// `pub(crate)` so the standalone `kopitiam view` command ([`crate::view`]) can
 /// reuse the exact same [`viewer::ViewDoc`] rendering/navigation path the TUI
@@ -73,7 +76,9 @@ use chat::ChatView;
 use commands::{CommandPane, PlanPrompt};
 use convert::{ConvertFolderState, ConvertPdfState};
 use explorer::ExplorerState;
+use git::GitView;
 use home::HomeState;
+use models::ModelsView;
 use viewer::ViewerState;
 
 /// Options for `kopitiam tui`. Mirrors [`crate::ai::ChatConfig`] so the chat
@@ -109,6 +114,7 @@ pub enum Route {
     Status,
     Plan,
     Models,
+    Git,
 }
 
 /// What a view's `on_key` asks the router to do. Views never mutate the router
@@ -128,6 +134,9 @@ pub enum Transition {
     OpenViewFile(PathBuf),
     /// Run the plan workflow with this task (from the Plan prompt).
     RunPlan(String),
+    /// Pull a model by catalog id with its sha auto-resolved (from the Models
+    /// view). Runs on the normal terminal so the download can stream progress.
+    PullModel(String),
 }
 
 /// A blocking action that needs the terminal handed over: it suspends the TUI,
@@ -136,6 +145,8 @@ enum Pending {
     Scan,
     Plan(String),
     Editor,
+    /// Pull the catalogued model with this id (auto-sha resolve + verify).
+    PullModel(String),
 }
 
 /// The active view and its owned state. Chat and the home menu live on [`App`]
@@ -153,6 +164,8 @@ enum View {
     Chat,
     Command(CommandPane),
     Plan(PlanPrompt),
+    Git(Box<GitView>),
+    Models(ModelsView),
 }
 
 /// The whole app: the current view, the persistent home + chat state, the
@@ -274,6 +287,8 @@ impl App {
             View::Viewer(state) => state.on_key(key),
             View::Command(state) => state.on_key(key),
             View::Plan(state) => state.on_key(key),
+            View::Git(state) => state.on_key(key),
+            View::Models(state) => state.on_key(key),
             View::Chat => {
                 // Chat needs the shared adapter; both are guaranteed present
                 // because entering chat initialises them.
@@ -303,6 +318,10 @@ impl App {
                 self.pending = Some(Pending::Plan(task));
                 self.view = View::Home;
             }
+            Transition::PullModel(id) => {
+                self.pending = Some(Pending::PullModel(id));
+                self.view = View::Home;
+            }
         }
     }
 
@@ -318,7 +337,8 @@ impl App {
                 View::Chat
             }
             Route::Status => View::Command(CommandPane::status(&self.cwd)),
-            Route::Models => View::Command(CommandPane::models()),
+            Route::Models => View::Models(ModelsView::new()),
+            Route::Git => View::Git(Box::new(GitView::new(self.cwd.clone()))),
             Route::Plan => View::Plan(PlanPrompt::new()),
             // Scan and the editor run on the normal terminal; stay on Home and
             // let the loop pick up the pending action.
@@ -380,6 +400,11 @@ impl App {
                 pause_for_enter();
                 notice
             }
+            Pending::PullModel(id) => {
+                let notice = models::run_pull(&id);
+                pause_for_enter();
+                notice
+            }
         };
 
         // Reclaim the terminal for the TUI and force a full repaint.
@@ -410,6 +435,8 @@ impl App {
             View::Viewer(state) => state.footer_hints(),
             View::Command(state) => state.footer_hints(),
             View::Plan(state) => state.footer_hints(),
+            View::Git(state) => state.footer_hints(),
+            View::Models(state) => state.footer_hints(),
             View::Chat => self.chat.as_ref().map(ChatView::footer_hints).unwrap_or_default(),
         };
 
@@ -421,6 +448,8 @@ impl App {
             View::Viewer(state) => state.render(frame, body),
             View::Command(state) => state.render(frame, body),
             View::Plan(state) => state.render(frame, body),
+            View::Git(state) => state.render(frame, body),
+            View::Models(state) => state.render(frame, body),
             View::Chat => {
                 if let Some(chat) = self.chat.as_mut() {
                     chat.render(frame, body);
