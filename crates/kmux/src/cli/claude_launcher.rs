@@ -1696,18 +1696,32 @@ mod tests {
         assert_eq!(stale_windows_claude_temp_dir_pid("rmux-claude-x-a-0"), None);
     }
 
+    /// The packaged `libexec` lookup must spell **kmux**, not the old rmux name.
+    ///
+    /// This one rotted quietly through the rmux -> kmux rename (aeda6da36d) because
+    /// it is `#[cfg(windows)]` and the rename was done on Linux, so nobody's suite
+    /// ran it. The product was already correct — `windows_full_helper_candidates()`
+    /// builds its leaf from `public_binary_file_name()` — only the expectation was
+    /// left behind.
+    ///
+    /// Note the deliberately foreign install root: the current exe is called
+    /// `legacy-name.exe` under `C:\vendorpkg\bin`, yet both candidates must still come
+    /// out as `libexec\kmux\kmux.exe`. That is the real invariant — the helper name
+    /// is derived from our own binary-name constant, never copied from whatever the
+    /// running executable happens to be called. Point it at `kmux.exe` and the test
+    /// would pass even if the code wrongly echoed `current`'s file name.
     #[cfg(windows)]
     #[test]
     fn windows_full_helper_candidates_cover_packaged_layouts() {
-        let current = Path::new(r"C:\rmux\bin\rmux.exe");
+        let current = Path::new(r"C:\vendorpkg\bin\legacy-name.exe");
         let candidates = windows_full_helper_candidates(current);
         assert_eq!(
             candidates[0],
-            PathBuf::from(r"C:\rmux\bin\libexec\rmux\rmux.exe")
+            PathBuf::from(r"C:\vendorpkg\bin\libexec\kmux\kmux.exe")
         );
         assert_eq!(
             candidates[1],
-            PathBuf::from(r"C:\rmux\bin\..\libexec\rmux\rmux.exe")
+            PathBuf::from(r"C:\vendorpkg\bin\..\libexec\kmux\kmux.exe")
         );
     }
 
