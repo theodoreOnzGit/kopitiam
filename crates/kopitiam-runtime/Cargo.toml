@@ -11,11 +11,22 @@ description = "Kopitiam Runtime: the Qwen transformer forward pass (embedding, R
 # (reference only, never compiled). Keep it out of the published .crate tarball.
 exclude = ["vendor/"]
 
+[features]
+# GPU offload for the output projection (see src/gpu_offload.rs). ON by default:
+# `kopitiam-gpu` handles a missing GPU at RUNTIME via its cascade, and it does
+# compile cleanly for aarch64-linux-android, so Termux is not the reason for the
+# gate. The gate exists so a build that wants nothing to do with wgpu — a lean
+# Termux image, a minimal embedding — can say `--no-default-features` and not
+# compile the graphics stack at all.
+default = ["gpu"]
+gpu = ["dep:kopitiam-gpu"]
+
 [dependencies]
 kopitiam-core.workspace = true
 kopitiam-tensor.workspace = true
 kopitiam-loader.workspace = true
 kopitiam-tokenizer.workspace = true
+kopitiam-gpu = { workspace = true, optional = true }
 
 # Test-only: unique-by-construction temp file names for synthetic GGUF
 # fixtures (see src/test_support/synthetic_gguf.rs). Already a workspace

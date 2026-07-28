@@ -157,8 +157,18 @@ impl SelectedAdapter {
     /// exact.
     pub fn notice(&self) -> String {
         match self {
-            SelectedAdapter::Local { source, .. } => {
-                format!("Using local model on CPU: {}", source.display())
+            SelectedAdapter::Local { adapter, source } => {
+                // Say which compute path actually ran. The output projection is
+                // the one matmul offloaded to the GPU (see
+                // `kopitiam_runtime::gpu_offload` for why only that one), so
+                // "hybrid" is the honest word — the rest of the forward pass is
+                // still CPU.
+                let where_ = if adapter.gpu_output_head_active() {
+                    "hybrid CPU + GPU (output projection on GPU)"
+                } else {
+                    "CPU"
+                };
+                format!("Using local model on {where_}: {}", source.display())
             }
             SelectedAdapter::Echo { reason, .. } => match reason {
                 FallbackReason::NoModelOnDisk {
