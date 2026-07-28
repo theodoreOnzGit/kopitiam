@@ -99,11 +99,31 @@ pub(crate) struct ModelWeights {
 
 impl ModelWeights {
     pub(crate) fn load(model: &LoadedModel, config: &QwenConfig) -> Result<Self> {
-        let token_embd = load_tensor_f32(model, "token_embd.weight")?;
+        // Load the embedding table WITHOUT dequantizing it.
+        //
+        // This used to be `load_tensor_f32`, and that one call was the most
+        // expensive decision in the loader. The table is the largest tensor in
+        // a small model — SmolLM2-360M's is 49152 x 960 — so expanding it to
+        // `f32` costs 188 MB against 47 MB of Q8_0, a 4x blow-up of the single
+        // biggest allocation. Worse, most models (both SmolLM2 releases
+        // included) have no separate `output.weight` and TIE the output
+        // projection to this tensor, so the `f32` clone below meant the biggest
+        // matmul in the network silently skipped the fused quantized kernel
+        // that every other projection gets.
+        //
+        // `Tensor::gather_rows` now decodes quantized rows in place — one row
+        // per token, instead of all 49152 — so the embedding lookup no longer
+        // needs the expansion, and `linear` takes the fused path for the tied
+        // output projection. `load_matmul_weight` still falls back to `f32` for
+        // any dtype without a fused kernel (e.g. the 1.7B's Q6_K), so this is
+        // strictly a win or a no-op, never a regression.
+        let token_embd = load_matmul_weight(model, "token_embd.weight")?;
         let layers = (0..config.n_layers).map(|i| LayerWeights::load(model, i)).collect::<Result<_>>()?;
         let output_norm = load_tensor_f32(model, "output_norm.weight")?;
         let output_weight = match load_matmul_weight_opt(model, "output.weight")? {
             Some(w) => w,
+            // Tied: the same tensor, and now the same *quantized* tensor, so
+            // this shares storage with `token_embd` rather than duplicating it.
             None => token_embd.clone(),
         };
         Ok(Self { token_embd, layers, output_norm, output_weight })
