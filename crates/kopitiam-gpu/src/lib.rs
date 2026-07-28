@@ -70,3 +70,4 @@ pub mod ops;
 
 pub use context::{GpuContext, GpuUnavailable};
 pub use executor::{ComputeOp, Executor, GpuOpError};
+pub use ops::{matmul_nt_cpu, matmul_nt_gpu, MatmulNt, MatmulNtInput};
