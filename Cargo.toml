@@ -222,6 +222,10 @@ kopitiam-models = { path = "crates/kopitiam-models", version = "0.2.4" }
 kopitiam-loader = { path = "crates/kopitiam-loader", version = "0.2.4" }
 kopitiam-tokenizer = { path = "crates/kopitiam-tokenizer", version = "0.2.4" }
 kopitiam-runtime = { path = "crates/kopitiam-runtime", version = "0.2.4" }
+# Seeded on crates.io at 0.0.1 while the GPU foundation is mid-build, so the
+# version req stays 0.0.1 rather than tracking the workspace — same pattern as
+# the other early name reservations noted above.
+kopitiam-gpu = { path = "crates/kopitiam-gpu", version = "0.0.1" }
 
 # gitoxide (`gix`): pure-Rust Git. This is the pure-Rust-core replacement for
 # kopi-beans's `git2` (vendored libgit2 + OpenSSL = a C toolchain), so `bn`

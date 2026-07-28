@@ -115,6 +115,8 @@ mod config;
 mod constraint;
 mod gguf_tokenizer;
 mod generate;
+#[cfg(feature = "gpu")]
+pub mod gpu_offload;
 mod kv_cache;
 mod linear;
 mod mlp;

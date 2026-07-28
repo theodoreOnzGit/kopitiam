@@ -21,6 +21,14 @@ pub struct QwenModel {
     weights: ModelWeights,
     rope: RotaryEmbedding,
     backend: CpuBackend,
+    /// GPU offload for the output projection, when this machine can do it.
+    ///
+    /// `None` is the ordinary case, not a failure — no GPU, a weight the kernel
+    /// does not decode, or an adapter that cannot bind it. See
+    /// [`crate::gpu_offload`] for why this ONE matmul is offloaded and the rest
+    /// deliberately are not.
+    #[cfg(feature = "gpu")]
+    gpu: Option<(kopitiam_gpu::Executor, crate::gpu_offload::GpuOutputHead)>,
 }
 
 impl QwenModel {
@@ -33,7 +41,43 @@ impl QwenModel {
         let config = QwenConfig::from_metadata(model.metadata())?;
         let weights = ModelWeights::load(model, &config)?;
         let rope = RotaryEmbedding::new(config.rope_dimension_count, config.rope_theta, config.max_context, config.rope_kind);
-        Ok(Self { config, weights, rope, backend: CpuBackend })
+
+        // Probing the adapter and uploading the weight costs ~100ms once, and
+        // buys ~17.6ms per token back on the output projection — so it pays for
+        // itself inside a six-token reply and is pure cost for a one-token one.
+        // Done at load rather than lazily because a chat session is the case
+        // this exists for; a caller that wants neither can build without the
+        // `gpu` feature.
+        #[cfg(feature = "gpu")]
+        let gpu = {
+            let executor = kopitiam_gpu::Executor::new();
+            crate::gpu_offload::GpuOutputHead::try_build(model, &executor).map(|head| (executor, head))
+        };
+
+        Ok(Self {
+            config,
+            weights,
+            rope,
+            backend: CpuBackend,
+            #[cfg(feature = "gpu")]
+            gpu,
+        })
+    }
+
+    /// Whether the output projection is running on the GPU for this model.
+    ///
+    /// Reported so a caller can say which path it took instead of guessing —
+    /// "is it using the GPU?" is otherwise unanswerable from outside.
+    #[must_use]
+    pub fn gpu_output_head_active(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
     }
 
     pub fn config(&self) -> &QwenConfig {
@@ -122,6 +166,19 @@ impl Model for QwenModel {
 
         let x = x.rms_norm(&self.weights.output_norm, self.config.norm_eps)?;
         trace("output_norm", &x);
+
+        // The one offloaded matmul. Falls through to the CPU path below on ANY
+        // GPU failure — a device can be lost or busy mid-session, and a wrong
+        // answer is never preferable to a slower one.
+        #[cfg(feature = "gpu")]
+        if let Some((executor, head)) = &self.gpu {
+            let rows = x.shape().dims()[0];
+            if let Ok(hidden) = x.to_vec_f32()
+                && let Some(logits) = head.forward(executor, &hidden, rows)
+            {
+                return Tensor::from_f32(logits, [rows, self.config.vocab_size]);
+            }
+        }
         // logits = x @ output_weight^T -> [seq, vocab_size]. Goes through
         // `linear` (not a bare `matmul`+`transpose`) so a quantized
         // `output.weight` -- usually the single largest weight matrix in a

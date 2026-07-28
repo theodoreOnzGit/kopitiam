@@ -94,6 +94,17 @@ pub struct LocalAdapter {
 }
 
 impl LocalAdapter {
+    /// Whether the output projection is running on the GPU for this model.
+    ///
+    /// Exposed so the CLI can tell the user which path it actually took. The
+    /// notice used to say "on CPU" unconditionally, which stopped being true
+    /// the moment the output head could be offloaded — and a status line that
+    /// is confidently wrong is worse than no status line.
+    #[must_use]
+    pub fn gpu_output_head_active(&self) -> bool {
+        self.model.gpu_output_head_active()
+    }
+
     /// Loads a GGUF Qwen model and its embedded tokenizer from `path`,
     /// once, and holds both for the lifetime of the returned adapter.
     ///
