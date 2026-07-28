@@ -14,12 +14,34 @@
 #
 #   cargo tree -p kopitiam -e normal --prefix none | grep -oE '^kopitiam[a-z-]*' | sort -u
 #
+# RE-RUN THAT COMMAND AND DIFF IT AGAINST `CRATES` EVERY TIME YOU RELEASE.
+# The list is hand-maintained, so it goes stale the moment somebody adds an
+# internal dep, and the failure is only visible at upload time -- one crate
+# into a multi-crate, rate-limited run. Bitten once already, at the 0.2.5
+# prep: `kopitiam-resource` (plain dep of apps/cli) and `kopitiam-gpu`
+# (pulled in by kopitiam-runtime's DEFAULT `gpu` feature) were both in the
+# tree but missing here, so `kopitiam` and `kopitiam-runtime` would each have
+# been rejected -- crates.io demand every dependency, optional-behind-a-
+# default-feature also count, already sit on the registry.
+#
+# ONE DELIBERATE EXCEPTION to that diff, for the 0.2.5 release: `kopitiam-neovim`
+# is commented OUT of the list on purpose. kvim is red on Windows (`:term` freeze
+# + the `gf` isfname bug), so the maintainer decided to ship the AI-chat fixes
+# WITHOUT the editor. Nothing to change in any manifest to make this work:
+# apps/cli already asks for `kopitiam-neovim = "0.2.1"`, i.e. `^0.2.1`, so a
+# published `kopitiam` 0.2.5 just resolves it to the newest ON THE REGISTRY --
+# 0.2.4, the previous release -- while local builds keep using the path dep.
+# When kvim goes green, uncomment the line and it ships again; existing installs
+# pick it up automatically because `^0.2.1` already allows it. So the list-vs-tree
+# diff SHOULD show kopitiam-neovim missing until then, and that is not drift.
+#
 # MIXED VERSIONS: the tree no longer shares one version. Most crates release
-# in lockstep at the workspace version (0.1.8), but the first-time Runtime /
-# workflow / ai crates debut at 0.1.0 (their own manifests pin it). So there
-# is NO single WORKSPACE_VERSION constant here: `cargo publish -p <crate>`
-# already uses each crate's own manifest version, and the already-published
-# skip-check resolves EACH crate's own version via `cargo pkgid`.
+# in lockstep at the workspace version (0.2.5), but a few sit on their own
+# pin: kopitiam-ocr at 0.1.0, and kopitiam-gpu at 0.0.1 (an early name-
+# reservation seed, see scripts/publish-gpu-seed.sh). So there is NO single
+# WORKSPACE_VERSION constant here: `cargo publish -p <crate>` already uses
+# each crate's own manifest version, and the already-published skip-check
+# resolves EACH crate's own version via `cargo pkgid`.
 #
 # This script does NOT run automatically as part of any other workflow. Run
 # it yourself, deliberately, after `cargo login <your-token>`:
@@ -56,6 +78,8 @@ CRATES=(
     kopitiam-index       # leaf
     kopitiam-pdf         # leaf
     kopitiam-models      # leaf (net feature -> ureq)
+    kopitiam-gpu         # leaf, STANDALONE (wgpu/pollster/bytemuck only), pinned 0.0.1
+    kopitiam-resource    # leaf: no internal deps; apps/cli's §6 budget gate
     kopitiam-config      # leaf (editor/kvim)
     kopitiam-lua         # leaf (editor/kvim: pure-Rust Lua interpreter)
     kopitiam-syntax      # leaf (editor/kvim)
@@ -71,7 +95,7 @@ CRATES=(
     kopitiam-runtime     # depends on: kopitiam-{core,loader,tensor,tokenizer}
     kopitiam-ai          # depends on: kopitiam-{loader,runtime,tokenizer}
     kopitiam-workflow    # depends on: kopitiam-{ai,knowledge,ontology,workspace}
-    kopitiam-neovim      # editor (kvim); depends on config/lua/syntax/snippet/semantic
+    # kopitiam-neovim    # HELD BACK at 0.2.4 for the 0.2.5 release -- see below.
     kopitiam-ocr         # NEW 0.1.0: Tesseract LSTM OCR port; depends on kopitiam-tensor
     kopitiam             # depends on: all of the above (incl. kopitiam-neovim + kopitiam-ocr)
 )

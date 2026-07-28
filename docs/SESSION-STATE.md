@@ -1,10 +1,106 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-27 (NUS working-hours rule removed — KOPITIAM is institute work now)
+**Last updated:** 2026-07-29 (0.2.5 release blocked; 3 agents in flight on Windows bugs)
 **Purpose:** if the session dies, this file plus `bd list` is enough to pick up
 without re-deriving anything.
 
-> ## ✅ LATEST — 2026-07-27 (Mon ~17:00 SGT, maintainer's Windows box — **SmolLM2 RUNS**)
+> ## ⏳ LATEST — 2026-07-29 (Wed ~06:00+ SGT, maintainer's Windows box — **0.2.5 publish BLOCKED**)
+>
+> Maintainer asked to publish kopitiam to crates.io at 6am. **Nothing was
+> published.** Three blockers found; two fixed, one still open.
+>
+> ### Release prep — DONE, uncommitted, owned by the ORCHESTRATOR
+>
+> * `Cargo.toml` — workspace version **0.2.4 → 0.2.5** + all 31 internal path-dep
+>   pins (32 strings total). `kopitiam-gpu` stays pinned **0.0.1** (deliberate
+>   name-reservation seed, see `scripts/publish-gpu-seed.sh`); `kopitiam-ocr`
+>   stays **0.1.0** (no commits since it shipped, nothing to release).
+> * `scripts/publish.sh` — the `CRATES` list was **stale against its own
+>   derivation command**. Missing `kopitiam-resource` (plain dep of `apps/cli`)
+>   and `kopitiam-gpu` (pulled by `kopitiam-runtime`'s **default** `gpu`
+>   feature). Both would have been rejected at upload, one crate into a
+>   rate-limited multi-crate run. Added in topological position + wrote the
+>   lesson into the header. List now matches `cargo tree -p kopitiam -e normal`
+>   exactly: **25 crates, zero drift**.
+> * `crates/kopitiam-neovim/src/editor/search.rs` — **`gf` Windows fix**, see below.
+>
+> Verified: `cargo publish --dry-run --allow-dirty` packages **kopitiam-gpu
+> 0.0.1** and **kopitiam-resource 0.2.5** cleanly. Packaging is NOT a blocker.
+> Everything at 0.2.4 is already live on crates.io, so without the bump a
+> publish run would have skipped all 25 crates and shipped nothing.
+>
+> ### THE BLOCKER — `kopitiam-neovim` is red, and it IS in the publish set
+>
+> Baseline `cargo test --release`: **913 passed, 10 failed**. All 24 other
+> publish crates green. (`kmux` also has 2 failures but is NOT published.)
+>
+> ### Frozen ownership — 3 agents running concurrently, SHARED tree
+>
+> Shared tree, not worktrees: the file sets are disjoint and a worktree each
+> would mean a full release rebuild of a wgpu-sized workspace. **The cargo
+> target-dir lock is shared, so agent builds serialize — minutes of blocking is
+> expected, not a hang.**
+>
+> | Owner | May edit ONLY | Job |
+> |---|---|---|
+> | Agent A | `src/termemu.rs`, `src/ui/app.rs` (kopitiam-neovim) | ConPTY `:term` freeze + 8 tests |
+> | Agent B | `crates/kmux/` | 2 kmux failures |
+> | Agent C | `crates/kopitiam-neovim/src/lsp/` | Linux-hardcoded test + portability sweep |
+> | Orchestrator | `Cargo.toml`, `Cargo.lock`, `scripts/`, `editor/search.rs`, this file | release prep, merge, gates |
+>
+> Agents are instructed: **no commit, no push, no publish**, leave uncommitted.
+>
+> ### `gf` — FIXED (orchestrator), fix written but NOT yet re-run
+>
+> `editor/search.rs::file_under_cursor` had `isfname` = alphanumerics +
+> `/._-~+#$%@`. **No `\`, no `:`** — so on `C:\Users\me\notes.txt` the scan died
+> at the drive-letter colon, returned the token `"C"`, found no file called `C`,
+> and `gf` silently did nothing. Fix: the set is now platform-conditional,
+> adding `\` and `:` **on Windows only** — exactly how vim does it (`:help
+> 'isfname'`, the Win32 default adds both). Deliberately NOT unconditional: on
+> Unix a bare `:` would eat the `file:line` idiom. Two regression tests, one per
+> platform.
+>
+> ### ConPTY — established facts, do NOT re-derive
+>
+> 1. `build_command()` falls back to `/bin/sh` + `-c`. On Windows cannot spawn:
+>    `CreateProcessW "/bin/sh -c ..." failed: ... (os error 3)`.
+> 2. `drop(pair.slave)` — commented *"FACT #1: drop the slave now, or EOF never
+>    comes"* — is a **no-op on Windows**. portable-pty 0.9's master and slave
+>    share the SAME `Arc<Mutex<Inner>>` (`src/win/conpty.rs`), so it closes
+>    nothing. That FACT is POSIX-only. Consequence: EOF never arrives on
+>    Windows, so `is_finished()` (`eof || exit_status.is_some()`) can only ever
+>    flip via `reap_if_done()`.
+> 3. cmd.exe / powershell.exe / bash.exe all **spawn OK** through portable-pty,
+>    then produce **zero bytes** and exit `3221225794` = `0xC0000142`
+>    STATUS_DLL_INIT_FAILED. Reader thread blocks forever, `eof=false`.
+> 4. Fact 3 is **not** a harness artefact — reproduced with the agent sandbox
+>    disabled AND from native PowerShell.
+> 5. From PowerShell, `child.wait()` on such a child **blocked >60s** (from Git
+>    Bash it returned `0xC0000142` promptly). `TermSession::drop` does
+>    `child.kill()` then `child.wait()` — prime suspect for the freeze.
+> 6. portable-pty **0.9.0 is the newest published version**. No upgrade escape.
+> 7. Bare `:term` uses `CommandBuilder::new_default_prog()`, which sets NO
+>    program, and portable-pty's `get_shell()` is `#[cfg(unix)]` only. That
+>    Windows default-prog path is **untested** by the probes so far.
+>
+> ### Maintainer's own report (real use, not tests)
+>
+> **kvim freezes IMMEDIATELY on `:term`.** Note the tests show *empty output*,
+> not a freeze — so passing the 8 unit tests does **not** by itself prove the
+> freeze is gone. Needs human dogfooding in a real terminal to confirm.
+>
+> ### Open / owed
+>
+> * `bd` is **not installed** on this box (neither PowerShell nor Git Bash PATH),
+>   so none of these findings got banked as beads. Owed.
+> * No root `CHANGELOG` — 0.2.5 carries real user-visible changes (embedding-table
+>   dequant 3.8–4.9× CPU + 138 MB, arch refusal, cross-platform fixes).
+> * `kvim` NOT part of this release — `scripts/publish-kvim.sh` is separate.
+> * Publish remains **maintainer-gated**: explicit prompt only, main loop only,
+>   never an agent.
+
+> ## 2026-07-27 (Mon ~17:00 SGT, maintainer's Windows box — **SmolLM2 RUNS**)
 >
 > **The chat bug is FIXED and proven on real weights.** Ran on the maintainer's
 > own machine, which *can* reach HuggingFace (the earlier container could not):
