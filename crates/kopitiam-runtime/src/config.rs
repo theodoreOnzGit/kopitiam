@@ -12,8 +12,39 @@
 //! fail to load, it loads a model that computes silent nonsense, which is
 //! strictly worse than refusing).
 
+use crate::rope::RopeKind;
 use kopitiam_core::{Error, Result};
 use kopitiam_loader::ModelMetadata;
+
+/// Maps a GGUF `general.architecture` string to the RoPE pairing its files
+/// were written for, mirroring `llama.cpp`'s `llama_model_rope_type`
+/// (`src/llama-model.cpp`).
+///
+/// The split is not intuitive and cost this project a long debugging session
+/// (`bd-b9x`): **`llama` is interleaved, `qwen2` is split-half**, even though
+/// HuggingFace's `LlamaAttention` uses split-half in Python — GGUF conversion
+/// permutes Q/K so ggml's interleaved rotation reproduces it. See
+/// [`crate::rope`]'s module docs for the full story.
+///
+/// Unknown architectures fall back to [`RopeKind::SplitHalf`], which is this
+/// crate's historical behaviour and correct for the Qwen family it was first
+/// built against. That default is a guess, and a wrong guess here is silent —
+/// so anything newly supported should be added here deliberately, checked
+/// against `llama_model_rope_type` rather than assumed.
+#[must_use]
+pub fn rope_kind_for_architecture(architecture: Option<&str>) -> RopeKind {
+    match architecture.unwrap_or_default() {
+        // ggml's NORM group ("pairs of consecutive head values").
+        "llama" | "llama4" | "deci" | "baichuan" | "starcoder" | "internlm2" | "minicpm"
+        | "xverse" | "command-r" | "cohere2" | "olmo" | "arctic" | "deepseek" | "deepseek2" => {
+            RopeKind::Interleaved
+        }
+        // ggml's NEOX group.
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "phi2" | "phi3" | "gemma" | "gemma2"
+        | "gemma3" | "stablelm" | "olmo2" | "gptneox" => RopeKind::SplitHalf,
+        _ => RopeKind::SplitHalf,
+    }
+}
 
 /// `format` tag used on every [`Error::MalformedModel`] this module raises,
 /// so a config-resolution failure is distinguishable from a GGUF/SafeTensors
@@ -69,6 +100,14 @@ pub struct QwenConfig {
     /// field exists in the format for architectures (e.g. GPT-NeoX-style
     /// partial rotary) that rotate only a prefix of each head.
     pub rope_dimension_count: usize,
+    /// Which RoPE pairing this architecture's GGUF files were written for.
+    ///
+    /// Derived from `general.architecture`, mirroring `llama.cpp`'s
+    /// `llama_model_rope_type` — see [`rope_kind_for_architecture`] and
+    /// [`crate::rope::RopeKind`]. Guessing this wrong does not fail; it
+    /// silently degrades output more and more as the context grows, which is
+    /// what `bd-b9x` turned out to be.
+    pub rope_kind: RopeKind,
     /// RMSNorm epsilon. Defaults to `1e-6`, the value every current Qwen2
     /// checkpoint uses, when the metadata omits both
     /// `attention.layer_norm_rms_epsilon` and `attention.layer_norm_epsilon`.
@@ -114,6 +153,7 @@ impl QwenConfig {
             )));
         }
 
+        let rope_kind = rope_kind_for_architecture(metadata.architecture.as_deref());
         let rope_theta = metadata.rope_theta.unwrap_or(10_000.0);
         let rope_dimension_count = metadata
             .rope_dimension_count
@@ -145,6 +185,7 @@ impl QwenConfig {
             max_context,
             rope_theta,
             rope_dimension_count,
+            rope_kind,
             norm_eps,
         })
     }
@@ -259,5 +300,37 @@ mod tests {
             QwenConfig::from_metadata(&metadata),
             Err(Error::MalformedModel { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod rope_kind_tests {
+    use super::*;
+
+    /// The mapping that `bd-b9x` turned on. `llama` really is interleaved and
+    /// `qwen2` really is split-half, however counter-intuitive that is next to
+    /// HuggingFace's Python (see `crate::rope`'s module docs). Checked against
+    /// `llama.cpp`'s `llama_model_rope_type`, not against intuition.
+    #[test]
+    fn llama_is_interleaved_and_qwen2_is_split_half() {
+        assert_eq!(rope_kind_for_architecture(Some("llama")), RopeKind::Interleaved);
+        assert_eq!(rope_kind_for_architecture(Some("qwen2")), RopeKind::SplitHalf);
+    }
+
+    /// SmolLM2 — the model this bug was found on, and KOPITIAM's default —
+    /// reports `general.architecture = "llama"`, so it must get interleaved.
+    #[test]
+    fn smollm2_reports_llama_and_therefore_gets_interleaved() {
+        assert_eq!(rope_kind_for_architecture(Some("llama")), RopeKind::Interleaved);
+    }
+
+    /// An unknown architecture falls back to split-half. That is a *guess*, and
+    /// a silently-wrong one if the model is really a NORM architecture — which
+    /// is exactly how this bug survived. Pinned so the fallback is a decision
+    /// someone made, not an accident someone inherited.
+    #[test]
+    fn an_unknown_architecture_falls_back_to_split_half() {
+        assert_eq!(rope_kind_for_architecture(None), RopeKind::SplitHalf);
+        assert_eq!(rope_kind_for_architecture(Some("not-a-real-arch")), RopeKind::SplitHalf);
     }
 }
