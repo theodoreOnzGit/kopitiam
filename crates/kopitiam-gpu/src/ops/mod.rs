@@ -10,8 +10,10 @@
 //!   it re-uploads the weight on every call, and making GPU offload *pay* needs
 //!   the weight resident on the device across calls.
 
+pub mod block_q8_matmul_nt;
 pub mod matmul_nt;
 pub mod vector_add;
 
+pub use block_q8_matmul_nt::{block_q8_matmul_nt_cpu, ResidentBlockQ8Weight, BLOCK};
 pub use matmul_nt::{matmul_nt_cpu, matmul_nt_gpu, MatmulNt, MatmulNtInput};
 pub use vector_add::{vector_add_cpu, vector_add_gpu, VectorAdd, VectorAddInput};
