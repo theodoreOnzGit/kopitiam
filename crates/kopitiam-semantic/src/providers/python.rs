@@ -255,9 +255,8 @@ fn which_in(executable: &str, path_var: &OsStr) -> Option<PathBuf> {
     None
 }
 
-/// Exists, is a regular file, and (on Unix) has an executable bit. On Windows
-/// there is no equivalent bit to check, and existence is the whole test — the
-/// same rule `cmd.exe` itself applies.
+/// Exists, is a regular file, and the platform considers it executable: an
+/// executable bit on Unix, an extension listed in `PATHEXT` on Windows.
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = path.metadata() else {
         return false;
@@ -272,7 +271,23 @@ fn is_executable_file(path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        true
+        // Windows has no executable bit, but "any file counts" is NOT the rule
+        // `cmd.exe` applies and was wrong here: it made a plain text file named
+        // `pylsp` look like a language server, so detection would hand a
+        // non-executable to `Command::spawn`. Windows decides by EXTENSION,
+        // against `PATHEXT` — so do that.
+        //
+        // `which_in` already probes `<name>.exe` alongside the bare name on
+        // Windows, so tightening this does not stop a real `pylsp.exe` being
+        // found; it only stops a bare `pylsp` text file being mistaken for one.
+        const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string());
+        pathext
+            .split(';')
+            .any(|candidate| candidate.trim_start_matches('.').eq_ignore_ascii_case(ext))
     }
 }
 
@@ -1947,7 +1962,7 @@ mod tests {
         assert_eq!(detected.as_ref().map(|d| d.server), Some(PythonServer::Pylsp));
         assert_eq!(
             detected.map(|d| d.program),
-            Some(bin.join("pylsp")),
+            Some(executable_path(&bin, "pylsp")),
             "detection must resolve to an absolute path, or spawning would re-resolve \
              the name against the real process PATH"
         );
@@ -1972,8 +1987,29 @@ mod tests {
         assert_eq!(PythonProvider::new().with_path(path).detect_server(), None);
     }
 
+    /// The on-disk name `fake_executable` would produce for `name`, so a test
+    /// can assert the resolved path without hardcoding one platform. Kept next
+    /// to its writer so the two cannot drift.
+    fn executable_path(dir: &Path, name: &str) -> std::path::PathBuf {
+        if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
+            dir.join(format!("{name}.exe"))
+        } else {
+            dir.join(name)
+        }
+    }
+
+    /// Creates something the platform genuinely considers executable: an
+    /// `0o755` file on Unix, and a `.exe` on Windows — where executability is
+    /// decided by extension against `PATHEXT`, not by a permission bit. Writing
+    /// an extensionless file on Windows produces something `is_executable_file`
+    /// correctly rejects, so the platform-specific name is load-bearing.
     fn fake_executable(dir: &Path, name: &str) {
-        let path = dir.join(name);
+        let file_name = if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        };
+        let path = dir.join(file_name);
         std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write");
         #[cfg(unix)]
         {
