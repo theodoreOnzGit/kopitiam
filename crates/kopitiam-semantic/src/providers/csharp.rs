@@ -720,8 +720,26 @@ impl CsProj {
 /// pretending otherwise.
 fn glob_matches(pattern: &str, dir: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(dir) else { return false };
-    let Some(relative) = relative.to_str() else { return false };
-    let path_segments: Vec<&str> = relative.split('/').collect();
+    // Split the PATH the way the platform does, not by scanning for '/'.
+    //
+    // This used to be `relative.to_str()?.split('/')`, which normalized the
+    // pattern's backslashes but not the path's. On Windows `strip_prefix` hands
+    // back `App\Excluded\Deep\Gone.cs`, so splitting on '/' produced a SINGLE
+    // segment and no multi-segment pattern could ever match — meaning
+    // `<Compile Remove="Excluded\**\*.cs" />` was silently ignored on the
+    // platform where .csproj files mostly live. Excluded sources were reported
+    // as part of the project, quietly.
+    //
+    // `Component::Normal` is separator-agnostic, so it is right on both
+    // platforms and cannot be defeated by a literal backslash in a Unix
+    // filename the way a `replace('\\', "/")` on the path would be.
+    let path_segments: Vec<&str> = relative
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
     let normalized = pattern.replace('\\', "/");
     let pattern_segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
     glob_segments(&pattern_segments, &path_segments)
