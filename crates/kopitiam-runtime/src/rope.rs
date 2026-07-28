@@ -1,31 +1,50 @@
 //! Rotary position embeddings (Su et al., 2021, "RoFormer").
 //!
-//! # Which pairing convention this implements: split-half, not interleaved
+//! # Two pairing conventions, and the architecture decides which
 //!
 //! RoPE rotates pairs of dimensions within each attention head by an angle
-//! proportional to sequence position. The *original* RoFormer paper (and
-//! GPT-J) pairs *adjacent* dimensions: `(x[0], x[1])`, `(x[2], x[3])`, ...,
-//! each pair rotated by its own frequency. LLaMA and every model derived
-//! from it — including every Qwen release — uses a *different* pairing that
-//! is easy to confuse with the first: dimension `i` is paired with
-//! dimension `i + rope_dim/2`, i.e. the rotary width is split into two
-//! halves and corresponding elements across the halves are rotated
-//! together. `llama.cpp`/ggml calls this variant `GGML_ROPE_TYPE_NEOX`.
+//! proportional to sequence position. Which dimensions pair up is **not**
+//! universal, and getting it wrong is the "silent-wrongness" failure the type
+//! system cannot catch: both conventions produce a full `head_dim`-sized
+//! output that looks like a valid rotation (same shape, same norm — rotation
+//! preserves length either way), so the model loads, runs, and emits fluent
+//! grammar built on mispositioned queries and keys.
 //!
-//! This module implements the **split-half** ("NEOX") convention
-//! exclusively, because that is what every GGUF Qwen/LLaMA export this
-//! crate loads was trained with. Getting this backwards is exactly the
-//! "silent-wrongness" failure mode the type system cannot catch: both
-//! conventions produce a full head_dim-sized output that *looks* like a
-//! valid rotation (same shape, same norm — rotation preserves vector
-//! length regardless of which pairing is used), so a wrong pairing does not
-//! fail to load or fail to run. It produces a model that emits fluent
-//! grammar and wrong facts, because every downstream attention score is
-//! computed from a subtly mispositioned query/key. See
-//! `apply_matches_split_half_hand_computation_and_differs_from_interleaved`
-//! below for the test that pins this down: it constructs a case where the
-//! two conventions provably disagree and asserts this implementation lands
-//! on the split-half answer.
+//! * [`RopeKind::Interleaved`] pairs *adjacent* dimensions — `(x[0], x[1])`,
+//!   `(x[2], x[3])`, ... This is the original RoFormer/GPT-J pairing, and
+//!   ggml calls it the "normal" RoPE (`LLAMA_ROPE_TYPE_NORM`, mode 0).
+//! * [`RopeKind::SplitHalf`] pairs dimension `i` with `i + rope_dim/2`, i.e.
+//!   the rotary width is split in half and corresponding elements across the
+//!   halves rotate together. ggml calls this `GGML_ROPE_TYPE_NEOX`.
+//!
+//! **This crate got the mapping backwards and it cost a long hunt (`bd-b9x`).**
+//! The previous docs here claimed "LLaMA and every model derived from it —
+//! including every Qwen release — uses split-half". Only the Qwen half is
+//! true. `llama.cpp`'s `llama_model_rope_type`
+//! (`src/llama-model.cpp`, the switch commented *"use what we call a normal
+//! RoPE, operating on pairs of consecutive head values"*) puts
+//! `LLM_ARCH_LLAMA` — and Deci, Baichuan, StarCoder, InternLM2, MiniCPM,
+//! Command-R, OLMo — in the **NORM/interleaved** group, while `LLM_ARCH_QWEN2`,
+//! Phi and Gemma sit in the **NEOX/split-half** group.
+//!
+//! Why HF and GGUF disagree, which is the trap underneath the trap:
+//! HuggingFace's `LlamaAttention` really does use `rotate_half` (split-half),
+//! but `convert_hf_to_gguf.py` **permutes the Q and K weight rows** on the way
+//! into a GGUF precisely so that ggml's cheaper interleaved rotation
+//! reproduces the same result. So a GGUF LLaMA file expects interleaved RoPE:
+//! reading the HF modelling code and concluding "split-half" is correct about
+//! the *architecture* and wrong about the *file*.
+//!
+//! Symptomatically this is nasty: at position 0 the rotation angle is 0, so
+//! both conventions are the identity and short prompts still answer correctly.
+//! The error grows with position, so quality degrades the longer the context —
+//! which reads exactly like "the model is small and weak" rather than like a
+//! bug.
+//!
+//! Element indexing is transcribed from ggml's `rotate_pairs`
+//! (`ggml/src/ggml-cpu/ops.cpp`, MIT): pair index `j` uses frequency
+//! `theta^(-2j/rope_dim)` in *both* conventions — only the two elements it
+//! rotates differ.
 //!
 //! # The math
 //!
@@ -55,9 +74,24 @@ use kopitiam_tensor::Tensor;
 /// so [`RotaryEmbedding::apply`] is a table lookup per (position, pair)
 /// rather than a `cos`/`sin` call — cheap enough to matter once this runs
 /// once per token per layer per head during decode.
+/// Which dimensions RoPE pairs up. See this module's docs — the choice is
+/// per-architecture and picking wrong is silently, progressively wrong rather
+/// than an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeKind {
+    /// Adjacent pairs `(2j, 2j+1)`. ggml's `LLAMA_ROPE_TYPE_NORM` (mode 0).
+    /// **This is what GGUF `llama`-architecture files want**, including every
+    /// SmolLM2 release.
+    Interleaved,
+    /// Pairs `(j, j + rope_dim/2)`. ggml's `GGML_ROPE_TYPE_NEOX`. What
+    /// `qwen2`, Phi and Gemma files want.
+    SplitHalf,
+}
+
 pub struct RotaryEmbedding {
     rope_dim: usize,
     half: usize,
+    kind: RopeKind,
     /// `cos[pos * half + i]` / `sin[pos * half + i]`.
     cos: Vec<f32>,
     sin: Vec<f32>,
@@ -69,7 +103,7 @@ impl RotaryEmbedding {
     /// `rope_dim` must be even (each pair needs two dimensions; see
     /// [`crate::config::QwenConfig::from_metadata`], which rejects an odd
     /// `rope_dimension_count` before a [`RotaryEmbedding`] is ever built).
-    pub fn new(rope_dim: usize, theta: f32, max_position: usize) -> Self {
+    pub fn new(rope_dim: usize, theta: f32, max_position: usize, kind: RopeKind) -> Self {
         debug_assert!(rope_dim.is_multiple_of(2), "rope_dim must be even");
         let half = rope_dim / 2;
         let freqs: Vec<f32> = (0..half).map(|i| theta.powf(-2.0 * i as f32 / rope_dim as f32)).collect();
@@ -83,7 +117,7 @@ impl RotaryEmbedding {
                 sin[pos * half + i] = angle.sin();
             }
         }
-        Self { rope_dim, half, cos, sin }
+        Self { rope_dim, half, kind, cos, sin }
     }
 
     /// Rotates `x`, shaped `[n_heads, seq, head_dim]`, in place per
@@ -119,13 +153,20 @@ impl RotaryEmbedding {
             for (s, &pos) in positions.iter().enumerate() {
                 let base = (h * seq + s) * head_dim;
                 let table_base = pos * self.half;
-                for i in 0..self.half {
-                    let cos = self.cos[table_base + i];
-                    let sin = self.sin[table_base + i];
-                    let x1 = data[base + i];
-                    let x2 = data[base + self.half + i];
-                    out[base + i] = x1 * cos - x2 * sin;
-                    out[base + self.half + i] = x2 * cos + x1 * sin;
+                // Pair index `j` carries the same frequency in both
+                // conventions; only which two elements it rotates differs.
+                // Transcribed from ggml's `rotate_pairs`.
+                for j in 0..self.half {
+                    let cos = self.cos[table_base + j];
+                    let sin = self.sin[table_base + j];
+                    let (lo, hi) = match self.kind {
+                        RopeKind::Interleaved => (base + 2 * j, base + 2 * j + 1),
+                        RopeKind::SplitHalf => (base + j, base + self.half + j),
+                    };
+                    let x1 = data[lo];
+                    let x2 = data[hi];
+                    out[lo] = x1 * cos - x2 * sin;
+                    out[hi] = x2 * cos + x1 * sin;
                 }
                 // Dimensions [rope_dim..head_dim] were already copied into
                 // `out` via `data.clone()` above and are left untouched.
@@ -153,7 +194,7 @@ mod tests {
     /// `theta = 10000`, position `1`, input `[1, 2, 3, 4]`.
     #[test]
     fn apply_matches_split_half_hand_computation_and_differs_from_interleaved() {
-        let rope = RotaryEmbedding::new(4, 10_000.0, 4);
+        let rope = RotaryEmbedding::new(4, 10_000.0, 4, RopeKind::SplitHalf);
         let x = Tensor::from_f32(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 4]).unwrap();
         let out = rope.apply(&x, &[1]).unwrap().to_vec_f32().unwrap();
 
@@ -179,6 +220,58 @@ mod tests {
         );
     }
 
+    /// The other half of the pair above — and the regression guard for
+    /// `bd-b9x`, where `llama`-architecture models were silently given the
+    /// split-half rotation. The expected vector is the very one the test above
+    /// names as "what interleaved would give", so the two tests pin each
+    /// convention against the same hand-computed input from opposite sides.
+    #[test]
+    fn interleaved_matches_the_hand_computed_adjacent_pairing() {
+        let rope = RotaryEmbedding::new(4, 10_000.0, 4, RopeKind::Interleaved);
+        let x = Tensor::from_f32(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 4]).unwrap();
+        let out = rope.apply(&x, &[1]).unwrap().to_vec_f32().unwrap();
+
+        // Interleaved ("NORM"/GPT-J): pairs (x[0], x[1]) and (x[2], x[3]).
+        let expected = [-1.142_639_7, 1.922_075_6, 2.959_850_7, 4.029_799_5];
+        for (o, e) in out.iter().zip(expected) {
+            assert_close(*o, e);
+        }
+    }
+
+    /// Why this bug hid for so long, encoded as a test: at position 0 the
+    /// angle is 0, so cos=1/sin=0 and **both conventions are the identity**.
+    /// A wrong choice therefore costs nothing on the first token and grows
+    /// with position — which reads as "small model, weak answers" rather than
+    /// as a bug. Anyone tempted to validate RoPE with a single-token prompt
+    /// should read this first.
+    #[test]
+    fn both_conventions_are_the_identity_at_position_zero() {
+        let x = Tensor::from_f32(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 4]).unwrap();
+        for kind in [RopeKind::Interleaved, RopeKind::SplitHalf] {
+            let rope = RotaryEmbedding::new(4, 10_000.0, 4, kind);
+            let out = rope.apply(&x, &[0]).unwrap().to_vec_f32().unwrap();
+            assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0], "{kind:?} must be identity at position 0");
+        }
+    }
+
+    /// Both conventions preserve each rotated pair's norm, so "the output
+    /// looks like a valid rotation" can never distinguish them — the reason
+    /// this class of bug is invisible to shape and sanity checks alike.
+    #[test]
+    fn both_conventions_preserve_norm_so_neither_looks_wrong() {
+        let v = vec![1.0f32, 2.0, 3.0, 4.0];
+        let x = Tensor::from_f32(v.clone(), [1, 1, 4]).unwrap();
+        let norm = |s: &[f32]| s.iter().map(|a| a * a).sum::<f32>().sqrt();
+        for kind in [RopeKind::Interleaved, RopeKind::SplitHalf] {
+            let rope = RotaryEmbedding::new(4, 10_000.0, 8, kind);
+            let out = rope.apply(&x, &[5]).unwrap().to_vec_f32().unwrap();
+            assert!(
+                (norm(&out) - norm(&v)).abs() < 1e-4,
+                "{kind:?} changed the vector norm"
+            );
+        }
+    }
+
     /// Rotation is an orthogonal linear map, so it can never change a
     /// vector's Euclidean norm -- true for *any* position, not just the
     /// hand-computed one above. A norm-changing bug (e.g. a sign error
@@ -187,7 +280,7 @@ mod tests {
     /// by coincidence.
     #[test]
     fn rotation_preserves_vector_norm() {
-        let rope = RotaryEmbedding::new(8, 10_000.0, 16);
+        let rope = RotaryEmbedding::new(8, 10_000.0, 16, RopeKind::SplitHalf);
         let input: Vec<f32> = (0..8).map(|i| (i as f32) * 0.37 - 1.1).collect();
         let norm_in: f32 = input.iter().map(|v| v * v).sum::<f32>().sqrt();
 
@@ -201,7 +294,7 @@ mod tests {
 
     #[test]
     fn position_zero_is_the_identity() {
-        let rope = RotaryEmbedding::new(4, 10_000.0, 4);
+        let rope = RotaryEmbedding::new(4, 10_000.0, 4, RopeKind::SplitHalf);
         let x = Tensor::from_f32(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 4]).unwrap();
         let out = rope.apply(&x, &[0]).unwrap().to_vec_f32().unwrap();
         assert_close(out[0], 1.0);
@@ -214,7 +307,7 @@ mod tests {
     /// dimensions untouched.
     #[test]
     fn dimensions_beyond_rope_dim_pass_through_unchanged() {
-        let rope = RotaryEmbedding::new(2, 10_000.0, 4);
+        let rope = RotaryEmbedding::new(2, 10_000.0, 4, RopeKind::SplitHalf);
         let x = Tensor::from_f32(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 4]).unwrap();
         let out = rope.apply(&x, &[1]).unwrap().to_vec_f32().unwrap();
         // Dims [2, 3] (0-indexed) are beyond rope_dim=2, so unchanged.
@@ -226,7 +319,7 @@ mod tests {
 
     #[test]
     fn different_positions_in_the_same_batch_get_different_rotations() {
-        let rope = RotaryEmbedding::new(4, 10_000.0, 8);
+        let rope = RotaryEmbedding::new(4, 10_000.0, 8, RopeKind::SplitHalf);
         let x = Tensor::from_f32(
             vec![
                 1.0, 2.0, 3.0, 4.0, // seq index 0
@@ -245,14 +338,14 @@ mod tests {
 
     #[test]
     fn wrong_rank_is_rejected() {
-        let rope = RotaryEmbedding::new(4, 10_000.0, 4);
+        let rope = RotaryEmbedding::new(4, 10_000.0, 4, RopeKind::SplitHalf);
         let x = Tensor::from_f32(vec![1.0, 2.0, 3.0, 4.0], [4]).unwrap();
         assert!(matches!(rope.apply(&x, &[0]), Err(Error::ShapeMismatch { .. })));
     }
 
     #[test]
     fn mismatched_positions_length_is_rejected() {
-        let rope = RotaryEmbedding::new(4, 10_000.0, 4);
+        let rope = RotaryEmbedding::new(4, 10_000.0, 4, RopeKind::SplitHalf);
         let x = Tensor::from_f32(vec![1.0; 8], [1, 2, 4]).unwrap();
         assert!(matches!(rope.apply(&x, &[0]), Err(Error::ShapeMismatch { .. })));
     }

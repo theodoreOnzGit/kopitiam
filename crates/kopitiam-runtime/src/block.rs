@@ -43,12 +43,17 @@ pub(crate) fn block_forward(
     cache: &mut KvCache,
 ) -> Result<Tensor> {
     let normed = x.rms_norm(&weights.attn_norm, norm_eps)?;
+    crate::model::trace(&format!("attn_norm-{layer_index}"), &normed);
     let attn_out =
         attention_forward(&normed, weights, rope, n_heads, n_kv_heads, head_dim, layer_index, position_offset, cache)?;
+    crate::model::trace(&format!("attn_out-{layer_index}"), &attn_out);
     let x = x.add(&attn_out)?;
+    crate::model::trace(&format!("ffn_inp-{layer_index}"), &x);
 
     let normed = x.rms_norm(&weights.ffn_norm, norm_eps)?;
+    crate::model::trace(&format!("ffn_norm-{layer_index}"), &normed);
     let mlp_out = swiglu_mlp(&normed, &weights.w_gate, &weights.w_up, &weights.w_down)?;
+    crate::model::trace(&format!("ffn_out-{layer_index}"), &mlp_out);
     x.add(&mlp_out)
 }
 
@@ -89,7 +94,7 @@ mod tests {
             w_up: eye(hidden),
             w_down: eye(hidden),
         };
-        let rope = RotaryEmbedding::new(head_dim, 10_000.0, 16);
+        let rope = RotaryEmbedding::new(head_dim, 10_000.0, 16, crate::rope::RopeKind::SplitHalf);
         let mut cache = KvCache::new(1, 16);
 
         let x = Tensor::from_f32(vec![0.5, -0.3, 0.8, 0.1, 0.2, 0.4, -0.6, 0.9], [2, hidden]).unwrap();

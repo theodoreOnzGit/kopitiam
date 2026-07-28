@@ -32,7 +32,7 @@ impl QwenModel {
     pub fn from_loaded_model(model: &LoadedModel) -> Result<Self> {
         let config = QwenConfig::from_metadata(model.metadata())?;
         let weights = ModelWeights::load(model, &config)?;
-        let rope = RotaryEmbedding::new(config.rope_dimension_count, config.rope_theta, config.max_context);
+        let rope = RotaryEmbedding::new(config.rope_dimension_count, config.rope_theta, config.max_context, config.rope_kind);
         Ok(Self { config, weights, rope, backend: CpuBackend })
     }
 
@@ -45,6 +45,49 @@ impl QwenModel {
     }
 }
 
+/// Prints a one-line fingerprint of an intermediate tensor when
+/// `KOPITIAM_TRACE_TENSORS` is set, and costs nothing otherwise.
+///
+/// # Why this exists
+///
+/// "The model answers nonsense" localises to *some* layer, and the only way to
+/// find which is to compare intermediates against a reference implementation
+/// (`llama.cpp`'s `llama-eval-callback` prints the same kind of fingerprint —
+/// see `docs/REFERENCE-ORACLE.md`). Reading our own code cannot do it: every
+/// component of this forward pass has been individually verified correct
+/// against hand-computed references, and the composed result still disagrees
+/// (`bd-b9x`).
+///
+/// The line carries shape, the first few values, and mean/max-abs. The
+/// summary statistics matter as much as the values: two implementations can
+/// agree on element 0 and diverge in scale, and `absmax` catches that
+/// immediately where eyeballing four floats does not.
+pub(crate) fn trace(label: &str, t: &Tensor) {
+    // Read the env var once, not once per tensor per layer per token: this sits
+    // on the decode hot path, where a `getenv` 200+ times per token is pure
+    // waste for a facility that is off in every normal run.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("KOPITIAM_TRACE_TENSORS").is_some()) {
+        return;
+    }
+    let Ok(v) = t.to_vec_f32() else {
+        eprintln!("[trace] {label:<28} <not materialisable>");
+        return;
+    };
+    let n = v.len().max(1);
+    let mean = v.iter().sum::<f32>() / n as f32;
+    let absmax = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let sum: f32 = v.iter().sum();
+    let head: Vec<String> = v.iter().take(4).map(|x| format!("{x:+.4}")).collect();
+    // `sum` is printed because llama.cpp's eval-callback prints exactly that,
+    // which makes the two dumps directly comparable line by line.
+    eprintln!(
+        "[trace] {label:<24} {:?} sum={sum:+.6} first=[{}] mean={mean:+.6} absmax={absmax:.4}",
+        t.shape().dims(),
+        head.join(", ")
+    );
+}
+
 impl Model for QwenModel {
     fn forward(&self, token_ids: &[u32], cache: &mut KvCache) -> Result<Tensor> {
         let ids: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
@@ -52,6 +95,7 @@ impl Model for QwenModel {
 
         // [seq, hidden]: one embedding row per input token.
         let mut x = self.weights.token_embd.gather_rows(&ids_tensor)?;
+        trace("inp_embd", &x);
 
         // Read once, before any layer's cache is touched by this call --
         // see crate::attention::attention_forward's docs for why reading
@@ -73,9 +117,11 @@ impl Model for QwenModel {
                 position_offset,
                 cache,
             )?;
+            trace(&format!("blk.{layer_index}.out"), &x);
         }
 
         let x = x.rms_norm(&self.weights.output_norm, self.config.norm_eps)?;
+        trace("output_norm", &x);
         // logits = x @ output_weight^T -> [seq, vocab_size]. Goes through
         // `linear` (not a bare `matmul`+`transpose`) so a quantized
         // `output.weight` -- usually the single largest weight matrix in a
@@ -245,17 +291,27 @@ mod tests {
         assert!((next as usize) < model.vocab_size());
     }
 
-    /// The architecture string is *only* a metadata-routing key: it selects
-    /// which `<arch>.*` hyperparameter names the loader reads, and nothing in
-    /// the forward pass branches on it. Two models identical in every value
-    /// but their `general.architecture` (`"llama"` vs `"qwen2"`) -- both
-    /// bias-free and both tied, so the tensor sets are byte-for-byte the same
-    /// -- must therefore produce bit-identical logits. This is what "add the
-    /// LLaMA path without disturbing the Qwen path" means concretely: there
-    /// is one forward pass, selected by which tensors are present, not by a
-    /// hard-coded architecture branch that could drift between the two.
+    /// The architecture string **does** affect compute, and must: it selects
+    /// the RoPE pairing convention.
+    ///
+    /// # This test used to assert the exact opposite, and that was the bug
+    ///
+    /// It previously demanded *bit-identical* logits across `"llama"` and
+    /// `"qwen2"`, on the reasoning that the arch string is "only a
+    /// metadata-routing key" and "nothing in the forward pass branches on it".
+    /// That reasoning was wrong, and the test enshrined the wrongness: per
+    /// `llama.cpp`'s `llama_model_rope_type`, `llama` files want interleaved
+    /// (NORM) RoPE and `qwen2` files want split-half (NEOX). We applied
+    /// split-half to both, so every LLaMA-architecture model — including
+    /// SmolLM2, KOPITIAM's default — ran with mispositioned queries and keys.
+    /// See `bd-b9x` and [`crate::rope`]'s module docs.
+    ///
+    /// The lesson worth keeping: a test asserting two things are equal is only
+    /// as good as the argument that they *should* be. This one passed happily
+    /// for as long as the bug existed, because the bug is precisely what made
+    /// the two paths identical.
     #[test]
-    fn llama_and_qwen2_arch_with_identical_weights_produce_bit_identical_logits() {
+    fn the_architecture_string_selects_the_rope_convention() {
         let base = SyntheticModelSpec { with_qkv_bias: false, tie_embeddings: true, ..SyntheticModelSpec::default() };
         let llama = SyntheticModelSpec { architecture: "llama", ..base.clone() };
         let qwen2 = SyntheticModelSpec { architecture: "qwen2", ..base };
@@ -263,6 +319,12 @@ mod tests {
         let m_llama = load_from_spec(&llama, "arch-eq-llama");
         let m_qwen2 = load_from_spec(&qwen2, "arch-eq-qwen2");
 
+        assert_eq!(m_llama.config().rope_kind, crate::rope::RopeKind::Interleaved);
+        assert_eq!(m_qwen2.config().rope_kind, crate::rope::RopeKind::SplitHalf);
+
+        // A multi-token prompt is essential: at position 0 both conventions are
+        // the identity, so a single-token prompt could not tell them apart —
+        // which is exactly why this bug hid behind short prompts.
         let prompt = [1u32, 4, 2, 7];
         let mut c_llama = m_llama.new_cache();
         let mut c_qwen2 = m_qwen2.new_cache();
@@ -270,13 +332,11 @@ mod tests {
         let l_qwen2 = m_qwen2.forward(&prompt, &mut c_qwen2).unwrap().to_vec_f32().unwrap();
 
         assert_eq!(l_llama.len(), l_qwen2.len());
-        for (i, (a, b)) in l_llama.iter().zip(&l_qwen2).enumerate() {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "logit {i} differs across architecture string ({a} vs {b}) -- the arch string must not affect compute"
-            );
-        }
+        assert!(
+            l_llama.iter().zip(&l_qwen2).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "llama and qwen2 must NOT produce identical logits — identical output means \
+             both are getting the same RoPE convention, which is the bd-b9x bug"
+        );
     }
 
     /// The KV-cache correctness property named explicitly in this crate's

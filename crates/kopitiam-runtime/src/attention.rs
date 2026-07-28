@@ -140,8 +140,14 @@ pub(crate) fn attention_forward(
     let k = linear(x, &weights.wk, weights.bk.as_ref())?.reshape([seq, n_kv_heads, head_dim])?.transpose(0, 1)?;
     let v = linear(x, &weights.wv, weights.bv.as_ref())?.reshape([seq, n_kv_heads, head_dim])?.transpose(0, 1)?;
 
+    crate::model::trace(&format!("Qcur-{layer_index}.proj"), &q);
+    crate::model::trace(&format!("Kcur-{layer_index}.proj"), &k);
+    crate::model::trace(&format!("Vcur-{layer_index}.proj"), &v);
+
     let q = rope.apply(&q, &positions)?;
     let k = rope.apply(&k, &positions)?;
+    crate::model::trace(&format!("Qcur-{layer_index}.rope"), &q);
+    crate::model::trace(&format!("Kcur-{layer_index}.rope"), &k);
 
     let (k_full, v_full) = cache.append(layer_index, k, v)?;
     let seq_kv = k_full.shape().dims()[1];
@@ -157,8 +163,10 @@ pub(crate) fn attention_forward(
     let scores = scores.add(&mask)?;
     let probs = scores.softmax(2)?;
 
+    crate::model::trace(&format!("probs-{layer_index}"), &probs);
     let attn_out = probs.matmul(&v_rep)?; // [n_heads, seq, head_dim]
     let attn_out = attn_out.transpose(0, 1)?.reshape([seq, n_heads * head_dim])?;
+    crate::model::trace(&format!("kqv_out-{layer_index}"), &attn_out);
 
     linear(&attn_out, &weights.wo, None)
 }
@@ -292,7 +300,7 @@ mod tests {
         let n_kv_heads = 1;
         let head_dim = hidden / n_heads;
         let weights = dummy_weights(hidden, n_kv_heads * head_dim);
-        let rope = RotaryEmbedding::new(head_dim, 10_000.0, 16);
+        let rope = RotaryEmbedding::new(head_dim, 10_000.0, 16, crate::rope::RopeKind::SplitHalf);
         let mut cache = KvCache::new(1, 16);
 
         let x = Tensor::from_f32((0..2 * hidden).map(|i| i as f32 * 0.1).collect(), [2, hidden]).unwrap();
@@ -312,7 +320,7 @@ mod tests {
         // tensor construction.
         let hidden = 32;
         let weights = dummy_weights(hidden, hidden);
-        let rope = RotaryEmbedding::new(hidden, 10_000.0, 16);
+        let rope = RotaryEmbedding::new(hidden, 10_000.0, 16, crate::rope::RopeKind::SplitHalf);
         let mut cache = KvCache::new(1, 16);
         let x = Tensor::from_quantized(DType::Q4_0, vec![0u8; 18], [1, hidden]).unwrap();
         assert!(attention_forward(&x, &weights, &rope, 1, 1, hidden, 0, 0, &mut cache).is_err());
