@@ -70,4 +70,7 @@ pub mod ops;
 
 pub use context::{GpuContext, GpuUnavailable};
 pub use executor::{ComputeOp, Executor, GpuOpError};
-pub use ops::{matmul_nt_cpu, matmul_nt_gpu, MatmulNt, MatmulNtInput};
+pub use ops::{
+    block_q8_matmul_nt_cpu, matmul_nt_cpu, matmul_nt_gpu, MatmulNt, MatmulNtInput,
+    ResidentBlockQ8Weight, BLOCK,
+};
