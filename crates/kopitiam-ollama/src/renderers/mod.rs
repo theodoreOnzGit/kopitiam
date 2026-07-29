@@ -526,25 +526,22 @@ mod tests {
     /// somebody looked.
     ///
     /// This is a **ceiling, not a snapshot**: the test asserts the real gap is a
-    /// *subset* of this list. [`crate::parsers`] is being filled in on its own
-    /// schedule, so a name disappearing from the real gap must not fail the
-    /// build -- but a name appearing that is not listed here must, because that
-    /// means somebody shipped a renderer without checking the other half.
+    /// *subset* of this list. A name appearing that is NOT listed here fails the
+    /// build, because it means somebody shipped a renderer without checking the
+    /// other half.
     ///
-    /// When a parser lands, deleting its name from here is optional tidying, not
-    /// a required step.
-    const KNOWN_RENDERABLE_BUT_UNPARSEABLE: &[&str] = &[
-        "cogito",
-        "olmo3",
-        "olmo3-think",
-        "nemotron-3-nano",
-        "functiongemma",
-        "lfm2",
-        "lfm2-thinking",
-        "laguna",
-        "poolside-v1",
-        "cohere",
-    ];
+    /// **It is now EMPTY, and that is the finished state.** It was written while
+    /// [`crate::parsers`] was still being filled in, and listed ten families --
+    /// cogito, olmo3, olmo3-think, nemotron-3-nano, functiongemma, lfm2,
+    /// lfm2-thinking, laguna, poolside-v1, cohere. All ten now have parsers, so
+    /// the ceiling drops to zero and the subset assertion below becomes the
+    /// strongest thing it can be: **every renderable family is parseable.**
+    ///
+    /// A ceiling that is allowed to stay stale is a doc that quietly lies -- the
+    /// subset test passes either way, so nothing would have told us. An audit
+    /// did. Keep this list at zero unless there is a reason not to, and say the
+    /// reason here.
+    const KNOWN_RENDERABLE_BUT_UNPARSEABLE: &[&str] = &[];
 
     /// The renderer half of the port is complete, and stays complete.
     ///

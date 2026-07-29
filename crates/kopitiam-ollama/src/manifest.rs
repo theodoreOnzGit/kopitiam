@@ -706,10 +706,27 @@ impl Manifest {
 ///
 /// For **display only**. Don't feed the result back into `fs::` on Windows and
 /// assume it means the same thing as the original -- it usually does, but
-/// "usually" is not a contract. Note also that on Unix a backslash is a legal
-/// filename character; inside this store it cannot occur (name parts are
-/// validated by `crate::name`, blob names are hex), so the substitution is safe
-/// *here* and this is not a general-purpose path converter.
+/// "usually" is not a contract.
+///
+/// ## Why this differs from [`crate::envconfig::slashify`], deliberately
+///
+/// An audit flagged the two as inconsistent, and they are -- on purpose, so it
+/// is written down here rather than discovered again:
+///
+/// * `envconfig::slashify` gates the substitution on `cfg!(windows)`, because it
+///   handles **arbitrary user-supplied paths**, and on Unix a backslash is a
+///   perfectly legal filename character. Replacing it there would corrupt a real
+///   name. Those are the correct semantics for a general path.
+/// * This one substitutes **unconditionally**, because it only ever sees paths
+///   *this store built*: every component is either a name part validated by
+///   [`crate::name`] (which rejects `\`) or a hex blob filename. A backslash
+///   cannot occur, so there is nothing to corrupt, and an unconditional replace
+///   means a store tree synced from Windows still renders cleanly when listed on
+///   Termux.
+///
+/// **Do not "unify" these by making `slashify` unconditional** -- that direction
+/// is the one that loses data. If they must become one function, it takes
+/// `envconfig`'s gated semantics plus this module's validation guarantee.
 pub fn to_slash(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }

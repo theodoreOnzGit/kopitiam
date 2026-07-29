@@ -156,13 +156,88 @@ impl From<i64> for Value {
     }
 }
 
-/// Go's `%v` for a float: shortest representation that round-trips, and a bare
-/// integer prints without a trailing `.0`.
+/// Go's `%v` for a float.
+///
+/// **Upstream:** `fmt`'s `%v` on a `float64` is `%g`, which is
+/// `strconv.FormatFloat(f, 'g', -1, 64)` (Go stdlib `strconv/ftoa.go`,
+/// BSD-3-Clause).
+///
+/// **This used to be wrong, and it was wrong in the worst possible place.** The
+/// old version printed the shortest decimal with no exponent at all, so
+/// `1000000.0` came out `"1000000"` where Go says `"1e+06"`. Every value this
+/// function touches goes straight into a rendered chat template -- i.e. into the
+/// model's context -- so a divergence here is not a display nit, it changes what
+/// the model reads. Found by an audit, not by a test, which is why the exact
+/// rule is now written down:
+///
+/// Let `exp` be the base-10 exponent in `d.ddd × 10^exp` form. For the shortest
+/// representation Go fixes `eprec = 6`, then picks:
+///
+/// * **`%e`** when `exp < -4 || exp >= 6` -- so `1e+06`, `1e-05`,
+/// * **`%f`** otherwise -- so `100000`, `0.0001`, `1.5`.
+///
+/// The `%e` exponent always carries a sign and **at least two digits**
+/// (`1e+06`, not `1e+6`) -- that is Go's `fmtE`, and it is the detail a naive
+/// `{:e}` in Rust gets wrong.
+///
+/// The old `1e15` threshold had no upstream source at all; it is gone.
 fn format_go_float(f: f64) -> String {
-    if f == f.trunc() && f.abs() < 1e15 {
-        format!("{}", f as i64)
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "+Inf" } else { "-Inf" }.to_string();
+    }
+    if f == 0.0 {
+        // Go prints negative zero as "-0"; Rust's `{:e}` gives "0e0" for both,
+        // so the sign has to be recovered from the bit pattern.
+        return if f.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+
+    // Rust's `{:e}` yields the SHORTEST round-tripping mantissa, which is the
+    // same digit set Go's `-1` precision computes. We only have to re-place the
+    // decimal point and re-spell the exponent Go's way.
+    let sci = format!("{f:e}"); // e.g. "1.5e0", "1e6", "-3.25e-7"
+    let (mantissa, exp) = sci.split_once('e').expect("{:e} always emits an 'e'");
+    let exp: i32 = exp.parse().expect("{:e} always emits an integer exponent");
+
+    let neg = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let sign = if neg { "-" } else { "" };
+
+    // Go: `if exp < -4 || exp >= eprec` with eprec = 6 for the shortest form.
+    //
+    // Clippy wants `!(-4..6).contains(&exp)`. Same thing, but the two-sided
+    // comparison is written the way `strconv/ftoa.go` writes it, and this is a
+    // faithfulness-critical line -- keeping it visually identical to the Go is
+    // worth more here than the lint.
+    #[expect(clippy::manual_range_contains, reason = "mirrors strconv/ftoa.go verbatim")]
+    if exp < -4 || exp >= 6 {
+        let mut out = String::from(sign);
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        // Go's fmtE: sign always, and a minimum of two exponent digits.
+        out.push('e');
+        out.push(if exp < 0 { '-' } else { '+' });
+        let a = exp.unsigned_abs();
+        if a < 10 {
+            out.push('0');
+        }
+        out.push_str(&a.to_string());
+        return out;
+    }
+
+    // %f: place the decimal point at `dp` digits from the left.
+    let dp = exp + 1;
+    if dp <= 0 {
+        format!("{sign}0.{}{}", "0".repeat((-dp) as usize), digits)
+    } else if (dp as usize) >= digits.len() {
+        format!("{sign}{digits}{}", "0".repeat(dp as usize - digits.len()))
     } else {
-        format!("{f}")
+        format!("{sign}{}.{}", &digits[..dp as usize], &digits[dp as usize..])
     }
 }
 
@@ -813,9 +888,55 @@ mod tests {
         assert_eq!(ymd_from_days(parse_ymd("2027-01-01").unwrap() - 1), "2026-12-31");
     }
 
+    /// Go's `%v` on a float is `%g`, and the switch to exponent form happens at
+    /// `exp < -4 || exp >= 6`. These are the exact strings Go prints -- the
+    /// boundary pairs are the point of the test, because the old
+    /// implementation got every one of the exponent cases wrong and no test
+    /// noticed.
     #[test]
-    fn float_rendering_drops_a_pointless_decimal() {
+    fn float_rendering_matches_gos_percent_g() {
+        // Plain %f range.
         assert_eq!(format_go_float(3.0), "3");
         assert_eq!(format_go_float(3.5), "3.5");
+        assert_eq!(format_go_float(-3.25), "-3.25");
+        assert_eq!(format_go_float(0.0), "0");
+
+        // Upper boundary: 1e5 stays decimal, 1e6 flips to exponent.
+        assert_eq!(format_go_float(100_000.0), "100000");
+        assert_eq!(format_go_float(1_000_000.0), "1e+06");
+        assert_eq!(format_go_float(999_999.0), "999999");
+        assert_eq!(format_go_float(1_234_567.0), "1.234567e+06");
+
+        // Lower boundary: 1e-4 stays decimal, 1e-5 flips.
+        assert_eq!(format_go_float(0.0001), "0.0001");
+        assert_eq!(format_go_float(0.00001), "1e-05");
+
+        // The exponent always carries a sign and at least two digits.
+        assert_eq!(format_go_float(1e20), "1e+20");
+        assert_eq!(format_go_float(1.5e-7), "1.5e-07");
+        assert_eq!(format_go_float(-1e100), "-1e+100");
+    }
+
+    #[test]
+    fn non_finite_floats_use_gos_spellings() {
+        assert_eq!(format_go_float(f64::NAN), "NaN");
+        assert_eq!(format_go_float(f64::INFINITY), "+Inf");
+        assert_eq!(format_go_float(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(format_go_float(-0.0), "-0");
+    }
+
+    /// The property that matters regardless of spelling: whatever we print must
+    /// parse back to the same float. A shortest-round-trip guarantee is the
+    /// whole reason Go uses precision -1.
+    #[test]
+    fn every_rendered_float_parses_back_to_itself() {
+        for f in [
+            1.0, -1.0, 0.1, 1.0 / 3.0, 1e-4, 1e-5, 1e5, 1e6, 1.234_567_89e8,
+            f64::MAX, f64::MIN_POSITIVE, 6.022e23, 2.5e-13,
+        ] {
+            let s = format_go_float(f);
+            let back: f64 = s.parse().unwrap_or_else(|e| panic!("{s:?} did not parse: {e}"));
+            assert_eq!(back, f, "round trip of {f} via {s:?}");
+        }
     }
 }

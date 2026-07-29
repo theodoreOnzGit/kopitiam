@@ -147,6 +147,15 @@ without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md
 > `llm/llama_server.go` (2.4k — subprocess management of a llama.cpp binary;
 > KOPITIAM's runtime is **in-process**, so it does not apply), `llama/` (cgo),
 > `ml/` (Go backend interface), `x/` (23.7k experimental, in flux).
+>
+> **Correction, found by the audit:** an earlier version of this note implied
+> `runner/` is the llama.cpp subprocess runner. It is **not** — `runner/runner.go`
+> is a 21-line dispatcher into `x/mlxrunner`. The llama.cpp runner is
+> `llm/llama_server.go`, skipped separately for the reason above. Both are
+> correctly absent; the description was wrong. Also note `llm/` **minus**
+> `llama_server.go` (~1,375 LOC: `status.go`, `exit_status*.go`,
+> `llama_binary.go`, `media.go`) is unported and was **not** on this list —
+> `status.go`'s out-of-memory detection is the part worth a second look.
 > **Undecided, worth a maintainer call:** `convert/` (11.4k — safetensors→GGUF
 > conversion, genuinely useful but a project of its own), `openai/` +
 > `anthropic/` + `middleware/` (4.8k — API-compat shims), `discover/` (3.4k —
