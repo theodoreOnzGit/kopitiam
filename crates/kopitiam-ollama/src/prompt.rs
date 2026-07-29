@@ -338,6 +338,10 @@ mod tests {
 
     /// Images cost tokens the text tokenizer cannot see, so they must be added
     /// to the estimate -- otherwise a picture-heavy chat overflow silently.
+    ///
+    /// The fixture only bites because [`IMAGE_NUM_TOKENS`] (768) dwarfs the
+    /// 4-token budget: one image alone blows the window, which is exactly the
+    /// situation the charge exists to catch.
     #[test]
     fn images_are_charged_against_the_window_when_a_projector_is_present() {
         let mut m = msgs(&[("user", "one"), ("user", "two")]);
@@ -351,7 +355,6 @@ mod tests {
         // budget -- so the earlier turn gets dropped to make room.
         let proj = chat_prompt(&tmpl(), &words(), 4, &m, &[], None, true, true).unwrap();
         assert_eq!(proj.dropped, 1, "the image must be charged against the window");
-        assert!(IMAGE_NUM_TOKENS > 4, "the fixture only makes sense if it overflows");
     }
 
     #[test]
