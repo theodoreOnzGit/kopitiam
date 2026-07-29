@@ -24,5 +24,14 @@ serde_json.workspace = true
 # Cargo.lock, so no new supply-chain surface.
 indexmap = { workspace = true, features = ["serde"] }
 
+# SHA-256, for the content-addressed blob store (`manifest`). RustCrypto's
+# `sha2` is pure Rust -- no C, no build script compiling native code, and its
+# `asm` feature is opt-in and we never turn it on. Already in this workspace's
+# Cargo.lock via kopi-beans / kopitiam-web / kopitiam-models / kmux, so it adds
+# ZERO new supply-chain surface. A blob's digest IS its address, so this is the
+# one place where a wrong byte silently corrupts the whole store -- hand-rolling
+# it was never an option.
+sha2 = "0.10"
+
 [dev-dependencies]
 tempfile.workspace = true
