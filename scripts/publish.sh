@@ -111,6 +111,31 @@ crate_version() {
     cargo pkgid -p "$name" 2>/dev/null | sed -E 's/.*[#@]//'
 }
 
+# A crate's directory on disk, from `cargo pkgid`, correct on BOTH Windows and
+# Unix. This exists because the naive version was silently wrong on Windows for
+# every release so far.
+#
+# `cargo pkgid` emit a file:// URL:
+#
+#   Windows:  path+file:///C:/Users/fifad/Documents/kopitiam/crates/kopitiam-ai#0.2.5
+#   Unix:     path+file:///home/theo/kopitiam/crates/kopitiam-ai#0.2.5
+#
+# Stripping everything up to `file://` leaves `/C:/Users/...` on Windows -- a
+# path that DOES NOT EXIST, because the drive letter must not carry a leading
+# slash. On Unix the same strip leaves `/home/...`, which is already correct.
+# So we drop the leading slash ONLY when what follow it look like a drive
+# letter (`/C:` -> `C:`); `/home` is untouched because `h` is not `X:`.
+#
+# Why it matter, hor: `preflight_vendor_check` do `[[ -d "${dir}/vendor" ]]`.
+# With a non-existent dir that test is ALWAYS false, so the vendor guard waved
+# through every crate on Windows without ever looking. It only ever appeared to
+# work because kopitiam-ai's manifest already carry `exclude = ["vendor/"]`.
+crate_dir() {
+    local name="$1"
+    cargo pkgid -p "$name" 2>/dev/null \
+        | sed -E 's#^.*file://##; s/#.*$//; s#^/([A-Za-z]:)#\1#'
+}
+
 # Queries the crates.io HTTP API directly, rather than `cargo info`: run
 # from inside this workspace, `cargo info <name>` happily reports the
 # *local path* crate as if it were published (it says so right in its
@@ -136,8 +161,18 @@ already_published() {
 preflight_vendor_check() {
     local name="$1"
     local dir manifest
-    dir="$(cargo pkgid -p "$name" 2>/dev/null | sed -E 's#^.*file://##; s/#.*$//')"
+    dir="$(crate_dir "$name")"
     manifest="${dir}/Cargo.toml"
+
+    # A guard that cannot find the crate must SHOUT, not wave everything through.
+    # This exact check was silently dead on Windows for who knows how long (see
+    # crate_dir), and a broken vendor guard is invisible precisely when it
+    # matters -- the run "passes" preflight and then packs 287MB of llama.cpp.
+    if [[ ! -f "$manifest" ]]; then
+        echo "error: preflight cannot locate $name's manifest (looked at ${manifest});" >&2
+        echo "       refusing to publish blind -- fix crate_dir before continuing." >&2
+        return 1
+    fi
     if [[ -d "${dir}/vendor" ]] && ! grep -qE '^[[:space:]]*exclude[[:space:]]*=.*"vendor/"' "$manifest"; then
         echo "error: $name has a vendor/ dir but its Cargo.toml lacks exclude = [\"vendor/\"];" >&2
         echo "       refusing to publish (would pack vendored third-party sources into the .crate)." >&2
