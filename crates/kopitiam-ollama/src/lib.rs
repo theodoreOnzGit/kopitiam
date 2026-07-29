@@ -66,23 +66,29 @@
 // Every module is declared here up front, including ones still being written,
 // so that concurrent porting work never has to touch this file. A module that
 // is still a stub says so in its own header.
+pub mod anthropic;
 pub mod api;
+pub mod convert;
 pub mod create;
 pub mod envconfig;
 pub mod format;
 pub mod gotmpl;
 pub mod manifest;
 pub mod memory;
+pub mod middleware;
 pub mod modelfile;
 pub mod name;
+pub mod openai;
 pub mod options;
 pub mod parsers;
+pub mod progress;
 pub mod prompt;
 pub mod registry;
 pub mod renderers;
 pub mod routes;
 pub mod sched;
 pub mod template;
+pub mod tools;
 pub mod thinking;
 
 pub use api::{
