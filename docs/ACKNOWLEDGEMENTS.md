@@ -41,7 +41,7 @@ KOPITIAM.
 | [ONNX](https://github.com/onnx/onnx) | Apache-2.0 | Model interchange format, for possible future ONNX support |
 | [Neovim](https://github.com/neovim/neovim) | Apache-2.0, plus Vim-licensed portions | Editor architecture, the `vim.*` API surface, and modal-editing semantics, for `kopitiam-neovim` (`kvim`) |
 | [transformers](https://github.com/huggingface/transformers) (HuggingFace) | Apache-2.0 | The reference **model implementations** (LLaMA-shaped architectures, attention / RoPE / RMSNorm layouts, tokenizer configs) studied for `kopitiam-runtime`'s from-scratch inference. A read-only reference clone is vendored at **`crates/kopitiam-runtime/vendor/transformers`** — gitignored, never built, linked, or shipped |
-| [ollama](https://github.com/ollama/ollama) | MIT | The reference **local model-serving runtime**. Studied for the sampling defaults a local chat must run with: `api/types.go`'s `DefaultOptions()` (temperature 0.8, top_k 40, top_p 0.9, repeat_penalty 1.1, repeat_last_n 64) is transcribed into `kopitiam-ai`'s `local::generation::default_sampling`, with the one deliberate divergence — a pinned PRNG seed, where ollama defaults `Seed: -1` to entropy — documented at the point of use. Parameter values only, no code (ollama is Go). A read-only reference clone is vendored at **`crates/kopitiam-runtime/vendor/ollama`** — gitignored, never built, linked, or shipped |
+| [ollama](https://github.com/ollama/ollama) | MIT | ⚠️ **No longer study only — see "The ollama port" section below.** ollama began as a parameter-values reference for `kopitiam-ai`'s sampling defaults (`api/types.go`'s `DefaultOptions()`), and that transcription is still in `local::generation::default_sampling`. It is now also **translated to Rust** in the `kopitiam-ollama` crate, which is derivation, not study. The entry stays in this table for the `kopitiam-ai` sampling-defaults use; the port has its own section |
 | [lazygit](https://github.com/jesseduffield/lazygit) (Jesse Duffield) | MIT | **UI reference** for the CLI's git-panel workflow — how a mature terminal git UI lays out status / staging / branch / log panes and their keybindings. Studied for the panel UX only, not for code (lazygit is Go). A read-only reference clone is vendored at **`apps/cli/vendor/lazygit`** — gitignored, never built or shipped |
 | [Helix](https://github.com/helix-editor/helix) | MPL-2.0 | Modal-editor **infrastructure and feature-completeness reference** for `kvim` — how a mature Rust editor wires LSP lifecycle, incremental syntax, a command palette, and buffer/window management. **kvim is vim-modeled**, so Helix's selection-first keymap is studied for *what* mature editors do, never for *how* kvim binds keys. Clean-room study only: no Helix code is copied, and MPL-2.0 governs any file that ever were — none is. |
 | [tmux](https://github.com/tmux/tmux) | ISC | The **terminal-multiplexer behavioural reference** for `kmux`. Read as data only — **no code copied** (tmux is C; `kmux` descends from rmux, see the fork table below). Consulted to settle exactly which lifecycle notifications a forced respawn may emit: `server-fn.c`'s `pane-exited` fires only from `server_destroy_pane()` (the child-death path), while `spawn.c`'s `SPAWN_RESPAWN\|SPAWN_KILL` path notifies nothing, and `input.c`'s `pane-title-changed` fires purely off the child writing OSC 0/2 with nothing in respawn suppressing it. That distinction is asserted in `crates/kmux/src/server/handler_pane_command_tests.rs` and attributed at the point of use. A read-only reference clone is vendored at **`crates/kmux/vendor/tmux`** (pinned `5534f1ac32`) — gitignored, never built, linked, or shipped |
@@ -177,6 +177,57 @@ vendored or committed.
 | [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) | Apache-2.0 | `db0ec62` | The LSTM OCR engine: `.traineddata` container + unicharset/recoder parsers, the LSTM recognizer and CTC/recode beam decoder, line-finding (`kopitiam-ocr`) |
 | [Leptonica](https://github.com/DanBloomberg/leptonica) | BSD-2-Clause | `10bdea2` | Image preprocessing on the OCR path: binarization (Otsu / Sauvola), grayscale, scale-to-line-height (`kopitiam-ocr`) |
 | [tessdata_best](https://github.com/tesseract-ocr/tessdata_best) | Apache-2.0 | — | Source of the `eng` / `chi_sim` / `jpn` LSTM language models — **downloaded at runtime via `kopitiam-models`, not vendored** |
+
+---
+
+## The ollama port (Go → Rust translation — notices retained)
+
+`crates/kopitiam-ollama/` is a **port of [ollama](https://github.com/ollama/ollama)**
+(Go, **MIT**, Copyright (c) Ollama). Not "inspired by", not "studied" — a
+translation, and therefore a **derivative work**. It is recorded here separately
+from the study table above precisely so nobody later mistakes one for the other.
+
+Ported against upstream commit **`4713800b08b2ddf5e14acf8398953cf7b12f169b`**
+(2026-07-28). A read-only reference clone lives at
+**`crates/kopitiam-ai/vendor/ollama`** — gitignored, never built, linked, or
+shipped.
+
+| KOPITIAM module | Upstream Go source | What it is |
+| --- | --- | --- |
+| `kopitiam-ollama::name` | `types/model/name.go` | The model-name grammar (`host/namespace/model:tag`), its validity rules, and the store filepath mapping |
+| `kopitiam-ollama::options` | `api/types.go` (`Options`, `Runner`, `DefaultOptions`, `FromMap`) | **The provenance of every sampling constant.** temperature 0.8, top_k 40, top_p 0.9, repeat_penalty 1.1, repeat_last_n 64, num_keep 4, num_batch 512 |
+| `kopitiam-ollama::format` | `format/{bytes,format,time}.go` | Human-readable sizes / counts / durations, rounding quirks included |
+| `kopitiam-ollama::modelfile` | `parser/parser.go` | The Modelfile rune state machine, command grammar, and quoting |
+| `kopitiam-ollama::template` | `template/template.go` | Prompt building: `collate`, the three execution modes, the grafted `{{ .Response }}`, and the truncate-at-response tail |
+| `kopitiam-ollama::gotmpl` | Go's `text/template` + `text/template/parse` | See the note below — a different upstream, and a different relationship |
+
+**A second upstream, with a different license: Go's standard library.**
+`kopitiam-ollama::gotmpl` implements a subset of Go's **`text/template`**
+language (Go, **BSD-3-Clause**, Copyright (c) 2009 The Go Authors). This is a
+**reimplementation from the language's documented semantics**, not a
+transliteration of Go's ~7000-line reflection-based engine — but the semantics
+being reproduced are deliberately and exactly Go's (truth rules, sorted map
+iteration, `and`/`or` returning values, `else if` nesting, trim markers,
+`missingkey=zero`), and each is attributed at the point of implementation.
+BSD-3-Clause is permissive and absorbs into AGPL-3.0-only with its notice
+retained, exactly like MIT.
+
+Why this was necessary at all: chat templates are *already written in* Go
+template syntax — every GGUF `tokenizer.chat_template`, every ollama Modelfile
+`TEMPLATE` block. A model fine-tuned against a particular prompt framing gets
+quietly worse when fed a different one, so KOPITIAM has to speak that language
+rather than approximate it.
+
+**Deliberate divergences** (each also stated at the point of divergence in the
+code): parse-from-filepath accepts both `/` and `\` for Windows/Termux
+portability; `Filepath()` returns `Option` where Go panics; `currentDate` /
+`yesterdayDate` take an injectable clock so a rendered prompt is reproducible;
+Modelfile input is `&str` (UTF-8) where Go's reader also transcodes UTF-16.
+
+**Licence consequence:** none beyond what already binds. MIT and BSD-3-Clause
+both combine into an AGPL-3.0-only work provided their notices travel with the
+code, which they do. Neither adds a restriction, and neither loosens the
+copyleft the MuPDF port already imposes (see below).
 
 ---
 

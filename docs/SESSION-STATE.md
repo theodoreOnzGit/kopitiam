@@ -1,8 +1,104 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-29 (0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
+**Last updated:** 2026-07-29 (ollama port started; 0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
 **Purpose:** if the session dies, this file plus `bn ready` is enough to pick up
 without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md.)
+
+> ## ⏵ IN FLIGHT (2026-07-29, later session): the ollama port
+>
+> **Bead:** `bd-uc9` (epic) + `bd-csi` (review AID-0055).
+> **AID:** `docs/ai-decisions/AID-0055-ollama-port-crate-boundary.md`.
+>
+> **Maintainer's standing instruction for this whole exercise, quoted, because
+> everything downstream depends on it:**
+>
+> > *"if in doubt, whether kopitiam-ai or ollama is correct, pick ollama. It is
+> > the golden oracle"*
+>
+> and *"I think it's best not to figure everything out when the source is already
+> there"* — i.e. **read the vendored Go, never reason it out from scratch.**
+>
+> **Vendored oracle:** `crates/kopitiam-ai/vendor/ollama`, shallow clone
+> (`--depth 1 --filter=blob:none`), gitignored, pinned at
+> `4713800b08b2ddf5e14acf8398953cf7b12f169b` (2026-07-28). Started as a sparse
+> checkout; **now a FULL checkout** (`git sparse-checkout disable`) because the
+> sparse path list silently omitted packages `server/` imports — `manifest`,
+> `thinking`, `tools`, `harmony`, `x/transfer`, `openai`, `anthropic`,
+> `middleware`, `convert`, `ml`, `tokenizer`, `agent`. If you re-clone, take the
+> whole tree; the blob filter keeps it cheap.
+>
+> **New crate:** `crates/kopitiam-ollama/` (version pinned `0.1.0` in its OWN
+> manifest, NOT `version.workspace = true` — per the no-lockstep-bump rule).
+> Depends on **nothing else in KOPITIAM** on purpose; see the AID.
+>
+> **DONE and green** (127 tests, clippy clean, `cargo check --workspace` clean;
+> the tree is **UNCOMMITTED** — the maintainer has not asked for a commit):
+>
+> | Module | Ported from |
+> | --- | --- |
+> | `name.rs` | `types/model/name.go` |
+> | `options.rs` | `api/types.go` — Options/Runner/DefaultOptions/FromMap |
+> | `format.rs` | `format/{bytes,format,time}.go` |
+> | `modelfile.rs` | `parser/parser.go` (state machine + grammar + quoting) |
+> | `gotmpl/` | Go `text/template` subset — lexer, parser, executor, builtins |
+> | `template.rs` | `template/template.go` — collate + the 3 execution modes |
+>
+> **NOT done, next in order** (all readable in the vendor clone). Two file paths
+> I first wrote here were WRONG and are corrected — upstream moved them, so do
+> not go looking:
+>
+> * ~~`llm/memory.go`~~ **does not exist.** The VRAM / KV-cache estimator is
+>   **`fs/ggml/ggml.go:648 GraphSize()`**, alongside the `KV` accessors above it.
+> * ~~`server/manifest.go`~~ **does not exist.** Manifests live in their own
+>   top-level package, **`manifest/`** (390 LOC), used from `server/images.go`.
+>
+> 1. `model/renderers/` (20 files, 3.6k) + `model/parsers/` (19 files, 5.9k) —
+>    per-family chat renderers and tool-call / thinking parsers. **Biggest
+>    remaining knowledge payload**; qwen3/qwen35/qwen3coder/qwen3vl, gemma4,
+>    deepseek3, glm46/glm47, olmo3, cohere, lfm2, nemotron3nano, cogito.
+> 2. `manifest/` + `server/images.go` + `server/download.go` + `upload.go` —
+>    content-addressed manifest/blob store + resumable registry pull.
+> 3. `fs/ggml/ggml.go` `GraphSize()` + `KV` accessors — the layer-fit estimator.
+> 4. `server/sched.go` (1.6k) — load/unload, keep_alive, concurrency, VRAM fit.
+>    **This is the step that will break the "depends on nothing else in KOPITIAM"
+>    property** — re-argue the crate boundary there rather than quietly relaxing
+>    it (AID-0055).
+> 5. Small but high value: `server/prompt.go` (130 — context-window truncation
+>    BEFORE templating, pairs with what is already ported), `thinking/` (282),
+>    `tools/` (491), `harmony/` (485), `types/model/{capability,config}.go` (51),
+>    `auth/` + `server/auth.go` (150 — ed25519 registry signing).
+> 6. `api/types.go` remainder (~1000 of 1130; only Options/Runner done),
+>    `envconfig/` (407).
+> 7. `server/routes.go` (2.7k) — the HTTP API surface.
+> 8. `parser/parser.go`'s `CreateRequest` / `fileDigestMap` / `expandPath` —
+>    deferred alongside (2), they need the blob store.
+> 9. `template/index.json` + the 20 bundled `.gotmpl` files + `Named()` — the
+>    fallback template library for GGUFs carrying no chat template.
+>
+> **Deliberately NOT porting** (recorded so nobody re-litigates it cold):
+> `cmd/` (24.7k — desktop launcher + ollama's own TUI; KOPITIAM has kvim/kmux),
+> `readline/` (kvim), `agent/` (kopitiam-workflow + kopitiam-tools own this),
+> `llm/llama_server.go` (2.4k — subprocess management of a llama.cpp binary;
+> KOPITIAM's runtime is **in-process**, so it does not apply), `llama/` (cgo),
+> `ml/` (Go backend interface), `x/` (23.7k experimental, in flux).
+> **Undecided, worth a maintainer call:** `convert/` (11.4k — safetensors→GGUF
+> conversion, genuinely useful but a project of its own), `openai/` +
+> `anthropic/` + `middleware/` (4.8k — API-compat shims), `discover/` (3.4k —
+> GPU discovery, but its native CUDA/ROCm/Vulkan probes are C-adjacent and
+> kopitiam-gpu already enumerates adapters through wgpu).
+>
+> **Not wired into `kopitiam-ai` yet — the port is purely additive so far.** No
+> existing crate gained a dependency, no existing API moved. `bd-250.3` ("chat
+> template is ChatML-only") is exactly what `template.rs` + `gotmpl` exist to
+> fix, but the wiring is still to do.
+>
+> **Dogfooding findings this session:** `bd-cni` bit again — `bn` refused every
+> command with *"store lock already held"* because a daemon from an earlier
+> session (pid 23864, started 08:08) held the lease, and a fresh `bn list`
+> autostarted a *second* daemon that then failed to acquire. What worked: kill
+> both `bn` processes, then `bn` works again. Separately: `bn create` has **no
+> `--label` flag** (unlike upstream `bd`) — create first, then
+> `bn label add <id> <label>`.
 
 > ## ⏹ WHERE THE 2026-07-29 SESSION ENDED (maintainer stopped, tired)
 >

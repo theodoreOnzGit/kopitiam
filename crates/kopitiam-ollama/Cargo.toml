@@ -1,0 +1,20 @@
+[package]
+name = "kopitiam-ollama"
+# First-time crate: debut at 0.1.0, NOT the workspace version. Pinned in this
+# manifest on purpose (no `version.workspace = true`) so a workspace-wide bump
+# cannot drag this crate along -- see CLAUDE.md's "no new commits, no version
+# bump" rule.
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "KOPITIAM's pure-Rust port of ollama (MIT, Copyright (c) Ollama): model-name grammar, Modelfile parser, prompt templates, Options defaults, manifest/blob store and registry client. Sits below kopitiam-ai; owns no inference."
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

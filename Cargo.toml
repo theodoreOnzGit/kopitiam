@@ -227,6 +227,14 @@ kopitiam-runtime = { path = "crates/kopitiam-runtime", version = "0.2.5" }
 # the other early name reservations noted above.
 kopitiam-gpu = { path = "crates/kopitiam-gpu", version = "0.0.1" }
 
+# The ollama port (Go -> Rust). The half of a local-model stack that sits ABOVE
+# the runtime: name grammar, Modelfile, prompt templates, sampling defaults,
+# manifest/blob store. Debuts at 0.1.0 with its own pinned version, so a
+# workspace bump cannot drag it along. Depends on nothing else in KOPITIAM by
+# design -- it is deterministic text/byte work, testable with no model, no GPU
+# and no network. See crates/kopitiam-ollama/src/lib.rs for the port's rules.
+kopitiam-ollama = { path = "crates/kopitiam-ollama", version = "0.1.0" }
+
 # gitoxide (`gix`): pure-Rust Git. This is the pure-Rust-core replacement for
 # kopi-beans's `git2` (vendored libgit2 + OpenSSL = a C toolchain), so `bn`
 # cross-compiles to Termux/Android with NO NDK. gitoxide is pure Rust and builds

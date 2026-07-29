@@ -3206,6 +3206,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kopitiam-ollama"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kopitiam-ontology"
 version = "0.2.5"
 dependencies = [
