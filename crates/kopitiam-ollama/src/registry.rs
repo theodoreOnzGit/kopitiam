@@ -18,7 +18,7 @@
 //! `a_half_done_part_resumes_from_its_recorded_offset_not_zero` is the test that
 //! keep us honest.
 //!
-//! ## The network seam -- no socket in this crate
+//! ## The network seam -- the socket is one implementation, not the design
 //!
 //! Every byte in and out goes through the [`Transport`] trait, and every bit of
 //! non-determinism (clock, sleep, randomness) through [`Ambient`]. Same house
@@ -28,21 +28,28 @@
 //! part splitting, sidecar persistence, resume, retry, backoff -- is driven in
 //! tests by a fake that never opens a connection and never sleeps.
 //!
-//! **There is deliberately NO real `Transport` in this crate yet.** `ureq` and an
-//! ed25519 signer are dependencies this crate does not have, and CLAUDE.md say
-//! stop-and-report rather than add. See the table below. Offline First is not
-//! hurt by this hor: with no networking compiled in at all, the crate still
-//! builds, still tests, and the store half (`crate::manifest`) is fully usable.
+//! ## What is real now, and what is still a hole
 //!
-//! ## Dependencies still owed (nothing here is guesswork -- it is just missing)
+//! Everything in the right-hand column below is compiled **only** with the
+//! `net` feature (on by default). Switch it off and you get an offline build
+//! with no socket, no TLS, no `ring` -- and the *whole* pull/push state machine
+//! plus its entire test suite still builds and still runs, against the fakes in
+//! this module's `tests`. That is KOPITIAM's Offline First rule expressed as a
+//! build-time promise, not just a runtime one, and
+//! `cargo test --release -p kopitiam-ollama --no-default-features` is how you
+//! check we kept it.
 //!
-//! | Need | Crate we'd want | Why nothing else will do |
+//! (The three `net`-only types are named in plain code font below, not as doc
+//! links -- they genuinely do not exist in a `--no-default-features` build, and
+//! a link to them would be a broken one exactly half the time.)
+//!
+//! | Need | What fills it | Notes |
 //! |---|---|---|
-//! | HTTP + TLS | `ureq` with `rustls` | house choice, already used by `kopitiam-models`; note the honest `ring` caveat in that crate's `HttpFetcher` docs -- rustls is pure Rust, its default crypto provider is not |
-//! | ed25519 signing | e.g. `ed25519-dalek` + an OpenSSH private-key reader | the registry authenticates with an SSH ed25519 key at `~/.ollama/id_ed25519`; [`Signer`] is the hole it plugs into |
-//! | CSPRNG for the nonce | `getrandom` | [`SystemAmbient`]'s randomness is a plain xorshift -- fine for backoff jitter, **not** fine for an auth nonce |
-//! | sparse-file hint on Windows | `windows-sys` (`FSCTL_SET_SPARSE`) | see [`BlobDownload::run`]; without it a pull reserves the full blob size up front |
-//! | md5 (push only) | `md-5` | the push commit step sends an `etag` built from per-part md5 sums; [`Md5Hasher`] is the hole |
+//! | HTTP + TLS | `UreqTransport` (`ureq` + `rustls`) | house choice, same as `kopitiam-models`. Honest caveat, same as that crate's `HttpFetcher`: "rustls" does NOT mean "no C" -- ureq's rustls feature picks the `ring` provider (C + perlasm). Accepted on purpose because `ring` cross-compiles clean to Termux/aarch64 where OpenSSL cannot. See `docs/ai-decisions/AID-0013`. |
+//! | ed25519 signing | `SshSigner` (`ed25519-dalek` + `ssh-key`) | reads -- and, like upstream, **creates** -- `~/.ollama/id_ed25519`, which is an OpenSSH-format PEM, not raw key bytes. That is why a signing crate alone was never enough. |
+//! | CSPRNG for the nonce | `getrandom`, inside [`SystemAmbient`] | bead `bd-djx`. Was a clock-seeded xorshift, which is fine for backoff jitter and a **replay hole** for an auth nonce. Now the OS CSPRNG, and it **refuses to degrade** -- see [`Ambient::random_bytes`]. |
+//! | md5 (push only) | `Md5` (`md-5`) | the push commit step sends an `etag` built from per-part md5 sums. A checksum, not a security claim -- the content address is still the sha256. |
+//! | sparse-file hint on Windows | **still a hole** -- wants `windows-sys` (`FSCTL_SET_SPARSE`) | see [`BlobDownload::run`]. Space/perf only, never correctness: without it a 20 GB pull on NTFS reserves 20 GB the moment it starts instead of as it goes. |
 //!
 //! ## Attribution
 //!
@@ -654,24 +661,55 @@ pub trait Ambient: Send + Sync {
     fn random_f64(&self) -> f64;
 
     /// Fill `out` with random bytes for the auth nonce. **Upstream:**
-    /// `auth.NewNonce(rand.Reader, 16)` -- and `crypto/rand` there means this one
-    /// **does** need to be cryptographic. [`SystemAmbient`]'s is not; see its docs.
-    fn random_bytes(&self, out: &mut [u8]);
+    /// `auth.NewNonce(rand.Reader, 16)` -- and `crypto/rand` there means this
+    /// one **does** need to be cryptographic.
+    ///
+    /// # Why this one returns a `Result` when [`Ambient::random_f64`] doesn't
+    ///
+    /// Because the two have completely different consequences when they go
+    /// wrong, so they must not share a signature. `random_f64` only smears
+    /// retries; a bad roll costs nobody anything. This one produces the **auth
+    /// nonce**, and a nonce an attacker can predict is a replay hole: somebody
+    /// who has seen one signed token request can mint another. So there is
+    /// deliberately **no way for an implementation to quietly hand back
+    /// second-best bytes** -- if the entropy source is not there, say so and let
+    /// the request fail. Upstream has the same shape hor: Go's `auth.NewNonce`
+    /// returns `(string, error)` and `registryChallenge.URL()` propagates it.
+    ///
+    /// **What would make this wrong:** an implementation that catches its
+    /// CSPRNG's failure and falls back to a PRNG. That silently reopens exactly
+    /// the hole this signature exists to close (bead `bd-djx`).
+    fn random_bytes(&self, out: &mut [u8]) -> Result<()>;
 }
 
-/// The std-only [`Ambient`]: real clock, real sleep, xorshift dice.
+/// The [`Ambient`] you actually run with: real clock, real sleep, and dice that
+/// know which job they are doing.
 ///
-/// # The randomness caveat, said out loud
+/// # Two grades of randomness, on purpose
 ///
-/// [`SystemAmbient::random_bytes`] is a **xorshift64\* PRNG seeded from the
-/// clock**. That is perfectly fine for [`Ambient::random_f64`] (its only job is
-/// to smear retries so a thousand clients don't stampede the registry together),
-/// but it is **NOT good enough for the auth nonce**, which upstream draws from
-/// `crypto/rand`. A predictable nonce lets an attacker who has seen one signed
-/// request replay it. Wiring `getrandom` in is the fix; until then, do not use
-/// this impl against a real registry that authenticates. This is written here,
-/// at the point of use, rather than buried in a TODO, precisely so nobody ships
-/// it by accident.
+/// * [`Ambient::random_f64`] -- **xorshift64\*, seeded from the clock.** Its only
+///   job is to smear retries so a thousand clients don't stampede the registry
+///   in lockstep, and for that a ten-line PRNG is plenty. No dependency needed,
+///   so none taken.
+/// * [`Ambient::random_bytes`] -- **the OS CSPRNG, via `getrandom`**, matching
+///   upstream's `crypto/rand`. These bytes become the auth nonce.
+///
+/// ## The history, because it is worth not repeating (bead `bd-djx`)
+///
+/// This used to serve the nonce out of the same xorshift stream. Two processes
+/// that started in the same nanosecond shared a seed, and from any one observed
+/// nonce the next one was computable -- which means somebody who had seen one
+/// signed token request could replay it. That is the bug this type now refuses
+/// to have: with the `net` feature on, `random_bytes` goes straight to
+/// `getrandom::fill`, and if the OS entropy source is unavailable it returns
+/// [`RegistryError::Signing`] rather than papering over the gap with PRNG bytes.
+///
+/// **Without the `net` feature** there is no `getrandom` compiled in, so
+/// `random_bytes` falls back to the xorshift stream and **says so at the top of
+/// the function**. That build cannot reach a registry anyway (there is no
+/// [`Transport`] in it), so no nonce it produces ever crosses a wire. What would
+/// make this wrong: someone writing a real `Transport` for a no-`net` build and
+/// pointing it at an authenticating registry. Don't.
 #[derive(Debug)]
 pub struct SystemAmbient {
     state: Mutex<u64>,
@@ -727,11 +765,35 @@ impl Ambient for SystemAmbient {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn random_bytes(&self, out: &mut [u8]) {
+    /// The OS CSPRNG (`getrandom::fill`), same guarantee as upstream's
+    /// `crypto/rand.Reader`.
+    ///
+    /// On Linux/Android this is `getrandom(2)`, on Windows `ProcessPrng` --
+    /// `getrandom` 0.3 picks per target, which is exactly why we take the crate
+    /// instead of opening `/dev/urandom` ourselves (Termux has no `/dev/random`
+    /// story we want to own, and Windows has no `/dev` at all).
+    ///
+    /// A failure here is an OS-level catastrophe -- no entropy source, or a
+    /// sandbox that blocked the syscall -- and it is reported, never smoothed
+    /// over. See the type docs for why that matters.
+    #[cfg(feature = "net")]
+    fn random_bytes(&self, out: &mut [u8]) -> Result<()> {
+        getrandom::fill(out).map_err(|e| {
+            RegistryError::Signing(format!("OS CSPRNG unavailable for the auth nonce: {e}"))
+        })
+    }
+
+    /// **No `net` feature: this is the xorshift stream, NOT a CSPRNG.**
+    ///
+    /// Safe only because a no-`net` build ships no [`Transport`], so nothing can
+    /// carry this nonce to a registry. See the type docs.
+    #[cfg(not(feature = "net"))]
+    fn random_bytes(&self, out: &mut [u8]) -> Result<()> {
         for chunk in out.chunks_mut(8) {
             let n = self.next_u64().to_le_bytes();
             chunk.copy_from_slice(&n[..chunk.len()]);
         }
+        Ok(())
     }
 }
 
@@ -1237,7 +1299,11 @@ impl RegistryChallenge {
 
         let ts = ambient.unix_secs().to_string();
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        ambient.random_bytes(&mut nonce_bytes);
+        // `?` on purpose: no nonce, no request. Upstream's `auth.NewNonce`
+        // likewise returns an error that `registryChallenge.URL()` propagates,
+        // and quietly carrying on with weak bytes is the replay hole `bd-djx`
+        // closed.
+        ambient.random_bytes(&mut nonce_bytes)?;
         let nonce = base64_raw_url(&nonce_bytes);
 
         let scopes: Vec<&str> = self.scope.split(' ').collect();
@@ -3123,6 +3189,825 @@ pub fn upload_blob(
 }
 
 // ---------------------------------------------------------------------------
+// The implementations that actually touch the outside world -- `net` only
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "net")]
+pub use self::net::{ollama_home, ollama_key_path, Md5, SshSigner, UreqTransport};
+
+/// The real [`Transport`], [`Signer`] and [`Md5Hasher`], plus where the key
+/// lives. **Compiled only with the `net` feature.**
+///
+/// Everything above this line is pure logic and builds with `--no-default-features`
+/// -- no socket, no TLS, no `ring`, and the whole test suite still green against
+/// the fakes. Everything below opens connections and reads your private key.
+/// Keeping the wall at exactly this line is what makes Offline First checkable
+/// by a build rather than by trust.
+#[cfg(feature = "net")]
+mod net {
+    use super::*;
+
+    use std::collections::hash_map::Entry;
+    use std::collections::HashMap;
+    use std::io::Seek;
+    use std::sync::Arc;
+
+    use ureq::config::{AutoHeaderValue, Config};
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::time::Duration as UreqDuration;
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout,
+        Transport as UreqWire,
+    };
+    use ureq::{Agent, SendBody};
+
+    // -----------------------------------------------------------------------
+    // Transport
+    // -----------------------------------------------------------------------
+
+    /// How many hops we follow before giving up.
+    ///
+    /// **Upstream:** Go's `net/http.defaultCheckRedirect`, which errors once
+    /// `len(via) > 10`, and ollama's own `CheckRedirect` in `blobDownload.run`
+    /// which repeats the same `> 10` bound before it does anything else. So it
+    /// is ten *followed* hops; the eleventh is refused.
+    const MAX_REDIRECTS: u32 = 10;
+
+    /// The statuses Go's `http.Client` treats as a redirect. 303 and 307/308 both
+    /// matter to us -- a registry answers a blob GET with **307** and that is the
+    /// hop [`RedirectPolicy::SameHostThenStop`] is built to catch.
+    fn is_redirect(status: u16) -> bool {
+        matches!(status, 301 | 302 | 303 | 307 | 308)
+    }
+
+    /// The real HTTP [`Transport`], on `ureq` 3 + `rustls`.
+    ///
+    /// # Honest note about "pure Rust"
+    ///
+    /// Same caveat as `kopitiam-models`' `HttpFetcher`, repeated here because
+    /// nobody should have to go find it: **`rustls` does not mean "no C".**
+    /// ureq's `rustls` feature selects the `ring` crypto provider, which is C
+    /// plus perlasm. We take it on purpose -- `ring` cross-compiles clean to
+    /// Termux/aarch64 where OpenSSL does not, and the alternative (`native-tls`)
+    /// would drag OpenSSL into every Android build. See `docs/ai-decisions/AID-0013`.
+    ///
+    /// # Why redirects are driven by hand
+    ///
+    /// ureq is configured with `max_redirects(0)` + `max_redirects_will_error(false)`,
+    /// which makes it hand back the `3xx` **response itself** instead of chasing
+    /// it. That is not us being difficult: [`RedirectPolicy::SameHostThenStop`]
+    /// needs to *stop* on the first cross-host hop and keep the `Location`
+    /// header, because that header **is** the presigned CDN URL the sixteen
+    /// part-workers then hit in parallel. Let a client follow it and you have
+    /// serially downloaded the whole blob before the real download even starts.
+    /// ureq has no `CheckRedirect` hook, so the loop lives in [`Self::execute`].
+    ///
+    /// # Pointing it somewhere local
+    ///
+    /// There is no host baked in anywhere -- [`Request::url`] decides. So a test
+    /// harness or a private mirror only has to hand out `http://127.0.0.1:PORT/v2/...`
+    /// names (with [`RegistryOptions::insecure`] set, or the scheme check in
+    /// [`RegistryOptions::check_scheme`] refuses the plaintext hop). The
+    /// loopback tests at the bottom of this module do exactly that.
+    #[derive(Debug)]
+    pub struct UreqTransport {
+        /// For every request that did **not** ask for stall detection: manifests,
+        /// token fetches, HEADs, uploads.
+        plain: Agent,
+
+        /// One agent per distinct [`Request::stall_timeout`], made on demand.
+        ///
+        /// Why a map and not one field: the idle deadline is baked into the
+        /// agent's *connector*, and connectors are per-agent, so two different
+        /// stall values genuinely need two agents. In practice the map holds
+        /// exactly one entry ([`DOWNLOAD_STALL_TIMEOUT`]) because
+        /// [`BlobDownload::download_chunk`] is the only caller that sets the
+        /// field -- but keying it means a caller with a different value gets
+        /// correct behaviour instead of somebody else's timeout.
+        stalling: Mutex<HashMap<Duration, Agent>>,
+
+        /// What we announce ourselves as when the caller didn't set one.
+        user_agent: String,
+    }
+
+    impl Default for UreqTransport {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl UreqTransport {
+        /// A transport with the house configuration.
+        pub fn new() -> Self {
+            let ua = user_agent();
+            UreqTransport {
+                plain: build_agent(&ua, None),
+                stalling: Mutex::new(HashMap::new()),
+                user_agent: ua,
+            }
+        }
+
+        /// The agent to run this request on, made on first use.
+        fn agent_for(&self, stall: Option<Duration>) -> Agent {
+            let Some(d) = stall else {
+                return self.plain.clone();
+            };
+            let mut map = self.stalling.lock().unwrap_or_else(|e| e.into_inner());
+            match map.entry(d) {
+                Entry::Occupied(e) => e.get().clone(),
+                Entry::Vacant(e) => e.insert(build_agent(&self.user_agent, Some(d))).clone(),
+            }
+        }
+
+        /// One request, no redirect chasing, no status interpretation.
+        fn one_shot(
+            &self,
+            agent: &Agent,
+            method: Method,
+            url: &Url,
+            headers: &[(String, String)],
+            body: &Body,
+            stall: Option<Duration>,
+        ) -> Result<Response> {
+            let mut builder = ureq::http::Request::builder()
+                .method(method.as_str())
+                .uri(url.to_string());
+
+            let mut saw_content_length = false;
+            for (k, v) in headers {
+                if k.eq_ignore_ascii_case("Content-Length") {
+                    saw_content_length = true;
+                }
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+
+            // Length framing comes from [`Body::len`], which knows the answer
+            // exactly, rather than from a header somebody typed. A caller-set
+            // Content-Length wins though, because `BlobUpload::part_headers`
+            // sets one deliberately and the registry expects to see that exact
+            // value. What would make this wrong: sending no length on a PUT/PATCH,
+            // which pushes ureq into `Transfer-Encoding: chunked` and the ollama
+            // registry rejects a chunked blob part.
+            if !saw_content_length && (!body.is_empty() || method_takes_body(method)) {
+                builder = builder.header("Content-Length", body.len().to_string());
+            }
+
+            let send: SendBody<'static> = match body {
+                Body::Empty => SendBody::none(),
+                Body::Bytes(b) => SendBody::from_owned_reader(io::Cursor::new(b.clone())),
+                Body::FileRange { path, offset, len } => {
+                    let mut f = File::open(path)
+                        .map_err(io_ctx(format!("open {} to upload", to_slash(path))))?;
+                    f.seek(io::SeekFrom::Start(*offset)).map_err(io_ctx(format!(
+                        "seek {} to {offset}",
+                        to_slash(path)
+                    )))?;
+                    // `.take(len)` is the port of `io.NewSectionReader(b.file,
+                    // part.Offset, part.Size)`: a 1000 MB part streams off disk,
+                    // it is never slurped into memory.
+                    SendBody::from_owned_reader(f.take(*len))
+                }
+            };
+
+            let request = builder
+                .body(send)
+                .map_err(|e| RegistryError::InvalidUrl(format!("{url}: {e}")))?;
+
+            let response = agent.run(request).map_err(|e| map_ureq_error(e, stall))?;
+
+            let (parts, body) = response.into_parts();
+            let status = parts.status.as_u16();
+            let headers = parts
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+
+            Ok(Response {
+                status,
+                headers,
+                // `into_reader()` is unlimited on purpose -- a blob part is up to
+                // 1000 MB and `copy_range` bounds it by the Range we asked for
+                // anyway. The wrapper is what turns ureq's error vocabulary into
+                // the one `copy_range` branches on; see [`StallAwareBody`].
+                body: Box::new(StallAwareBody {
+                    inner: body.into_reader(),
+                }),
+            })
+        }
+    }
+
+    /// Does this verb normally carry a body, so an empty one still wants an
+    /// explicit `Content-Length: 0`?
+    ///
+    /// The commit step of a push is literally a `PUT` with
+    /// `Content-Length: 0` (see `BlobUpload::run`), so getting this wrong turns
+    /// a finished 20 GB push into a rejected commit.
+    fn method_takes_body(method: Method) -> bool {
+        matches!(method, Method::Post | Method::Put | Method::Patch)
+    }
+
+    impl Transport for UreqTransport {
+        /// **Upstream:** the behaviour of Go's `http.Client.Do` under ollama's
+        /// `registryOptions.CheckRedirect`, reproduced hop by hop.
+        ///
+        /// The ordering below is copied from
+        /// `server/download.go`'s `CheckRedirect` and matters: the **hop count is
+        /// checked first**, then the hostname. So an eleventh redirect that also
+        /// leaves the host is [`RegistryError::MaxRedirectsExceeded`], not a
+        /// stop-and-return-the-3xx. Swap the two and a hostile chain of ten
+        /// same-host hops followed by one cross-host hop would come back looking
+        /// like a perfectly good direct URL.
+        fn execute(&self, request: Request) -> Result<Response> {
+            let agent = self.agent_for(request.stall_timeout);
+            let origin_host = request.url.hostname().to_string();
+
+            let mut url = request.url.clone();
+            let mut method = request.method;
+            let mut body = request.body.clone();
+            let mut headers = request.headers.clone();
+            let mut hops: u32 = 0;
+
+            loop {
+                let resp = self.one_shot(
+                    &agent,
+                    method,
+                    &url,
+                    &headers,
+                    &body,
+                    request.stall_timeout,
+                )?;
+
+                if !is_redirect(resp.status) {
+                    return Ok(resp);
+                }
+                // A 3xx with no `Location` is not a redirect we can follow. Go's
+                // `resp.Location()` errors with `http.ErrNoLocation` and the
+                // client stops; we hand the response back and let the caller
+                // decide, which is what `resolve_direct_url`'s
+                // `UnexpectedStatus` arm is for.
+                let Some(loc) = resp.header("Location").filter(|s| !s.is_empty()) else {
+                    return Ok(resp);
+                };
+                let next = url.resolve(loc)?;
+
+                hops += 1;
+                if hops > MAX_REDIRECTS {
+                    return Err(RegistryError::MaxRedirectsExceeded);
+                }
+
+                if let RedirectPolicy::SameHostThenStop { host } = &request.redirect
+                    && next.hostname() != host
+                {
+                    // Stop here and hand the 3xx up, `Location` and all -- this
+                    // is the presigned CDN URL. **Deliberate divergence, and it
+                    // is the safer side:** we rewrite `Location` to the
+                    // *absolute* resolved URL first. Upstream can only ever
+                    // resolve against the last hop it made, while our caller
+                    // (`resolve_direct_url`) resolves against the URL it
+                    // originally asked for. Those two agree for an absolute
+                    // `Location` (what real registries send) and disagree for a
+                    // relative one after >= 1 same-host hop. Absolutising here
+                    // removes the disagreement instead of leaving it as a latent
+                    // wrong-URL bug.
+                    return Ok(with_absolute_location(resp, &next));
+                }
+
+                // Never carry credentials across a host boundary. **Upstream:**
+                // Go's `http.Client` strips `Authorization` on a cross-host
+                // redirect by default (`RedirectAuthHeaders` is ureq's name for
+                // the same rule). Without this, a registry that 302s you to its
+                // friend collects your bearer token.
+                if next.hostname() != origin_host {
+                    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("Authorization"));
+                }
+
+                // Method/body rewriting on the way round. **Upstream:**
+                // `net/http`'s `redirectBehavior` -- 307/308 replay the request
+                // as-is, 301/302/303 become a bodyless GET.
+                //
+                // **Divergence, stated plainly:** Go is fussier than this. It
+                // keeps a non-POST method across a 301/302 and only re-sends the
+                // body when `GetBody` is available. We collapse all three onto
+                // GET. It cannot bite the registry protocol -- the only redirect
+                // ollama's registry emits is the 307 to a presigned blob URL,
+                // and 307 goes down the faithful branch -- but a future registry
+                // that 302s a PUT would see a GET from us and a PUT from ollama.
+                // 301 Moved Permanently, 302 Found, 303 See Other -- written as
+                // a range only because clippy insists; they are three separate
+                // statuses that happen to be adjacent, not a band.
+                if matches!(resp.status, 301..=303) {
+                    method = Method::Get;
+                    body = Body::Empty;
+                    headers.retain(|(k, _)| {
+                        !k.eq_ignore_ascii_case("Content-Length")
+                            && !k.eq_ignore_ascii_case("Content-Type")
+                            && !k.eq_ignore_ascii_case("Content-Range")
+                    });
+                }
+
+                url = next;
+            }
+        }
+    }
+
+    /// Replace a response's `Location` with the already-resolved absolute URL.
+    fn with_absolute_location(mut resp: Response, absolute: &Url) -> Response {
+        let text = absolute.to_string();
+        if let Some(slot) = resp
+            .headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Location"))
+        {
+            slot.1 = text;
+        } else {
+            resp.headers.push(("Location".to_string(), text));
+        }
+        resp
+    }
+
+    /// Turn a ureq failure into our vocabulary.
+    ///
+    /// The `stall` argument is what decides whether a timeout means "this link
+    /// went quiet" ([`RegistryError::PartStalled`], which costs no retry) or
+    /// just a broken connection. Only [`BlobDownload::download_chunk`] sets a
+    /// stall timeout, and only it wants the stall semantics.
+    fn map_ureq_error(e: ureq::Error, stall: Option<Duration>) -> RegistryError {
+        match e {
+            ureq::Error::Timeout(_) if stall.is_some() => RegistryError::PartStalled,
+            other => RegistryError::Transport(other.to_string()),
+        }
+    }
+
+    /// Wraps ureq's body reader so `copy_range` sees the error kinds it branches on.
+    ///
+    /// Two translations, and both are load-bearing:
+    ///
+    /// * **A ureq timeout becomes [`io::ErrorKind::TimedOut`].** ureq's
+    ///   `Error::into_io` buries everything that is not already an `io::Error`
+    ///   under `ErrorKind::Other`, so without this a stalled part reads as a
+    ///   generic transport failure -- which **spends a retry**, and lousy hotel
+    ///   wifi would then burn the whole budget meant for real failures.
+    /// * **A short body becomes `Ok(0)`.** ureq raises `UnexpectedEof` when the
+    ///   connection dies before `Content-Length` is satisfied. `copy_range`
+    ///   reads a `0` as "stream ended" and returns
+    ///   [`RegistryError::UnexpectedEof`], which is **resumable** -- so the bytes
+    ///   that did arrive get committed to the sidecar. That is precisely Go's
+    ///   behaviour (`net/http` yields `io.ErrUnexpectedEOF` and `downloadChunk`
+    ///   keeps the partial progress). Report it as a hard error instead and a
+    ///   flaky link would throw away good bytes on every hiccup.
+    struct StallAwareBody {
+        inner: ureq::BodyReader<'static>,
+    }
+
+    impl Read for StallAwareBody {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.inner.read(buf) {
+                Ok(n) => Ok(n),
+                Err(e) => {
+                    if let Some(ureq::Error::Timeout(_)) =
+                        e.get_ref().and_then(|r| r.downcast_ref::<ureq::Error>())
+                    {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "part stalled"));
+                    }
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        return Ok(0);
+                    }
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Build one agent. `stall`, when set, becomes a **per-read idle deadline**.
+    fn build_agent(user_agent: &str, stall: Option<Duration>) -> Agent {
+        let config = Config::builder()
+            // Non-2xx is not an error -- `make_request_with_retry` needs the
+            // 401's `WWW-Authenticate` and the 404's meaning, and `upload_blob`
+            // branches on the 404 to decide whether to upload at all. This is
+            // the `Transport` contract, spelled as config.
+            .http_status_as_error(false)
+            // Hand us the 3xx; we chase it ourselves. See `UreqTransport`.
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .user_agent(AutoHeaderValue::Provided(Arc::new(user_agent.to_string())))
+            // No `Accept-Encoding`, ever. A gzipped blob body would arrive a
+            // different length from the byte range we asked for, and every
+            // offset in the sidecar would then be a lie. `Accept` is ours to set
+            // too -- `pull_model_manifest` sends a specific manifest media type.
+            .accept_encoding(AutoHeaderValue::None)
+            .accept(AutoHeaderValue::None)
+            .build();
+
+        match stall {
+            None => Agent::with_parts(config, DefaultConnector::new(), DefaultResolver::default()),
+            Some(after) => Agent::with_parts(
+                config,
+                DefaultConnector::new().chain(StallClamp { after }),
+                DefaultResolver::default(),
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The stall watchdog
+    // -----------------------------------------------------------------------
+
+    /// Clamps every socket read/write on a connection to an **idle** deadline.
+    ///
+    /// # Why this exists instead of just setting a ureq timeout
+    ///
+    /// This is the bit worth reading before touching it. ureq's `Timeouts` are
+    /// all **deadlines** -- "this body must finish arriving within N". A blob
+    /// part is up to [`MAX_DOWNLOAD_PART_SIZE`] (1000 MB) and
+    /// [`DOWNLOAD_STALL_TIMEOUT`] is 30 s, so wiring the stall value into
+    /// `timeout_recv_body` would abort every part that merely takes longer than
+    /// half a minute. And it would do so as [`RegistryError::PartStalled`],
+    /// which **deliberately does not spend a retry** -- so on any link slower
+    /// than ~33 MB/s the pull would loop forever, re-fetching and discarding the
+    /// same bytes, never finishing and never failing. That is a far worse bug
+    /// than the one the timeout was meant to fix.
+    ///
+    /// What upstream actually does is *idle* detection: `downloadChunk` runs a
+    /// watchdog goroutine ticking once a second against `part.lastUpdated`, and
+    /// only fires when **no byte has arrived** for the window. Rust cannot
+    /// interrupt a blocking `Read` from another thread, so we push the same
+    /// semantics down to where a socket read timeout lives: ureq calls
+    /// [`UreqWire::await_input`] once per read attempt with a deadline-derived
+    /// timeout, and the TCP transport turns that into `set_read_timeout`. Clamp
+    /// that argument and every individual read gets at most `after` -- a genuine
+    /// idle timeout, with a fast-but-long transfer unaffected.
+    ///
+    /// **What would make this wrong:** a ureq release that stops calling
+    /// `await_input` per read attempt, or that batches many reads under one
+    /// call. The clamp would then bound a *span* rather than an idle gap, and we
+    /// would be back to the infinite-loop failure above. The loopback stall test
+    /// is what would notice.
+    #[derive(Debug)]
+    struct StallClamp {
+        after: Duration,
+    }
+
+    impl Connector<Box<dyn UreqWire>> for StallClamp {
+        type Out = StallGuard;
+
+        fn connect(
+            &self,
+            _details: &ConnectionDetails<'_>,
+            chained: Option<Box<dyn UreqWire>>,
+        ) -> std::result::Result<Option<StallGuard>, ureq::Error> {
+            Ok(chained.map(|inner| StallGuard {
+                inner,
+                after: self.after,
+            }))
+        }
+    }
+
+    /// The connection produced by [`StallClamp`]: everything forwarded, only the
+    /// timeout shortened.
+    #[derive(Debug)]
+    struct StallGuard {
+        inner: Box<dyn UreqWire>,
+        after: Duration,
+    }
+
+    impl StallGuard {
+        /// `min` is the whole trick.
+        ///
+        /// Mind the type hor: `NextTimeout::after` is **ureq's** `Duration`
+        /// (`Exact(..) | NotHappening`), not `std::time::Duration`. When no
+        /// deadline is configured ureq hands us `NotHappening`, which sorts
+        /// above every `Exact`, so the `min` yields our idle window. When a real
+        /// deadline is nearer than the idle window, that one wins instead and we
+        /// have not made ureq wait longer than it asked to. The `reason` rides
+        /// through untouched so ureq's own error message still names whichever
+        /// timeout it thought it was applying.
+        fn clamp(&self, t: NextTimeout) -> NextTimeout {
+            NextTimeout {
+                after: t.after.min(UreqDuration::Exact(self.after)),
+                reason: t.reason,
+            }
+        }
+    }
+
+    impl UreqWire for StallGuard {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.inner.buffers()
+        }
+
+        fn transmit_output(
+            &mut self,
+            amount: usize,
+            timeout: NextTimeout,
+        ) -> std::result::Result<(), ureq::Error> {
+            let t = self.clamp(timeout);
+            self.inner.transmit_output(amount, t)
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+            let t = self.clamp(timeout);
+            self.inner.await_input(t)
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.inner.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.inner.is_tls()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // md5, for the push commit etag
+    // -----------------------------------------------------------------------
+
+    /// The real md5, from RustCrypto's `md-5`. **Upstream:** `crypto/md5` in
+    /// `server/upload.go`.
+    ///
+    /// md5 here is a **checksum, not a security claim**: it is the registry's
+    /// upload-integrity token, while the thing that actually guarantees the blob
+    /// is its sha256 content address. Nobody should read this as KOPITIAM
+    /// trusting md5 for anything.
+    ///
+    /// `digest::Digest::finalize_reset` has exactly the reset semantics
+    /// [`Md5Hasher`] demands, so the contract comes free rather than being
+    /// something this wrapper must remember.
+    #[derive(Default, Clone)]
+    pub struct Md5(md5::Md5);
+
+    impl Md5 {
+        /// A fresh, empty hasher.
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl std::fmt::Debug for Md5 {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Md5(..)")
+        }
+    }
+
+    impl Md5Hasher for Md5 {
+        fn update(&mut self, chunk: &[u8]) {
+            md5::Digest::update(&mut self.0, chunk);
+        }
+
+        fn finalize_and_reset(&mut self) -> [u8; 16] {
+            md5::Digest::finalize_reset(&mut self.0).into()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The ed25519 signer, and the key file it lives in
+    // -----------------------------------------------------------------------
+
+    /// The private-key filename under `~/.ollama`. **Upstream:**
+    /// `auth/auth.go`'s `const defaultPrivateKey = "id_ed25519"`.
+    pub const DEFAULT_PRIVATE_KEY: &str = "id_ed25519";
+
+    /// `~/.ollama`, resolved the way this workspace resolves homes everywhere.
+    ///
+    /// **Upstream:** `filepath.Join(os.UserHomeDir(), ".ollama")`, which on
+    /// Windows reads `%USERPROFILE%` and on Unix reads `$HOME`.
+    ///
+    /// The probe order -- `HOME`, then `USERPROFILE`, then `HOMEDRIVE` +
+    /// `HOMEPATH` -- is the house one, same as `create::SystemUsers::current_home`
+    /// in this crate. `HOME` first is what makes **Termux/Android** work
+    /// unchanged (it sets only `HOME`), and the `HOMEDRIVE`+`HOMEPATH` tail is
+    /// what saves a Windows session that somehow has neither of the first two.
+    ///
+    /// Note this is **not** `OLLAMA_MODELS` and must not become it: the model
+    /// store moves with that variable, the identity key does not. Upstream reads
+    /// the key from the real home directory regardless of where blobs live.
+    pub fn ollama_home() -> Result<PathBuf> {
+        for key in ["HOME", "USERPROFILE"] {
+            if let Some(v) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+                return Ok(PathBuf::from(v).join(".ollama"));
+            }
+        }
+        if let (Some(drive), Some(path)) = (
+            std::env::var_os("HOMEDRIVE").filter(|v| !v.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|v| !v.is_empty()),
+        ) {
+            let mut home = PathBuf::from(drive);
+            home.push(PathBuf::from(path));
+            return Ok(home.join(".ollama"));
+        }
+        Err(RegistryError::Signing(
+            "cannot find a home directory: none of HOME, USERPROFILE or HOMEDRIVE+HOMEPATH is set"
+                .to_string(),
+        ))
+    }
+
+    /// `~/.ollama/id_ed25519`.
+    pub fn ollama_key_path() -> Result<PathBuf> {
+        Ok(ollama_home()?.join(DEFAULT_PRIVATE_KEY))
+    }
+
+    /// Signs registry challenges with the user's ed25519 key, **creating the key
+    /// on first use** exactly like ollama does.
+    ///
+    /// **Upstream:** `auth/auth.go` (`GetPublicKey`, `Sign`) for the reading and
+    /// signing half, and `cmd/cmd.go`'s `initializeKeypair` for the creation
+    /// half. Upstream splits those across two packages because the server
+    /// creates the key at boot and the client only reads it; we fold them
+    /// together so a first-ever push cannot fail with "no such file".
+    ///
+    /// # The two things that are easy to get wrong here
+    ///
+    /// 1. **The file is OpenSSH PEM, not raw key bytes.** `-----BEGIN OPENSSH
+    ///    PRIVATE KEY-----`, base64, with its own inner framing. That is the
+    ///    whole reason `ssh-key` is a dependency and a bare ed25519 crate was
+    ///    never enough.
+    /// 2. **The public key we send is the middle field only.** Upstream does
+    ///    `ssh.MarshalAuthorizedKey(pub)` -- which yields
+    ///    `ssh-ed25519 AAAAC3... comment\n` -- and then
+    ///    `bytes.Split(publicKey, " ")[1]`. Send the whole authorized-key line
+    ///    and the registry cannot match you to an account.
+    ///
+    /// # What it does with the key
+    ///
+    /// Parses once at construction and keeps the signing key in memory. The
+    /// alternative is upstream's: re-read and re-parse `~/.ollama/id_ed25519` on
+    /// *every* `Sign` call. Holding it is a deliberate divergence -- fewer file
+    /// reads and no chance of the key changing halfway through a push -- and the
+    /// cost is that a key rotated mid-process is not picked up until a new
+    /// [`SshSigner`] is made.
+    pub struct SshSigner {
+        key_path: PathBuf,
+        /// The base64 blob only, no `ssh-ed25519 ` prefix and no comment.
+        public_blob: String,
+        signing: ed25519_dalek::SigningKey,
+    }
+
+    impl std::fmt::Debug for SshSigner {
+        /// Never prints key material -- only where it came from and the public
+        /// half. A `Debug` that leaks a private key into a log is a bug that
+        /// only shows up after the log is shared.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SshSigner")
+                .field("key_path", &to_slash(&self.key_path))
+                .field("public_blob", &self.public_blob)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl SshSigner {
+        /// Load (or create) `~/.ollama/id_ed25519`.
+        pub fn open() -> Result<Self> {
+            Self::open_at(ollama_key_path()?)
+        }
+
+        /// Same, but at a path you choose -- what the tests use, and what a
+        /// caller with a non-default identity would use.
+        pub fn open_at(key_path: impl Into<PathBuf>) -> Result<Self> {
+            let key_path = key_path.into();
+            if !key_path.exists() {
+                generate_keypair(&key_path)?;
+            }
+
+            let pem = fs::read(&key_path)
+                .map_err(io_ctx(format!("read ssh key {}", to_slash(&key_path))))?;
+            let key = ssh_key::PrivateKey::from_openssh(&pem).map_err(|e| {
+                RegistryError::Signing(format!("{} is not an OpenSSH private key: {e}", to_slash(&key_path)))
+            })?;
+
+            if key.is_encrypted() {
+                // Upstream's `ssh.ParsePrivateKey` fails the same way. We say it
+                // in words instead, because "invalid format" sends people
+                // hunting the wrong bug for an hour.
+                return Err(RegistryError::Signing(format!(
+                    "{} is passphrase-protected; the registry client cannot prompt for it",
+                    to_slash(&key_path)
+                )));
+            }
+
+            let pair = key.key_data().ed25519().ok_or_else(|| {
+                RegistryError::Signing(format!(
+                    "{} is a {} key; the ollama registry only accepts ed25519",
+                    to_slash(&key_path),
+                    key.algorithm()
+                ))
+            })?;
+
+            let signing = ed25519_dalek::SigningKey::from_bytes(&pair.private.to_bytes());
+
+            // `to_openssh()` gives `ssh-ed25519 <base64> [comment]` -- upstream's
+            // `MarshalAuthorizedKey` output. Take field 1 and nothing else.
+            let line = key.public_key().to_openssh().map_err(|e| {
+                RegistryError::Signing(format!("cannot encode the public key: {e}"))
+            })?;
+            let public_blob = line
+                .split(' ')
+                .nth(1)
+                .ok_or_else(|| RegistryError::Signing("malformed public key".to_string()))?
+                .trim()
+                .to_string();
+
+            Ok(SshSigner {
+                key_path,
+                public_blob,
+                signing,
+            })
+        }
+
+        /// Where the key was read from.
+        pub fn key_path(&self) -> &Path {
+            &self.key_path
+        }
+    }
+
+    impl Signer for SshSigner {
+        fn public_key_blob(&self) -> Result<String> {
+            Ok(self.public_blob.clone())
+        }
+
+        fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+            use ed25519_dalek::Signer as _;
+            // The **raw** 64-byte signature. Upstream takes
+            // `signedData.Blob`, which for ed25519 is the bare signature and
+            // *not* the SSH wire-format wrapper. Return the wrapper and the
+            // registry rejects every single request, with no clue why.
+            Ok(self.signing.sign(data).to_bytes().to_vec())
+        }
+    }
+
+    /// Create a fresh ed25519 keypair at `key_path`, plus its `.pub` neighbour.
+    ///
+    /// **Upstream:** `initializeKeypair` in `cmd/cmd.go` -- `ed25519.GenerateKey`,
+    /// `ssh.MarshalPrivateKey`, `pem.EncodeToMemory`, written `0o600`, with the
+    /// authorized-key line written alongside at `0o644`.
+    ///
+    /// **Deliberate divergence: we create the file with `create_new`.** Upstream
+    /// does `os.Stat` and then `os.WriteFile`, which races -- two ollama
+    /// processes starting together can each decide the key is missing and the
+    /// second clobbers the first's key, silently changing your identity. Ours
+    /// fails the loser with `AlreadyExists`, and the caller
+    /// ([`SshSigner::open_at`]) then just reads the winner's key. On Unix the
+    /// `0o600` is applied **by the create itself**, so there is no window where
+    /// a fresh private key is world-readable.
+    ///
+    /// Line endings are LF on every platform, including Windows: an OpenSSH PEM
+    /// with CRLF is not accepted by OpenSSH, and Go writes LF here too.
+    fn generate_keypair(key_path: &Path) -> Result<()> {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| {
+            RegistryError::Signing(format!("OS CSPRNG unavailable to make a key: {e}"))
+        })?;
+
+        let pair = ssh_key::private::Ed25519Keypair::from_seed(&seed);
+        let key = ssh_key::PrivateKey::try_from(ssh_key::private::KeypairData::Ed25519(pair))
+            .map_err(|e| RegistryError::Signing(format!("cannot build the keypair: {e}")))?;
+
+        let pem = key
+            .to_openssh(ssh_key::LineEnding::LF)
+            .map_err(|e| RegistryError::Signing(format!("cannot encode the private key: {e}")))?;
+
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(io_ctx(format!("create {}", to_slash(parent))))?;
+        }
+
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(key_path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(pem.as_bytes())
+                    .map_err(io_ctx(format!("write {}", to_slash(key_path))))?;
+            }
+            // Somebody else won the race. Their key is as good as ours would
+            // have been, so just use it.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(io_ctx(format!("create {}", to_slash(key_path)))(e)),
+        }
+
+        // The `.pub` is a convenience for the human ("here is the key to paste
+        // into ollama.com"), never read back by this crate. A failure to write
+        // it must not fail the pull, so it is best-effort -- upstream treats it
+        // as fatal, and that is a divergence in the user's favour.
+        let pub_path = key_path.with_extension("pub");
+        if let Ok(line) = key.public_key().to_openssh() {
+            let _ = fs::write(&pub_path, format!("{line}\n"));
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3179,11 +4064,12 @@ mod tests {
             // through unchanged.
             0.5
         }
-        fn random_bytes(&self, out: &mut [u8]) {
+        fn random_bytes(&self, out: &mut [u8]) -> Result<()> {
             let n = self.nonce_counter.fetch_add(1, Ordering::SeqCst);
             for (i, b) in out.iter_mut().enumerate() {
                 *b = (n as u8).wrapping_add(i as u8);
             }
+            Ok(())
         }
     }
 
@@ -5044,5 +5930,756 @@ mod tests {
 
         assert_eq!(tr.calls(), 1, "only the HEAD");
         assert_eq!(seen.lock().unwrap()[0].completed, data.len() as i64);
+    }
+
+    // =======================================================================
+    // The `net` implementations
+    //
+    // Everything below is `#[cfg(feature = "net")]`, so `--no-default-features`
+    // still compiles and runs the whole suite above against the fakes. Nothing
+    // here touches the real internet either: the transport tests drive a
+    // throwaway HTTP server on **loopback**, which is hermetic (no DNS, no
+    // route, no third party) while still exercising real sockets, real HTTP/1.1
+    // framing and the real redirect loop. A test that reached
+    // `registry.ollama.ai` would download gigabytes and would fail on a plane.
+    // =======================================================================
+
+    /// A disposable HTTP/1.1 server on 127.0.0.1, for the transport tests.
+    ///
+    /// Deliberately dumb: it reads one request, logs it, writes whatever the
+    /// test's closure returns, and closes. It is **not** an HTTP server, it is a
+    /// scripted peer -- which is exactly what you want when the thing under test
+    /// is our side of the conversation.
+    #[cfg(feature = "net")]
+    mod loopback {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        /// One request as the server saw it, head and body kept apart.
+        #[derive(Debug, Clone)]
+        pub struct Seen {
+            /// Request line plus headers, verbatim, `\r\n` and all.
+            pub head: String,
+            /// The body, already read using the request's `Content-Length`.
+            pub body: Vec<u8>,
+        }
+
+        impl Seen {
+            /// Case-insensitive "did this header go out with this value?".
+            pub fn has_header(&self, name: &str, value: &str) -> bool {
+                self.head
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .any(|(k, v)| k.trim().eq_ignore_ascii_case(name) && v.trim() == value)
+            }
+
+            /// Is a header present at all, whatever its value?
+            pub fn has_header_name(&self, name: &str) -> bool {
+                self.head
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .any(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            }
+
+            /// The request line, e.g. `GET /v2/x HTTP/1.1`.
+            pub fn line(&self) -> &str {
+                self.head.lines().next().unwrap_or("")
+            }
+        }
+
+        /// A live scripted peer. Drop it and the thread finishes on its own.
+        pub struct Server {
+            port: u16,
+            log: Arc<Mutex<Vec<Seen>>>,
+        }
+
+        impl Server {
+            /// A URL on this server. `host` is a *name*, so a test can address
+            /// the same listener as `127.0.0.1` or as `localhost` and thereby
+            /// stage a genuine cross-host redirect over loopback.
+            pub fn url(&self, host: &str, path: &str) -> String {
+                format!("http://{host}:{}{path}", self.port)
+            }
+
+            /// Everything it has been asked so far, in order.
+            pub fn seen(&self) -> Vec<Seen> {
+                self.log.lock().unwrap().clone()
+            }
+        }
+
+        /// Spawn one. `reply` gets the request and its 0-based index.
+        pub fn serve(reply: impl Fn(&Seen, usize) -> Vec<u8> + Send + 'static) -> Server {
+            serve_with_port(|_| reply)
+        }
+
+        /// Same, but the reply closure is built **after** the port is known.
+        ///
+        /// Needed whenever a response has to name this very server -- staging a
+        /// cross-host redirect, for instance, where one listener is addressed as
+        /// both `localhost` and `127.0.0.1`.
+        pub fn serve_with_port<F>(make: impl FnOnce(u16) -> F) -> Server
+        where
+            F: Fn(&Seen, usize) -> Vec<u8> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local_addr").port();
+            let reply = make(port);
+            let log: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+            let thread_log = log.clone();
+
+            std::thread::spawn(move || {
+                // Bounded so a wrong test cannot leave a thread spinning
+                // forever; 64 is far more than any test here needs.
+                for (n, stream) in listener.incoming().take(64).enumerate() {
+                    let Ok(mut s) = stream else { break };
+                    let Some(req) = read_request(&mut s) else { break };
+                    thread_log.lock().unwrap().push(req.clone());
+                    let out = reply(&req, n);
+                    let _ = s.write_all(&out);
+                    let _ = s.flush();
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                }
+            });
+
+            Server { port, log }
+        }
+
+        /// Read one request. Byte-at-a-time is slow and completely fine at these
+        /// sizes; it keeps the framing obvious instead of hiding it in a buffer.
+        fn read_request(s: &mut std::net::TcpStream) -> Option<Seen> {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match s.read(&mut byte) {
+                    Ok(0) | Err(_) => return None,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let len: usize = head
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, v)| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            if len > 0 && s.read_exact(&mut body).is_err() {
+                return None;
+            }
+            Some(Seen { head, body })
+        }
+
+        /// Build a response. Always `Connection: close`, so every request in a
+        /// test is its own accept and the request log reads one-to-one.
+        pub fn http(status: u16, reason: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+            let mut out = format!("HTTP/1.1 {status} {reason}\r\n");
+            out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            out.push_str("Connection: close\r\n");
+            for (k, v) in headers {
+                out.push_str(&format!("{k}: {v}\r\n"));
+            }
+            out.push_str("\r\n");
+            let mut bytes = out.into_bytes();
+            bytes.extend_from_slice(body);
+            bytes
+        }
+    }
+
+    #[cfg(feature = "net")]
+    fn loopback_url(s: &str) -> Url {
+        Url::parse(s).expect("loopback url")
+    }
+
+    // -- Transport: the contract -------------------------------------------
+
+    /// A non-2xx is **not** an error. `make_request_with_retry` needs the 401's
+    /// `WWW-Authenticate` and `upload_blob` branches on the 404, so a transport
+    /// that swallowed them would break both.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_real_transport_hands_back_a_404_instead_of_erroring() {
+        let srv = loopback::serve(|_, _| loopback::http(404, "Not Found", &[], b"no such blob"));
+        let tr = UreqTransport::new();
+
+        let mut resp = tr
+            .execute(Request::get(loopback_url(&srv.url("127.0.0.1", "/v2/x/blobs/y"))))
+            .expect("a 404 is a response, not a transport failure");
+
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.read_to_end().unwrap(), b"no such blob");
+    }
+
+    /// The `Range` header goes out exactly as [`BlobDownload::download_chunk`]
+    /// spells it (inclusive-inclusive), and the bytes land unmangled.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_range_request_goes_out_verbatim_and_its_bytes_come_back_whole() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let served = data.clone();
+        let srv = loopback::serve(move |req, _| {
+            // Mirror what a CDN does, straight off the header we were sent.
+            let spec = req
+                .head
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim().eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.trim().trim_start_matches("bytes=").to_string())
+                .expect("a Range header");
+            let (a, b) = spec.split_once('-').unwrap();
+            let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+            loopback::http(206, "Partial Content", &[], &served[a..=b])
+        });
+
+        let tr = UreqTransport::new();
+        let mut req = Request::get(loopback_url(&srv.url("127.0.0.1", "/blob")));
+        req.set_header("Range", "bytes=10-19");
+        let mut resp = tr.execute(req).unwrap();
+
+        assert_eq!(resp.status, 206);
+        assert_eq!(resp.read_to_end().unwrap(), data[10..=19]);
+        assert!(srv.seen()[0].has_header("Range", "bytes=10-19"));
+    }
+
+    /// `Content-Length` is set from [`Body::len`], which knows the truth --
+    /// otherwise ureq falls back to `Transfer-Encoding: chunked` and the ollama
+    /// registry rejects the part.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_put_body_goes_up_length_delimited_never_chunked() {
+        let srv = loopback::serve(|_, _| loopback::http(201, "Created", &[], b""));
+        let tr = UreqTransport::new();
+
+        tr.execute(Request {
+            method: Method::Put,
+            url: loopback_url(&srv.url("127.0.0.1", "/v2/x/blobs/uploads/1")),
+            headers: Vec::new(),
+            body: Body::Bytes(b"hello".to_vec()),
+            redirect: RedirectPolicy::Follow,
+            stall_timeout: None,
+        })
+        .unwrap();
+
+        let seen = &srv.seen()[0];
+        assert!(seen.has_header("Content-Length", "5"), "head was:\n{}", seen.head);
+        assert!(
+            !seen.has_header_name("Transfer-Encoding"),
+            "chunked would be rejected by the registry"
+        );
+        assert_eq!(seen.body, b"hello");
+    }
+
+    /// A [`Body::FileRange`] sends **only** that range, straight off the disk.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_file_range_body_sends_exactly_the_slice_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        fs::write(&path, b"0123456789").unwrap();
+
+        let srv = loopback::serve(|_, _| loopback::http(202, "Accepted", &[], b""));
+        let tr = UreqTransport::new();
+
+        tr.execute(Request {
+            method: Method::Patch,
+            url: loopback_url(&srv.url("127.0.0.1", "/upload")),
+            headers: Vec::new(),
+            body: Body::FileRange {
+                path: path.clone(),
+                offset: 3,
+                len: 4,
+            },
+            redirect: RedirectPolicy::Follow,
+            stall_timeout: None,
+        })
+        .unwrap();
+
+        let seen = &srv.seen()[0];
+        assert!(seen.has_header("Content-Length", "4"));
+        assert_eq!(seen.body, b"3456");
+    }
+
+    /// The push **commit** is a `PUT` with `Content-Length: 0`. No header, no
+    /// commit -- a finished 20 GB push would be refused at the last step.
+    #[cfg(feature = "net")]
+    #[test]
+    fn an_empty_put_still_declares_content_length_zero() {
+        let srv = loopback::serve(|_, _| loopback::http(201, "Created", &[], b""));
+        let tr = UreqTransport::new();
+
+        tr.execute(Request {
+            method: Method::Put,
+            url: loopback_url(&srv.url("127.0.0.1", "/commit?digest=sha256:x&etag=y-1")),
+            headers: Vec::new(),
+            body: Body::Empty,
+            redirect: RedirectPolicy::Follow,
+            stall_timeout: None,
+        })
+        .unwrap();
+
+        assert!(srv.seen()[0].has_header("Content-Length", "0"));
+    }
+
+    // -- Transport: redirects ----------------------------------------------
+
+    /// The whole reason the redirect loop is hand-written: a cross-host hop must
+    /// **stop** and hand back the 3xx with its `Location`, because that URL is
+    /// the presigned CDN link the sixteen part-workers hit in parallel. Follow
+    /// it and you have serially downloaded the blob before the download starts.
+    #[cfg(feature = "net")]
+    #[test]
+    fn same_host_then_stop_returns_the_307_with_its_location_and_does_not_follow() {
+        let srv = loopback::serve(|_, _| {
+            loopback::http(
+                307,
+                "Temporary Redirect",
+                &[("Location", "https://cdn.example.invalid/blob?sig=abc")],
+                b"",
+            )
+        });
+        let tr = UreqTransport::new();
+
+        let mut req = Request::get(loopback_url(&srv.url("127.0.0.1", "/v2/x/blobs/y")));
+        req.redirect = RedirectPolicy::SameHostThenStop {
+            host: "127.0.0.1".to_string(),
+        };
+        let resp = tr.execute(req).unwrap();
+
+        assert_eq!(resp.status, 307);
+        assert_eq!(
+            resp.header("Location").unwrap(),
+            "https://cdn.example.invalid/blob?sig=abc"
+        );
+        assert_eq!(srv.seen().len(), 1, "it must NOT have chased the CDN");
+    }
+
+    /// ...but a hop that stays on the host **is** followed, exactly like
+    /// upstream's `CheckRedirect` returning `nil`.
+    #[cfg(feature = "net")]
+    #[test]
+    fn same_host_then_stop_follows_a_hop_that_stays_on_the_host() {
+        let srv = loopback::serve(|_, n| {
+            if n == 0 {
+                loopback::http(307, "Temporary Redirect", &[("Location", "/second")], b"")
+            } else {
+                loopback::http(200, "OK", &[], b"landed")
+            }
+        });
+        let tr = UreqTransport::new();
+
+        let mut req = Request::get(loopback_url(&srv.url("127.0.0.1", "/first")));
+        req.redirect = RedirectPolicy::SameHostThenStop {
+            host: "127.0.0.1".to_string(),
+        };
+        let mut resp = tr.execute(req).unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.read_to_end().unwrap(), b"landed");
+        let seen = srv.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].line().starts_with("GET /second"), "{}", seen[1].line());
+    }
+
+    /// Ten hops followed, the eleventh refused. **Upstream:** `len(via) > 10` in
+    /// both ollama's `CheckRedirect` and Go's own `defaultCheckRedirect`.
+    #[cfg(feature = "net")]
+    #[test]
+    fn following_redirects_gives_up_after_ten_hops() {
+        let srv = loopback::serve(|_, _| {
+            loopback::http(307, "Temporary Redirect", &[("Location", "/next")], b"")
+        });
+        let tr = UreqTransport::new();
+
+        let err = tr
+            .execute(Request::get(loopback_url(&srv.url("127.0.0.1", "/start"))))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RegistryError::MaxRedirectsExceeded),
+            "got {err:?}"
+        );
+        // The original request plus ten follows; the eleventh 3xx is where we
+        // stop, so the server saw exactly eleven.
+        assert_eq!(srv.seen().len(), 11);
+    }
+
+    /// Credentials never cross a host boundary. **Upstream:** Go's `http.Client`
+    /// strips `Authorization` on a cross-host redirect by default. Without this,
+    /// a registry that redirects you to its friend collects your bearer token.
+    ///
+    /// Staged entirely on loopback by addressing **one** listener under two
+    /// names: `localhost` and `127.0.0.1` are different hostnames to
+    /// [`Url::hostname`] but the same socket, so the follow really does cross a
+    /// host boundary while never leaving the machine. If this box does not
+    /// resolve `localhost` to that listener the test says so and stops, rather
+    /// than failing for a reason that has nothing to do with the code.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_cross_host_follow_arrives_without_the_bearer_token() {
+        let srv = loopback::serve_with_port(|port| {
+            move |_: &loopback::Seen, n: usize| {
+                if n == 0 {
+                    let target = format!("http://127.0.0.1:{port}/second");
+                    loopback::http(302, "Found", &[("Location", target.as_str())], b"")
+                } else {
+                    loopback::http(200, "OK", &[], b"ok")
+                }
+            }
+        });
+
+        let tr = UreqTransport::new();
+        let mut req = Request::get(loopback_url(&srv.url("localhost", "/first")));
+        req.set_header("Authorization", "Bearer secret-token");
+
+        let outcome = tr.execute(req);
+        let seen = srv.seen();
+        if outcome.is_err() || seen.len() < 2 {
+            eprintln!("skipping: `localhost` does not resolve to this listener here");
+            return;
+        }
+
+        assert!(
+            seen[0].has_header("Authorization", "Bearer secret-token"),
+            "the first hop must still be authenticated"
+        );
+        assert!(
+            !seen[1].has_header_name("Authorization"),
+            "the token leaked across a host boundary:\n{}",
+            seen[1].head
+        );
+    }
+
+    /// A `302` downgrades to a bodyless `GET`, per `net/http`'s
+    /// `redirectBehavior`. (A `307`, the one the registry actually sends, keeps
+    /// its method -- covered by the same-host follow test above.)
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_302_turns_the_request_into_a_bodyless_get() {
+        let srv = loopback::serve(|_, n| {
+            if n == 0 {
+                loopback::http(302, "Found", &[("Location", "/after")], b"")
+            } else {
+                loopback::http(200, "OK", &[], b"ok")
+            }
+        });
+        let tr = UreqTransport::new();
+
+        tr.execute(Request {
+            method: Method::Post,
+            url: loopback_url(&srv.url("127.0.0.1", "/before")),
+            headers: Vec::new(),
+            body: Body::Bytes(b"payload".to_vec()),
+            redirect: RedirectPolicy::Follow,
+            stall_timeout: None,
+        })
+        .unwrap();
+
+        let seen = srv.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].line().starts_with("POST /before"));
+        assert!(seen[1].line().starts_with("GET /after"), "{}", seen[1].line());
+        assert!(seen[1].body.is_empty(), "the body must not be replayed");
+    }
+
+    // -- the stall watchdog -------------------------------------------------
+
+    /// The claim `StallClamp` makes, actually checked: a connection that goes
+    /// **quiet mid-body** is abandoned after [`Request::stall_timeout`], and it
+    /// surfaces as [`io::ErrorKind::TimedOut`] -- which is the kind `copy_range`
+    /// turns into [`RegistryError::PartStalled`], the error that costs no retry.
+    ///
+    /// If a ureq upgrade ever stops calling `await_input` once per read attempt,
+    /// this is the test that notices before a 20 GB pull hangs forever.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_body_that_goes_quiet_mid_stream_times_out_as_a_stall() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            // Drain the request head so the client's write completes.
+            let mut byte = [0u8; 1];
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                match s.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            // Promise 100 bytes, hand over 10, then go silent. This is exactly
+            // what a wedged CDN connection looks like.
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            let _ = s.write_all(&[0u8; 10]);
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let tr = UreqTransport::new();
+        let mut req = Request::get(loopback_url(&format!("http://127.0.0.1:{port}/blob")));
+        req.stall_timeout = Some(Duration::from_millis(300));
+
+        let started = std::time::Instant::now();
+        let mut resp = tr.execute(req).unwrap();
+        assert_eq!(resp.status, 200);
+
+        // Drain until it gives up. The first read hands over the ten bytes that
+        // did arrive; the next one is the one that hangs.
+        let mut buf = [0u8; 64];
+        let err = loop {
+            match resp.body.read(&mut buf) {
+                Ok(0) => panic!("a silent connection must time out, not report clean EOF"),
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "copy_range only maps TimedOut onto PartStalled; got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "it waited for the server's 5s nap instead of its own 300ms idle window"
+        );
+    }
+
+    // -- md5 ----------------------------------------------------------------
+
+    /// The real md5, against RFC 1321 appendix A.5's own test suite. Also proves
+    /// the reset half of the [`Md5Hasher`] contract: the second and third
+    /// digests are only right if `finalize_and_reset` really emptied the state.
+    #[cfg(feature = "net")]
+    #[test]
+    fn md5_matches_the_rfc_1321_test_vectors() {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        let mut h = Md5::new();
+        assert_eq!(hex(&h.finalize_and_reset()), "d41d8cd98f00b204e9800998ecf8427e");
+
+        h.update(b"abc");
+        assert_eq!(hex(&h.finalize_and_reset()), "900150983cd24fb0d6963f7d28e17f72");
+
+        // Fed in two goes, to prove streaming and one-shot agree.
+        h.update(b"message ");
+        h.update(b"digest");
+        assert_eq!(hex(&h.finalize_and_reset()), "f96b697d7cb7938d525a2f31aaf161d0");
+    }
+
+    /// The commit etag with the **real** md5 behind it.
+    ///
+    /// The stub-based test above pins the framing; this one pins the thing the
+    /// stub cannot see -- that `commit_etag` hashes each part's **16-byte
+    /// digest**, in order, and not the part's payload. Feeding it the payload
+    /// instead produces a plausible-looking etag the registry rejects, and
+    /// nothing else in the push would notice.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_commit_etag_with_a_real_md5_hashes_the_part_digests_in_order() {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+
+        let mut up = BlobUpload::new(layer_of(b"xy", ""), 2);
+        up.parts = vec![
+            UploadPart { n: 0, offset: 0, size: 1, md5: Some([1u8; 16]) },
+            UploadPart { n: 1, offset: 1, size: 1, md5: Some([2u8; 16]) },
+        ];
+
+        // What it must be: md5 over the two digests concatenated, then `-2`.
+        let mut expect = Md5::new();
+        expect.update(&[1u8; 16]);
+        expect.update(&[2u8; 16]);
+        let want = format!("{}-2", hex(&expect.finalize_and_reset()));
+
+        assert_eq!(up.commit_etag(&mut Md5::new()).unwrap(), want);
+
+        // Order is load-bearing: swap the parts and the etag must move.
+        up.parts.swap(0, 1);
+        assert_ne!(up.commit_etag(&mut Md5::new()).unwrap(), want);
+    }
+
+    // -- the signer ---------------------------------------------------------
+
+    /// First use makes the key; every later use reads the same one back.
+    ///
+    /// **Upstream:** `initializeKeypair` in `cmd/cmd.go`. The identity must be
+    /// stable -- regenerate it and the registry stops recognising the account.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_missing_key_is_created_on_first_use_and_then_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join(".ollama").join("id_ed25519");
+        assert!(!key.exists());
+
+        let first = SshSigner::open_at(&key).unwrap();
+        assert!(key.exists(), "the key must have been created");
+        assert!(
+            key.with_extension("pub").exists(),
+            "the .pub is written alongside, like upstream"
+        );
+
+        let pem = fs::read_to_string(&key).unwrap();
+        assert!(
+            pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"),
+            "must be OpenSSH PEM, not raw key bytes"
+        );
+        assert!(!pem.contains('\r'), "OpenSSH PEM is LF, even on Windows");
+
+        let second = SshSigner::open_at(&key).unwrap();
+        assert_eq!(
+            first.public_key_blob().unwrap(),
+            second.public_key_blob().unwrap(),
+            "reopening must NOT mint a new identity"
+        );
+    }
+
+    /// The two things that are impossible to debug from the outside, pinned:
+    /// the advertised public key is the **middle field only**, and the signature
+    /// is the **raw 64 bytes**, not the SSH wire wrapper. Get either wrong and
+    /// the registry answers 401 forever with no explanation.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_signature_verifies_against_the_public_key_blob_we_advertise() {
+        use ed25519_dalek::Verifier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let signer = SshSigner::open_at(dir.path().join("id_ed25519")).unwrap();
+
+        let blob = signer.public_key_blob().unwrap();
+        assert!(
+            !blob.starts_with("ssh-ed25519"),
+            "the type prefix must be stripped -- upstream takes Split(..., \" \")[1]"
+        );
+        assert!(!blob.contains(' '), "no comment, no prefix, just the blob");
+
+        // Reassemble the authorized-key line the blob came from; if the blob is
+        // the right field this parses, and if it is not it doesn't.
+        let public = ssh_key::PublicKey::from_openssh(&format!("ssh-ed25519 {blob}"))
+            .expect("the blob is a real ed25519 authorized-key field");
+        let raw = public.key_data().ed25519().expect("ed25519").0;
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&raw).unwrap();
+
+        // Sign the exact payload the registry challenge would produce.
+        let url = Url::parse("https://ollama.com/api/me?ts=1&nonce=abc").unwrap();
+        let payload = authorization_payload(Method::Get, &url);
+        let sig = signer.sign(&payload).unwrap();
+
+        assert_eq!(sig.len(), 64, "raw ed25519 signature, not the SSH wrapper");
+        let sig = ed25519_dalek::Signature::from_slice(&sig).unwrap();
+        verifying
+            .verify(&payload, &sig)
+            .expect("the registry must be able to verify what we send");
+
+        // A different payload must not verify -- otherwise the check above would
+        // pass for a signer that ignored its input.
+        let other = authorization_payload(Method::Get, &Url::parse("https://ollama.com/x").unwrap());
+        assert!(verifying.verify(&other, &sig).is_err());
+    }
+
+    /// `sign_authorization` frames it as `<pubkey blob>:<base64 signature>`.
+    /// **Upstream:** the last line of `auth.Sign`.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_real_signer_frames_its_answer_as_pubkey_colon_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = SshSigner::open_at(dir.path().join("id_ed25519")).unwrap();
+
+        let framed = sign_authorization(&signer, b"whatever").unwrap();
+        let (pubkey, sig) = framed.split_once(':').expect("pubkey:signature");
+
+        assert_eq!(pubkey, signer.public_key_blob().unwrap());
+        // 64 raw bytes -> 88 base64 chars with padding.
+        assert_eq!(sig.len(), 88, "std base64 of 64 bytes");
+        assert!(sig.ends_with("=="));
+    }
+
+    /// A file that is not an OpenSSH key fails with a message that says so,
+    /// instead of a shrug. Nobody should spend an hour on the wrong bug.
+    #[cfg(feature = "net")]
+    #[test]
+    fn a_key_file_that_is_not_openssh_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_ed25519");
+        fs::write(&key, b"this is not a key lah").unwrap();
+
+        let err = SshSigner::open_at(&key).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not an OpenSSH private key"), "got {msg}");
+        assert!(msg.contains("id_ed25519"), "must name the file: {msg}");
+    }
+
+    /// `~/.ollama` resolves off `$HOME` -- which is what makes Termux work
+    /// unchanged, since it sets only `HOME`.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_key_lives_under_a_dot_ollama_directory_in_the_home() {
+        let home = ollama_home().expect("this machine has a home directory");
+        assert_eq!(home.file_name().unwrap(), ".ollama");
+        assert_eq!(
+            ollama_key_path().unwrap(),
+            home.join("id_ed25519"),
+            "upstream's auth/auth.go defaultPrivateKey"
+        );
+    }
+
+    // -- the nonce (bd-djx) -------------------------------------------------
+
+    /// **bd-djx.** The auth nonce comes from the OS CSPRNG now, not the
+    /// clock-seeded xorshift it used to come from.
+    ///
+    /// A statistical test cannot *prove* a CSPRNG, so this pins the two things
+    /// that are actually checkable and that the old code failed: the draw
+    /// succeeds, and independently constructed ambients do not share a stream.
+    /// Under the old xorshift, two [`SystemAmbient`]s made in the same
+    /// nanosecond got the same seed and therefore the same nonce sequence --
+    /// which is what made a replay possible.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_auth_nonce_comes_from_the_os_csprng() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            // A fresh ambient each time: this is the case the old clock-seeded
+            // PRNG could collide on.
+            let amb = SystemAmbient::new();
+            let mut buf = [0u8; NONCE_LEN];
+            amb.random_bytes(&mut buf)
+                .expect("the OS CSPRNG must be available");
+            assert!(buf.iter().any(|b| *b != 0), "an all-zero nonce is not random");
+            assert!(seen.insert(buf), "a nonce repeated -- that is a replay hole");
+        }
+    }
+
+    /// And the same ambient does not repeat itself either.
+    #[cfg(feature = "net")]
+    #[test]
+    fn one_ambient_never_hands_out_the_same_nonce_twice() {
+        let amb = SystemAmbient::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let mut buf = [0u8; NONCE_LEN];
+            amb.random_bytes(&mut buf).unwrap();
+            assert!(seen.insert(buf));
+        }
+    }
+
+    /// The jitter dice are still the cheap PRNG, still in `[0, 1)`, and still
+    /// move -- they were never the problem and did not need a dependency.
+    #[cfg(feature = "net")]
+    #[test]
+    fn the_backoff_jitter_is_still_the_cheap_prng_and_still_in_range() {
+        let amb = SystemAmbient::new();
+        let rolls: Vec<f64> = (0..64).map(|_| amb.random_f64()).collect();
+        assert!(rolls.iter().all(|r| (0.0..1.0).contains(r)));
+        assert!(
+            rolls.windows(2).any(|w| w[0] != w[1]),
+            "a constant roll would defeat the whole point of jitter"
+        );
     }
 }
