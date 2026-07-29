@@ -1,6 +1,67 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-29 (ollama port started; 0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
+**Last updated:** 2026-07-29 18:30 (ollama port: 3 agent waves done, 1358 tests; 0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
+
+> ## ⏹ WHERE THE 2026-07-29 EVENING SESSION ENDED
+>
+> **Branch `ollama-port`, pushed, `HEAD == origin/ollama-port` at `564d74c5c9`.**
+> Working tree clean. NOT merged to `main` — that is the maintainer's call.
+> **NOT published to crates.io**, deliberately: see "before publishing" below.
+>
+> **Gates, run by the main loop over the merged tree, not taken on any agent's
+> word:** 1358 tests (1350 lib + 8 doctests) with `net` on, 1290 with
+> `--no-default-features`, clippy clean in both, `cargo check --workspace` clean.
+>
+> ### The three-wave shape, and the one trick that made it work
+>
+> 18 agents across 3 waves, each owning **exactly one path**, each in its own
+> worktree. **Declare every module in `lib.rs` as a stub BEFORE spawning** — that
+> is what let 18 branches merge with zero conflicts, because no agent ever had to
+> touch `lib.rs` or `Cargo.toml`. Freeze the shared vocabulary (`api.rs`) first,
+> for the same reason. Both are written up under the wave-1 notes below.
+>
+> **Two traps that cost real time, do not rediscover them:**
+> * Worktrees branch from `main`, which does NOT contain the crate, so every
+>   agent mirrors it in. **Copy back ONLY the agent's owned path**, never a
+>   worktree wholesale — the rest is a stale snapshot of other agents' work.
+> * **`cargo` serves a stale test binary after a file swap.** A green run right
+>   after a merge can be a lie; it reported the OLD test count twice. Always
+>   `cargo clean -p kopitiam-ollama --release` before verifying a merge.
+>
+> ### Before anything is published — read `bd-fkv` first
+>
+> `bd-fkv` (P1) is the one that matters: `convert.rs`'s `permute()` is the single
+> place an agent had to **reason rather than read** the Go. If that reading is
+> wrong, every llama/mistral Q/K tensor converts **transposed** and the model
+> produces *fluent nonsense* rather than failing loudly. The bead lists three
+> verification routes, cheapest first. Until it is settled, treat llama/mistral
+> conversion output as untrusted.
+>
+> Also open: `bd-9a4` (the independent audit — coverage gaps, duplicate types,
+> provenance), `bd-nzk` (`Timestamp::from_unix_nanos` wraps silently outside
+> ~1678..2262). `bd-djx` and `bd-iut` are **closed**.
+>
+> ### Next session, in order
+>
+> 1. **`routes.rs` reconciliation — the maintainer APPROVED it this session:**
+>    routes may depend on `create` / `sched` / `manifest` / `options`. Until it
+>    does, `CreateRequest` exists twice with **incompatible field types**,
+>    `LoadedModel` twice with different integer widths, and the model descriptor
+>    three times. No handler can actually run until this is done.
+> 2. Verify `bd-fkv`.
+> 3. The unported-but-unacknowledged gaps in `bd-9a4`: `model_list_cache.go` +
+>    `model_show_cache.go` (1,599 LOC — why `list`/`show` are instant),
+>    `api/client.go` (we can BE an ollama server, not talk to one),
+>    `openai/responses.go` (1,382 LOC).
+> 4. `routes.rs` handler bodies (33 route variants, 10 handlers).
+> 5. Fix the one byte-level Anthropic divergence: `MessagesResponse::content`
+>    emits `[]` where Go emits `null` for a wholly empty reply.
+> 6. **Wire it into `kopitiam-ai`** — still entirely additive so far, nothing
+>    consumes the port. This is what closes `bd-250.3` (ChatML hardcoded for
+>    every model), which was the original point.
+>
+> Housekeeping done at close: `.claude/worktrees/` is now gitignored (19 full
+> repo copies were sitting untracked — one careless `git add -A` from disaster).
 **Purpose:** if the session dies, this file plus `bn ready` is enough to pick up
 without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md.)
 

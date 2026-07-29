@@ -41,3 +41,14 @@ vendor/
 *.traineddata
 # Scratch dir the netfetch tests use when pointed away from the XDG store.
 /.netfetch-models/
+
+# ---------------------------------------------------------------------------
+# Agent worktrees
+# ---------------------------------------------------------------------------
+# When work is fanned out to parallel agents, each gets its own git worktree
+# under here — and each is a FULL checkout of the repo. During the ollama port
+# there were nineteen of them at once, all showing as untracked, which means a
+# careless `git add -A` would have tried to commit nineteen copies of the tree.
+# They are disposable by construction (`git worktree prune` after the agents
+# finish), so nothing in here should ever be committable.
+/.claude/worktrees/
