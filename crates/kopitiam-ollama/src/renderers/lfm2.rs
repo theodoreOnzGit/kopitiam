@@ -307,9 +307,12 @@ fn lfm2_tool_schema_json(tool: &Tool) -> String {
         s.push(']');
     }
     s.push_str(",\"properties\":");
-    if !f.parameters.has_properties() {
+    if f.parameters.properties.is_none() {
         // Nil `*ToolPropertiesMap` upstream -- and this family's fixture is the
-        // one that pins it. See [`super::json`].
+        // one that pins the `null`. Note the check is `is_none()`, NOT
+        // `!has_properties()`: `ToolFunctionParameters.Properties` has no
+        // `omitempty`, so a **set-but-empty** map marshals `{}` and must fall
+        // through to the branch below. See [`super::json`].
         s.push_str("null");
     } else {
         s.push('{');
@@ -760,5 +763,35 @@ mod tests {
             .unwrap();
         assert!(!got.contains("<think>"), "{got}");
         assert!(!got.contains("secret"), "{got}");
+    }
+
+    /// `bd-iut`, at the family whose fixture pins the `null`.
+    ///
+    /// `ToolFunctionParameters.Properties` carries **no** `omitempty` upstream,
+    /// so the key is always written and all three states differ. The `null` half
+    /// is upstream's own fixture; the `{}` half is not, and it is the one that
+    /// `!has_properties()` used to get wrong -- an argument-less tool would have
+    /// gone out as `"properties": null`, telling the model nobody had described
+    /// the tool rather than that it takes nothing.
+    #[test]
+    fn a_set_but_empty_property_map_is_an_object_not_null() {
+        let schema = |parameters: serde_json::Value| {
+            lfm2_tool_schema_json(
+                &serde_json::from_value(json!({
+                    "type": "function",
+                    "function": {"name": "noargs", "parameters": parameters}
+                }))
+                .expect("valid fixture tool"),
+            )
+        };
+
+        assert!(
+            schema(json!({"type": "object"})).contains(r#""properties": null"#),
+            "absent stays null"
+        );
+        assert!(
+            schema(json!({"type": "object", "properties": {}})).contains(r#""properties": {}"#),
+            "set-but-empty must survive as an empty object"
+        );
     }
 }

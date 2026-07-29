@@ -460,12 +460,17 @@ impl Gemma4Renderer {
         sb.push_str(&format!("<|tool>declaration:{}{{", fn_.name));
         sb.push_str(&format!("description:{G4Q}{}{G4Q}", fn_.description));
 
-        // Upstream's guard is `Properties != nil || Type != ""`. Our
-        // `properties` is a non-optional map, so "not nil" becomes "not empty";
-        // a tool with neither properties nor a type still writes no
-        // `parameters:` block, which is upstream's `rawDeclRef` case... except
-        // that one HAS a type. See the tests.
-        if fn_.parameters.has_properties() || !fn_.parameters.param_type.is_empty() {
+        // Upstream: `Properties != nil || Type != ""` -- the OUTER guard asks
+        // "did anybody describe this tool at all?", so a **set-but-empty**
+        // property map opens a `parameters:{}` block while an absent one does
+        // not. `is_some()`, therefore, NOT `has_properties()`: the latter is
+        // false for `Some(empty)` too and would swallow the distinction. (Go's
+        // pointer field makes all three states real -- see [`super::json`].)
+        //
+        // The INNER guard is upstream's `Properties != nil && Len() > 0`, which
+        // IS exactly `has_properties()` -- an empty map contributes no
+        // `properties:{}` sub-block.
+        if fn_.parameters.properties.is_some() || !fn_.parameters.param_type.is_empty() {
             sb.push_str(",parameters:{");
             let mut needs_comma = false;
 
@@ -1191,6 +1196,31 @@ mod tests {
             r().render(&[Message::new("user", "Hi")], &[], None)
                 .unwrap()
                 .starts_with("<bos>")
+        );
+    }
+
+    /// `bd-iut`, gemma4's copy of the same guard. Upstream:
+    /// `Properties != nil || Type != ""`. With no type, whether a `parameters:`
+    /// block appears at all turns entirely on set-but-empty vs absent, and no
+    /// upstream fixture reaches it -- so it is pinned here instead.
+    #[test]
+    fn a_typeless_tool_still_declares_parameters_when_its_property_map_is_set() {
+        let decl = |parameters: serde_json::Value| {
+            r().render_tool_declaration(&tool(json!({
+                "type": "function",
+                "function": {"name": "noargs", "description": "", "parameters": parameters}
+            })))
+        };
+
+        assert_eq!(
+            decl(json!({"type": "", "properties": {}})),
+            "<|tool>declaration:noargs{description:<|\"|><|\"|>,parameters:{}}<tool|>",
+            "set-but-empty means `takes no arguments` -- the block must appear"
+        );
+        assert_eq!(
+            decl(json!({"type": ""})),
+            "<|tool>declaration:noargs{description:<|\"|><|\"|>}<tool|>",
+            "absent means `nobody described this` -- no block at all"
         );
     }
 }

@@ -115,7 +115,14 @@ impl FunctionGemmaRenderer {
         ));
         sb.push_str(&format!("description:{ESC}{}{ESC}", f.description));
 
-        if f.parameters.has_properties() || !f.parameters.param_type.is_empty() {
+        // Upstream: `Properties != nil || Type != ""`. The OUTER guard is a
+        // nil-check, so a **set-but-empty** property map still opens a
+        // `parameters:{...}` block -- `is_some()`, never `has_properties()`,
+        // which is false for `Some(empty)` as well as `None`. The INNER guard
+        // below really is `Properties != nil && Len() > 0`, i.e. exactly
+        // `has_properties()`. See [`super::json`] for why the three states are
+        // distinguishable at all.
+        if f.parameters.properties.is_some() || !f.parameters.param_type.is_empty() {
             sb.push_str(",parameters:{");
             let mut needs_comma = false;
 
@@ -595,5 +602,61 @@ mod tests {
             .unwrap();
         assert!(got.contains("response:first{<escape>r1<escape>}"), "{got}");
         assert!(got.contains("response:second{<escape>r2<escape>}"), "{got}");
+    }
+
+    /// Upstream `tool_empty_properties`: a **set-but-empty** property map emits
+    /// no `properties:{}` sub-block, only the `type`.
+    #[test]
+    fn an_empty_property_map_contributes_no_properties_sub_block() {
+        let got = r().render_tool_declaration(
+            &serde_json::from_value(json!({
+                "type": "function",
+                "function": {
+                    "name": "test_fn",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            got,
+            "<start_function_declaration>declaration:test_fn{description:<escape><escape>,\
+             parameters:{type:<escape>OBJECT<escape>}}<end_function_declaration>"
+        );
+    }
+
+    /// `bd-iut`. Upstream's OUTER guard is `Properties != nil || Type != ""`,
+    /// so with **no** type at all the empty-vs-absent distinction is the only
+    /// thing deciding whether a `parameters:` block appears. Nothing in
+    /// upstream's fixture set reaches this (its empty-properties tool also has a
+    /// type), which is exactly why it is worth pinning: `has_properties()` here
+    /// instead of `is_some()` silently drops the block and tells the model this
+    /// tool was never described, rather than that it takes nothing.
+    #[test]
+    fn a_typeless_tool_still_declares_parameters_when_its_property_map_is_set() {
+        let decl = |raw: serde_json::Value| r().render_tool_declaration(&raw_tool(raw));
+
+        assert_eq!(
+            decl(json!({"type": "", "properties": {}})),
+            "<start_function_declaration>declaration:noargs{description:<escape><escape>,\
+             parameters:{}}<end_function_declaration>",
+            "set-but-empty means `takes no arguments` -- the block must appear"
+        );
+        assert_eq!(
+            decl(json!({"type": ""})),
+            "<start_function_declaration>declaration:noargs{description:<escape><escape>}\
+             <end_function_declaration>",
+            "absent means `nobody described this` -- no block at all"
+        );
+    }
+
+    /// A tool with only its `parameters` varying, for the test above.
+    fn raw_tool(parameters: serde_json::Value) -> Tool {
+        serde_json::from_value(json!({
+            "type": "function",
+            "function": {"name": "noargs", "description": "", "parameters": parameters}
+        }))
+        .expect("valid fixture tool")
     }
 }

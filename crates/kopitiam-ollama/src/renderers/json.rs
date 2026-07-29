@@ -31,18 +31,53 @@
 //! ever marshals. Small price, and it means the framing can be tested without
 //! a feature flag on `serde_json` deciding whether our prompts are right.
 //!
+//! ## `"properties"`: three states, and the `omitempty` that differs between them
+//!
+//! Upstream declares the field **twice**, with different tags, and the
+//! difference is load-bearing (`api/types.go`):
+//!
+//! ```go
+//! type ToolFunctionParameters struct { ... Properties *ToolPropertiesMap `json:"properties"` }
+//! type ToolProperty          struct { ... Properties *ToolPropertiesMap `json:"properties,omitempty"` }
+//! ```
+//!
+//! Both are **pointers**, so all three states are distinguishable, and
+//! [`crate::api::ToolFunctionParameters::properties`] is an `Option` for exactly
+//! that reason (`bd-iut`). Go's `omitempty` on a pointer means *omit when nil*,
+//! **not** *omit when the map is empty* -- a non-nil pointer to an empty map is
+//! still written out. So:
+//!
+//! | State | in `ToolFunctionParameters` (no omitempty) | in `ToolProperty` (omitempty) |
+//! |---|---|---|
+//! | `None` | `"properties":null` | key omitted entirely |
+//! | `Some(empty)` | `"properties":{}` | `"properties":{}` |
+//! | `Some(populated)` | `"properties":{...}` | `"properties":{...}` |
+//!
+//! [`write_go_parameters`] and [`write_go_property`] implement one column each.
+//! Upstream's LFM2 fixture pins the `null` cell; upstream's functiongemma
+//! `tool_empty_properties` fixture is the one that supplies a `Some(empty)`.
+//!
+//! **The trap this cost us once already:** [`crate::api::ToolFunctionParameters::has_properties`]
+//! answers *"is there anything to iterate?"*, and it is **false for both `None`
+//! and `Some(empty)`**. That is right for a loop and wrong for a `!= nil` check.
+//! Anywhere upstream writes `Properties != nil`, the Rust must be
+//! `properties.is_some()` -- never `has_properties()`.
+//!
 //! ## Known divergences (deliberate, say-so-out-loud)
 //!
-//! * **`"properties"` when there are none.** Upstream's `Properties` is a
-//!   `*ToolPropertiesMap`, so a caller who never set it marshals `null`, while
-//!   one who set it and left it empty marshals `{}`. Our [`crate::api`] models it
-//!   as a plain `IndexMap` with no nil state, so empty maps to **`null`** -- the
-//!   nil case, which is the one upstream's LFM2 fixture actually asserts. The
-//!   set-but-empty case is unrepresentable here; no fixture exercises it.
 //! * **Extreme floats.** Go's float encoder and Rust's shortest-round-trip
 //!   encoder can disagree on the exponent spelling for magnitudes below `1e-6`
 //!   or at/above `1e21`. Tool arguments in that range basically don't happen,
 //!   and no fixture has one.
+//! * **Backspace (U+0008) and form feed (U+000C).** `write_go_string` sends both
+//!   out in the six-character `\u00xx` form, matching Go's **classic**
+//!   `encoding/json`: its `encode.go` carries
+//!   short forms for `\n`, `\r` and `\t` only, and sends every other byte below
+//!   `0x20` out as `\u00xx`. Upstream's own `marshalWithSpaces` test table
+//!   *writes* them as `\b` / `\f`, which is what the newer `encoding/json` v2
+//!   emitter does -- we follow the classic one. A control character inside a
+//!   tool description is a broken schema either way, and no renderer fixture
+//!   reaches it.
 
 use serde_json::Value;
 
@@ -84,7 +119,7 @@ fn write_go_string(s: &str, out: &mut String) {
 /// marshals a `map[string]any` -- and every `any` a renderer touches (tool-call
 /// argument values, `items`, `enum` entries) arrived as a Go map. Note this is
 /// the *opposite* of what happens to the argument map itself, which keeps
-/// insertion order (see [`write_go_arguments`]); the two rules live side by side
+/// insertion order (see [`go_arguments`]); the two rules live side by side
 /// on purpose.
 pub(crate) fn write_go_value(v: &Value, out: &mut String) {
     match v {
@@ -579,6 +614,70 @@ mod tests {
             go_tool(&tool),
             r#"{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","required":["location"],"properties":{"location":{"type":"string","description":"City"}}}}}"#
         );
+    }
+
+    /// `bd-iut`, at the emitter. `ToolFunctionParameters.Properties` has **no**
+    /// `omitempty` upstream, so the key is always written and all three states
+    /// land on three different bytes-on-the-wire.
+    #[test]
+    fn parameters_emit_all_three_property_states_distinctly() {
+        let mut p = ToolFunctionParameters {
+            param_type: "object".into(),
+            ..Default::default()
+        };
+
+        let go = |p: &ToolFunctionParameters| {
+            let mut s = String::new();
+            write_go_parameters(p, &mut s);
+            s
+        };
+
+        assert_eq!(go(&p), r#"{"type":"object","properties":null}"#);
+
+        p.properties = Some(indexmap::IndexMap::new());
+        assert_eq!(
+            go(&p),
+            r#"{"type":"object","properties":{}}"#,
+            "a tool that takes NO arguments must not look like one nobody described"
+        );
+
+        let mut m = indexmap::IndexMap::new();
+        m.insert(
+            "city".to_string(),
+            ToolProperty {
+                prop_type: PropertyType(vec!["string".into()]),
+                ..Default::default()
+            },
+        );
+        p.properties = Some(m);
+        assert_eq!(
+            go(&p),
+            r#"{"type":"object","properties":{"city":{"type":"string"}}}"#
+        );
+    }
+
+    /// ...and the other column of the table: on `ToolProperty` the field DOES
+    /// carry `omitempty`, so `None` drops the key entirely while `Some(empty)`
+    /// still writes `{}`. Two fields, one name, two rules.
+    #[test]
+    fn a_nested_property_map_omits_when_absent_but_writes_when_empty() {
+        let go = |p: &ToolProperty| {
+            let mut s = String::new();
+            write_go_property(p, &mut s);
+            s
+        };
+
+        let base = ToolProperty {
+            prop_type: PropertyType(vec!["object".into()]),
+            ..Default::default()
+        };
+        assert_eq!(go(&base), r#"{"type":"object"}"#);
+
+        let empty = ToolProperty {
+            properties: Some(indexmap::IndexMap::new()),
+            ..base.clone()
+        };
+        assert_eq!(go(&empty), r#"{"type":"object","properties":{}}"#);
     }
 
     #[test]

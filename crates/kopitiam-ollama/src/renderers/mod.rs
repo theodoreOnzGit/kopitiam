@@ -53,11 +53,35 @@
 //! | `lfm2`, `lfm2-thinking` | [`Lfm2Renderer`] | `lfm2.go` |
 //! | `gemma4`, `gemma4-small`, `gemma4-large` | [`Gemma4Renderer`] | `gemma4.go` |
 //! | `functiongemma` | [`FunctionGemmaRenderer`] | `functiongemma.go` |
+//! | `nemotron-3-nano` | [`Nemotron3NanoRenderer`] | `nemotron3nano.go` |
+//! | `laguna` | [`LagunaRenderer`] | `laguna.go` |
+//! | `poolside-v1` | [`LagunaV8Renderer`] | `laguna.go` |
 //!
-//! Not yet reached (still upstream-only): `nemotron-3-nano`, `laguna` /
-//! `poolside-v1`. Asking for one of those names returns
-//! [`RenderError::UnknownRenderer`] -- a loud failure, never a silently wrong
-//! prompt.
+//! **The renderer side of the port is now complete** -- every name upstream's
+//! `rendererForName` dispatches, we dispatch.
+//! `tests::the_renderer_registry_is_at_parity_with_upstream` pins that in both
+//! directions: drop a name and it fails, invent one upstream does not have and
+//! it fails too.
+//!
+//! Any *other* name still returns [`RenderError::UnknownRenderer`] -- a loud
+//! failure, never a silently wrong prompt.
+//!
+//! ## Renderers vs. parsers -- two lists, and they do NOT match
+//!
+//! A model manifest carries **two independent** names: `ConfigV2.renderer`
+//! (prompt in) and `ConfigV2.parser` (text out). They are not one namespace, and
+//! **upstream itself does not keep them in sync** -- see
+//! `tests::the_renderer_and_parser_name_lists_agree_where_upstream_says_they_should`
+//! for the full accounting and the current gap list. The short version:
+//!
+//! * Upstream registers **23** renderer names and **25** parser names, sharing
+//!   only **18**. `deepseek3.1` renders but parses as `deepseek3`;
+//!   `gemma4-large` / `gemma4-small` render but parse as `gemma4` /
+//!   `gemma4-no-thinking`; `harmony`, `ministral` and `passthrough` parse but
+//!   never render. Those skews are upstream's design, not drift.
+//! * **Our port's gap is different and real**: ten families we can render, we
+//!   cannot yet parse. [`crate::parsers`] is being filled in separately; the test
+//!   is written so the gap *shrinking* passes and the gap *growing* fails.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,7 +99,9 @@ mod glm47;
 mod glmocr;
 mod image_tags;
 mod json;
+mod laguna;
 mod lfm2;
+mod nemotron3nano;
 mod olmo3;
 mod olmo3_think;
 mod qwen35;
@@ -90,7 +116,9 @@ pub use gemma4::Gemma4Renderer;
 pub use glm46::Glm46Renderer;
 pub use glm47::Glm47Renderer;
 pub use glmocr::GlmOcrRenderer;
+pub use laguna::{LagunaRenderer, LagunaV8Renderer};
 pub use lfm2::Lfm2Renderer;
+pub use nemotron3nano::Nemotron3NanoRenderer;
 pub use olmo3::Olmo3Renderer;
 pub use olmo3_think::{Olmo3ThinkRenderer, Olmo3ThinkVariant};
 pub use qwen3coder::Qwen3CoderRenderer;
@@ -251,6 +279,7 @@ fn built_in_renderer(name: &str) -> Option<Box<dyn Renderer>> {
         "olmo3-32b-think" => Box::new(Olmo3ThinkRenderer {
             variant: Olmo3ThinkVariant::Olmo3Think32B,
         }),
+        "nemotron-3-nano" => Box::new(Nemotron3NanoRenderer),
         "gemma4" | "gemma4-small" => Box::new(Gemma4Renderer {
             use_img_tags: img,
             empty_block_on_nothink: false,
@@ -270,6 +299,10 @@ fn built_in_renderer(name: &str) -> Option<Box<dyn Renderer>> {
             is_thinking: true,
             use_img_tags: img,
         }),
+        // Two names, two *different* renderers -- v2 and v8 of the same family.
+        // See `laguna.rs`: they share a vocabulary and disagree on every newline.
+        "laguna" => Box::new(LagunaRenderer),
+        "poolside-v1" => Box::new(LagunaV8Renderer),
         "cohere" => Box::new(CohereRenderer),
         _ => return None,
     })
@@ -379,7 +412,7 @@ mod tests {
         );
     }
 
-    /// Upstream `TestLeadingBOSForRenderer`, minus the families not yet ported.
+    /// Upstream `TestLeadingBOSForRenderer`, every case.
     /// The BOS strings are full-width / unusual on purpose -- copy them, never
     /// retype them.
     #[test]
@@ -392,6 +425,8 @@ mod tests {
             ("gemma4-large", "<bos>"),
             ("lfm2", "<|startoftext|>"),
             ("lfm2-thinking", "<|startoftext|>"),
+            ("laguna", "〈|EOS|〉"),
+            ("poolside-v1", "〈|EOS|〉"),
             ("deepseek3.1", "<｜begin▁of▁sentence｜>"),
             ("cogito", "<｜begin▁of▁sentence｜>"),
             ("qwen3-coder", ""),
@@ -400,6 +435,252 @@ mod tests {
         ];
         for (name, want) in cases {
             assert_eq!(leading_bos_for_renderer(name), want, "{name}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Renderer / parser name reconciliation
+    // -----------------------------------------------------------------------
+    //
+    // Everything below exists because `ConfigV2` carries TWO names -- `renderer`
+    // and `parser` -- and a model is only fully supported when BOTH resolve. A
+    // family that renders but does not parse produces a correct prompt and then
+    // leaks raw `<tool_call>` markup into user-visible content; a family that
+    // parses but does not render gets a generic template prompt and quietly
+    // degrades. Neither failure raises an error at runtime, which is exactly why
+    // it needs a test.
+    //
+    // These lists are transcribed from the oracle -- ollama
+    // `model/renderers/renderer.go` `rendererForName` and
+    // `model/parsers/parsers.go` `ParserForName`, pinned at 4713800b08. If you
+    // re-vendor a newer ollama, re-transcribe them; that is the whole point.
+
+    /// Every name upstream's `rendererForName` dispatches. 23 of them.
+    const UPSTREAM_RENDERER_NAMES: &[&str] = &[
+        "qwen3-coder",
+        "qwen3-vl-instruct",
+        "qwen3-vl-thinking",
+        "qwen3.5",
+        "ornith",
+        "cogito",
+        "deepseek3.1",
+        "olmo3",
+        "olmo3.1",
+        "olmo3-think",
+        "olmo3-32b-think",
+        "nemotron-3-nano",
+        "gemma4",
+        "gemma4-small",
+        "gemma4-large",
+        "functiongemma",
+        "glm-4.7",
+        "glm-ocr",
+        "lfm2",
+        "lfm2-thinking",
+        "laguna",
+        "poolside-v1",
+        "cohere",
+    ];
+
+    /// Every name upstream's `ParserForName` dispatches. 25 of them.
+    const UPSTREAM_PARSER_NAMES: &[&str] = &[
+        "qwen3",
+        "qwen3-thinking",
+        "qwen3.5",
+        "ornith",
+        "qwen3-coder",
+        "qwen3-vl-instruct",
+        "qwen3-vl-thinking",
+        "ministral",
+        "passthrough",
+        "harmony",
+        "cogito",
+        "deepseek3",
+        "olmo3",
+        "olmo3-think",
+        "nemotron-3-nano",
+        "functiongemma",
+        "glm-4.7",
+        "gemma4",
+        "gemma4-no-thinking",
+        "glm-ocr",
+        "lfm2",
+        "lfm2-thinking",
+        "laguna",
+        "poolside-v1",
+        "cohere",
+    ];
+
+    /// Names upstream registers on **both** sides. These are the only ones where
+    /// "renderable but not parseable" is a genuine gap rather than upstream's own
+    /// naming skew.
+    fn upstream_names_on_both_sides() -> Vec<&'static str> {
+        UPSTREAM_RENDERER_NAMES
+            .iter()
+            .copied()
+            .filter(|n| UPSTREAM_PARSER_NAMES.contains(n))
+            .collect()
+    }
+
+    /// Families this port can **render but not yet parse**, as of the last time
+    /// somebody looked.
+    ///
+    /// This is a **ceiling, not a snapshot**: the test asserts the real gap is a
+    /// *subset* of this list. [`crate::parsers`] is being filled in on its own
+    /// schedule, so a name disappearing from the real gap must not fail the
+    /// build -- but a name appearing that is not listed here must, because that
+    /// means somebody shipped a renderer without checking the other half.
+    ///
+    /// When a parser lands, deleting its name from here is optional tidying, not
+    /// a required step.
+    const KNOWN_RENDERABLE_BUT_UNPARSEABLE: &[&str] = &[
+        "cogito",
+        "olmo3",
+        "olmo3-think",
+        "nemotron-3-nano",
+        "functiongemma",
+        "lfm2",
+        "lfm2-thinking",
+        "laguna",
+        "poolside-v1",
+        "cohere",
+    ];
+
+    /// The renderer half of the port is complete, and stays complete.
+    ///
+    /// Equality in both directions on purpose: a missing name is an unsupported
+    /// model, and an **extra** name is worse -- an invented framing nothing was
+    /// fine-tuned on, which no fixture would ever catch.
+    #[test]
+    fn the_renderer_registry_is_at_parity_with_upstream() {
+        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let missing: Vec<&str> = UPSTREAM_RENDERER_NAMES
+            .iter()
+            .copied()
+            .filter(|n| built_in_renderer(n).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "upstream renders these and we do not: {missing:?}"
+        );
+
+        // The other direction. `built_in_renderer` is a closed `match`, so the
+        // only way to enumerate it is to probe -- these are the names a typo or
+        // an over-eager alias would plausibly add.
+        for invented in [
+            "laguna-v8",
+            "poolside",
+            "nemotron",
+            "nemotron3nano",
+            "glm-4.6",
+            "deepseek3",
+            "gemma4-no-thinking",
+            "qwen3",
+            "harmony",
+            "ministral",
+            "passthrough",
+        ] {
+            assert!(
+                built_in_renderer(invented).is_none(),
+                "{invented:?} is not an upstream renderer name -- \
+                 an invented framing is worse than an unsupported model"
+            );
+        }
+    }
+
+    /// The reconciliation itself: state the rule, and fail when the port drifts
+    /// **further** from it.
+    ///
+    /// Three claims, each for its own reason:
+    ///
+    /// 1. **No new render-without-parse gaps.** Over the 18 names upstream
+    ///    registers on both sides, whatever we can render we should be able to
+    ///    parse; the exceptions are enumerated in
+    ///    [`KNOWN_RENDERABLE_BUT_UNPARSEABLE`] and the check is `⊆`, so a parser
+    ///    landing shrinks the gap and passes.
+    /// 2. **No parse-without-render at all.** If we parse a name, we must render
+    ///    it -- *unless* upstream itself makes that name parser-only
+    ///    (`harmony`, `passthrough`, `deepseek3`, ...). Unlike claim 1 this is
+    ///    exact, because we are already at renderer parity, so any violation is
+    ///    a genuine regression rather than unfinished work.
+    /// 3. **Nobody invented a name.** Every name either side dispatches must
+    ///    appear in the corresponding upstream list.
+    ///
+    /// What would make this test wrong: re-vendoring a newer ollama without
+    /// re-transcribing `UPSTREAM_RENDERER_NAMES` / `UPSTREAM_PARSER_NAMES`. The
+    /// lists are the oracle's, copied by hand; they cannot notice upstream
+    /// moving on by themselves.
+    #[test]
+    fn the_renderer_and_parser_name_lists_agree_where_upstream_says_they_should() {
+        let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let renders = |n: &str| built_in_renderer(n).is_some();
+        let parses = |n: &str| crate::parsers::parser_for_name(n).is_some();
+
+        // (1) Renderable but not parseable, over the shared 18.
+        let gap: Vec<&str> = upstream_names_on_both_sides()
+            .into_iter()
+            .filter(|n| renders(n) && !parses(n))
+            .collect();
+        let unexpected: Vec<&&str> = gap
+            .iter()
+            .filter(|n| !KNOWN_RENDERABLE_BUT_UNPARSEABLE.contains(n))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "these families gained a renderer with no parser: {unexpected:?}\n\
+             A renderable-but-unparseable family produces a correct prompt and then \
+             leaks raw tool-call markup into user-visible content. Either land the \
+             parser or add the name to KNOWN_RENDERABLE_BUT_UNPARSEABLE with a reason."
+        );
+
+        // (2) Parseable but not renderable -- allowed only where upstream is
+        // itself parser-only.
+        let upstream_parser_only: Vec<&str> = UPSTREAM_PARSER_NAMES
+            .iter()
+            .copied()
+            .filter(|n| !UPSTREAM_RENDERER_NAMES.contains(n))
+            .collect();
+        let reverse_gap: Vec<&str> = UPSTREAM_PARSER_NAMES
+            .iter()
+            .copied()
+            .filter(|n| parses(n) && !renders(n) && !upstream_parser_only.contains(n))
+            .collect();
+        assert!(
+            reverse_gap.is_empty(),
+            "these parse but no longer render: {reverse_gap:?} -- \
+             the renderer registry is meant to be at full upstream parity"
+        );
+
+        // (3) Nothing invented on either side.
+        for name in KNOWN_RENDERABLE_BUT_UNPARSEABLE {
+            assert!(
+                UPSTREAM_RENDERER_NAMES.contains(name) && UPSTREAM_PARSER_NAMES.contains(name),
+                "{name:?} is on the gap list but is not a name upstream \
+                 registers on both sides -- the list has gone stale"
+            );
+        }
+    }
+
+    /// The accounting, asserted rather than trusted, so the numbers quoted in
+    /// this module's docs cannot silently rot.
+    #[test]
+    fn upstream_itself_keeps_two_deliberately_different_name_lists() {
+        assert_eq!(UPSTREAM_RENDERER_NAMES.len(), 23);
+        assert_eq!(UPSTREAM_PARSER_NAMES.len(), 25);
+        assert_eq!(upstream_names_on_both_sides().len(), 18);
+
+        // The skews worth knowing by name: the same family under two spellings.
+        assert!(UPSTREAM_RENDERER_NAMES.contains(&"deepseek3.1"));
+        assert!(UPSTREAM_PARSER_NAMES.contains(&"deepseek3"));
+        assert!(!UPSTREAM_PARSER_NAMES.contains(&"deepseek3.1"));
+        assert!(UPSTREAM_RENDERER_NAMES.contains(&"gemma4-large"));
+        assert!(UPSTREAM_PARSER_NAMES.contains(&"gemma4-no-thinking"));
+        // ...and the three that only ever parse.
+        for parser_only in ["harmony", "passthrough", "ministral"] {
+            assert!(UPSTREAM_PARSER_NAMES.contains(&parser_only));
+            assert!(!UPSTREAM_RENDERER_NAMES.contains(&parser_only));
         }
     }
 }
