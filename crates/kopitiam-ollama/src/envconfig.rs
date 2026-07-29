@@ -1211,7 +1211,7 @@ fn parse_go_uint(s: &str) -> Option<u64> {
 /// Both micro-sign spellings are here on purpose: `µ` is U+00B5 MICRO SIGN and
 /// `μ` is U+03BC GREEK SMALL LETTER MU. They look identical and different
 /// keyboards produce different ones, so Go accept both and so must we.
-fn go_duration_unit(u: &str) -> Option<i64> {
+pub(crate) fn go_duration_unit(u: &str) -> Option<i64> {
     Some(match u {
         "ns" => 1,
         "us" | "\u{00b5}s" | "\u{03bc}s" => 1_000,
@@ -1225,7 +1225,7 @@ fn go_duration_unit(u: &str) -> Option<i64> {
 
 /// **Upstream:** `time.leadingInt`. Digits only, error (here `None`) on
 /// overflow. Returns the value and the index just past the last digit.
-fn leading_int(b: &[u8], mut i: usize) -> Option<(i64, usize)> {
+pub(crate) fn leading_int(b: &[u8], mut i: usize) -> Option<(i64, usize)> {
     let mut x: i64 = 0;
     while i < b.len() && b[i].is_ascii_digit() {
         x = x.checked_mul(10)?.checked_add((b[i] - b'0') as i64)?;
@@ -1241,7 +1241,7 @@ fn leading_int(b: &[u8], mut i: usize) -> Option<(i64, usize)> {
 /// extra precision is dropped rather than the whole parse being rejected. That
 /// asymmetry with [`leading_int`] is upstream's, and it is why `0.<50 digits>s`
 /// parse fine.
-fn leading_fraction(b: &[u8], mut i: usize) -> (i64, f64, usize) {
+pub(crate) fn leading_fraction(b: &[u8], mut i: usize) -> (i64, f64, usize) {
     let mut x: i64 = 0;
     let mut scale: f64 = 1.0;
     let mut overflow = false;
@@ -1272,7 +1272,7 @@ fn leading_fraction(b: &[u8], mut i: usize) -> (i64, f64, usize) {
 /// `1y` are rejected -- days and up are not fixed-length in Go's model, so the
 /// package refuse to guess. `None` on any parse error or overflow, matching Go
 /// returning an error; every caller here fall back to its own default.
-fn parse_go_duration(s: &str) -> Option<i64> {
+pub(crate) fn parse_go_duration(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let mut i = 0usize;
     let mut neg = false;

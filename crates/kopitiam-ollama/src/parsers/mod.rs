@@ -62,19 +62,37 @@ use std::sync::{OnceLock, RwLock};
 
 use crate::api::{Message, ThinkValue, Tool, ToolCall};
 
+pub mod cogito;
+pub mod cohere;
 pub mod deepseek3;
+pub mod functiongemma;
 pub mod gemma4;
 pub mod glm46;
 pub mod glm47;
+pub mod harmony;
+pub mod laguna;
+pub mod lfm2;
+pub mod ministral;
+pub mod nemotron3nano;
+pub mod olmo3;
 pub mod qwen3;
 pub mod qwen35;
 pub mod qwen3coder;
 pub mod qwen3vl;
 
+pub use cogito::CogitoParser;
+pub use cohere::CohereParser;
 pub use deepseek3::DeepSeek3Parser;
+pub use functiongemma::FunctionGemmaParser;
 pub use gemma4::Gemma4Parser;
 pub use glm46::Glm46Parser;
 pub use glm47::{Glm47Parser, GlmOcrParser};
+pub use harmony::HarmonyMessageHandler;
+pub use laguna::{LagunaParser, LagunaV8Parser};
+pub use lfm2::LFM2Parser;
+pub use ministral::MinistralParser;
+pub use nemotron3nano::Nemotron3NanoParser;
+pub use olmo3::{Olmo3Parser, Olmo3ThinkParser};
 pub use qwen3::Qwen3Parser;
 pub use qwen35::Qwen35Parser;
 pub use qwen3coder::Qwen3CoderParser;
@@ -124,6 +142,18 @@ pub enum ParserError {
     /// The XML-ish tool-call body (qwen3-coder style) did not parse.
     #[error("malformed tool call: {0}")]
     MalformedToolCall(String),
+
+    /// A harmony tool-call body was not valid JSON. **Upstream:**
+    /// `fmt.Errorf("error parsing tool call: raw='%s', err=%w", raw, err)`.
+    ///
+    /// Carries the raw body on purpose: by the time this fires the bytes are
+    /// gone from the accumulator, and without them nobody can tell a truncated
+    /// stream apart from a model that emitted prose where JSON was expected.
+    #[error("error parsing tool call: raw='{raw}', err={source}")]
+    HarmonyToolCall {
+        raw: String,
+        source: serde_json::Error,
+    },
 }
 
 /// One model family's response parser.
@@ -223,13 +253,17 @@ fn unregister(name: &str) {
 /// `"qwen3-thinking"` really is the same struct as `"qwen3"` with two flags
 /// flipped.
 ///
-/// **Partial port, stated plainly:** upstream dispatches ~25 names. Still not
-/// ported, and therefore falling through to `None` here exactly like an unknown
-/// name: `harmony`, `olmo3`, `olmo3-think`, `cogito`, `cohere`, `laguna`,
-/// `poolside-v1`, `lfm2`, `lfm2-thinking`, `ministral`, `nemotron-3-nano`,
-/// `functiongemma`. `None` is the honest answer -- handing them a passthrough
-/// instead would silently leak raw `<tool_call>` markup into user-visible
-/// content, which is worse than the caller knowing it has no parser.
+/// **Complete port:** all 25 names upstream's switch dispatches are dispatched
+/// here, pinned by `every_name_upstream_dispatches_is_dispatched_here_too`.
+///
+/// An **unknown** name still resolves to `None`, never to a passthrough, and
+/// that matters: a passthrough would silently leak raw `<tool_call>` markup into
+/// user-visible content, where `None` tells the caller plainly it has no parser
+/// and should fall back to the generic template path.
+///
+/// One structural note: upstream reaches into its own top-level `harmony`
+/// package for `"harmony"`. This port keeps that parser inside `parsers/`
+/// ([`harmony`]) -- module location only, no behaviour change.
 pub fn parser_for_name(name: &str) -> Option<Box<dyn Parser>> {
     if let Ok(m) = registry().read()
         && let Some(c) = m.get(name)
@@ -252,6 +286,21 @@ pub fn parser_for_name(name: &str) -> Option<Box<dyn Parser>> {
         // because it is where all the behaviour lives.
         "glm-4.7" => Box::new(Glm47Parser::default()),
         "glm-ocr" => Box::new(GlmOcrParser::default()),
+        // Upstream reaches into its own top-level `harmony` package for this
+        // one: `return harmony.NewHarmonyMessageHandler()`. Same thing, just
+        // living inside this module -- see `harmony.rs`'s header.
+        "harmony" => Box::new(HarmonyMessageHandler::new()),
+        "olmo3" => Box::new(Olmo3Parser::default()),
+        "olmo3-think" => Box::new(Olmo3ThinkParser::default()),
+        "cohere" => Box::new(CohereParser::default()),
+        "lfm2" => Box::new(LFM2Parser::new(false)),
+        "lfm2-thinking" => Box::new(LFM2Parser::new(true)),
+        "nemotron-3-nano" => Box::new(Nemotron3NanoParser::default()),
+        "cogito" => Box::new(CogitoParser::default()),
+        "ministral" => Box::new(MinistralParser::new(false)),
+        "functiongemma" => Box::new(FunctionGemmaParser::default()),
+        "laguna" => Box::new(LagunaParser::default()),
+        "poolside-v1" => Box::new(LagunaV8Parser::default()),
         "passthrough" => Box::new(PassthroughParser),
         _ => return None,
     })
@@ -473,35 +522,63 @@ mod tests {
             "gemma4-no-thinking",
             "glm-4.7",
             "glm-ocr",
+            "harmony",
+            "olmo3",
+            "olmo3-think",
+            "cohere",
+            "lfm2",
+            "lfm2-thinking",
+            "nemotron-3-nano",
+            "cogito",
+            "ministral",
+            "functiongemma",
+            "laguna",
+            "poolside-v1",
         ] {
             assert!(parser_for_name(name).is_some(), "missing built-in {name}");
         }
     }
 
-    /// The families this port has NOT reached must resolve to `None`, not to a
-    /// passthrough. A passthrough would leak raw `<tool_call>` markup into what
-    /// the user sees; `None` tells the caller plainly there is no parser.
+    /// Upstream dispatches these 25 names and **so do we** -- the port is
+    /// complete. This test is the thing that stops the docs drifting from
+    /// reality: it fails if a name is ever dropped from `parser_for_name`.
+    ///
+    /// The count is asserted on purpose. If upstream adds a family, this number
+    /// is what tells the next person the port has fallen behind, rather than the
+    /// gap going unnoticed until a model produces raw `<tool_call>` markup.
     #[test]
-    fn families_this_port_has_not_reached_resolve_to_nothing() {
+    fn every_name_upstream_dispatches_is_dispatched_here_too() {
         let _g = REGISTRY_LOCK.lock().expect("lock");
-        for name in [
+        let names = [
+            "qwen3",
+            "qwen3-thinking",
+            "qwen3.5",
+            "ornith",
+            "qwen3-coder",
+            "qwen3-vl-instruct",
+            "qwen3-vl-thinking",
+            "ministral",
+            "passthrough",
             "harmony",
+            "cogito",
+            "deepseek3",
             "olmo3",
             "olmo3-think",
-            "cogito",
-            "cohere",
-            "laguna",
-            "poolside-v1",
-            "lfm2",
-            "lfm2-thinking",
-            "ministral",
             "nemotron-3-nano",
             "functiongemma",
-        ] {
-            assert!(
-                parser_for_name(name).is_none(),
-                "{name} now resolves -- update the doc comment on parser_for_name"
-            );
+            "glm-4.7",
+            "gemma4",
+            "gemma4-no-thinking",
+            "glm-ocr",
+            "lfm2",
+            "lfm2-thinking",
+            "laguna",
+            "poolside-v1",
+            "cohere",
+        ];
+        assert_eq!(names.len(), 25, "upstream's ParserForName switch has 25 arms");
+        for name in names {
+            assert!(parser_for_name(name).is_some(), "missing built-in {name}");
         }
     }
 

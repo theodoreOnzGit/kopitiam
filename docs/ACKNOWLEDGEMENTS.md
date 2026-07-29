@@ -201,16 +201,28 @@ shipped.
 | `kopitiam-ollama::template` | `template/template.go` | Prompt building: `collate`, the three execution modes, the grafted `{{ .Response }}`, and the truncate-at-response tail |
 | `kopitiam-ollama::gotmpl` | Go's `text/template` + `text/template/parse` | See the note below — a different upstream, and a different relationship |
 
-**A second upstream, with a different license: Go's standard library.**
-`kopitiam-ollama::gotmpl` implements a subset of Go's **`text/template`**
-language (Go, **BSD-3-Clause**, Copyright (c) 2009 The Go Authors). This is a
-**reimplementation from the language's documented semantics**, not a
-transliteration of Go's ~7000-line reflection-based engine — but the semantics
-being reproduced are deliberately and exactly Go's (truth rules, sorted map
-iteration, `and`/`or` returning values, `else if` nesting, trim markers,
-`missingkey=zero`), and each is attributed at the point of implementation.
+**A second upstream, with a different license: Go's standard library**
+(**BSD-3-Clause**, Copyright (c) 2009 The Go Authors). Ollama's behaviour is in
+several places *inherited from Go itself*, so reproducing ollama faithfully
+means reproducing pieces of Go. Each is attributed at its point of use:
+
+| KOPITIAM site | Go stdlib source | Why it had to be ported |
+| --- | --- | --- |
+| `gotmpl` | `text/template` + `text/template/parse` | The language chat templates are written in. A **reimplementation from documented semantics**, not a transliteration of Go's ~7000-line reflection engine — but the semantics reproduced are deliberately and exactly Go's (truth rules, sorted map iteration, `and`/`or` returning values, `else if` nesting, trim markers, `missingkey=zero`) |
+| `envconfig`, `routes` | `time` — `ParseDuration`, `Duration.String`, `fmtFrac` | Rust's `Duration` has no equivalent formatter: `Debug` gives `"300s"` where Go gives `"5m0s"`, and `keep_alive` travels on the wire as a Go duration string |
+| `envconfig` | `net` — `SplitHostPort`, `JoinHostPort`, `(net.IP).String` | Go prints `::ffff:1.2.3.4` as `1.2.3.4`; Rust's `Display` keeps the mapped form |
+| `create` | `path/filepath` — `Clean`, `Join`, `Abs`, `Rel`, `IsLocal`, `Match`, `Glob` | `std::path::absolute` does **not** remove `..`, and the security check reads a leading `..`. Also Go's `*` never crosses a separator, so upstream's `**` is one level, not recursive — a glob crate would walk the whole tree |
+| `create` | `net/http` — `DetectContentType` (three signatures only) | Decides which weights file a Modelfile picks |
+| `renderers/json`, `create` | `encoding/json` escaping rules | Go HTML-escapes `<`/`>`/`&` and `json.Encoder` appends a newline; getting this wrong changes both prompts **and** blob digests |
+
 BSD-3-Clause is permissive and absorbs into AGPL-3.0-only with its notice
 retained, exactly like MIT.
+
+**A third, public-domain:** Howard Hinnant's `civil_from_days` /
+`days_from_civil` ([chrono-Compatible Low-Level Date
+Algorithms](https://howardhinnant.github.io/date_algorithms.html)), used in
+`gotmpl` and `routes` so the crate can do calendar arithmetic without taking a
+date-time dependency.
 
 Why this was necessary at all: chat templates are *already written in* Go
 template syntax — every GGUF `tokenizer.chat_template`, every ollama Modelfile
