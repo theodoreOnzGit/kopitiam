@@ -41,7 +41,13 @@ use super::json::marshal_tool_with_spaces;
 use super::qwen3coder::format_tool_call_argument;
 use super::{IM_END_TAG, IM_START_TAG, Message, RenderError, Renderer, ThinkValue, Tool};
 
+/// **Upstream:** `model/renderers/qwen35.go`.
+///
+/// Plain ASCII, and a single token in Qwen's vocabulary. `crate::parsers::qwen35`
+/// reads the same pair back out; the two must agree exactly and nothing checks
+/// that they do.
 const THINK_OPEN_TAG: &str = "<think>";
+/// **Upstream:** `model/renderers/qwen35.go`. Pairs with [`THINK_OPEN_TAG`].
 const THINK_CLOSE_TAG: &str = "</think>";
 
 /// The instructions appended after the `<tools>` list.

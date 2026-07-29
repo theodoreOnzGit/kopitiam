@@ -48,6 +48,17 @@ use super::image_tags::render_content_with_image_tags;
 use super::{IM_END_TAG, IM_START_TAG, Message, RenderError, Renderer, ThinkValue, Tool};
 use crate::api::{ToolCall, ToolFunction};
 
+// LFM2's special tokens. **Upstream:** the `lfm2*` consts in
+// `model/renderers/lfm2.go`.
+//
+// Every one of these is a SINGLE token in LFM2's vocabulary, so they are wire
+// format, not punctuation: change a character and the model sees a handful of
+// ordinary tokens where it expected one special one, and the framing silently
+// stops meaning anything. `crate::parsers::lfm2` reads the same set back out --
+// the two must agree exactly, and there is no compiler check that they do.
+//
+// These are plain ASCII `|`, unlike the full-width `｜` used by the cogito and
+// deepseek3 families. Do not "normalise" between the two.
 const BOS_TOKEN: &str = "<|startoftext|>";
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";

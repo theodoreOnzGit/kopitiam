@@ -58,7 +58,16 @@ pub struct DeepSeek3Renderer {
     pub variant: DeepSeek3Variant,
 }
 
+/// **Upstream:** `model/renderers/deepseek3.go`.
+///
+/// **Full-width characters, not ASCII lookalikes.** The bars are U+FF5C
+/// FULLWIDTH VERTICAL LINE (`｜`), not `|`, and the underscores are U+2581 LOWER
+/// ONE EIGHTH BLOCK (`▁`), not `_`. Single tokens in this family's vocabulary;
+/// an ASCII lookalike tokenises as several ordinary tokens and quietly destroys
+/// the framing. `crate::parsers::deepseek3` documents the same hazard on the
+/// reading side, and the two must agree exactly.
 const BOS: &str = "<｜begin▁of▁sentence｜>";
+/// **Upstream:** `model/renderers/deepseek3.go`. Full-width, as above.
 const EOS: &str = "<｜end▁of▁sentence｜>";
 
 impl Renderer for DeepSeek3Renderer {

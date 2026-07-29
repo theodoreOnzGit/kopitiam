@@ -416,13 +416,9 @@ impl Modelfile {
     /// them would silently drop terminators and let a model run past its own
     /// end-of-turn marker.
     pub fn parameters(&self) -> Vec<(&str, &str)> {
-        const KEYWORDS: [&str; 9] = [
-            "model", "license", "template", "system", "adapter", "draft", "renderer", "parser",
-            "requires",
-        ];
         self.commands
             .iter()
-            .filter(|c| c.name != "message" && !KEYWORDS.contains(&c.name.as_str()))
+            .filter(|c| c.name != "message" && !is_reserved_command_name(&c.name))
             .map(|c| (c.name.as_str(), c.args.as_str()))
             .collect()
     }
@@ -614,6 +610,37 @@ fn is_valid_command(cmd: &str) -> bool {
     VALID_COMMANDS.contains(&cmd.to_lowercase().as_str())
 }
 
+/// Is this parsed command name a **keyword**, as opposed to a parameter name?
+///
+/// **DERIVED from [`VALID_COMMANDS`] on purpose.** This used to be a second
+/// hand-written list of nine strings sitting inside `parameters()`, which is a
+/// silent-drift trap: add a keyword upstream, update one list and not the other,
+/// and the forgotten one starts quietly reclassifying that keyword as a
+/// *sampling parameter*. It would then be handed to the sampler as an unknown
+/// option instead of being acted on. An audit flagged it; deriving removes the
+/// possibility rather than documenting it.
+///
+/// Two names need translating on the way through, and both are noted where the
+/// parser does them:
+///
+/// * **`from` is stored as `model`** -- see [`Command::name`].
+/// * **`parameter` never survives parsing at all** -- a `PARAMETER x y` line is
+///   flattened to `name = "x"`, so the keyword itself is gone by now. That is
+///   exactly why anything left unmatched here *is* a parameter.
+///
+/// `message` is excluded by the caller rather than here, because it is a real
+/// stored command name and the caller already filters it explicitly.
+fn is_reserved_command_name(name: &str) -> bool {
+    VALID_COMMANDS.iter().any(|kw| match *kw {
+        "from" => name == "model",
+        // Flattened away during parsing; never appears as a command name.
+        "parameter" => false,
+        // The caller filters this one itself.
+        "message" => false,
+        other => name == other,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +793,41 @@ mod tests {
         assert_eq!(f.from(), Some("x.gguf"));
         assert_eq!(f.system(), Some("hi"));
         assert_eq!(f.parameters(), vec![("Temperature", "0.7")]);
+    }
+
+    /// The keyword set `parameters()` filters by must stay derived from
+    /// [`VALID_COMMANDS`], not hand-maintained beside it. This pins the exact
+    /// translation so a future upstream keyword cannot silently start being
+    /// treated as a sampling parameter.
+    #[test]
+    fn the_reserved_name_set_is_derived_from_the_command_grammar() {
+        // Every keyword that survives parsing under its own name.
+        for kw in [
+            "license", "template", "system", "adapter", "draft", "renderer", "parser", "requires",
+        ] {
+            assert!(is_reserved_command_name(kw), "{kw} must be reserved");
+        }
+
+        // The two that get translated on the way through.
+        assert!(is_reserved_command_name("model"), "FROM is stored as `model`");
+        assert!(!is_reserved_command_name("from"), "`from` never survives parsing");
+        assert!(
+            !is_reserved_command_name("parameter"),
+            "PARAMETER is flattened away; the keyword itself never appears"
+        );
+
+        // And a real parameter name is not reserved.
+        for p in ["temperature", "top_k", "stop", "mirostat"] {
+            assert!(!is_reserved_command_name(p), "{p} is a parameter");
+        }
+
+        // The derived set must have exactly the arity the old hand-written list
+        // had -- 9 = the 11 grammar keywords, minus `parameter` and `message`.
+        let derived = VALID_COMMANDS
+            .iter()
+            .filter(|kw| !matches!(**kw, "parameter" | "message"))
+            .count();
+        assert_eq!(derived, 9, "grammar changed -- re-check is_reserved_command_name");
     }
 
     #[test]

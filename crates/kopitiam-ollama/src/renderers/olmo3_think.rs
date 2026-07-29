@@ -41,9 +41,18 @@ pub enum Olmo3ThinkVariant {
     Olmo31Think,
 }
 
+/// Appended to the system message when the caller offers no tools.
+///
+/// **Upstream:** `model/renderers/olmo3_think.go`. Note the LEADING space -- it
+/// joins onto the system text, so dropping it welds two sentences together.
 const FUNCTIONS_SUFFIX: &str =
     " You do not currently have access to any functions. <functions></functions>";
+/// **Upstream:** `model/renderers/olmo3_think.go` (the 32B variant).
 const THINK_32B_SYSTEM: &str = "You are a helpful AI assistant.";
+/// **Upstream:** `model/renderers/olmo3_think.go:21` (`olmo31ThinkSystemMessage`).
+///
+/// Identical to `olmo3::OLMO31_DEFAULT_SYSTEM` EXCEPT it has no trailing space.
+/// That asymmetry is upstream's and deliberate -- see the variant docs above.
 const THINK_31_SYSTEM: &str = "You are Olmo, a helpful AI assistant built by Ai2. Your date cutoff is December 2024, and your model weights are available at https://huggingface.co/allenai.";
 
 /// **Upstream:** `Olmo3ThinkRenderer`.

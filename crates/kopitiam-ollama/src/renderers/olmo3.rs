@@ -39,9 +39,23 @@
 use super::json::{go_value, marshal_tools_with_spaces};
 use super::{IM_END_TAG, IM_START_TAG, Message, RenderError, Renderer, ThinkValue, Tool};
 
-/// `olmo3`'s default identity. Note the trailing space -- deliberate.
+/// `olmo3`'s default identity, injected when the caller gives no system message.
+///
+/// **Upstream:** `model/renderers/olmo3.go:13` (`olmo3DefaultSystemMessage`).
+///
+/// **The trailing space is real and load-bearing** -- it is in the Go constant,
+/// so the rendered prompt has it, so the model was trained with it. Trimming it
+/// would look like tidying and would change the token stream.
 const OLMO3_DEFAULT_SYSTEM: &str = "You are a helpful function-calling AI assistant. ";
-/// `olmo3.1`'s default identity. Trailing space, same reason.
+/// `olmo3.1`'s default identity.
+///
+/// **Upstream:** `model/renderers/olmo3.go:14` (`olmo31DefaultSystemMessage`).
+///
+/// Trailing space, same reason as above. Note the date cutoff and the weights
+/// URL are part of the tuned prompt, not documentation -- do not update them to
+/// be "current". Compare `olmo3_think.go:21`, whose otherwise-identical string
+/// has **no** trailing space; that difference is upstream's and it is
+/// deliberate.
 const OLMO31_DEFAULT_SYSTEM: &str = "You are Olmo, a helpful AI assistant built by Ai2. Your date cutoff is December 2024, and your model weights are available at https://huggingface.co/allenai. ";
 const OLMO3_NO_FUNCTIONS: &str = "You do not currently have access to any functions. ";
 const OLMO3_WITH_FUNCTIONS: &str = "You are provided with function signatures within <functions></functions> XML tags. You may call one or more functions to assist with the user query. Output any function calls within <function_calls></function_calls> XML tags. Do not make assumptions about what values to plug into functions.";

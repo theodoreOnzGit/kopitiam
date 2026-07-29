@@ -41,8 +41,26 @@ pub struct CogitoRenderer {
     pub is_thinking: bool,
 }
 
+/// **Upstream:** `model/renderers/cogito.go:15` (and `:62`).
+///
+/// **Full-width characters, not ASCII lookalikes.** The bars are U+FF5C
+/// FULLWIDTH VERTICAL LINE (`｜`), not `|`, and the underscores are U+2581 LOWER
+/// ONE EIGHTH BLOCK (`▁`), not `_`. They are single tokens in this family's
+/// vocabulary; paste an ASCII lookalike and the model sees several ordinary
+/// tokens instead of one special one, which corrupts the framing silently.
+/// `crate::parsers::deepseek3` documents the same codepoint hazard on the
+/// reading side.
 const BOS: &str = "<｜begin▁of▁sentence｜>";
+/// **Upstream:** `model/renderers/cogito.go:95` / `:97`. Full-width, as above.
 const EOS: &str = "<｜end▁of▁sentence｜>";
+/// The identity injected into **every** Cogito conversation that supplies no
+/// system message of its own.
+///
+/// **Upstream:** `model/renderers/cogito.go:21` (`defaultPrompt`).
+///
+/// Verbatim, punctuation and all. It is a prompt the model was tuned against,
+/// so "improving" the wording changes behaviour -- this is exactly the class of
+/// constant the house rule about provenance exists for.
 const DEFAULT_PROMPT: &str = "You are Cogito, an AI assistant created by Deep Cogito, which is an AI research lab based in San Francisco.";
 
 impl Renderer for CogitoRenderer {
