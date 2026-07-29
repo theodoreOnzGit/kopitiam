@@ -43,35 +43,71 @@ without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md
 > | `gotmpl/` | Go `text/template` subset — lexer, parser, executor, builtins |
 > | `template.rs` | `template/template.go` — collate + the 3 execution modes |
 >
-> ### ⚠ SIX AGENTS RUNNING IN PARALLEL (launched ~15:20, 2026-07-29)
+> ### SIX PARALLEL AGENTS — ALL MERGED (2026-07-29, ~15:20–16:15)
 >
-> Each owns **exactly one path** inside `crates/kopitiam-ollama/src/` and works
-> in its **own git worktree**. The main loop owns everything else.
+> Each owned **exactly one path** and worked in its **own git worktree**. All six
+> are merged, and every merge was verified by the main loop re-running the gates
+> itself, never on the agent's say-so. **485 tests, clippy clean,
+> `cargo check --workspace` clean.**
 >
-> | Agent owns | Ports from |
-> | --- | --- |
-> | `thinking.rs` | `thinking/parser.go` + `template.go` |
-> | `envconfig.rs` | `envconfig/config.go` |
-> | `manifest.rs` | `manifest/` + the blob-store half of `server/images.go` |
-> | `memory.rs` | `fs/ggml/ggml.go` — `GraphSize()` + the `KV` accessors |
-> | `renderers/` | `model/renderers/` (20 files) |
-> | `parsers/` | `model/parsers/` (19 files) + maybe `harmony/` |
+> | Path | Ported from | Outcome |
+> | --- | --- | --- |
+> | `thinking.rs` | `thinking/parser.go` + `template.go` | complete |
+> | `envconfig.rs` | `envconfig/config.go` | complete |
+> | `manifest.rs` | `manifest/` + blob-store half of `server/images.go` | complete (needed `sha2`) |
+> | `memory.rs` | `fs/ggml/ggml.go` `GraphSize()` + `KV` | complete |
+> | `parsers/` | `model/parsers/` | **partial** — 9 of ~19 families |
+> | `renderers/` | `model/renderers/` | **partial** — 13 of 15 families |
 >
-> **The coordination trick, so this merges cleanly:** every module — including
-> the ones still unwritten — is ALREADY declared in `lib.rs`, and each unwritten
-> one is a one-line stub saying so. Agents therefore never touch `lib.rs`,
-> `Cargo.toml`, or each other's files, so six worktree branches merge with zero
-> conflicts. **If you add a module later, declare it in `lib.rs` FIRST, before
-> spawning anyone.**
+> #### What worked, and should be reused
 >
-> Standing instructions given to every agent: read the vendored Go (at the
-> ABSOLUTE path — `vendor/` is gitignored so it does NOT exist in a worktree),
-> ollama wins any disagreement, provenance at the point of use, Singlish docs
-> with precision intact, release-profile builds only, **do not commit/push/
-> publish**, and STOP-and-report rather than adding a `Cargo.toml` dependency.
-> Expect at least one to come back asking for **sha256** (the manifest agent).
+> **Declare every module in `lib.rs` UP FRONT as a stub, before spawning
+> anyone.** That is what made six worktree branches merge with zero conflicts —
+> no agent ever had to touch `lib.rs` or `Cargo.toml`. **If you add a module
+> later, declare it first, then spawn.**
 >
-> Main loop has already done `api.rs` (the frozen contract) and `prompt.rs`.
+> **Freeze the shared vocabulary first.** `api.rs` was written by the main loop
+> and pasted into every prompt. Without it six agents would each have invented
+> their own `Message`.
+>
+> **"STOP and report rather than add a dependency"** worked exactly as intended:
+> the manifest agent needed sha256, asked instead of adding, and the main loop
+> approved `sha2` (already in the workspace lockfile) and wired the real hasher
+> plus FIPS 180-4 known-answer vectors — closing a correctness gap the agent had
+> been honest about (its fake hash proved the plumbing but could not prove our
+> digests agree with ollama's).
+>
+> #### What went WRONG — fix this before the next fan-out
+>
+> **Every worktree branched from `main` (`6fbece9bcf`), not from `ollama-port`.**
+> So none of them contained the new crate, and each agent had to mirror the crate
+> in just to compile. It worked, but it means each worktree holds a **stale
+> snapshot** of everyone else's files. The rule that saved it: **copy back ONLY
+> the agent's owned path, then re-run the gates in the main tree.** Never merge a
+> worktree wholesale. Next time, branch the worktrees from the working branch.
+>
+> #### Findings the agents surfaced (each now a bead)
+>
+> * **`GraphSize` has no branch for qwen3 / qwen3moe / qwen3next / mistral3 /
+>   olmo3 / lfm2 / nemotron_h / bert** — they fall through to the default loop and
+>   get `partial_offload = full_offload = 0`, i.e. sized as if the compute graph
+>   is free. Upstream's gap, faithfully reproduced. Sharper still: several are
+>   exactly the archs `ollama_engine_required()` says must run on ollama's own
+>   engine, whose caching the default loop does not model. **qwen3 is a family
+>   KOPITIAM cares about** (`bd-250`, `bd-250.3`).
+> * **`api::ToolFunctionParameters.properties` loses Go's nil-vs-empty
+>   distinction** (`bd-iut`) — the one place our vocabulary is strictly less
+>   expressive than the oracle's. Not fixed during the fan-out because `api.rs`
+>   was the frozen contract; safe to fix now.
+> * Unported families: parsers (`harmony`, olmo3, cogito, cohere, laguna, lfm2,
+>   ministral, nemotron-3-nano, functiongemma) and renderers (nemotron-3-nano,
+>   laguna/poolside-v1). **The two lists do not agree** — a family can be
+>   renderable but not parseable. Check that before wiring into `kopitiam-ai`.
+> * `serde_json` **cannot** produce Go-compatible tool JSON (Go HTML-escapes
+>   `<`/`>`/`&`; a single `PropertyType` marshals as a bare string not a
+>   one-element array; structs marshal in declaration order while maps marshal
+>   sorted). `renderers/json.rs` hand-rolls the emitter. Do not "simplify" it
+>   back to `serde_json` — upstream's glm47 fixture pins all three.
 >
 > **NOT done, next in order** (all readable in the vendor clone). Two file paths
 > I first wrote here were WRONG and are corrected — upstream moved them, so do
