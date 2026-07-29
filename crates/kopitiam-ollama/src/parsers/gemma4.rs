@@ -550,7 +550,10 @@ fn gemma4_tool_properties<'a>(
     tools
         .iter()
         .find(|t| t.function.name == tool_name)
-        .map(|t| &t.function.parameters.properties)
+        // `None` here now means either "no such tool" or "that tool declares no
+        // properties" -- the caller treats both the same way (no schema to gate
+        // a repair on), so flattening the two Options loses nothing.
+        .and_then(|t| t.function.parameters.properties.as_ref())
 }
 
 /// The small, ordered set of repairs we are willing to try.
@@ -943,7 +946,7 @@ mod tests {
                 description: String::new(),
                 parameters: ToolFunctionParameters {
                     param_type: "object".into(),
-                    properties,
+                    properties: Some(properties),
                     ..Default::default()
                 },
             },

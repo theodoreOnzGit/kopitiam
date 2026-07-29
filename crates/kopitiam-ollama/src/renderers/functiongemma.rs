@@ -115,13 +115,13 @@ impl FunctionGemmaRenderer {
         ));
         sb.push_str(&format!("description:{ESC}{}{ESC}", f.description));
 
-        if !f.parameters.properties.is_empty() || !f.parameters.param_type.is_empty() {
+        if f.parameters.has_properties() || !f.parameters.param_type.is_empty() {
             sb.push_str(",parameters:{");
             let mut needs_comma = false;
 
-            if !f.parameters.properties.is_empty() {
+            if f.parameters.has_properties() {
                 sb.push_str("properties:{");
-                self.write_properties(&mut sb, f.parameters.properties.iter());
+                self.write_properties(&mut sb, f.parameters.properties_iter());
                 sb.push('}');
                 needs_comma = true;
             }

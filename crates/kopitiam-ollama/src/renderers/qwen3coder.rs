@@ -267,7 +267,7 @@ impl Renderer for Qwen3CoderRenderer {
                     }
                     sb.push_str("\n<parameters>");
 
-                    for (name, prop) in &tool.function.parameters.properties {
+                    for (name, prop) in tool.function.parameters.properties_iter() {
                         sb.push_str("\n<parameter>");
                         sb.push_str(&format!("\n<name>{name}</name>"));
 

@@ -356,7 +356,7 @@ fn parse_glm46_tool_call(raw: &str, tools: &[Tool]) -> Result<ToolCall, ParserEr
 
         let mut param_type = PropertyType::default();
         if let Some(tool) = matched
-            && let Some(prop) = tool.function.parameters.properties.get(key)
+            && let Some(prop) = tool.function.parameters.property(key)
         {
             if prop.any_of.is_empty() {
                 param_type = prop.prop_type.clone();
@@ -734,7 +734,7 @@ mod tests {
                 description: String::new(),
                 parameters: ToolFunctionParameters {
                     param_type: "object".into(),
-                    properties,
+                    properties: Some(properties),
                     required: required.iter().map(|s| (*s).to_string()).collect(),
                     ..Default::default()
                 },

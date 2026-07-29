@@ -307,13 +307,13 @@ fn lfm2_tool_schema_json(tool: &Tool) -> String {
         s.push(']');
     }
     s.push_str(",\"properties\":");
-    if f.parameters.properties.is_empty() {
+    if !f.parameters.has_properties() {
         // Nil `*ToolPropertiesMap` upstream -- and this family's fixture is the
         // one that pins it. See [`super::json`].
         s.push_str("null");
     } else {
         s.push('{');
-        for (i, (k, v)) in f.parameters.properties.iter().enumerate() {
+        for (i, (k, v)) in f.parameters.properties_iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }

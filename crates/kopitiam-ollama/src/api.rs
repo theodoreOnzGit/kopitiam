@@ -258,12 +258,46 @@ pub struct ToolFunctionParameters {
     pub items: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required: Vec<String>,
+
     /// Insertion-ordered, same reasoning as [`ToolCallArguments`].
-    #[serde(default)]
-    pub properties: IndexMap<String, ToolProperty>,
+    ///
+    /// **`Option` because Go's is a POINTER, and the three states differ on the
+    /// wire.** Upstream's field is `*ToolPropertiesMap`, so:
+    ///
+    /// | Go state | marshals as | means |
+    /// |---|---|---|
+    /// | nil pointer | `"properties":null` | nobody said what this tool takes |
+    /// | set, empty | `"properties":{}` | this tool takes **no** arguments |
+    /// | set, populated | `{"city":{...}}` | these arguments |
+    ///
+    /// Collapsing the first two loses a real distinction. A no-argument tool
+    /// emitted as `null` reads to a model as *"I don't know this tool's
+    /// arguments"* rather than *"it has none"*, and some families are sensitive
+    /// to that. This was `bd-iut`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<IndexMap<String, ToolProperty>>,
 }
 
 impl ToolFunctionParameters {
+    /// Walk the declared properties, treating **absent and empty alike**.
+    ///
+    /// Most callers want this: the nil-vs-empty distinction only matters when
+    /// *emitting* JSON (see [`ToolFunctionParameters::properties`]); when you
+    /// are iterating, "none declared" and "none present" are the same job.
+    pub fn properties_iter(&self) -> impl Iterator<Item = (&String, &ToolProperty)> {
+        self.properties.iter().flatten()
+    }
+
+    /// Is there at least one declared property? Absent and empty both say no.
+    pub fn has_properties(&self) -> bool {
+        self.properties.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
+    /// Look one property up by name.
+    pub fn property(&self, name: &str) -> Option<&ToolProperty> {
+        self.properties.as_ref()?.get(name)
+    }
+
     pub fn to_template_value(&self) -> Value {
         let mut m = std::collections::BTreeMap::new();
         m.insert("Type".into(), Value::Str(self.param_type.clone()));
@@ -271,12 +305,17 @@ impl ToolFunctionParameters {
             "Required".into(),
             Value::List(self.required.iter().map(|s| Value::Str(s.clone())).collect()),
         );
-        // Sorted for the template -- see the module docs.
+        // Sorted for the template -- see the module docs. An absent map and an
+        // empty one both render as an empty (falsy) map here, which is right:
+        // `{{ if .Properties }}` must not fire for either, and a template has no
+        // way to act on the difference anyway. The distinction only matters on
+        // the wire, which is where it is preserved.
         m.insert(
             "Properties".into(),
             Value::Map(
                 self.properties
                     .iter()
+                    .flatten()
                     .map(|(k, v)| (k.clone(), v.to_template_value()))
                     .collect(),
             ),
@@ -600,6 +639,63 @@ mod tests {
     #[test]
     fn empty_arguments_render_as_an_object_not_null() {
         assert_eq!(ToolCallArguments::new().to_json_string(), "{}");
+    }
+
+    /// **`bd-iut`.** Go's `Properties` is a pointer, so three states are
+    /// distinguishable on the wire, and the middle one carries real meaning: a
+    /// tool that takes NO arguments must not be indistinguishable from a tool
+    /// whose arguments nobody described.
+    #[test]
+    fn properties_keeps_gos_three_way_nil_empty_populated_distinction() {
+        let mut p = ToolFunctionParameters {
+            param_type: "object".into(),
+            ..Default::default()
+        };
+
+        // Absent -> null.
+        assert_eq!(p.properties, None);
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("properties"),
+            "absent must not emit a properties key at all"
+        );
+        assert!(!p.has_properties());
+
+        // Set but empty -> a real, present, empty map.
+        p.properties = Some(IndexMap::new());
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["properties"], json!({}), "empty must survive as {{}}");
+        assert!(!p.has_properties(), "empty still means nothing to iterate");
+        assert_eq!(p.properties_iter().count(), 0);
+
+        // Populated.
+        let mut m = IndexMap::new();
+        m.insert("city".to_string(), ToolProperty::default());
+        p.properties = Some(m);
+        assert!(p.has_properties());
+        assert_eq!(p.properties_iter().count(), 1);
+        assert!(p.property("city").is_some());
+        assert!(p.property("nope").is_none());
+    }
+
+    /// The round trip both ways, since a client sending `null` and one omitting
+    /// the key must land in the same state.
+    #[test]
+    fn absent_and_explicit_null_properties_both_deserialise_to_none() {
+        let omitted: ToolFunctionParameters =
+            serde_json::from_value(json!({"type": "object"})).unwrap();
+        let explicit: ToolFunctionParameters =
+            serde_json::from_value(json!({"type": "object", "properties": null})).unwrap();
+        assert_eq!(omitted.properties, None);
+        assert_eq!(explicit.properties, None);
+
+        let empty: ToolFunctionParameters =
+            serde_json::from_value(json!({"type": "object", "properties": {}})).unwrap();
+        assert_eq!(
+            empty.properties,
+            Some(IndexMap::new()),
+            "an explicit {{}} is NOT the same as absent"
+        );
     }
 
     #[test]

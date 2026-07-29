@@ -230,7 +230,7 @@ pub(super) fn parse_tool_call(raw: &str, tools: &[Tool]) -> Result<ToolCall, Par
         // precedence rules then pick the most specific one that parses.
         let mut param_type = PropertyType::default();
         if let Some(tool) = matched
-            && let Some(prop) = tool.function.parameters.properties.get(&param_name)
+            && let Some(prop) = tool.function.parameters.property(&param_name)
         {
             if prop.any_of.is_empty() {
                 param_type = prop.prop_type.clone();
@@ -693,7 +693,7 @@ mod tests {
                 description: String::new(),
                 parameters: ToolFunctionParameters {
                     param_type: "object".into(),
-                    properties,
+                    properties: Some(properties),
                     ..Default::default()
                 },
             },
@@ -1008,7 +1008,7 @@ mod tests {
                 description: String::new(),
                 parameters: ToolFunctionParameters {
                     param_type: "object".into(),
-                    properties,
+                    properties: Some(properties),
                     ..Default::default()
                 },
             },

@@ -269,27 +269,32 @@ pub(crate) fn write_go_parameters(p: &ToolFunctionParameters, out: &mut String) 
     }
     {
         let out = o.key("properties");
-        if p.properties.is_empty() {
-            // Upstream's field is a `*ToolPropertiesMap` with no `omitempty`,
-            // so a caller who never set it marshals **`null`** -- and that is
-            // by far the common case (a tool that takes no parameters).
-            // Upstream's own LFM2 fixture asserts `"properties": null`. Our
-            // [`crate::api`] uses a plain `IndexMap` with no nil state, so we
-            // map empty -> `null` and accept that a deliberately-set-but-empty
-            // map (which would be `{}` upstream) is unrepresentable. No fixture
-            // exercises that second case.
-            out.push_str("null");
-        } else {
-            out.push('{');
-            for (i, (k, v)) in p.properties.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
+        // Upstream's field is a `*ToolPropertiesMap` with no `omitempty`, so all
+        // three states are distinguishable on the wire and we now reproduce them
+        // exactly (this was `bd-iut`):
+        //
+        //   None            -> `null`  ("nobody said what this tool takes")
+        //   Some(empty)     -> `{}`    ("this tool takes NO arguments")
+        //   Some(populated) -> `{...}`
+        //
+        // The first is by far the common case, and upstream's own LFM2 fixture
+        // asserts `"properties": null`. The middle one matters because a
+        // no-argument tool emitted as `null` reads to a model as "I don't know
+        // this tool's arguments" rather than "it has none".
+        match &p.properties {
+            None => out.push_str("null"),
+            Some(props) => {
+                out.push('{');
+                for (i, (k, v)) in props.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_go_string(k, out);
+                    out.push(':');
+                    write_go_property(v, out);
                 }
-                write_go_string(k, out);
-                out.push(':');
-                write_go_property(v, out);
+                out.push('}');
             }
-            out.push('}');
         }
     }
     o.finish();

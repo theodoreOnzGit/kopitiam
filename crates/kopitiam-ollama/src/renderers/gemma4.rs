@@ -465,15 +465,15 @@ impl Gemma4Renderer {
         // a tool with neither properties nor a type still writes no
         // `parameters:` block, which is upstream's `rawDeclRef` case... except
         // that one HAS a type. See the tests.
-        if !fn_.parameters.properties.is_empty() || !fn_.parameters.param_type.is_empty() {
+        if fn_.parameters.has_properties() || !fn_.parameters.param_type.is_empty() {
             sb.push_str(",parameters:{");
             let mut needs_comma = false;
 
-            if !fn_.parameters.properties.is_empty() {
+            if fn_.parameters.has_properties() {
                 sb.push_str("properties:{");
                 write_schema_properties(
                     &mut sb,
-                    fn_.parameters.properties.iter(),
+                    fn_.parameters.properties_iter(),
                     TypeStyle::TopLevel,
                 );
                 sb.push('}');
