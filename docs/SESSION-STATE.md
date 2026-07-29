@@ -1,10 +1,13 @@
 # Session state — resumable handoff
 
 **Last updated:** 2026-07-29 18:30 (ollama port: 3 agent waves done, 1358 tests; 0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
+**Purpose:** if the session dies, this file plus `bn ready` is enough to pick up
+without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md.)
 
 > ## ⏹ WHERE THE 2026-07-29 EVENING SESSION ENDED
 >
-> **Branch `ollama-port`, pushed, `HEAD == origin/ollama-port` at `564d74c5c9`.**
+> **Branch `ollama-port`, pushed, tree clean.** The last code commit is
+> `564d74c5c9` (the `convert/` port); this handoff commit sits on top of it.
 > Working tree clean. NOT merged to `main` — that is the maintainer's call.
 > **NOT published to crates.io**, deliberately: see "before publishing" below.
 >
@@ -28,9 +31,9 @@
 >   after a merge can be a lie; it reported the OLD test count twice. Always
 >   `cargo clean -p kopitiam-ollama --release` before verifying a merge.
 >
-> ### Before anything is published — read `bd-fkv` first
+> ### Before anything is published — read `bd-40q` first
 >
-> `bd-fkv` (P1) is the one that matters: `convert.rs`'s `permute()` is the single
+> `bd-40q` (P1) is the one that matters: `convert.rs`'s `permute()` is the single
 > place an agent had to **reason rather than read** the Go. If that reading is
 > wrong, every llama/mistral Q/K tensor converts **transposed** and the model
 > produces *fluent nonsense* rather than failing loudly. The bead lists three
@@ -38,7 +41,7 @@
 > conversion output as untrusted.
 >
 > Also open: `bd-9a4` (the independent audit — coverage gaps, duplicate types,
-> provenance), `bd-nzk` (`Timestamp::from_unix_nanos` wraps silently outside
+> provenance), `bd-n86` (`Timestamp::from_unix_nanos` wraps silently outside
 > ~1678..2262). `bd-djx` and `bd-iut` are **closed**.
 >
 > ### Next session, in order
@@ -48,7 +51,7 @@
 >    does, `CreateRequest` exists twice with **incompatible field types**,
 >    `LoadedModel` twice with different integer widths, and the model descriptor
 >    three times. No handler can actually run until this is done.
-> 2. Verify `bd-fkv`.
+> 2. Verify `bd-40q`.
 > 3. The unported-but-unacknowledged gaps in `bd-9a4`: `model_list_cache.go` +
 >    `model_show_cache.go` (1,599 LOC — why `list`/`show` are instant),
 >    `api/client.go` (we can BE an ollama server, not talk to one),
@@ -62,8 +65,12 @@
 >
 > Housekeeping done at close: `.claude/worktrees/` is now gitignored (19 full
 > repo copies were sitting untracked — one careless `git add -A` from disaster).
-**Purpose:** if the session dies, this file plus `bn ready` is enough to pick up
-without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md.)
+>
+> **Bead-ID warning for anyone reading the commit messages:** several commits in
+> this branch cite `bd-fkv` and `bd-nzk`. **Those IDs do not exist** — I wrote
+> them from memory before `bn` had assigned the real ones. The actual beads are
+> **`bd-40q`** (the `permute()` verification) and **`bd-n86`** (the `Timestamp`
+> overflow). This file is correct; the commit messages are not.
 
 > ## ⏵ IN FLIGHT (2026-07-29, later session): the ollama port
 >
