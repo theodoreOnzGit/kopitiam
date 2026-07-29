@@ -195,10 +195,35 @@ pub fn word_pattern_loose(word: &str) -> String {
 /// the line. Mirrors [`word_under_cursor`]'s scan-forward-when-off-a-token
 /// behaviour so pressing `gf` with the cursor in the indent still finds the
 /// name.
+///
+/// # Why the set is platform-dependent
+///
+/// On Windows the set ALSO carries `\` and `:`. Not a nicety — without them
+/// `gf` is simply broken there, and it broke silently: on
+/// `C:\Users\me\notes.txt` the forward scan die at the colon, so the token come
+/// back as just `"C"`, no file called `C` exist, and `gf` leave the buffer sitting
+/// there looking like nothing happen. Vim hit this same wall long ago and solve
+/// it the same way — its `'isfname'` default is per-platform, and the Win32 one
+/// (`:help 'isfname'`) add `\` and `:` on top of the Unix set exactly so drive
+/// letters and backslash separators survive the scan.
+///
+/// Deliberately NOT unconditional, hor. On Unix a bare `:` in the set would eat
+/// the `file:line` idiom (`src/main.rs:42` would come back whole and resolve to
+/// nothing), and `\` there is an escape character, not a separator. So each
+/// platform get the set that is correct for it — same reasoning vim use.
+///
+/// **What would make this wrong:** if `gf` ever need to follow a path written in
+/// the *other* platform's convention (a Windows path inside a file opened on
+/// Linux, say). That is out of scope on purpose — resolving `C:\...` on Linux
+/// cannot succeed anyway, so widening the Unix set would only add false
+/// positives in prose without ever opening a real file.
 pub fn file_under_cursor(buf: &Buffer, pos: Position) -> Option<String> {
     let text = buf.line(pos.line)?;
     let graphemes: Vec<&str> = text.graphemes(true).collect();
-    let is_fname = |g: &str| g.chars().next().is_some_and(|c| c.is_alphanumeric() || "/._-~+#$%@".contains(c));
+    // vim's `'isfname'`: the Unix default, plus `\` and `:` on Windows. See the
+    // doc comment above for why this MUST stay platform-conditional.
+    const FNAME_PUNCT: &str = if cfg!(windows) { "/._-~+#$%@\\:" } else { "/._-~+#$%@" };
+    let is_fname = |g: &str| g.chars().next().is_some_and(|c| c.is_alphanumeric() || FNAME_PUNCT.contains(c));
 
     let mut start = pos.col.min(graphemes.len());
     while start < graphemes.len() && !is_fname(graphemes[start]) {
@@ -388,6 +413,35 @@ mod tests {
         assert_eq!(file_under_cursor(&buf, Position::new(0, 4)).as_deref(), Some("src/main.rs"));
         // Off a token, it scans forward to the next one on the line.
         assert_eq!(file_under_cursor(&buf, Position::new(0, 3)).as_deref(), Some("src/main.rs"));
+    }
+
+    /// Regression: `gf` used to die at the colon of a drive letter, so a Windows
+    /// absolute path came back as just `"C"` and `gf` quietly did nothing. See
+    /// [`file_under_cursor`]'s doc comment for why the `isfname` set is
+    /// platform-conditional, same as vim's.
+    #[cfg(windows)]
+    #[test]
+    fn file_under_cursor_keeps_a_windows_drive_path_whole() {
+        let buf = Buffer::from_str(r"C:\Users\me\notes.txt");
+        assert_eq!(
+            file_under_cursor(&buf, Position::new(0, 0)).as_deref(),
+            Some(r"C:\Users\me\notes.txt"),
+            "the drive letter's colon and the backslash separators must not end the token"
+        );
+        // Mid-token works too — the backward scan must cross them as well.
+        assert_eq!(
+            file_under_cursor(&buf, Position::new(0, 10)).as_deref(),
+            Some(r"C:\Users\me\notes.txt")
+        );
+    }
+
+    /// The other half of the same rule: on Unix `:` must stay OUT of the set, so
+    /// the `file:line` idiom still yields a path a caller can actually open.
+    #[cfg(not(windows))]
+    #[test]
+    fn file_under_cursor_stops_at_the_colon_of_a_file_line_reference() {
+        let buf = Buffer::from_str("src/main.rs:42");
+        assert_eq!(file_under_cursor(&buf, Position::new(0, 0)).as_deref(), Some("src/main.rs"));
     }
 
     #[test]

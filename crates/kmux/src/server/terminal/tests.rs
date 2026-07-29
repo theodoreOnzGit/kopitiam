@@ -898,11 +898,85 @@ fn windows_interactive_cmd_starts_in_profile_cwd_and_accepts_input() -> Result<(
     windows_interactive_shell_starts_in_profile_cwd_and_accepts_input("cmd.exe")
 }
 
+/// Same interactive-shell contract as the `cmd.exe` test, but against PowerShell 7.
+///
+/// `pwsh.exe` is PowerShell 7 — a **separate download**, not a Windows component.
+/// A box carrying only the in-box Windows PowerShell 5.1 (`powershell.exe`, which
+/// lives at `%SystemRoot%\System32\WindowsPowerShell\v1.0\`) simply has no
+/// `pwsh.exe` anywhere, so this test cannot run there. Don't confuse the two
+/// binaries — they are different products with different paths.
+///
+/// A test that cannot run is not a test that failed, so we skip loudly instead of
+/// going red forever (same call as commit 55c9bd562b made for the gguf_tokenizer
+/// tests when `vendor/` is absent). A permanent red just teaches people to ignore
+/// the suite, which is exactly how a real ConPTY regression sneaks through.
+///
+/// The guard is deliberately narrow and CANNOT hide a resolver bug: we probe PATH
+/// ourselves, and skip **only** when `pwsh.exe` is genuinely nowhere on it. If
+/// `pwsh.exe` IS installed the test runs in full, and a `not found on PATH` spawn
+/// error then means our own `resolve_application_path()` is broken and must fail
+/// loudly. Install PowerShell 7 (`winget install Microsoft.PowerShell`) to run it.
 #[cfg(windows)]
 #[test]
 fn windows_interactive_pwsh_starts_in_profile_cwd_and_accepts_input() -> Result<(), Box<dyn Error>>
 {
+    if !windows_executable_on_path("pwsh.exe") {
+        eprintln!(
+            "SKIPPED: pwsh.exe not on PATH. PowerShell 7 is a separate install from the \
+             in-box Windows PowerShell 5.1 — `winget install Microsoft.PowerShell` to run this."
+        );
+        return Ok(());
+    }
     windows_interactive_shell_starts_in_profile_cwd_and_accepts_input("pwsh.exe")
+}
+
+/// Is this bare `.exe` leaf name actually resolvable on `PATH`?
+///
+/// Mirrors what `pty::backend::windows::application::search_application_path()`
+/// does, but only for the easy case we need: a name that ALREADY carries its
+/// `.exe` extension. That is why there is no PATHEXT expansion here — the product
+/// resolver skips PATHEXT too once `program.extension()` is `Some`, so for these
+/// inputs the two agree. Pass a bare name without an extension and this becomes
+/// wrong, so don't.
+///
+/// Relative PATH entries get joined onto the cwd, same as the product does.
+#[cfg(windows)]
+fn windows_executable_on_path(leaf_name: &str) -> bool {
+    debug_assert!(
+        Path::new(leaf_name).extension().is_some(),
+        "windows_executable_on_path skips PATHEXT, so the caller must spell the extension"
+    );
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let current_dir = std::env::current_dir().ok();
+    std::env::split_paths(&path_value).any(|directory| {
+        let directory = if directory.is_absolute() {
+            directory
+        } else if let Some(current_dir) = &current_dir {
+            current_dir.join(directory)
+        } else {
+            directory
+        };
+        directory.join(leaf_name).is_file()
+    })
+}
+
+/// Guards the guard: proves `windows_executable_on_path` can still say "yes".
+///
+/// Without this, a bug that made the probe always return `false` would quietly
+/// turn the pwsh test into a permanent skip — green forever, testing nothing.
+/// That is the one failure mode a skip guard must never have, so we pin both
+/// answers against a binary every Windows box has (`cmd.exe` in System32) and a
+/// name no box has.
+#[cfg(windows)]
+#[test]
+fn windows_executable_on_path_answers_both_ways() {
+    assert!(
+        windows_executable_on_path("cmd.exe"),
+        "cmd.exe ships in System32 on every Windows, so PATH probing is broken"
+    );
+    assert!(!windows_executable_on_path("kmux-definitely-not-a-real-binary.exe"));
 }
 
 #[cfg(windows)]

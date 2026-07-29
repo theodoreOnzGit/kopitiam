@@ -207,10 +207,38 @@ fn split_words(line: &str) -> impl Iterator<Item = &str> {
 /// isn't meant as a relative path completion (an absolute path is honoured
 /// as-is, matching shell-style completion) — a completion source failing
 /// should narrow the menu, not interrupt typing.
+///
+/// # Which character counts as a separator (this used to be wrong on Windows)
+///
+/// The split used to be a hardcoded `typed.rfind('/')`, which quietly killed
+/// path completion outright on Windows: a user typing `src\lsp\cl` found no
+/// `/`, so the whole fragment became the *filename prefix*, `base` itself got
+/// listed, and nothing on earth starts with `src\lsp\cl` — empty menu, no
+/// error, no clue why.
+///
+/// The split is now [`std::path::is_separator`], which is the platform's own
+/// answer and is exactly right in **both** directions, hor:
+///
+/// * On Windows it is true for `\` **and** `/` — Win32 accepts either, so a
+///   user who types either one gets completion.
+/// * On unix (Linux, macOS, Android/Termux) it is true for `/` **only**, which
+///   matters just as much: `\` is a perfectly legal character in a unix
+///   filename, so treating it as a separator there would break completing any
+///   file whose name genuinely contains a backslash.
+///
+/// Whatever separator the user typed is the one echoed back in
+/// [`CompletionItem::insert_text`] and in the trailing directory marker, so the
+/// suggestion never comes back as a mongrel `src\lsp/client.rs`. With nothing
+/// typed yet we default to `/`, which works on every platform kvim supports
+/// and matches the forward-slash output convention the workspace already
+/// follows.
 pub fn path_candidates(typed: &str, base: &Path) -> Vec<CompletionItem> {
-    let (dir_part, file_prefix) = match typed.rfind('/') {
-        Some(idx) => (&typed[..idx], &typed[idx + 1..]),
-        None => ("", typed),
+    let (dir_part, sep, file_prefix) = match typed.rfind(std::path::is_separator) {
+        Some(idx) => {
+            let sep = typed[idx..].chars().next().expect("rfind returned a char boundary with a char at it");
+            (&typed[..idx], sep, &typed[idx + sep.len_utf8()..])
+        }
+        None => ("", '/', typed),
     };
     let dir = if dir_part.is_empty() {
         base.to_path_buf()
@@ -230,8 +258,10 @@ pub fn path_candidates(typed: &str, base: &Path) -> Vec<CompletionItem> {
             continue;
         }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let label = if is_dir { format!("{name}/") } else { name.to_string() };
-        let insert_text = if dir_part.is_empty() { label.clone() } else { format!("{dir_part}/{label}") };
+        // Echo back the separator the user actually typed (see the doc comment)
+        // so a Windows `src\` completes to `src\lsp\`, not `src\lsp/`.
+        let label = if is_dir { format!("{name}{sep}") } else { name.to_string() };
+        let insert_text = if dir_part.is_empty() { label.clone() } else { format!("{dir_part}{sep}{label}") };
         items.push(CompletionItem { label, insert_text, source: CompletionSource::Path, detail: None, kind: None, snippet: None });
     }
     items
@@ -348,6 +378,7 @@ pub fn merge_and_rank(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn lsp(label: &str) -> CompletionItem {
         CompletionItem::new(label, CompletionSource::Lsp)
@@ -395,8 +426,68 @@ mod tests {
 
     #[test]
     fn path_candidates_returns_empty_for_a_nonexistent_directory_rather_than_erroring() {
-        let items = path_candidates("nope/", Path::new("/definitely/does/not/exist"));
+        // Built from the platform's own separator instead of a literal
+        // "/definitely/does/not/exist", so the path is nonsense-but-well-formed
+        // on Windows too rather than a drive-relative POSIX-looking string.
+        let nowhere: PathBuf = ["definitely", "does", "not", "exist"].iter().collect();
+        let items = path_candidates("nope/", &nowhere);
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn path_candidates_splits_on_the_separators_this_platform_actually_uses() {
+        // The regression this pins: the split used to be a hardcoded
+        // `rfind('/')`, so on Windows a typed `sub\l` never split, the whole
+        // fragment was treated as a filename prefix, and completion silently
+        // returned nothing. Assert the true behaviour on BOTH families rather
+        // than skipping one:
+        //
+        //   * `/` splits everywhere.
+        //   * `\` splits on Windows only; on unix it is an ordinary filename
+        //     character and must NOT split.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("lib.rs"), "").unwrap();
+
+        // Forward slash: works on every platform kvim supports.
+        let items = path_candidates("sub/l", dir.path());
+        let inserts: HashSet<&str> = items.iter().map(|i| i.insert_text.as_str()).collect();
+        assert_eq!(inserts, HashSet::from(["sub/lib.rs"]), "`/` must split on every platform");
+
+        // Backslash: a separator on Windows, a filename character on unix.
+        let items = path_candidates("sub\\l", dir.path());
+        let inserts: HashSet<&str> = items.iter().map(|i| i.insert_text.as_str()).collect();
+        if cfg!(windows) {
+            assert_eq!(inserts, HashSet::from(["sub\\lib.rs"]), "Windows must split on `\\` and echo it back");
+        } else {
+            assert!(
+                inserts.is_empty(),
+                "on unix `\\` is a filename character, not a separator, so `sub\\l` matches nothing in the base dir: {inserts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_candidate_is_marked_with_a_separator_that_matches_what_was_typed() {
+        // With nothing typed the marker defaults to `/` on every platform (it
+        // works on Windows too, and matches the workspace's forward-slash output
+        // convention); with a separator typed, that same separator comes back.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("outer")).unwrap();
+        std::fs::create_dir(dir.path().join("outer").join("inner")).unwrap();
+
+        let labels: HashSet<String> = path_candidates("out", dir.path()).into_iter().map(|i| i.label).collect();
+        assert_eq!(labels, HashSet::from(["outer/".to_string()]), "no separator typed -> default `/` marker");
+
+        let labels: HashSet<String> = path_candidates("outer/", dir.path()).into_iter().map(|i| i.label).collect();
+        assert_eq!(labels, HashSet::from(["inner/".to_string()]));
+
+        #[cfg(windows)]
+        {
+            let labels: HashSet<String> = path_candidates("outer\\", dir.path()).into_iter().map(|i| i.label).collect();
+            assert_eq!(labels, HashSet::from(["inner\\".to_string()]), "a typed `\\` must not come back as `/`");
+        }
     }
 
     #[test]

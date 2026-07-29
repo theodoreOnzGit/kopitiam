@@ -5744,6 +5744,37 @@ mod tests {
         }
     }
 
+    /// The `:term` ex-command line for "print `hello` and exit", spelled in the
+    /// shell [`crate::termemu::build_command`] will actually use on this OS.
+    ///
+    /// `printf` does not exist in `cmd.exe`. Only the *spelling* differs — every
+    /// caller still asserts the same painted output, so the unix side of these
+    /// tests is unchanged.
+    fn term_echo_hello() -> &'static str {
+        if cfg!(windows) {
+            ":term echo hello"
+        } else {
+            ":term printf hello"
+        }
+    }
+
+    /// The `:term` ex-command line for a long-lived child that echoes what you
+    /// type at it.
+    ///
+    /// * unix — `:term cat`, echoed by the tty line discipline.
+    /// * Windows — bare `:term`, i.e. an interactive `cmd.exe`, echoed by the
+    ///   console. There is no `cat` on Windows, and `more`/`sort` buffer until
+    ///   EOF rather than echoing line by line. Bare `:term` is also *exactly*
+    ///   the keystroke the maintainer reported as freezing the editor, so on
+    ///   Windows these tests now cover the reported bug head-on.
+    fn term_interactive() -> &'static str {
+        if cfg!(windows) {
+            ":term"
+        } else {
+            ":term cat"
+        }
+    }
+
     /// The painted screen of a real-editor app, one string per row.
     fn real_screen(app: &mut App<Editor>, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -5767,7 +5798,7 @@ mod tests {
         let _ = real_screen(&mut app, 80, 24);
 
         // Type `:term printf hello` and run it.
-        feed_str(&mut app, ":term printf hello");
+        feed_str(&mut app, term_echo_hello());
         app.handle_event(enter_event());
 
         assert_eq!(app.host.mode(), crate::core::Mode::Terminal, "`:term` must switch to terminal-mode");
@@ -5795,9 +5826,9 @@ mod tests {
         let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
         let _ = real_screen(&mut app, 80, 24);
 
-        // `cat` is a long-lived child, so the session stays alive across the
-        // mode dance (unlike a command that exits immediately).
-        feed_str(&mut app, ":term cat");
+        // A long-lived child, so the session stays alive across the mode dance
+        // (unlike a command that exits immediately). See `term_interactive`.
+        feed_str(&mut app, term_interactive());
         app.handle_event(enter_event());
         assert_eq!(app.host.mode(), crate::core::Mode::Terminal);
 
@@ -5814,20 +5845,21 @@ mod tests {
         assert_eq!(app.host.mode(), crate::core::Mode::Terminal, "`i` on a terminal buffer must re-enter terminal-mode");
     }
 
-    /// A keystroke typed in terminal-mode reaches the child: feed an interactive
-    /// `cat` the line `hi`, and `cat`'s echo of it must paint. This proves the
-    /// whole keystroke path — App terminal-mode routing → `encode_key` → pty →
-    /// reader → vt100 → render — not just the model-level unit test.
+    /// A keystroke typed in terminal-mode reaches the child: feed an echoing
+    /// child (see [`term_interactive`]) the line `hi`, and its echo of that line
+    /// must paint. This proves the whole keystroke path — App terminal-mode
+    /// routing → `encode_key` → pty → reader → vt100 → render — not just the
+    /// model-level unit test.
     #[test]
     fn a_keystroke_in_terminal_mode_reaches_the_child_and_echoes() {
         let editor = Editor::new();
         let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
         let _ = real_screen(&mut app, 80, 24);
-        feed_str(&mut app, ":term cat");
+        feed_str(&mut app, term_interactive());
         app.handle_event(enter_event());
         assert_eq!(app.host.mode(), crate::core::Mode::Terminal);
 
-        // Type `hi` then Enter — `cat` echoes each line back.
+        // Type `hi` then Enter — the child echoes the line back.
         app.handle_event(key_event('h'));
         app.handle_event(key_event('i'));
         app.handle_event(enter_event());
@@ -5836,7 +5868,7 @@ mod tests {
         for _ in 0..300 {
             app.drain_terminals();
             screen = real_screen(&mut app, 80, 24).join("\n");
-            // `cat` echoes "hi" back, so it appears twice; one is enough proof.
+            // The child echoes "hi" back, so it appears twice; one is enough.
             if screen.contains("hi") {
                 break;
             }
@@ -5857,8 +5889,10 @@ mod tests {
         let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
         let _ = real_screen(&mut app, 80, 24);
 
-        // `true` exits 0 straight away — same lifecycle as a shell that got EOF.
-        feed_str(&mut app, ":term true");
+        // `exit 0` exits 0 straight away — same lifecycle as a shell that got
+        // EOF — and it is spelled identically in `sh -c` and in `cmd /C`, so no
+        // platform split is needed (there is no `true` on Windows).
+        feed_str(&mut app, ":term exit 0");
         app.handle_event(enter_event());
         assert_eq!(app.host.mode(), crate::core::Mode::Terminal, "`:term` starts in terminal-mode");
         assert_eq!(app.terminals.len(), 1);
@@ -5898,7 +5932,7 @@ mod tests {
         let mut app = App::new(editor, Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
         let _ = real_screen(&mut app, 80, 24);
 
-        feed_str(&mut app, ":term true");
+        feed_str(&mut app, ":term exit 0");
         app.handle_event(enter_event());
 
         let mut dropped = false;
@@ -5932,7 +5966,7 @@ mod tests {
 
         // A long-lived child so the session is still running at `:bd` time —
         // proving Drop reaps a *live* child, not only an already-exited one.
-        feed_str(&mut app, ":term cat");
+        feed_str(&mut app, term_interactive());
         app.handle_event(enter_event());
         assert!(app.has_live_terminal(), "`:term` must make a live terminal");
 

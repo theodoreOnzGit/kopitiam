@@ -548,6 +548,34 @@ panel) CANNOT be verified without a real terminal, so they require **human
 dogfooding**: flag the issue and propose the change, but never auto-"fix"
 unverifiable interactive behaviour.
 
+### HARD RULE — dogfooding kopitiam means using `kopi-beans` (`bn`), not upstream `bd`
+
+**`kopi-beans` is part of KOPITIAM.** It lives at `crates/kopi-beans/` and ships
+the binary **`bn`**. It is not a third-party tool we happen to use — it is our
+own fork of beads-rs, made pure-Rust and made to build on Windows and
+Android/Termux, and it is *included* in the platform. So the dogfooding rule
+above covers it exactly like `kopitiam tokens` / `outline` / `refs`: **when you
+track work on KOPITIAM, you use KOPITIAM's own issue tracker.**
+
+Concretely, and this is a hard rule, not a preference:
+
+* **Run `bn`, never `bd`.** The fork renamed the binary `bd` → `bn` (see
+  `docs/ACKNOWLEDGEMENTS.md`). Upstream `bd` is a different program and is not
+  installed here. Every `bd <cmd>` in the managed Beads block below means
+  `bn <cmd>`.
+* **`bn` may not be on `PATH`, and that is not a reason to skip filing.** It is a
+  workspace crate — run the built binary directly (`./target/release/bn.exe` on
+  Windows, `./target/release/bn` elsewhere), or `cargo run --release -p
+  kopi-beans --bin bn -- <args>`. "The tracker wasn't on PATH" is never an excuse
+  for losing a finding; that failure has already happened once and cost a
+  session's worth of discoveries.
+* **Rough edges in `bn` are dogfooding feedback, same as the CLI's.** File them
+  (`bd-cni` — "a read autostarts a daemon that then blocks every write" — is
+  exactly this genre). Fixing a headless `bn` issue you hit is in-scope; patch it.
+* **The point is self-hosting.** KOPITIAM tracks KOPITIAM's work in KOPITIAM's
+  own tracker. Reaching for an external tool instead hides the bugs we most need
+  to find.
+
 ---
 
 # Working Practices
@@ -672,6 +700,46 @@ Still forbidden, even now:
   went live. Because it cannot be undone, if the prompt is explicit but the target
   is ambiguous (which crate? which version?), state what you are about to publish
   before you do — don't publish the wrong thing.
+
+## HARD RULE: no new commits, no version bump. Hold it at the previous version.
+
+**A crate's version moves only when that crate's code moved.** Never bump a crate
+that has no changes since its last published version, and never republish it.
+This is a hard rule, not a tidiness preference.
+
+Per crate, at release time:
+
+1. Find when its currently-published version went up:
+   `curl -fsS https://crates.io/api/v1/crates/<name>/<version> | grep created_at`
+2. Ask git whether anything actually changed since then:
+   `git log --since='<that timestamp>' -- crates/<name>`
+3. **Empty log → hold it.** Leave it at the published version, leave it out of
+   the publish set. **Non-empty → bump that crate, and only that crate.**
+
+**Lockstep bumping the whole workspace is forbidden.** It burns a version number
+on crates nobody touched, makes every changelog a lie about what actually
+changed, forces downstream users into pointless re-resolves, and buries the real
+change among twenty no-op republishes. Doing it "because the workspace version
+moved" is exactly the reflex this rule exists to stop — the 0.2.5 release bumped
+all 32 pins to ship what was really a handful of changed crates.
+
+**The mechanical wrinkle that makes this easy to get wrong.** Most crates here
+inherit `version.workspace = true`, so touching `[workspace.package] version`
+moves *everything* by default — holding one back is not the default, it takes an
+explicit act. A crate that must hold needs its **own pinned `version =` in its
+own manifest**, exactly like `kopitiam-gpu` (0.0.1) and `kopitiam-ocr` (0.1.0)
+already do. So:
+
+* **Mixed versions across the tree are NORMAL and correct**, not a smell to be
+  tidied away. `scripts/publish.sh` already handles this — it resolves each
+  crate's own version via `cargo pkgid` and has no single `WORKSPACE_VERSION`.
+* Anyone "cleaning up" the tree back into one uniform version is reintroducing
+  the bug this rule forbids.
+
+Holding a crate back costs nothing downstream: a caret requirement like
+`kopitiam-neovim = "0.2.1"` keeps resolving to whatever is newest on the
+registry, so consumers pick a later release automatically when one finally
+lands.
 
 ## Record decisions the maintainer would have made
 

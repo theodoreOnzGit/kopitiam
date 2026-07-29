@@ -23,12 +23,16 @@
 //! ```no_run
 //! use std::time::Duration;
 //!
-//! use crate::sdk::{
+//! // `kmux::sdk`, NOT `crate::sdk` — a doctest is built as its own crate that
+//! // merely links this one, so `crate::` there means the doctest itself and the
+//! // path cannot resolve. (Leftover from the rmux-sdk -> kmux::sdk collapse: the
+//! // rewrite was right for intra-doc links, wrong inside a runnable example.)
+//! use kmux::sdk::{
 //!     EnsureSession, EnsureSessionPolicy, ProcessSpec, Rmux, RmuxEndpoint, SessionName,
 //!     TerminalSizeSpec,
 //! };
 //!
-//! # async fn run() -> crate::sdk::Result<()> {
+//! # async fn run() -> kmux::sdk::Result<()> {
 //! let rmux = Rmux::builder()
 //!     .default_timeout(Duration::from_secs(5))
 //!     .connect_or_start()

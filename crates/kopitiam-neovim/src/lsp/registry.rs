@@ -386,9 +386,31 @@ pub fn which_in(executable: &str, path_var: &OsStr) -> Option<PathBuf> {
     None
 }
 
+/// The filenames to try, in order, for a bare executable name on this host.
+///
+/// # Why `.exe` goes FIRST on Windows, and why the bare name still stays
+///
+/// On unix the answer is one name and no drama — `rust-analyzer` is
+/// `rust-analyzer`, and a trailing `.exe` is just an ordinary filename
+/// character, so we must NOT go inventing one there.
+///
+/// Windows hor, got a real ordering question. `cmd.exe` resolving a name with
+/// no extension does not try the bare name at all — it appends each entry of
+/// `%PATHEXT%` (`.COM;.EXE;.BAT;.CMD;...`) and takes the first hit. Rust's own
+/// `std::process::Command` does the same thing in spirit: on Windows it appends
+/// `.exe` when the program name carries no extension. So if a directory on
+/// `PATH` somehow holds BOTH `rust-analyzer` and `rust-analyzer.exe`, the one
+/// that will actually spawn is the `.exe` — returning the extensionless file
+/// would hand the caller a path that resolves fine on disk and then fails at
+/// spawn time. Ordering `.exe` first makes what we report match what will run.
+///
+/// The bare name is kept as a **fallback**, not dropped: a Windows box running
+/// kvim from Git Bash / MSYS can legitimately have extensionless things on
+/// `PATH`, and an honest "found it here" beats a false "not installed" that
+/// sends the user off downloading a server they already have.
 fn candidate_names(executable: &str) -> Vec<String> {
     if cfg!(windows) && !executable.to_ascii_lowercase().ends_with(".exe") {
-        vec![executable.to_string(), format!("{executable}.exe")]
+        vec![format!("{executable}.exe"), executable.to_string()]
     } else {
         vec![executable.to_string()]
     }
@@ -585,11 +607,66 @@ mod tests {
     }
 
     #[test]
-    fn host_target_detection_does_not_panic_and_is_some_on_this_ci_machine() {
-        // This test runs on a real x86_64 Linux desktop (see the top-level
-        // report), so `host()` must resolve.
+    fn host_target_detection_agrees_with_the_platform_the_test_binary_was_built_for() {
+        // This one used to hardcode `Some(t(Os::Linux, Arch::X86_64))` with the
+        // comment "this test runs on a real x86_64 Linux desktop". That is not a
+        // fact about `host()` hor -- it's a fact about ONE machine, and the day
+        // the same suite ran on the maintainer's Windows box it blew up:
+        //     left:  Some(Target { os: Windows, arch: X86_64 })
+        //     right: Some(Target { os: Linux,   arch: X86_64 })
+        // The production code was correct -- it detected Windows properly. The
+        // ASSERTION was the bug. kvim ships on Windows, Linux, macOS and
+        // Android/Termux, so a test that pins one developer's desktop is a
+        // tripwire for the other three, not coverage.
+        //
+        // What's actually true everywhere: `host()`'s hand-rolled `cfg!` ladder
+        // must agree with `std::env::consts`, which is std's own independent
+        // statement of what this binary was compiled for. Cross-checking the two
+        // is a real assertion, not a restatement of the implementation -- if
+        // somebody adds an `Os` variant and forgets a rung of the ladder, or
+        // swaps two arms, this catches it on whichever platform they're on.
+        let expected_os = match std::env::consts::OS {
+            "linux" => Some(Os::Linux),
+            "android" => Some(Os::Android),
+            "macos" => Some(Os::MacOs),
+            "windows" => Some(Os::Windows),
+            // Anything else (freebsd, ios, wasm, ...) is not modelled here, and
+            // `host()` must say `None` rather than guess wrongly.
+            _ => None,
+        };
+        let expected_arch = match std::env::consts::ARCH {
+            "x86_64" => Some(Arch::X86_64),
+            "aarch64" => Some(Arch::Aarch64),
+            // e.g. armv7 Termux on an older phone -- deliberately unmodelled,
+            // see `Arch`'s doc comment.
+            _ => None,
+        };
+        let expected = expected_os.zip(expected_arch).map(|(os, arch)| t(os, arch));
+
         let host = Target::host();
-        assert_eq!(host, Some(t(Os::Linux, Arch::X86_64)));
+        assert_eq!(
+            host, expected,
+            "Target::host() disagrees with std::env::consts ({}/{}) -- the cfg! ladder in host() is wrong for \
+             this platform, not the platform",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+
+        // Second half, and the bit that makes this worth running on a platform
+        // nobody has tried yet: whatever machine we turn out to be on, if we can
+        // name it then the acquisition ladder must have something actionable to
+        // say about it. Never a panic, never an empty excuse. On Windows/Linux/
+        // macOS that lands on a download; on Android/Termux it lands on `pkg`
+        // or cargo (AID-0005). Any host that resolves to `Unavailable` for
+        // rust-analyzer means kvim cannot bootstrap itself there -- a real
+        // regression, and this catches it without naming any one OS.
+        if let Some(host) = host {
+            let src = resolve_with_path(&RUST_ANALYZER, host, None);
+            assert!(
+                !matches!(src, Source::Unavailable { .. }),
+                "rust-analyzer must be obtainable on the host kvim is running on ({host:?}), got {src:?}"
+            );
+        }
     }
 
     /// Builds a fake executable named `name` inside a fresh tempdir and
@@ -622,6 +699,59 @@ mod tests {
         let (_dir, path_var) = fake_executable_on_a_path_of_its_own("some-other-tool");
         let src = resolve_with_path(&RUST_ANALYZER, t(Os::Linux, Arch::X86_64), Some(&path_var));
         assert!(matches!(src, Source::Download { .. }), "expected a download source, got {src:?}");
+    }
+
+    #[test]
+    fn the_dot_exe_suffix_is_implied_on_windows_and_never_implied_anywhere_else() {
+        // The `.exe` half of `which_in` had no coverage at all, which is how a
+        // Windows-only path stays broken for months without anybody noticing.
+        // This test asserts the REAL, opposite behaviour on each family, so it
+        // is meaningful on all four platforms rather than skipped on three:
+        //
+        //   * Windows: a `texlab.exe` on PATH satisfies a search for `texlab`.
+        //   * unix (Linux, macOS, Android/Termux): `.exe` is an ordinary
+        //     filename character, NOT an implied suffix, so the same file must
+        //     NOT satisfy the search -- inventing one would make kvim claim a
+        //     server is installed when nothing there can run it.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("texlab.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        #[cfg(unix)]
+        {
+            // Give it the exec bit, so the ONLY reason unix can reject it is the
+            // name -- otherwise the test would pass for the wrong reason.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var = std::env::join_paths([dir.path()]).unwrap();
+
+        let found = which_in("texlab", &path_var);
+        if cfg!(windows) {
+            assert_eq!(found, Some(exe), "Windows must find `texlab` via its `.exe`");
+        } else {
+            assert_eq!(found, None, "`.exe` must never be implied on unix -- `texlab.exe` is not `texlab`");
+        }
+
+        // And an explicitly-spelled `.exe` is honoured verbatim on every
+        // platform: we append the suffix, we never strip or double it.
+        assert_eq!(which_in("texlab.exe", &path_var), Some(dir.path().join("texlab.exe")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_the_dot_exe_over_an_extensionless_file_of_the_same_name() {
+        // Both present in one PATH directory: `cmd.exe` and Rust's own
+        // `Command` will spawn the `.exe`, so `which_in` must report the `.exe`
+        // too. Reporting the extensionless file would resolve on disk and then
+        // fail at spawn -- the worst kind of "available".
+        //
+        // Windows-only by necessity, not by laziness: on unix the two names are
+        // simply two different programs, and there is no preference to assert.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("texlab"), b"extensionless").unwrap();
+        std::fs::write(dir.path().join("texlab.exe"), b"the real one").unwrap();
+        let path_var = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(which_in("texlab", &path_var), Some(dir.path().join("texlab.exe")));
     }
 
     #[cfg(unix)]

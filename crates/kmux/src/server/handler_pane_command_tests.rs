@@ -1089,11 +1089,7 @@ async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
         .await;
     assert!(matches!(response, crate::proto::Response::RespawnPane(_)));
 
-    let maybe_event = timeout(Duration::from_millis(150), lifecycle_events.recv()).await;
-    assert!(
-        maybe_event.is_err(),
-        "forced respawn must not synthesize pane-exited like tmux 3.4/3.6: {maybe_event:?}"
-    );
+    assert_no_pane_exited_event(&mut lifecycle_events, "forced respawn").await;
 
     let state = handler.state.lock().await;
     let pane = state
@@ -1205,6 +1201,35 @@ async fn pane_id_respawn_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     assert!(lifecycle.exit_state.is_none());
 }
 
+/// Drains lifecycle events for a while and fails only if `pane-exited` shows up.
+///
+/// Why "only `pane-exited`" and not "no event at all", hor — this is the whole
+/// point of the helper, so don't tighten it back:
+///
+/// * tmux fires `pane-exited` from exactly ONE place, `server-fn.c:422` inside
+///   `server_destroy_pane()` — that is the child-really-died path. The respawn
+///   path is `spawn.c`'s `SPAWN_RESPAWN|SPAWN_KILL` branch (the `sc->wp0->fd`
+///   block), which closes the fd, calls `window_pane_reset_mode_all()`,
+///   `screen_reinit()` and `input_free()`, and notifies **nothing**. So a forced
+///   respawn must never synthesize `pane-exited`. That invariant is real and we
+///   hold ourselves to it.
+/// * But tmux happily fires OTHER hooks across a respawn. `pane-title-changed`
+///   comes out of `input.c:808` (`input_fire_pane_title_changed()`), driven purely
+///   by the child writing OSC 0/2. Nothing in the respawn path suppresses it, and
+///   `screen_reinit()` only frees the title *stack* (`screen_free_titles()`), not
+///   the current title — our `ScreenWriter::full_reset()` matches that exactly.
+///
+/// So on Windows a respawned pane genuinely does emit `PaneTitleChanged`: ConPTY
+/// hands us a real OSC title sequence when the new child attaches to the console.
+/// That is correct behaviour, same as tmux, NOT a spurious event — kmux only ever
+/// emits `PaneTitleChanged` from `handler_alerts.rs` off a real byte-diff of the
+/// screen title, never from the respawn code itself.
+///
+/// Asserting "zero events in 150ms" therefore tests the *machine's mood*, not the
+/// code: when the box is loaded the child is slow to say hello and the test goes
+/// green vacuously; when the box is quick the OSC lands inside the window and the
+/// test goes red. Flaky both directions, ownself sabotage. Assert the invariant
+/// that actually exists instead.
 async fn assert_no_pane_exited_event(
     lifecycle_events: &mut tokio::sync::broadcast::Receiver<super::QueuedLifecycleEvent>,
     context: &str,

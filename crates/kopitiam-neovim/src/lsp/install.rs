@@ -73,8 +73,24 @@ fn data_dir_from(xdg_data_home: Option<&std::ffi::OsStr>, home: Option<&std::ffi
 /// support scripts next to the binary, which need a directory of their own
 /// to avoid collisions with the other two servers' files.
 pub fn install_path(server: &LanguageServer) -> Option<PathBuf> {
+    Some(install_path_under(&data_dir()?, server))
+}
+
+/// The layout half of [`install_path`], with the data directory passed in.
+///
+/// Split out so the `<dir>/<exe>/<exe>[.exe]` shape can be tested on **any**
+/// machine. [`data_dir`] reads `$XDG_DATA_HOME`/`$HOME`, and `$HOME` is simply
+/// not set in a stock `cmd.exe` or PowerShell session — so a test that went
+/// through [`install_path`] passed under Git Bash on Windows and panicked in
+/// PowerShell on the same box. Environment-dependent tests hide platform bugs;
+/// the pure function does not.
+///
+/// The `.exe` suffix follows `cfg!(windows)`, i.e. the machine kvim is running
+/// on, not some [`Target`] passed by a caller — this is where the binary lands
+/// on *this* host, so it must match what this host can actually spawn.
+fn install_path_under(data_dir: &Path, server: &LanguageServer) -> PathBuf {
     let exe_name = if cfg!(windows) { format!("{}.exe", server.executable) } else { server.executable.to_string() };
-    Some(data_dir()?.join(server.executable).join(exe_name))
+    data_dir.join(server.executable).join(exe_name)
 }
 
 /// What to do to obtain `server` for `target`: already usable, a precise
@@ -138,17 +154,33 @@ impl Plan {
 /// `PATH` string is a parameter rather than always read from the real
 /// environment).
 pub fn plan_with_path(server: &LanguageServer, target: Target, path_var: Option<&std::ffi::OsStr>) -> Plan {
+    plan_in(server, target, path_var, data_dir().as_deref())
+}
+
+/// The whole of [`plan_with_path`], with the install directory injected too.
+///
+/// Same reason `path_var` is already a parameter (see
+/// [`super::registry::resolve_with_path`]): a function that reads the ambient
+/// environment cannot be tested the same way twice on two machines. `data_dir`
+/// is worse than `PATH` in that respect — it resolves from `$XDG_DATA_HOME` /
+/// `$HOME`, and `$HOME` is a unix convention that a stock `cmd.exe` or
+/// PowerShell session simply does not set. So a test going through the ambient
+/// path passed under Git Bash on Windows and hit the "no data directory" arm in
+/// PowerShell on the exact same box. Inject it, and the plan is the same
+/// everywhere.
+fn plan_in(server: &LanguageServer, target: Target, path_var: Option<&std::ffi::OsStr>, data_dir: Option<&Path>) -> Plan {
     match resolve_with_path(server, target, path_var) {
         Source::OnPath(path) => Plan::AlreadyAvailable(path),
         Source::Unavailable { reason } => Plan::Unavailable { reason },
         Source::SystemPackage { command, manager } => Plan::RunPackageManager { command, manager },
         Source::CargoInstall { crate_name, rustup_component } => Plan::BuildWithCargo { crate_name, rustup_component },
         Source::Download { url, archive } => {
-            let Some(executable_path) = install_path(server) else {
+            let Some(data_dir) = data_dir else {
                 return Plan::Unavailable {
                     reason: "cannot resolve a data directory to install into: neither $XDG_DATA_HOME nor $HOME is set".to_string(),
                 };
             };
+            let executable_path = install_path_under(data_dir, server);
             let unpack_dir = executable_path.parent().map(Path::to_path_buf).unwrap_or_else(|| executable_path.clone());
             Plan::FetchInstructions { url, archive, unpack_dir, executable_path }
         }
@@ -209,8 +241,32 @@ mod tests {
 
     #[test]
     fn install_path_nests_the_executable_under_its_own_directory() {
-        let path = install_path(&RUST_ANALYZER).expect("HOME or XDG_DATA_HOME must be set in the test environment");
-        assert!(path.ends_with(if cfg!(windows) { "rust-analyzer/rust-analyzer.exe" } else { "rust-analyzer/rust-analyzer" }));
+        // Deliberately goes through the pure `install_path_under` rather than
+        // `install_path`. The old version did `install_path(..).expect("HOME or
+        // XDG_DATA_HOME must be set in the test environment")` -- which is a
+        // bet on the ambient environment, and on Windows it is a losing one:
+        // `HOME` is a unix convention that Git Bash happens to export, so the
+        // same test passed in Git Bash and panicked in PowerShell on the very
+        // same machine. Test the layout, not the shell you happened to launch
+        // from.
+        //
+        // `Path::ends_with` compares whole components, and `/` is a separator on
+        // Windows as well as unix, so the expected suffix reads the same on
+        // every platform -- only the `.exe` differs, and that is the point.
+        let fake_data_dir: PathBuf = ["some", "data", "dir"].iter().collect();
+        let path = install_path_under(&fake_data_dir, &RUST_ANALYZER);
+        assert!(
+            path.ends_with(if cfg!(windows) { "rust-analyzer/rust-analyzer.exe" } else { "rust-analyzer/rust-analyzer" }),
+            "unexpected install layout: {}",
+            path.display()
+        );
+        assert!(path.starts_with(&fake_data_dir), "the binary must land under the data dir, got {}", path.display());
+
+        // And when the environment DOES give us a data directory (unix always;
+        // Windows under Git Bash), the public wrapper must agree with it.
+        if let Some(dir) = data_dir() {
+            assert_eq!(install_path(&RUST_ANALYZER), Some(install_path_under(&dir, &RUST_ANALYZER)));
+        }
     }
 
     #[test]
@@ -230,13 +286,41 @@ mod tests {
 
     #[test]
     fn plan_for_a_missing_binary_produces_a_precise_fetch_instruction_not_a_download() {
-        let plan = plan_with_path(&RUST_ANALYZER, Target::new(Os::Linux, Arch::X86_64), None);
+        // Data dir injected rather than read from the environment: this used to
+        // go through `plan_with_path`, so on a Windows shell with no `$HOME`
+        // (cmd.exe, PowerShell) it hit the "no data directory" arm and the test
+        // panicked on `expected FetchInstructions` -- a green suite in Git Bash
+        // and a red one in PowerShell on the same machine.
+        let data_dir: PathBuf = ["some", "data", "dir"].iter().collect();
+        let plan = plan_in(&RUST_ANALYZER, Target::new(Os::Linux, Arch::X86_64), None, Some(&data_dir));
         match plan {
-            Plan::FetchInstructions { url, executable_path, .. } => {
+            Plan::FetchInstructions { url, executable_path, unpack_dir, .. } => {
                 assert!(url.starts_with("https://github.com/rust-lang/rust-analyzer/releases/download/nightly/"));
-                assert!(executable_path.ends_with(if cfg!(windows) { "rust-analyzer/rust-analyzer.exe" } else { "rust-analyzer/rust-analyzer" }));
+                assert!(
+                    executable_path.ends_with(if cfg!(windows) { "rust-analyzer/rust-analyzer.exe" } else { "rust-analyzer/rust-analyzer" }),
+                    "unexpected install layout: {}",
+                    executable_path.display()
+                );
+                assert_eq!(unpack_dir, data_dir.join("rust-analyzer"), "the archive unpacks beside the binary");
             }
             other => panic!("expected FetchInstructions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_host_with_no_resolvable_data_directory_says_so_instead_of_planning_a_fetch() {
+        // The other half of the same seam, and a real state on Windows today:
+        // neither `$XDG_DATA_HOME` nor `$HOME` is set in a stock cmd.exe or
+        // PowerShell session, so there is nowhere to install to. The contract is
+        // an honest, non-empty explanation -- never a fetch plan pointing at a
+        // path we could not compute.
+        let plan = plan_in(&RUST_ANALYZER, Target::new(Os::Linux, Arch::X86_64), None, None);
+        match plan {
+            Plan::Unavailable { reason } => {
+                assert!(reason.contains("data directory"), "the reason must name the actual problem, got: {reason}");
+                assert!(!reason.trim().is_empty(), "an empty excuse helps nobody");
+            }
+            other => panic!("expected an honest Unavailable with no data dir, got {other:?}"),
         }
     }
 

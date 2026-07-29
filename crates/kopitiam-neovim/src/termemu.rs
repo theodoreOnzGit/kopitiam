@@ -47,22 +47,90 @@
 //! [`TermSession::with_screen`]. A `dirty` atomic tells the UI "new output
 //! landed, worth repainting" so it does not repaint on a fixed clock.
 //!
-//! # The two pty facts that will bite you if you forget them
+//! # The pty facts that will bite you if you forget them
 //!
-//! 1. **Drop the slave after spawning, or you never see EOF.** After the child
-//!    is spawned, the child holds the slave end. If kvim *also* keeps a slave
-//!    handle open, then when the child exits the slave fd stays open, the
+//! 1. **On unix: drop the slave after spawning, or you never see EOF.** After
+//!    the child is spawned, the child holds the slave end. If kvim *also* keeps
+//!    a slave fd open, then when the child exits the slave fd stays open, the
 //!    master read never returns 0 (EOF), and the reader thread blocks forever —
 //!    the terminal looks alive after the shell already quit. So [`spawn`] drops
 //!    `pair.slave` immediately once the command is running.
-//! 2. **The child must be reaped, or it becomes a zombie.** A finished child
+//! 2. **On Windows that drop is a no-op, so EOF is NOT a liveness signal.**
+//!    `portable-pty` 0.9's ConPTY backend builds `ConPtyMasterPty` and
+//!    `ConPtySlavePty` over the *same* `Arc<Mutex<Inner>>` (see
+//!    `portable-pty-0.9.0/src/win/conpty.rs`, `openpty()`), so dropping the
+//!    slave closes exactly nothing — the refcount just goes 2 → 1. Worse, the
+//!    master's read handle is the read end of a pipe whose write end is dup'd
+//!    into the console host; the parent's own copy is already dropped inside
+//!    `PsuedoCon::new`, so the *only* thing that can produce EOF is
+//!    `ClosePseudoConsole`, which runs when `Inner` finally drops. Consequence:
+//!    on Windows a child can exit, and the pty still never reports EOF. So
+//!    liveness must come from the process, never from the byte stream — which
+//!    is why [`is_finished`] polls the child rather than trusting the `eof`
+//!    flag, and why the App's idle tick drives [`reap_if_done`].
+//! 3. **The child must be reaped, or it becomes a zombie.** A finished child
 //!    that nobody `wait()`s stays as a `<defunct>` process. [`TermSession`]
-//!    reaps it two ways: [`reap_if_done`] harvests it during the idle tick once
-//!    the reader signals EOF, and `Drop` kills-then-waits as the backstop so
-//!    closing kvim never leaks a process.
+//!    reaps it two ways: [`reap_if_done`] harvests it during the idle tick, and
+//!    `Drop` kills-then-waits as the backstop so closing kvim never leaks a
+//!    process. That backstop wait is *bounded* — see [`TermSession::drop`].
+//! 4. **A terminal that never answers `ESC[6n` hangs ConPTY dead.** This one
+//!    cost a whole debugging session; see the next heading.
+//!
+//! # WINDOWS FACT: you MUST answer the cursor-position report, or `:term` dies
+//!
+//! Wah, this one damn sneaky. On Windows `portable-pty` creates its pseudo
+//! console with the flags hardcoded in `PsuedoCon::new`
+//! (`portable-pty-0.9.0/src/win/psuedocon.rs`):
+//!
+//! ```text
+//! PSUEDOCONSOLE_INHERIT_CURSOR | PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE
+//!   = 0x1                      | 0x2                        | 0x4
+//! ```
+//!
+//! `PSUEDOCONSOLE_INHERIT_CURSOR` (0x1) tells the console host: "before you let
+//! the client run, ask the *host terminal* where its cursor is, and start the
+//! console buffer there." The host does that by writing the VT **DSR-CPR**
+//! query `ESC [ 6 n` down the pty and **blocking until somebody writes back
+//! `ESC [ row ; col R`**. A real terminal emulator (wezterm, Windows Terminal —
+//! the people this flag was written for) answers it reflexively. kvim's reader
+//! thread used to just feed those bytes to `vt100` and move on, and `vt100`
+//! 0.15 does not implement DSR at all (grep its source for `dsr` — nothing). So
+//! nobody ever answered, and the client sat wedged **inside console/DLL
+//! initialisation**, forever.
+//!
+//! What that looks like from the maintainer's chair: `:term`, blank window, zero
+//! bytes ever, and since terminal-mode forwards every keystroke to a pty nobody
+//! is reading, the editor looks stone dead. Measured on Windows 11 26200 with a
+//! flag-by-flag bisect against raw Win32 `CreatePseudoConsole`:
+//!
+//! | conpty flags | result |
+//! |---|---|
+//! | `0x0` (Microsoft's own `EchoCon` sample) | `cmd /c echo hello` → "hello", exit 0 |
+//! | `0x2` RESIZE_QUIRK alone | works |
+//! | `0x4` WIN32_INPUT_MODE alone | works |
+//! | `0x1` INHERIT_CURSOR alone | **wedged forever, 0 bytes out** |
+//! | `0x7` (what portable-pty uses) | **wedged forever, 0 bytes out** |
+//! | `0x7` **+ we answer `ESC[6n`** | "hello", exit 0 |
+//!
+//! A wedged client is also stuck in the loader, so `ClosePseudoConsole` does not
+//! free it and it can report `STATUS_DLL_INIT_FAILED` (0xC0000142) when it
+//! finally dies — that exit code is the *symptom* of the stall, not a separate
+//! bug. Chasing 0xC0000142 leads nowhere; the flag is the cause.
+//!
+//! We cannot change those flags (they are hardcoded upstream and 0.9.0 is the
+//! newest release), so [`spawn_reader`] answers the query itself: it watches the
+//! raw pty stream for `ESC [ 6 n` and writes `ESC [ row ; col R` back, using the
+//! parser's real cursor. **What would make this wrong:** if a future
+//! `portable-pty` stops setting `INHERIT_CURSOR`, answering is still correct
+//! (that is what every terminal does); but if you ever remove the answering
+//! code while the flag is still set, `:term` on Windows breaks again, silently
+//! and totally. Do not remove it. It is also not Windows-only politeness — on
+//! unix, programs like `tput u7` and shells probing the prompt column send the
+//! very same query and hang waiting for the same reply.
 //!
 //! [`spawn`]: TermSession::spawn
 //! [`reap_if_done`]: TermSession::reap_if_done
+//! [`is_finished`]: TermSession::is_finished
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,7 +185,21 @@ pub struct TermSession {
     /// them from tearing.
     parser: Arc<Mutex<vt100::Parser>>,
     /// The write side of the pty — keystrokes go here, to the child's stdin.
-    writer: Box<dyn Write + Send>,
+    ///
+    /// Shared with the reader thread, because the reader must be able to write
+    /// too: it answers the `ESC[6n` cursor-position query (see the module docs
+    /// — without that answer ConPTY never starts the child on Windows). Only
+    /// one writer can ever exist — `portable-pty`'s `take_writer()` literally
+    /// `take()`s an `Option` and errors on the second call — so sharing this
+    /// one behind a mutex is the only way both sides can speak.
+    ///
+    /// **Lock order, and what would make this wrong:** never grab `parser`
+    /// while holding `writer`. The reader thread does parser-then-writer only
+    /// by taking the parser lock, computing the reply, *dropping* the guard,
+    /// and only then locking the writer. The UI thread takes them one at a time
+    /// and never nests. Nest them the other way round and you have a deadlock
+    /// that will only show up under load.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// The master handle, kept alive so [`resize`] can push the new window size
     /// down to the kernel (the `TIOCSWINSZ` ioctl) and so the pty stays open.
     ///
@@ -133,6 +215,12 @@ pub struct TermSession {
     /// Set by the reader thread when the pty hits EOF (the child closed its end,
     /// i.e. the program exited). Distinct from "reaped": EOF says the output is
     /// finished, [`reap_if_done`] then harvests the exit status.
+    ///
+    /// **Unix-only signal.** On Windows this flag basically never fires while
+    /// the session is alive — the console host holds the pipe's write end until
+    /// `ClosePseudoConsole`, which only runs when this whole session drops (pty
+    /// fact #2 in the module docs). So it is a *hint* that the child is gone,
+    /// never the proof. The proof is [`reap_if_done`] polling the process.
     ///
     /// [`reap_if_done`]: TermSession::reap_if_done
     eof: Arc<AtomicBool>,
@@ -163,10 +251,12 @@ impl TermSession {
     /// `command` is neovim's `:terminal [cmd]` argument:
     /// * `None` runs the user's login shell interactively — `portable-pty`'s
     ///   `new_default_prog`, which honours `$SHELL`.
-    /// * `Some(line)` runs `line` through `$SHELL -c line` (falling back to
-    ///   `/bin/sh` if `$SHELL` is unset), so shell syntax — pipes, `&&`, globs —
-    ///   works the way it does when you type the same thing at a prompt. This
-    ///   matches vim's `:terminal {cmd}` going through `'shell'`/`'shellcmdflag'`.
+    /// * `Some(line)` runs `line` through the platform's shell, so shell syntax
+    ///   — pipes, `&&`, globs — works the way it does when you type the same
+    ///   thing at a prompt. This matches vim's `:terminal {cmd}` going through
+    ///   `'shell'`/`'shellcmdflag'`. See [`build_command`] for which shell and
+    ///   which flag on which OS — hor, they are not the same, and getting it
+    ///   wrong is how `:term` used to be unusable on Windows.
     ///
     /// Returns an error only if the pty could not be opened or the command could
     /// not be spawned; a command that spawns and then immediately fails is a
@@ -186,13 +276,18 @@ impl TermSession {
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(format!("spawn failed: {e}")))?;
 
-        // FACT #1 from the module docs: drop the slave now, or EOF never comes.
+        // FACT #1 from the module docs: on unix, drop the slave now or EOF never
+        // comes. FACT #2: on Windows this is a no-op (master and slave share one
+        // `Arc<Mutex<Inner>>`), which is exactly why nothing here may treat EOF
+        // as the liveness signal. Dropping is still right on both — it just only
+        // *achieves* something on unix.
         drop(pair.slave);
 
         let writer = pair
             .master
             .take_writer()
             .map_err(|e| std::io::Error::other(format!("pty take_writer failed: {e}")))?;
+        let writer = Arc::new(Mutex::new(writer));
         let reader = pair
             .master
             .try_clone_reader()
@@ -202,7 +297,13 @@ impl TermSession {
         let dirty = Arc::new(AtomicBool::new(false));
         let eof = Arc::new(AtomicBool::new(false));
 
-        let reader_handle = spawn_reader(reader, Arc::clone(&parser), Arc::clone(&dirty), Arc::clone(&eof));
+        let reader_handle = spawn_reader(
+            reader,
+            Arc::clone(&parser),
+            Arc::clone(&dirty),
+            Arc::clone(&eof),
+            Arc::clone(&writer),
+        );
 
         Ok(Self {
             parser,
@@ -224,8 +325,9 @@ impl TermSession {
     /// an interactive program should react to each keystroke, not wait for a
     /// buffer to fill.
     pub fn write_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        writer.write_all(bytes)?;
+        writer.flush()
     }
 
     /// Tell the pty (and thus the child) the grid is now `size`.
@@ -274,11 +376,25 @@ impl TermSession {
         self.dirty.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether the child has exited (the pty reached EOF). True does not by
-    /// itself mean the process has been reaped — call [`reap_if_done`] for that.
+    /// Whether the child has exited.
+    ///
+    /// Takes `&mut self` because on Windows there is no cheap read-only way to
+    /// know: the pty's EOF cannot be trusted (pty fact #2 — the console host
+    /// keeps the pipe open until this session drops, so a long-dead child still
+    /// shows no EOF), so the only honest answer is to *poll the process*. This
+    /// therefore calls [`reap_if_done`] first and then reports
+    /// `eof || reaped`. Polling is a single non-blocking `try_wait`
+    /// (`GetExitCodeProcess` on Windows, `waitpid(WNOHANG)` on unix), so calling
+    /// it on every idle tick costs nothing.
+    ///
+    /// The reaping is a feature, not a side effect: whoever asks "is it done?"
+    /// almost always wants [`exit_code`] next, and this guarantees it is already
+    /// there rather than one tick late.
     ///
     /// [`reap_if_done`]: Self::reap_if_done
-    pub fn is_finished(&self) -> bool {
+    /// [`exit_code`]: Self::exit_code
+    pub fn is_finished(&mut self) -> bool {
+        self.reap_if_done();
         self.eof.load(Ordering::Acquire) || self.exit_status.is_some()
     }
 
@@ -301,11 +417,10 @@ impl TermSession {
     ///
     /// Why "reaped", not just "finished": the UI uses this to announce
     /// `[Process exited N]` and to drop out of terminal-mode, and it wants the
-    /// real code, not a guess. [`is_finished`] flips on EOF (before reaping) so
-    /// the fast poll kicks in; `exit_code` flips one tick later, once the code
-    /// is known for sure. The gap is ~16ms (the child has already exited, so the
-    /// next `try_wait` succeeds straight away), so the transition still feels
-    /// instant to the user.
+    /// real code, not a guess. `App::drain_terminals` therefore calls
+    /// [`reap_if_done`] every idle tick and keys the lifecycle off *this*, not
+    /// off [`is_finished`] — which is also what makes that path correct on
+    /// Windows, where EOF alone would never arrive.
     ///
     /// [`reap_if_done`]: Self::reap_if_done
     /// [`is_finished`]: Self::is_finished
@@ -314,60 +429,240 @@ impl TermSession {
     }
 }
 
+impl TermSession {
+    /// How long [`TermSession::drop`] will wait for a killed child before giving
+    /// up and letting the OS clean up.
+    ///
+    /// **Why bounded at all — this is the anti-freeze constant.** `Drop` runs on
+    /// the UI thread (a `:bd` on a terminal buffer, or kvim shutting down), and
+    /// `portable-pty`'s `Child::wait()` is `WaitForSingleObject(..., INFINITE)`
+    /// on Windows (`portable-pty-0.9.0/src/win/mod.rs`) and a blocking `waitpid`
+    /// on unix. A child that is wedged inside console/DLL initialisation — the
+    /// exact state the unanswered-`ESC[6n` bug used to leave every `:term`
+    /// child in — does not die on `TerminateProcess` straight away, so an
+    /// unbounded wait there freezes the whole editor with no way out. Kill, then
+    /// poll, then move on: a stuck process is the OS's problem at that point,
+    /// a frozen editor is ours.
+    ///
+    /// 2 seconds because a `SIGKILL`ed / `TerminateProcess`d child is normally
+    /// reaped in microseconds; two orders of magnitude of headroom means the
+    /// bound only ever fires in the genuinely-pathological case.
+    ///
+    /// **What would make this wrong:** on unix, giving up before `waitpid`
+    /// succeeds leaks a `<defunct>` zombie until kvim itself exits. That is the
+    /// deliberate trade — one zombie beats a hung editor — but if you ever see
+    /// zombies pile up, the bug is upstream of here (something is blocking the
+    /// child's death), not this timeout.
+    const DROP_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+}
+
 impl Drop for TermSession {
     fn drop(&mut self) {
-        // Backstop cleanup (FACT #2): kill the child if it is still running,
+        // Backstop cleanup (pty fact #3): kill the child if it is still running,
         // then reap it so we never leave a zombie or an orphaned shell when a
         // terminal window closes or kvim exits. Both best-effort — by Drop time
         // there is no one to hand an error to, and a child that already exited
         // makes `kill` a harmless error we ignore.
-        if self.exit_status.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.exit_status.is_some() {
+            return;
+        }
+        let _ = self.child.kill();
+
+        // Bounded reap, NOT `child.wait()` — see `DROP_REAP_BUDGET` for why an
+        // unbounded wait here is a hard editor freeze.
+        let deadline = std::time::Instant::now() + Self::DROP_REAP_BUDGET;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                // The handle is unusable; nothing more we can do, and looping
+                // would just burn the whole budget for nothing.
+                Err(_) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    // 5ms: fast enough that the common case (child already dead)
+                    // costs one sleep at most, slow enough not to spin a core.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
         }
     }
 }
 
 /// Build the `portable-pty` command for `:term [cmd]`. See
 /// [`TermSession::spawn`] for the `None` vs `Some` semantics.
+///
+/// `None` hands off to `portable-pty`'s own default-program logic, which is
+/// already platform-correct: `$SHELL` (then the passwd database) on unix, and
+/// `%ComSpec%` falling back to `cmd.exe` on Windows
+/// (`portable-pty-0.9.0/src/cmdbuilder.rs`, `CommandBuilder::cmdline()`).
+///
+/// `Some(line)` is where the platforms genuinely part ways, and where kvim used
+/// to be plain broken:
+///
+/// * **unix** — `$SHELL -c <line>`, falling back to `/bin/sh`. Matches vim's
+///   `'shell'` + `'shellcmdflag'` defaults (`/bin/sh`, `-c`).
+/// * **Windows** — `%ComSpec% /C <line>`, falling back to `cmd.exe`. There is no
+///   `/bin/sh` on Windows, so the old unconditional unix path could not spawn
+///   *anything*: `CreateProcessW "/bin/sh -c ..." failed: The system cannot find
+///   the path specified. (os error 3)`. Neovim's Windows defaults are
+///   `shell=cmd.exe`, `shellcmdflag=/s /c`; we use `/C` without `/s` because
+///   `/s`'s job is to strip an outer pair of quotes that neovim's own quoting
+///   adds, whereas `portable-pty` already applies the Win32 `ArgvQuote` rules
+///   for us when it builds the command line (`cmdbuilder.rs`,
+///   `CommandBuilder::append_quoted`). Adding `/s` on top would strip quotes we
+///   actually meant.
+///
+/// **What would make this wrong:** a user whose `%ComSpec%` points at
+/// PowerShell would get `/C` when PowerShell wants `-Command`. That is not a
+/// real configuration (Windows itself requires `ComSpec` to be a `cmd.exe`-
+/// compatible processor), but if kvim ever grows a `'shell'` option, this is the
+/// function that must read it instead of guessing.
 fn build_command(command: Option<&str>) -> CommandBuilder {
-    match command {
-        None => CommandBuilder::new_default_prog(),
-        Some(line) => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            let mut cmd = CommandBuilder::new(shell);
-            cmd.arg("-c");
-            cmd.arg(line);
-            cmd
-        }
+    let Some(line) = command else {
+        return CommandBuilder::new_default_prog();
+    };
+
+    #[cfg(windows)]
+    {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg("/C");
+        cmd.arg(line);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg("-c");
+        cmd.arg(line);
+        cmd
+    }
+}
+
+/// The **DSR-CPR** query: "Device Status Report — report the cursor position".
+///
+/// FORMAT KNOWLEDGE (ECMA-48 / DEC VT100 `DSR`, parameter 6): a program that
+/// wants to know where the cursor is writes `ESC [ 6 n` to the terminal and then
+/// *blocks reading its input* until the terminal writes back a CPR. Windows'
+/// ConPTY sends exactly this during pseudo-console startup when created with
+/// `PSUEDOCONSOLE_INHERIT_CURSOR`, which `portable-pty` always sets — see the
+/// module docs for the flag bisect. `vt100` 0.15 ignores DSR entirely, so if we
+/// do not answer, nobody does.
+const DSR_CPR_REQUEST: &[u8] = b"\x1b[6n";
+
+/// Format the **CPR** reply for a cursor at zero-based `(row, col)`.
+///
+/// FORMAT KNOWLEDGE (ECMA-48 `CPR`): the answer to [`DSR_CPR_REQUEST`] is
+/// `ESC [ <row> ; <col> R`, and the coordinates are **one-based** — the top-left
+/// cell is `1;1`, not `0;0`. `vt100::Screen::cursor_position()` is zero-based,
+/// so every value gets `+ 1` on the way out. Off-by-one here does not crash
+/// anything; it silently shifts where ConPTY thinks the inherited cursor sits,
+/// which shows up as a stray blank line at the top of every `:term`.
+fn cpr_reply(row: u16, col: u16) -> Vec<u8> {
+    format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(col) + 1).into_bytes()
+}
+
+/// Watches the raw pty byte stream for [`DSR_CPR_REQUEST`], across chunk
+/// boundaries.
+///
+/// A `read()` can split `ESC [ 6 n` anywhere — the escape lands in one chunk and
+/// the `6n` in the next — and a scanner that only looked inside single chunks
+/// would miss it and hang the terminal on Windows *intermittently*, which is a
+/// far nastier bug than hanging it always. So we carry the last
+/// `DSR_CPR_REQUEST.len() - 1` bytes of every chunk into the next scan.
+///
+/// Carrying exactly `len - 1` is also what makes double-counting impossible: any
+/// match found in `carry ++ chunk` must consume at least one byte of `chunk`
+/// (the carry alone is too short to hold a whole request), so no request is ever
+/// answered twice.
+#[derive(Default)]
+struct DsrWatcher {
+    carry: Vec<u8>,
+}
+
+impl DsrWatcher {
+    /// How many complete DSR-CPR requests appear in `chunk` (plus whatever
+    /// straddled the boundary from last time).
+    fn requests_in(&mut self, chunk: &[u8]) -> usize {
+        let mut window = std::mem::take(&mut self.carry);
+        window.extend_from_slice(chunk);
+
+        let found = window
+            .windows(DSR_CPR_REQUEST.len())
+            .filter(|w| *w == DSR_CPR_REQUEST)
+            .count();
+
+        let keep = DSR_CPR_REQUEST.len() - 1;
+        let from = window.len().saturating_sub(keep);
+        self.carry = window[from..].to_vec();
+        found
     }
 }
 
 /// Spin the reader-thread actor (see the module docs). Owns the pty read handle
-/// for its whole life; the only things it shares with the UI thread are the
-/// parser (behind the mutex) and the two flags.
+/// for its whole life; what it shares with the UI thread is the parser (behind
+/// its mutex), the two flags, and the writer (behind *its* mutex, for CPR
+/// replies only — never for user input).
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     dirty: Arc<AtomicBool>,
     eof: Arc<AtomicBool>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("kvim-term-reader".to_string())
         .spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut watcher = DsrWatcher::default();
             loop {
                 match reader.read(&mut buf) {
                     // EOF: the child closed the pty (it exited). Flag it and
-                    // stop — there will never be more output.
+                    // stop — there will never be more output. NOTE: on Windows
+                    // this only ever happens at teardown (pty fact #2), so
+                    // nothing may rely on it to notice an exited child.
                     Ok(0) => {
                         eof.store(true, Ordering::Release);
                         dirty.store(true, Ordering::Release);
                         break;
                     }
                     Ok(n) => {
-                        if let Ok(mut parser) = parser.lock() {
-                            parser.process(&buf[..n]);
+                        let chunk = &buf[..n];
+                        // Answer every cursor-position query in this chunk.
+                        // Compute the reply UNDER the parser lock, then let the
+                        // guard go before touching the writer — the lock order
+                        // in `TermSession::writer`'s docs is not optional.
+                        let replies = watcher.requests_in(chunk);
+                        let reply = {
+                            let Ok(mut parser) = parser.lock() else {
+                                // Poisoned parser: the session is already in
+                                // trouble and re-locking would panic in a
+                                // detached thread. Stop cleanly instead.
+                                eof.store(true, Ordering::Release);
+                                dirty.store(true, Ordering::Release);
+                                break;
+                            };
+                            parser.process(chunk);
+                            if replies > 0 {
+                                let (row, col) = parser.screen().cursor_position();
+                                Some(cpr_reply(row, col))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(reply) = reply
+                            && let Ok(mut writer) = writer.lock()
+                        {
+                            // Best-effort: if the child already went away the
+                            // write fails, and there is nobody left to tell.
+                            for _ in 0..replies {
+                                let _ = writer.write_all(&reply);
+                            }
+                            let _ = writer.flush();
                         }
                         dirty.store(true, Ordering::Release);
                     }
@@ -506,6 +801,46 @@ mod tests {
         KeyPress { key, mods: Modifiers { ctrl: true, alt: false, shift: false } }
     }
 
+    /// A one-shot command line that prints `word` and exits, spelled in the
+    /// shell [`build_command`] will actually use on this OS.
+    ///
+    /// `printf` does not exist in `cmd.exe` and `echo` in `cmd` appends CRLF —
+    /// both fine, because every caller only asserts that `word` shows up on the
+    /// screen. Keeping the *assertion* identical and swapping only the spelling
+    /// is the point: the unix side of these tests is unchanged.
+    fn echo_line(word: &str) -> String {
+        if cfg!(windows) {
+            format!("echo {word}")
+        } else {
+            format!("printf {word}")
+        }
+    }
+
+    /// Spawn a long-lived child that echoes back whatever you type at it.
+    ///
+    /// * unix — `cat`, echoed by the tty line discipline.
+    /// * Windows — the default program (an interactive `cmd.exe`), echoed by the
+    ///   console itself. There is no `cat`, and `more`/`sort` buffer until EOF
+    ///   instead of echoing line by line, so the console's own echo is the
+    ///   faithful equivalent — and it happens to be exactly what a user sees
+    ///   when they type bare `:term`.
+    fn spawn_echoing(size: TermSize) -> TermSession {
+        if cfg!(windows) {
+            TermSession::spawn(None, size).unwrap()
+        } else {
+            TermSession::spawn(Some("cat"), size).unwrap()
+        }
+    }
+
+    /// Poll until the child has exited or `timeout` runs out, exactly the way
+    /// `App::drain_terminals` does on its idle tick.
+    fn wait_for_exit(session: &mut TermSession, timeout: Duration) {
+        let start = Instant::now();
+        while !session.is_finished() && start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Spin until `pred` sees what it wants or `timeout` runs out. The reader
     /// thread is asynchronous, so a test that reads the screen the instant after
     /// spawning would race it; this waits, cheaply, for the output to land.
@@ -527,16 +862,21 @@ mod tests {
     fn spawned_command_output_lands_on_the_screen() {
         // FACT the test pins: spawn a scripted command, the reader drains the
         // pty into the parser, and the parsed screen shows the output.
-        let session = TermSession::spawn(Some("printf hello"), TermSize::new(24, 80)).unwrap();
+        //
+        // On Windows this is also the regression test for the unanswered-`ESC[6n`
+        // hang: with ConPTY's INHERIT_CURSOR flag and no CPR reply the child
+        // never leaves console initialisation, so the screen stays empty forever
+        // and this assert is the thing that catches it.
+        let session = TermSession::spawn(Some(&echo_line("hello")), TermSize::new(24, 80)).unwrap();
         let contents = wait_until(&session, Duration::from_secs(5), |c| c.contains("hello"));
         assert!(contents.contains("hello"), "screen was: {contents:?}");
     }
 
     #[test]
     fn typed_input_is_forwarded_to_the_child() {
-        // An interactive `cat` echoes back whatever we type. Forward "hi\n" and
-        // it must appear on the screen — proving keystroke → pty → parser works.
-        let mut session = TermSession::spawn(Some("cat"), TermSize::new(24, 80)).unwrap();
+        // An echoing child sends back whatever we type. Forward "hi\n" and it
+        // must appear on the screen — proving keystroke → pty → parser works.
+        let mut session = spawn_echoing(TermSize::new(24, 80));
         session.write_input(b"hi\r\n").unwrap();
         let contents = wait_until(&session, Duration::from_secs(5), |c| c.contains("hi"));
         assert!(contents.contains("hi"), "screen was: {contents:?}");
@@ -563,31 +903,93 @@ mod tests {
         let dirty = Arc::new(AtomicBool::new(false));
         let eof = Arc::new(AtomicBool::new(false));
         let reader: Box<dyn Read + Send> = Box::new(std::io::empty());
-        let handle = spawn_reader(reader, Arc::clone(&parser), Arc::clone(&dirty), Arc::clone(&eof));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(Vec::new())));
+        let handle =
+            spawn_reader(reader, Arc::clone(&parser), Arc::clone(&dirty), Arc::clone(&eof), writer);
         assert!(join_within(handle, Duration::from_secs(2)), "reader thread must terminate on EOF, not hang");
         assert!(eof.load(Ordering::Acquire), "EOF flag must be set once the read returns 0");
     }
 
     #[test]
-    fn exit_code_is_none_until_reaped_then_matches() {
-        // `false` exits with code 1. Before reaping, `exit_code()` is None even
-        // once EOF landed; after `reap_if_done` it reports the real code.
-        let mut session = TermSession::spawn(Some("exit 3"), TermSize::new(24, 80)).unwrap();
-        let start = Instant::now();
-        while !session.is_finished() && start.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(10));
+    fn a_cursor_position_query_gets_answered_on_the_write_side() {
+        // THE Windows regression test, minus Windows: ConPTY blocks the child
+        // until somebody answers `ESC[6n`. Feed the reader a stream containing
+        // one, and the writer side must come back with a CPR.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let eof = Arc::new(AtomicBool::new(false));
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        /// A `Write` that appends into a shared `Vec` so the test can read back
+        /// what the reader thread wrote.
+        struct Tee(Arc<Mutex<Vec<u8>>>);
+        impl Write for Tee {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
+
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(Tee(Arc::clone(&sink)))));
+        // Cursor lands at row 0, col 2 after "ab" -> CPR must say 1;3.
+        let reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(b"ab\x1b[6n".to_vec()));
+        let handle =
+            spawn_reader(reader, Arc::clone(&parser), Arc::clone(&dirty), Arc::clone(&eof), writer);
+        assert!(join_within(handle, Duration::from_secs(2)), "reader thread must terminate");
+
+        let got = sink.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            b"\x1b[1;3R".to_vec(),
+            "a DSR-CPR query must be answered with the one-based cursor position, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn cpr_reply_is_one_based() {
+        // ECMA-48 CPR counts from 1, `vt100` counts from 0. Pin the conversion.
+        assert_eq!(cpr_reply(0, 0), b"\x1b[1;1R".to_vec());
+        assert_eq!(cpr_reply(23, 79), b"\x1b[24;80R".to_vec());
+    }
+
+    #[test]
+    fn dsr_watcher_sees_a_query_split_across_reads() {
+        // A `read()` can chop `ESC [ 6 n` anywhere. Missing the split case would
+        // hang `:term` on Windows only *sometimes*, which is far worse to debug
+        // than always.
+        let mut w = DsrWatcher::default();
+        assert_eq!(w.requests_in(b"hello\x1b["), 0);
+        assert_eq!(w.requests_in(b"6nworld"), 1, "the split query must still be seen");
+
+        // ...and no double-counting when a whole query sits at a chunk's tail.
+        let mut w = DsrWatcher::default();
+        assert_eq!(w.requests_in(b"x\x1b[6n"), 1);
+        assert_eq!(w.requests_in(b"yyyy"), 0, "an already-answered query must not be re-answered");
+
+        // Two in one chunk get two answers.
+        let mut w = DsrWatcher::default();
+        assert_eq!(w.requests_in(b"\x1b[6n\x1b[6n"), 2);
+    }
+
+    #[test]
+    fn exit_code_is_none_until_reaped_then_matches() {
+        // `exit 3` is spelled the same in `sh -c` and in `cmd /C`, so no
+        // platform split needed here.
+        let mut session = TermSession::spawn(Some("exit 3"), TermSize::new(24, 80)).unwrap();
+        wait_for_exit(&mut session, Duration::from_secs(5));
         session.reap_if_done();
         assert_eq!(session.exit_code(), Some(3), "exit_code must report the child's real code once reaped");
     }
 
     #[test]
     fn a_command_that_exits_marks_the_session_finished() {
-        let mut session = TermSession::spawn(Some("printf bye"), TermSize::new(24, 80)).unwrap();
-        let start = Instant::now();
-        while !session.is_finished() && start.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let mut session = TermSession::spawn(Some(&echo_line("bye")), TermSize::new(24, 80)).unwrap();
+        wait_for_exit(&mut session, Duration::from_secs(5));
         assert!(session.is_finished(), "session should report finished after the command exits");
         // Reaping is idempotent and must not panic.
         session.reap_if_done();
@@ -596,7 +998,7 @@ mod tests {
 
     #[test]
     fn resize_updates_the_grid_size() {
-        let mut session = TermSession::spawn(Some("cat"), TermSize::new(24, 80)).unwrap();
+        let mut session = spawn_echoing(TermSize::new(24, 80));
         assert_eq!(session.size(), TermSize::new(24, 80));
         session.resize(TermSize::new(30, 100));
         assert_eq!(session.size(), TermSize::new(30, 100));
@@ -609,7 +1011,7 @@ mod tests {
         // vt100 panics on a zero dimension; a window too small to show anything
         // must still give a 1x1 grid.
         assert_eq!(TermSize::new(0, 0), TermSize::new(1, 1));
-        let session = TermSession::spawn(Some("printf x"), TermSize::new(0, 0)).unwrap();
+        let session = TermSession::spawn(Some(&echo_line("x")), TermSize::new(0, 0)).unwrap();
         assert_eq!(session.size(), TermSize::new(1, 1));
     }
 

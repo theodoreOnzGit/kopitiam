@@ -17,9 +17,24 @@ fn target_text(target: &Option<super::TargetSpec>) -> String {
     target.as_ref().expect("target").to_string()
 }
 
+/// Reads a repo text file, with CRLF folded down to LF.
+///
+/// The normalisation is load-bearing, don't drop it: the repo root's
+/// `.gitattributes` only pins `*.pdf` as binary, so on a Windows box with
+/// `core.autocrlf=true` (the git-for-Windows default) EVERY file this helper
+/// reads — `docs/man/kmux.1`, the `tests/reference/tmux_compat/*.yaml` fixtures —
+/// lands on disk with `\r\n`. The troff parsers below then hunt for a literal
+/// `".nf\n"` and never find `".nf\r\n"`, so the surface-doc tests fail with
+/// "missing literal block" on Windows while staying green on Linux and Termux.
+///
+/// The checked-in bytes are LF; the `\r` is a checkout artefact of the developer's
+/// git config, not content. A test must assert about content, not about whoever
+/// happens to be running it — so we strip the artefact here, at the one funnel
+/// every reader goes through, rather than sprinkling `\r` into each pattern.
 fn repo_file(path: &str) -> String {
     fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path))
         .unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
+        .replace("\r\n", "\n")
 }
 
 fn troff_section<'a>(contents: &'a str, heading: &str, next_heading: &str) -> &'a str {
