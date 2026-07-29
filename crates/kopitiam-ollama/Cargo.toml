@@ -33,5 +33,46 @@ indexmap = { workspace = true, features = ["serde"] }
 # it was never an option.
 sha2 = "0.10"
 
+# ---------------------------------------------------------------------------
+# The network + registry-auth stack. ALL of it is chope-d behind the `net`
+# feature and the `Transport` / `Signer` / `Ambient` traits in `registry`, so
+# `--no-default-features` still builds and tests the whole pull/push logic with
+# a fake and never compiles a socket. Same seam `kopitiam-models` uses for its
+# `Fetcher`, and the same reason: KOPITIAM's Offline First rule is a build-time
+# promise, not just a runtime one.
+# ---------------------------------------------------------------------------
+
+# Copied verbatim from crates/kopitiam-models/Cargo.toml -- same decision, same
+# tradeoff. `default-features = false` + `rustls` keeps ureq's `native-tls` OFF,
+# which is what would otherwise drag in OpenSSL and break an Android
+# cross-build. Say the honest caveat though: "rustls" does NOT mean "no C" --
+# ureq's rustls feature picks the `ring` provider (C + perlasm) for the actual
+# crypto. `ring` is accepted on purpose because it cross-compiles clean to
+# Termux/aarch64 where OpenSSL cannot. See docs/ai-decisions/AID-0013.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+# Registry auth. ollama signs each challenge with an ed25519 key kept at
+# ~/.ollama/id_ed25519 -- and that file is in OPENSSH format, not raw key bytes,
+# so a signing crate alone is not enough; `ssh-key` does the parsing. Both are
+# pure Rust (RustCrypto), no C toolchain.
+ed25519-dalek = { version = "2", optional = true }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "alloc"], optional = true }
+
+# The auth nonce MUST come from a real CSPRNG. The fallback PRNG in `registry`
+# is fine for backoff jitter and is a replay hazard for a nonce -- see bd-djx.
+# Already in the workspace lockfile, so no new supply-chain surface.
+getrandom = { version = "0.3", optional = true }
+
+# Push only: the commit etag on a completed blob upload is an md5.
+md-5 = { version = "0.10", optional = true }
+
+[features]
+# Networking on by default so `pull` works out of the box, matching
+# kopitiam-models. Turn it off and you get an offline build with no socket, no
+# TLS and no `ring` compiled at all -- the registry logic still builds and its
+# whole test suite still runs against the fakes.
+default = ["net"]
+net = ["dep:ureq", "dep:ed25519-dalek", "dep:ssh-key", "dep:getrandom", "dep:md-5"]
+
 [dev-dependencies]
 tempfile.workspace = true
