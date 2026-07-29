@@ -227,14 +227,31 @@ mod tests {
         ));
     }
 
-    /// A K-quant matmul weight (Q4_K) has no fused
-    /// [`kopitiam_tensor::Tensor::quantized_matmul`] kernel, so before this
-    /// fix `load_matmul_weight` left it quantized and the first
-    /// [`crate::linear::linear`] call dead-ended in an `UnsupportedDType`.
-    /// It must now be dequantized to `f32` at load and complete a forward
-    /// pass whose output equals dequantize-then-`f32`-matmul.
+    /// A Q4_K matmul weight must **stay quantized** at load and run through
+    /// the fused kernel.
+    ///
+    /// # This test used to assert the exact opposite, and that was the bug
+    ///
+    /// Its previous form demanded `w.dtype() == F32` and hard-coded
+    /// `assert!(!has_fused_matmul_kernel(DType::Q4_K))`. That was honest at
+    /// the time — there really was no Q4_K kernel, and dequantizing at load
+    /// was better than dead-ending in `UnsupportedDType`. But it turned a
+    /// stopgap into an asserted invariant, so the test passed for exactly as
+    /// long as `Q4_K_M` models were unusable: every matmul weight in one is
+    /// Q4_K or Q6_K, so "no fused kernel" meant the *whole* model expanded to
+    /// `f32` at load — SmolLM2-1.7B-Instruct-Q4_K_M went 1.06 GB on disk ->
+    /// 6.82 GB of private commit, and took 392.9 s (19m04s the first time,
+    /// when the box had to page) to answer what llama.cpp answers in 4.0 s
+    /// from the same file. Nothing was numerically wrong; it was just too slow
+    /// to finish, which the maintainer saw as "emits one token then stops".
+    ///
+    /// Same shape of trap as `bd-b9x`'s
+    /// `llama_and_qwen2_arch_with_identical_weights_produce_bit_identical_logits`:
+    /// a test that encodes a limitation as a requirement will defend that
+    /// limitation forever. Recorded rather than quietly deleted so the next
+    /// person sees why it flipped.
     #[test]
-    fn a_q4_k_matmul_weight_is_dequantized_at_load_and_completes_a_forward_pass() {
+    fn a_q4_k_matmul_weight_stays_quantized_at_load_and_uses_the_fused_kernel() {
         use crate::test_support::synthetic_gguf::{
             arbitrary_q4_k_blocks, single_quantized_weight_gguf, GGML_TYPE_Q4_K,
         };
@@ -247,30 +264,38 @@ mod tests {
         let path = write_temp_gguf(&gguf, "q4k-load");
         let model = kopitiam_loader::load_model(&path).unwrap();
 
-        // The whole point of the fix: a format without a fused kernel is
-        // dequantized at load, not kept quantized.
+        // The property that keeps a Q4_K_M model in RAM: no f32 expansion.
         let w = load_matmul_weight(&model, "test.weight").unwrap();
-        assert_eq!(w.dtype(), DType::F32);
-        assert!(!w.dtype().is_quantized());
-        assert!(!kopitiam_tensor::has_fused_matmul_kernel(DType::Q4_K));
+        assert_eq!(w.dtype(), DType::Q4_K, "Q4_K must stay quantized for the fused kernel");
+        assert!(w.dtype().is_quantized());
+        assert!(kopitiam_tensor::has_fused_matmul_kernel(DType::Q4_K));
 
-        // The loaded weight is exactly the decode of the same on-disk bytes.
-        let entry = model.tensor("test.weight").unwrap().clone();
-        let reference_w = tensor_from_entry(&model, &entry).unwrap().to_dtype(DType::F32).unwrap();
-        assert_eq!(w.to_vec_f32().unwrap(), reference_w.to_vec_f32().unwrap());
-
-        // A forward pass through `linear` now completes with finite output
-        // equal to dequantize-then-f32-matmul (`x @ W^T`).
+        // `linear` routes it through the fused `quantized_matmul`, matching a
+        // direct fused call bit-for-bit (i.e. no dequantize slipped in).
         let x_vals: Vec<f32> = (0..in_features).map(|i| (i as f32 % 7.0 - 3.0) * 0.1).collect();
         let x = Tensor::from_f32(x_vals, [1, in_features]).unwrap();
         let y = crate::linear::linear(&x, &w, None).unwrap();
         assert_eq!(y.dtype(), DType::F32);
         let y_vals = y.to_vec_f32().unwrap();
         assert_eq!(y_vals.len(), out_features);
+        assert_eq!(y_vals, x.quantized_matmul(&w).unwrap().to_vec_f32().unwrap());
         assert!(y_vals.iter().all(|v| v.is_finite()), "forward-pass output must be finite: {y_vals:?}");
 
+        // And the fused result must still MEAN the same thing as decoding the
+        // weight and doing an ordinary f32 matmul. The two differ only by the
+        // activation's own Q8_0 rounding, so the tolerance is derived from
+        // that — worst case `sum_j |w_j| * x_step/2` — not picked to pass.
+        let entry = model.tensor("test.weight").unwrap().clone();
+        let reference_w = tensor_from_entry(&model, &entry).unwrap().to_dtype(DType::F32).unwrap();
         let reference = x.matmul(&reference_w.transpose(0, 1).unwrap()).unwrap().to_vec_f32().unwrap();
-        assert_eq!(y_vals, reference);
+        let x_amax = x.to_vec_f32().unwrap().iter().fold(0f32, |m, v| m.max(v.abs()));
+        let x_step = x_amax / 127.0;
+        let w_rows = reference_w.to_vec_f32().unwrap();
+        for (o, (&got, &want)) in y_vals.iter().zip(&reference).enumerate() {
+            let abs_w: f32 = w_rows[o * in_features..(o + 1) * in_features].iter().map(|v| v.abs()).sum();
+            let bound = abs_w * x_step / 2.0 + 1e-3;
+            assert!((got - want).abs() <= bound, "out {o}: fused {got} vs decoded {want} (bound {bound})");
+        }
     }
 
     /// The no-regression counterpart: a Q4_0 matmul weight — the format the

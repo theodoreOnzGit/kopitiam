@@ -18,12 +18,26 @@ use super::Tensor;
 /// must choose "compute on the quantized bytes directly" vs. "dequantize to
 /// `f32` first" shares, so the two decisions can never drift apart.
 ///
-/// Today only [`DType::Q4_0`] and [`DType::Q8_0`] have such a kernel (the
-/// integer per-block dot products in [`crate::quant`]). Every other quantized
-/// format — `Q4_1`/`Q5_0`/`Q5_1` and every K-quant (`Q2_K`..`Q6_K`, `Q8_K`) —
-/// dequantizes correctly via [`Tensor::to_dtype`] but has no fused path here,
+/// Today [`DType::Q4_0`], [`DType::Q8_0`], [`DType::Q4_K`] and
+/// [`DType::Q6_K`] have such a kernel (the integer per-block dot products in
+/// [`crate::quant`]). The remaining quantized formats —
+/// `Q4_1`/`Q5_0`/`Q5_1`, and the K-quants `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K` —
+/// dequantize correctly via [`Tensor::to_dtype`] but have no fused path here,
 /// so a caller wanting to matmul against one must dequantize it to `f32` and
 /// take the ordinary [`Tensor::matmul`] route.
+///
+/// # Why Q4_K and Q6_K specifically, and not the rest of the K-quants
+///
+/// Those two are exactly what a `Q4_K_M` file is made of — every matmul
+/// weight in one is Q4_K or Q6_K (SmolLM2-1.7B-Instruct-Q4_K_M: 144 Q4_K
+/// tensors, 25 Q6_K, 49 `f32` norms/biases, and nothing else). Leaving them
+/// unfused made `Q4_K_M` the one real-world configuration where *nothing*
+/// stayed quantized, so a 1.06 GB file expanded to ~6.8 GB of `f32` at load
+/// and the model became too slow to finish an answer. See
+/// [`Tensor::quantized_matmul`]'s "Why this is not just a speed optimisation"
+/// for the measurement. The other K-quants are not absent for any deep
+/// reason — no model the maintainer runs ships them as matmul weights yet, so
+/// adding them would be untested code.
 ///
 /// # Why this is a predicate, not a hard-coded match in each caller
 ///
@@ -45,7 +59,7 @@ use super::Tensor;
 /// by one), and when it does, only this crate changes; `kopitiam-core` stays a
 /// pure description of the byte layout.
 pub const fn has_fused_matmul_kernel(dtype: DType) -> bool {
-    matches!(dtype, DType::Q4_0 | DType::Q8_0)
+    matches!(dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4_K | DType::Q6_K)
 }
 
 impl Tensor {
@@ -178,8 +192,43 @@ impl Tensor {
     /// `self` is `[..., in_features]`, `f32`, any rank >= 1; `weight` is
     /// `[out_features, in_features]`, exactly rank 2, quantized. Returns
     /// `[..., out_features]`. `in_features` must be a whole number of
-    /// 32-element blocks (true of every real GGUF Q4_0/Q8_0 export, since a
-    /// block may never straddle a row boundary).
+    /// `weight`'s own blocks — 32 for Q4_0/Q8_0, **256** for the Q4_K/Q6_K
+    /// super-block formats — which is true of every real GGUF export, since a
+    /// block may never straddle a row boundary.
+    ///
+    /// # Why this is not just a speed optimisation
+    ///
+    /// It is what keeps a model in RAM at all. `kopitiam-runtime`'s
+    /// `load_matmul_weight` dequantizes any weight this method cannot fuse, so
+    /// an unfused format is not merely a slow path — it is a **~5x memory
+    /// expansion at load**, and past a certain model size that expansion is
+    /// what kills you, not the arithmetic.
+    ///
+    /// MEASURED on the maintainer's 15 GB Windows box, SmolLM2-1.7B-Instruct-
+    /// Q4_K_M (1.06 GB on disk), prompt "What is the capital of France?",
+    /// same binary, toggled only by `KOPITIAM_FORCE_F32_WEIGHTS` (which
+    /// reproduces the pre-fix behaviour exactly — every matmul weight in this
+    /// file is Q4_K or Q6_K, so "no fused kernel" and "force f32" are the same
+    /// thing here):
+    ///
+    /// ```text
+    ///                              wall     peak private commit
+    ///   dequantized f32          392.9s                 6.82 GB
+    ///   fused K-quant kernels     45.2s                 1.23 GB
+    ///   llama.cpp, same file       4.0s                       -
+    /// ```
+    ///
+    /// The very first observation of this was worse still — 19m04s — because
+    /// only 0.42 GB was free at the time and the 6.8 GB of `f32` had to page
+    /// to disk. Same work, 3x the wall clock, purely from not fitting.
+    ///
+    /// The output was never *wrong* at any point: all three rows above answer
+    /// "The capital of France is Paris." It was unreachably slow, and the
+    /// maintainer — watching a token-by-token stream — saw the first token
+    /// appear and reasonably reported it as "emits one token then stops". That
+    /// is the failure mode an unfused format actually produces, and it is why
+    /// [`has_fused_matmul_kernel`] covering the formats a real file ships
+    /// matters more than covering them elegantly.
     ///
     /// # Correctness
     ///
@@ -198,16 +247,17 @@ impl Tensor {
     ///
     /// [`Error::DTypeMismatch`] if `self` is not `f32`.
     /// [`Error::UnsupportedDType`] if `weight`'s dtype is not one of the
-    /// two formats this method has a fused kernel for. The other quantized
-    /// formats — `Q4_1`/`Q5_0`/`Q5_1` and every K-quant
-    /// (`Q4_K`/`Q5_K`/`Q6_K`/...) — dequantize fine via [`Tensor::to_dtype`]
-    /// but have no fused path here yet, so a caller wanting to matmul against
-    /// one must dequantize it to `f32` first; see the parent crate's Phase 2
-    /// scope. Also errors if `weight` is not quantized at all (use
+    /// formats this method has a fused kernel for (see
+    /// [`has_fused_matmul_kernel`]). The remaining quantized formats —
+    /// `Q4_1`/`Q5_0`/`Q5_1` and the K-quants `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K` —
+    /// dequantize fine via [`Tensor::to_dtype`] but have no fused path here
+    /// yet, so a caller wanting to matmul against one must dequantize it to
+    /// `f32` first. Also errors if `weight` is not quantized at all (use
     /// [`Tensor::matmul`] directly for a plain `f32` weight).
     /// [`Error::ShapeMismatch`] if `weight` is not rank 2, if `self`'s last
     /// dimension does not equal `weight`'s `in_features`, or if
-    /// `in_features` is not a multiple of 32.
+    /// `in_features` is not a multiple of `weight`'s block size (32, or 256
+    /// for a K-quant).
     pub fn quantized_matmul(&self, weight: &Tensor) -> Result<Tensor> {
         self.require_dtype(DType::F32)?;
         if !has_fused_matmul_kernel(weight.dtype()) {
@@ -219,11 +269,24 @@ impl Tensor {
         let wdims = weight.shape.dims();
         let (out_features, in_features) = (wdims[0], wdims[1]);
 
+        let Storage::Quantized { dtype, bytes } = weight.storage.as_ref() else {
+            unreachable!("has_fused_matmul_kernel is true only for quantized dtypes, so the guard above guarantees Storage::Quantized")
+        };
+        let dtype = *dtype;
+        // The weight's own block length: 32 for the classic formats, 256 for a
+        // K-quant super-block. `in_features` must be a whole number of THESE,
+        // not of 32 — a K-quant row that is a multiple of 32 but not of 256
+        // would slice super-blocks in half.
+        let weight_block_size = dtype.block_size();
+
         let xdims = self.shape.dims();
         let Some((&last, leading)) = xdims.split_last() else {
             return Err(Error::ShapeMismatch { expected: self.shape.clone(), actual: weight.shape.clone() });
         };
-        if last != in_features || in_features == 0 || !in_features.is_multiple_of(32) {
+        if last != in_features
+            || in_features == 0
+            || !in_features.is_multiple_of(weight_block_size)
+        {
             return Err(Error::ShapeMismatch { expected: self.shape.clone(), actual: weight.shape.clone() });
         }
 
@@ -232,13 +295,15 @@ impl Tensor {
         // the common contiguous case.
         let x_data = self.to_vec_f32()?;
 
-        let Storage::Quantized { dtype, bytes } = weight.storage.as_ref() else {
-            unreachable!("has_fused_matmul_kernel is true only for quantized dtypes, so the guard above guarantees Storage::Quantized")
-        };
-        let dtype = *dtype;
         let block_bytes = dtype.block_bytes();
-        let blocks_per_row = in_features / 32;
+        let blocks_per_row = in_features / weight_block_size;
         let row_bytes = blocks_per_row * block_bytes;
+        // Activations are always Q8_0 (32 per block), whatever the weight's
+        // block length — so one weight block lines up with this many of them.
+        // `quantize_row_q8_0` is the crate's single activation encoder; see
+        // [`quant::q4_k_dot_q8_0`] on why the K-quant kernels consume Q8_0
+        // rather than ggml's Q8_K.
+        let x_blocks_per_weight_block = weight_block_size / 32;
 
         let rows = leading.iter().product::<usize>();
         let mut out = vec![0f32; rows * out_features];
@@ -249,11 +314,20 @@ impl Tensor {
                 let w_row = &bytes[o * row_bytes..(o + 1) * row_bytes];
                 let mut acc = 0f32;
                 for (b, w_block) in w_row.chunks_exact(block_bytes).enumerate() {
-                    let xq_block = &x_q[b * 32..(b + 1) * 32];
+                    let xq_block = &x_q[b * weight_block_size..(b + 1) * weight_block_size];
                     acc += match dtype {
                         DType::Q4_0 => quant::q4_0_dot_q8_0(w_block, xq_block, x_scales[b]),
                         DType::Q8_0 => quant::q8_0_dot_q8_0(w_block, xq_block, x_scales[b]),
-                        _ => unreachable!("has_fused_matmul_kernel admits only Q4_0 and Q8_0"),
+                        DType::Q4_K | DType::Q6_K => {
+                            let s = &x_scales[b * x_blocks_per_weight_block
+                                ..(b + 1) * x_blocks_per_weight_block];
+                            if dtype == DType::Q4_K {
+                                quant::q4_k_dot_q8_0(w_block, xq_block, s)
+                            } else {
+                                quant::q6_k_dot_q8_0(w_block, xq_block, s)
+                            }
+                        }
+                        _ => unreachable!("has_fused_matmul_kernel admits only Q4_0, Q8_0, Q4_K and Q6_K"),
                     };
                 }
                 out[r * out_features + o] = acc;
@@ -566,6 +640,143 @@ mod tests {
         assert_allclose(&fast, &reference, 0.0, 1e-3);
     }
 
+    // ---- K-quant fused kernels (Q4_K / Q6_K): the `Q4_K_M` workhorses ----
+    //
+    // These need no `f32 -> K-quant` encoder, and deliberately do not have
+    // one. EVERY byte pattern is a structurally valid K-quant super-block —
+    // the scales, mins and packed quants are just integers, and only the f16
+    // super-scales need to be sane — so the fixtures below emit arbitrary
+    // deterministic bytes and let [`crate::quant`]'s ggml-verified
+    // dequantizer say what they mean. That makes the oracle the *decoder*
+    // (already checked bit-exact against `ggml-quants.c`) rather than a
+    // hand-rolled encoder that could share a bug with the thing under test.
+
+    /// `n_superblocks` of arbitrary-but-valid Q4_K bytes (144 each): `f16 d`,
+    /// `f16 dmin`, 12 packed scale/min bytes, 128 nibble-pair bytes. The
+    /// super-scales are kept small so the decoded weights land in a normal
+    /// activation range instead of overflowing into f32 noise.
+    fn arbitrary_q4_k(seed: u64, n_superblocks: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        let mut bytes = Vec::with_capacity(n_superblocks * 144);
+        for _ in 0..n_superblocks {
+            bytes.extend_from_slice(&crate::half::f32_to_f16(0.01).to_le_bytes());
+            bytes.extend_from_slice(&crate::half::f32_to_f16(0.005).to_le_bytes());
+            for _ in 0..(12 + 128) {
+                bytes.push(byte());
+            }
+        }
+        bytes
+    }
+
+    /// `n_superblocks` of arbitrary-but-valid Q6_K bytes (210 each):
+    /// `ql[128]`, `qh[64]`, 16 SIGNED `i8` scales, `f16 d`.
+    fn arbitrary_q6_k(seed: u64, n_superblocks: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        let mut bytes = Vec::with_capacity(n_superblocks * 210);
+        for _ in 0..n_superblocks {
+            for _ in 0..(128 + 64 + 16) {
+                bytes.push(byte());
+            }
+            bytes.extend_from_slice(&crate::half::f32_to_f16(0.002).to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The property that makes the Q4_K fused kernel safe to switch on:
+    /// dotting the packed super-block directly must agree with dequantizing
+    /// it and doing an ordinary `f32` matmul, to within the error the
+    /// *activation's* Q8_0 rounding alone can introduce. Q4_K is the harder
+    /// of the two because it is affine — `d*sc*nib - dmin*min` — so the min
+    /// term has to be carried through the integer factorisation separately;
+    /// drop it and the output is quietly biased rather than obviously wrong.
+    #[test]
+    fn quantized_matmul_q4_k_agrees_with_dequantize_then_matmul_reference() {
+        let (out_features, in_features) = (5, 512); // 2 super-blocks per row.
+        let bytes = arbitrary_q4_k(11, out_features * in_features / 256);
+        let weight = Tensor::from_quantized(DType::Q4_K, bytes, [out_features, in_features]).unwrap();
+        let weight_rows_f32: Vec<Vec<f32>> = weight
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap()
+            .chunks_exact(in_features)
+            .map(<[f32]>::to_vec)
+            .collect();
+
+        let x_rows: Vec<Vec<f32>> =
+            (0..3).map(|r| random_f32s(12 + r as u64 * 100, in_features, 2.0)).collect();
+
+        assert_agrees_within_activation_quantization_bound(&x_rows, &weight, &weight_rows_f32);
+    }
+
+    /// Same property for Q6_K. Its trap is ordering, not arithmetic: 16-element
+    /// sub-blocks laid out in four interleaved quadrants per 128-element half,
+    /// with SIGNED scales. Using the wrong sub-block's scale still produces
+    /// finite, plausible numbers, so only a comparison against the decoder
+    /// catches it.
+    #[test]
+    fn quantized_matmul_q6_k_agrees_with_dequantize_then_matmul_reference() {
+        let (out_features, in_features) = (4, 512);
+        let bytes = arbitrary_q6_k(21, out_features * in_features / 256);
+        let weight = Tensor::from_quantized(DType::Q6_K, bytes, [out_features, in_features]).unwrap();
+        let weight_rows_f32: Vec<Vec<f32>> = weight
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap()
+            .chunks_exact(in_features)
+            .map(<[f32]>::to_vec)
+            .collect();
+
+        let x_rows: Vec<Vec<f32>> =
+            (0..3).map(|r| random_f32s(22 + r as u64 * 100, in_features, 2.0)).collect();
+
+        assert_agrees_within_activation_quantization_bound(&x_rows, &weight, &weight_rows_f32);
+    }
+
+    /// THE REGRESSION TEST FOR THE LIVE BUG — and the gap the existing Q4_K
+    /// tests could not close.
+    ///
+    /// `quant.rs` already proved `dequant_q4_k` bit-exact against ggml, and it
+    /// was right: the decode was never wrong. But nothing anywhere asserted
+    /// that a Q4_K weight could be *computed on without being expanded*, and
+    /// that is the property a `Q4_K_M` model actually needs. With no fused
+    /// kernel, `kopitiam-runtime` dequantized every matmul weight at load, so
+    /// SmolLM2-1.7B-Instruct-Q4_K_M went from 1.06 GB on disk to 6.82 GB of
+    /// private commit and answered in 392.9 s (19m04s the first time, when the
+    /// box had to page) against llama.cpp's 4.0 s on the same file — correct
+    /// output nobody would ever wait for.
+    ///
+    /// So this test states the invariant in the terms that broke: **every
+    /// quantized dtype a real `Q4_K_M` file is built from must have a fused
+    /// kernel.** The two dtypes below are what SmolLM2-1.7B-Instruct-Q4_K_M
+    /// actually ships (144 Q4_K tensors + 25 Q6_K, verified by reading the
+    /// GGUF's tensor table). A future refactor that drops either from
+    /// `has_fused_matmul_kernel` reintroduces the memory blowup, and this
+    /// fails instead of the maintainer discovering it as a hang.
+    #[test]
+    fn every_dtype_a_q4_k_m_file_ships_has_a_fused_kernel() {
+        for dtype in [DType::Q4_K, DType::Q6_K] {
+            assert!(
+                has_fused_matmul_kernel(dtype),
+                "{dtype} is a Q4_K_M matmul weight format; without a fused kernel the whole \
+                 model is dequantized to f32 at load (~4x memory) and becomes unusably slow"
+            );
+        }
+    }
+
     #[test]
     fn quantized_matmul_supports_leading_batch_dimensions() {
         let in_features = 32;
@@ -635,21 +846,37 @@ mod tests {
 
     #[test]
     fn quantized_matmul_rejects_a_k_quant_weight_with_no_fused_kernel() {
-        // Q4_K dequantizes fine (see quant::dequant_q4_k) but, like every
-        // K-quant, has no fused integer dot product here — it must be
-        // dequantized to f32 and go through `matmul` instead. One Q4_K
-        // super-block is 256 elements / 144 bytes.
+        // Q5_K dequantizes fine (see quant::dequant_q5_k) but has no fused
+        // integer dot product here — it must be dequantized to f32 and go
+        // through `matmul` instead. One Q5_K super-block is 256 elements /
+        // 176 bytes. (Q4_K and Q6_K, its neighbours, DO have kernels now —
+        // they are what a real Q4_K_M file is made of.)
         let x = Tensor::from_f32(vec![1.0; 256], [1, 256]).unwrap();
-        let weight = Tensor::from_quantized(DType::Q4_K, vec![0u8; 144], [1, 256]).unwrap();
+        let weight = Tensor::from_quantized(DType::Q5_K, vec![0u8; 176], [1, 256]).unwrap();
         assert!(matches!(x.quantized_matmul(&weight), Err(Error::UnsupportedDType { .. })));
     }
 
+    /// A K-quant super-block is 256 elements, so an `in_features` that is a
+    /// whole number of 32s but NOT of 256 must be refused. Slicing a
+    /// super-block in half would read another row's scales as this row's —
+    /// wrong numbers, no error, exactly the class of bug that is invisible
+    /// downstream.
     #[test]
-    fn has_fused_matmul_kernel_is_true_for_exactly_q4_0_and_q8_0() {
-        // The single source of truth every layer keys off. Q4_0 and Q8_0 are
-        // the only formats with a fused kernel; everything else (float, int,
-        // the other classic quants, and every K-quant) dequantizes to f32.
-        for dtype in [DType::Q4_0, DType::Q8_0] {
+    fn quantized_matmul_rejects_a_k_quant_in_features_not_a_multiple_of_256() {
+        // out=4, in=64: 256 elements total = one whole super-block, so
+        // `from_quantized` accepts it, but each row straddles the block.
+        let weight = Tensor::from_quantized(DType::Q4_K, vec![0u8; 144], [4, 64]).unwrap();
+        let x = Tensor::from_f32(vec![1.0; 64], [1, 64]).unwrap();
+        assert!(matches!(x.quantized_matmul(&weight), Err(Error::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn has_fused_matmul_kernel_is_true_for_exactly_q4_0_q8_0_q4_k_and_q6_k() {
+        // The single source of truth every layer keys off. Anything NOT in
+        // the first list is dequantized to f32 at load by `kopitiam-runtime`'s
+        // `load_matmul_weight`, which costs ~4x that tensor's memory — so this
+        // set is a memory-budget decision, not just a dispatch table.
+        for dtype in [DType::Q4_0, DType::Q8_0, DType::Q4_K, DType::Q6_K] {
             assert!(has_fused_matmul_kernel(dtype), "{dtype} should have a fused kernel");
         }
         for dtype in [
@@ -663,9 +890,7 @@ mod tests {
             DType::Q5_1,
             DType::Q2_K,
             DType::Q3_K,
-            DType::Q4_K,
             DType::Q5_K,
-            DType::Q6_K,
             DType::Q8_K,
         ] {
             assert!(!has_fused_matmul_kernel(dtype), "{dtype} should not have a fused kernel");

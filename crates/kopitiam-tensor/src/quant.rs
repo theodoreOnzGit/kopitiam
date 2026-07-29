@@ -500,6 +500,155 @@ pub(crate) fn q8_0_dot_q8_0(weight_block: &[u8], x_q: &[i8], x_scale: f32) -> f3
     acc as f32 * d_w * x_scale
 }
 
+/// Integer dot product of one Q4_K **super-block** (256 weights) against the
+/// eight Q8_0 activation blocks covering the same 256 positions.
+///
+/// # Why a K-quant can be dotted at all, and why the algebra is exact
+///
+/// A Q4_K element is `d * sc_s * nibble - dmin * m_s`, where `s` is its
+/// 32-element sub-block ([`dequant_q4_k`]). That is *affine*, not merely
+/// scaled, so unlike Q4_0 the min term must be carried separately — but it
+/// still factors out of the sum. Per sub-block `s`, with the activation
+/// written as `x_scale_s * xq`:
+///
+/// ```text
+/// sum_j (d*sc_s*nib_j - dmin*m_s) * x_scale_s * xq_j
+///   = x_scale_s * ( d*sc_s * SUM(nib_j * xq_j)  -  dmin*m_s * SUM(xq_j) )
+/// ```
+///
+/// Both sums are pure `i32` — exact, no rounding — and the whole sub-block
+/// then costs a handful of `f32` multiplies. Same deal as
+/// [`q4_0_dot_q8_0`], just with the extra `SUM(xq_j)` term that the min
+/// needs. Confirm hor: `SUM(xq_j)` is ggml's `y[i].bsums`, precomputed
+/// there because Q8_K stores it; we sum it inline instead since Q8_0 has no
+/// such field.
+///
+/// # Provenance, and one deliberate divergence
+///
+/// Follows ggml's `ggml_vec_dot_q4_K_q8_K_generic`
+/// (`crates/kopitiam-ai/vendor/llama.cpp/ggml/src/ggml-cpu/quants.c:696`,
+/// MIT) — same factorisation, same `sumf -= dmin * sumi` min term (line
+/// 765), same per-sub-block scale walk (line 747).
+///
+/// **We diverge on the activation format, on purpose.** ggml dots Q4_K
+/// against **Q8_K**, which carries ONE `f32` scale for all 256 elements;
+/// this crate quantizes activations to **Q8_0**, which carries one `f16`-
+/// range scale per 32. Q8_0's blocks line up exactly with Q4_K's 32-element
+/// sub-blocks, so the factorisation above still holds term for term — the
+/// only difference is that `x_scale` sits inside the per-sub-block sum
+/// instead of being hoisted to the super-block. That makes our activation
+/// *more* finely scaled than ggml's (8 scales per 256 instead of 1), so it
+/// cannot lose precision relative to the reference; it costs 7 extra `f32`
+/// multiplies per super-block. The reason is not precision though, it is
+/// reuse: [`quantize_row_q8_0`] is the crate's one activation encoder and
+/// every fused kernel here consumes it, so adding Q4_K needed no second
+/// activation format. What WOULD make this wrong: if a caller ever passed
+/// `x_scales` that did not correspond 1:1 with the 32-element sub-blocks
+/// (e.g. one scale per 256), every min term would be mis-weighted.
+///
+/// `weight_block` must be exactly [`DType::Q4_K`]'s [`DType::block_bytes`]
+/// (144) long; `x_q` exactly 256 elements; `x_scales` exactly 8, in
+/// sub-block order.
+pub(crate) fn q4_k_dot_q8_0(weight_block: &[u8], x_q: &[i8], x_scales: &[f32]) -> f32 {
+    debug_assert_eq!(weight_block.len(), DType::Q4_K.block_bytes());
+    debug_assert_eq!(x_q.len(), 256);
+    debug_assert_eq!(x_scales.len(), 8);
+
+    let d = read_f16(weight_block, 0);
+    let dmin = read_f16(weight_block, 2);
+    let scales = &weight_block[4..16];
+    let qs = &weight_block[16..144];
+
+    let mut acc = 0f32;
+    // Four 64-element groups, each 32 `qs` bytes: low nibbles are sub-block
+    // 2g, high nibbles sub-block 2g+1 — the same walk `dequant_q4_k` does,
+    // so element `e` lands in sub-block `e / 32` on both paths.
+    for g in 0..4 {
+        let q = &qs[g * 32..g * 32 + 32];
+        for half in 0..2 {
+            let s = 2 * g + half;
+            let (sc, m) = get_scale_min_k4(s, scales);
+            let xq = &x_q[s * 32..s * 32 + 32];
+            let mut dot: i32 = 0;
+            let mut xsum: i32 = 0;
+            for (l, &xv) in xq.iter().enumerate() {
+                let nib = if half == 0 { q[l] & 0x0F } else { q[l] >> 4 };
+                dot += i32::from(nib) * i32::from(xv);
+                xsum += i32::from(xv);
+            }
+            acc += x_scales[s]
+                * (d * f32::from(sc) * dot as f32 - dmin * f32::from(m) * xsum as f32);
+        }
+    }
+    acc
+}
+
+/// Integer dot product of one Q6_K **super-block** (256 weights) against the
+/// eight Q8_0 activation blocks covering the same 256 positions.
+///
+/// Simpler than [`q4_k_dot_q8_0`]: Q6_K is symmetric (`d * sc_s * (q - 32)`,
+/// no min), so there is no `SUM(xq_j)` correction term. The fiddly bit is
+/// the *ordering* instead — Q6_K's sub-blocks are 16 elements, not 32, and
+/// its bytes are laid out in four interleaved quadrants per 128-element
+/// half rather than in natural order ([`dequant_q6_k`]). So this walks the
+/// same quadrant pattern the dequantizer does and files each product into
+/// an accumulator indexed by `element / 16`, which is that element's real
+/// sub-block. Getting that index wrong would apply a neighbouring
+/// sub-block's scale — plausible-looking output, silently wrong weights.
+///
+/// Two 16-element sub-blocks share one 32-element Q8_0 activation block, so
+/// `x_scales[s / 2]` is the scale for sub-block `s`; the two are combined
+/// under a single multiply per activation block.
+///
+/// # Provenance
+///
+/// Follows ggml's `ggml_vec_dot_q6_K_q8_K_generic`
+/// (`crates/kopitiam-ai/vendor/llama.cpp/ggml/src/ggml-cpu/quants.c:851`,
+/// MIT): the quadrant unpack at lines 879-882 and the `scales[is++]` walk
+/// advancing once per 16 elements at line 890. The scales are **signed**
+/// `i8` here, unlike Q4_K's unsigned 6-bit — read them wrong and the sign
+/// flips on roughly half the sub-blocks. Same deliberate Q8_0-instead-of-
+/// Q8_K activation divergence as [`q4_k_dot_q8_0`]; see its docs.
+///
+/// `weight_block` must be exactly [`DType::Q6_K`]'s [`DType::block_bytes`]
+/// (210) long; `x_q` exactly 256 elements; `x_scales` exactly 8.
+pub(crate) fn q6_k_dot_q8_0(weight_block: &[u8], x_q: &[i8], x_scales: &[f32]) -> f32 {
+    debug_assert_eq!(weight_block.len(), DType::Q6_K.block_bytes());
+    debug_assert_eq!(x_q.len(), 256);
+    debug_assert_eq!(x_scales.len(), 8);
+
+    let ql_all = &weight_block[0..128];
+    let qh_all = &weight_block[128..192];
+    let scales = &weight_block[192..208]; // signed i8, read as such below
+    let d = read_f16(weight_block, 208);
+
+    // One `i32` accumulator per 16-element sub-block. Exact: each product is
+    // at most 32 * 127 in magnitude and 16 of them cannot overflow `i32`.
+    let mut sub = [0i32; 16];
+    for half in 0..2 {
+        let ql = &ql_all[half * 64..half * 64 + 64];
+        let qh = &qh_all[half * 32..half * 32 + 32];
+        let base = half * 128;
+        for l in 0..32 {
+            let q1 = (i32::from(ql[l] & 0x0F) | (i32::from(qh[l] & 3) << 4)) - 32;
+            let q2 = (i32::from(ql[l + 32] & 0x0F) | (i32::from((qh[l] >> 2) & 3) << 4)) - 32;
+            let q3 = (i32::from(ql[l] >> 4) | (i32::from((qh[l] >> 4) & 3) << 4)) - 32;
+            let q4 = (i32::from(ql[l + 32] >> 4) | (i32::from((qh[l] >> 6) & 3) << 4)) - 32;
+            for (e, q) in [(base + l, q1), (base + l + 32, q2), (base + l + 64, q3), (base + l + 96, q4)] {
+                sub[e / 16] += q * i32::from(x_q[e]);
+            }
+        }
+    }
+
+    let mut acc = 0f32;
+    for (b, &x_scale) in x_scales.iter().enumerate() {
+        let lo = f32::from(scales[2 * b] as i8) * sub[2 * b] as f32;
+        let hi = f32::from(scales[2 * b + 1] as i8) * sub[2 * b + 1] as f32;
+        acc += x_scale * (lo + hi);
+    }
+    acc * d
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
