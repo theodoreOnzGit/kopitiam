@@ -1,8 +1,41 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-29 (0.2.5 release blocked; 3 agents in flight on Windows bugs)
-**Purpose:** if the session dies, this file plus `bd list` is enough to pick up
-without re-deriving anything.
+**Last updated:** 2026-07-29 (0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
+**Purpose:** if the session dies, this file plus `bn ready` is enough to pick up
+without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md.)
+
+> ## ⏹ WHERE THE 2026-07-29 SESSION ENDED (maintainer stopped, tired)
+>
+> **Shipped:** 0.2.5, 23 crates, `kopitiam` CLI included. `main` = `7ad82b59db`,
+> pushed, matches `origin/main`. Gates green on the merged tree (clippy exit 0;
+> kopitiam-neovim 932/0, runtime 310/0, ai 150/0, kopitiam 70/0).
+>
+> **Ready to ship, NOT yet shipped — needs an explicit publish prompt:**
+> `kopitiam-neovim@0.2.5`, one crate on its own. The Linux gate (bd-5gn) is
+> CLEARED — the maintainer ran `cargo test --release -p kopitiam-neovim` on a
+> real Linux box and it passes; Windows was already 932/0. To ship it:
+> **uncomment `kopitiam-neovim` in `scripts/publish.sh`** (line ~98) and run the
+> script. Nothing else to change and NO need to republish `kopitiam` — apps/cli
+> asks for `^0.2.1`, so existing 0.2.5 installs pick up kvim 0.2.5 by themselves.
+> That ships the `:term` ConPTY fix, `gf`, and the LSP fixes.
+>
+> **Open, agent was still running when the session ended:** the Q4_K_M bug (P1).
+> Its edits, if any, are UNCOMMITTED in `crates/kopitiam-tensor/`,
+> `crates/kopitiam-runtime/`, `crates/kopitiam-loader/` — check `git status`
+> before trusting the tree. Full evidence is in the bead; the short version:
+> Q8_0 works, Q4_0 works, **only Q4_K_M is broken**, so it is a k-quant bug and
+> NOT a SmolLM2 bug (the 360M SmolLM2 answers fine). Do not "fix SmolLM2".
+>
+> **Still unresolved, needs Linux:** the maintainer sees nonsense on Linux for
+> BOTH cli and tui; Windows shows one-token-then-stop for Q4_K_M only. Same root
+> cause or two bugs is UNKNOWN. The decisive datum nobody has yet is the Q8_0 vs
+> Q4_K_M comparison run *on Linux* — if both fail there, it is platform-level
+> (wgpu picks Vulkan on Linux, DX12 on Windows), not the quant.
+>
+> **Confirmed NOT bugs, do not re-investigate:** TUI vs CLI chat plumbing is
+> genuinely identical (same adapter, same `CompletionRequest`, same system
+> prompt, `drain_stream` correctly restores the receiver). Model picking works.
+
 
 > ## ⏳ LATEST — 2026-07-29 (Wed ~06:00+ SGT, maintainer's Windows box — **0.2.5 publish BLOCKED**)
 >
