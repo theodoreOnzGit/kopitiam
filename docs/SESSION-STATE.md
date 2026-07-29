@@ -43,6 +43,36 @@ without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md
 > | `gotmpl/` | Go `text/template` subset — lexer, parser, executor, builtins |
 > | `template.rs` | `template/template.go` — collate + the 3 execution modes |
 >
+> ### ⚠ SIX AGENTS RUNNING IN PARALLEL (launched ~15:20, 2026-07-29)
+>
+> Each owns **exactly one path** inside `crates/kopitiam-ollama/src/` and works
+> in its **own git worktree**. The main loop owns everything else.
+>
+> | Agent owns | Ports from |
+> | --- | --- |
+> | `thinking.rs` | `thinking/parser.go` + `template.go` |
+> | `envconfig.rs` | `envconfig/config.go` |
+> | `manifest.rs` | `manifest/` + the blob-store half of `server/images.go` |
+> | `memory.rs` | `fs/ggml/ggml.go` — `GraphSize()` + the `KV` accessors |
+> | `renderers/` | `model/renderers/` (20 files) |
+> | `parsers/` | `model/parsers/` (19 files) + maybe `harmony/` |
+>
+> **The coordination trick, so this merges cleanly:** every module — including
+> the ones still unwritten — is ALREADY declared in `lib.rs`, and each unwritten
+> one is a one-line stub saying so. Agents therefore never touch `lib.rs`,
+> `Cargo.toml`, or each other's files, so six worktree branches merge with zero
+> conflicts. **If you add a module later, declare it in `lib.rs` FIRST, before
+> spawning anyone.**
+>
+> Standing instructions given to every agent: read the vendored Go (at the
+> ABSOLUTE path — `vendor/` is gitignored so it does NOT exist in a worktree),
+> ollama wins any disagreement, provenance at the point of use, Singlish docs
+> with precision intact, release-profile builds only, **do not commit/push/
+> publish**, and STOP-and-report rather than adding a `Cargo.toml` dependency.
+> Expect at least one to come back asking for **sha256** (the manifest agent).
+>
+> Main loop has already done `api.rs` (the frozen contract) and `prompt.rs`.
+>
 > **NOT done, next in order** (all readable in the vendor clone). Two file paths
 > I first wrote here were WRONG and are corrected — upstream moved them, so do
 > not go looking:
