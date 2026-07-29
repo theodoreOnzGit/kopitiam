@@ -16,5 +16,13 @@ thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+# Insertion-ordered map. NOT a convenience -- see `api::ToolCallArguments`:
+# when a model emits {"city":...,"unit":...}, re-serialising it in a different
+# key order produces a different string, and anything that hashes, caches,
+# diffs or replays that tool call then disagrees with the model's own output.
+# Upstream uses `orderedmap.Map` for exactly this. Already in the workspace's
+# Cargo.lock, so no new supply-chain surface.
+indexmap = { workspace = true, features = ["serde"] }
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -53,58 +53,16 @@
 //!   `[img-N]` tags, and it carries its own `todo(parthsareen)` about revisiting
 //!   that. Ported when the vision path needs it.
 
+use crate::api::{Message, Tool};
 use crate::gotmpl::{self, Env, ExecError, ParseError, Value};
 use std::collections::BTreeMap;
-
-/// One conversation turn. **Upstream:** `api.Message` reduced to the fields a
-/// template can actually reach (`templateMessage` in `template.go`).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Message {
-    /// `system`, `user`, `assistant`, or `tool`.
-    pub role: String,
-    pub content: String,
-    /// A reasoning model's hidden scratchpad, when the model exposes one.
-    pub thinking: String,
-    /// Tool calls the assistant emitted, as raw JSON objects.
-    pub tool_calls: Vec<serde_json::Value>,
-    pub tool_name: String,
-    pub tool_call_id: String,
-}
-
-impl Message {
-    /// Convenience constructor for the common two-field case.
-    pub fn new(role: &str, content: &str) -> Self {
-        Self {
-            role: role.to_string(),
-            content: content.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn to_value(&self) -> Value {
-        let mut m = BTreeMap::new();
-        m.insert("Role".into(), Value::Str(self.role.clone()));
-        m.insert("Content".into(), Value::Str(self.content.clone()));
-        m.insert("Thinking".into(), Value::Str(self.thinking.clone()));
-        m.insert("ToolName".into(), Value::Str(self.tool_name.clone()));
-        m.insert("ToolCallID".into(), Value::Str(self.tool_call_id.clone()));
-        m.insert(
-            "ToolCalls".into(),
-            Value::List(self.tool_calls.iter().map(Value::from_json).collect()),
-        );
-        Value::Map(m)
-    }
-}
 
 /// Everything a template render needs. **Upstream:** `type Values struct`.
 #[derive(Debug, Clone, Default)]
 pub struct Values {
     pub messages: Vec<Message>,
-    /// Tool schemas, as raw JSON. Kept as JSON rather than typed because the
-    /// `api.Tool` hierarchy is not ported yet -- templates only ever `range`
-    /// over these and read `.Function.Name` / `.Description` / `.Parameters`,
-    /// which JSON maps serve exactly.
-    pub tools: Vec<serde_json::Value>,
+    /// Tool schemas the caller is offering the model. See [`crate::api::Tool`].
+    pub tools: Vec<Tool>,
     pub prompt: String,
     pub suffix: String,
     pub think: bool,
@@ -212,19 +170,14 @@ impl Template {
             m.insert("System".into(), Value::Str(system));
             m.insert(
                 "Messages".into(),
-                Value::List(messages.iter().map(Message::to_value).collect()),
+                Value::List(messages.iter().map(Message::to_template_value).collect()),
             );
+            // Upstream returns a nil slice when there are no tools, and Go's
+            // template truth makes nil falsy -- `{{ if .Tools }}` must not fire.
+            // An empty list is falsy here too, so the behaviour matches.
             m.insert(
                 "Tools".into(),
-                if v.tools.is_empty() {
-                    // Upstream returns a nil slice when there are no tools, and
-                    // Go's template truth makes nil falsy -- `{{ if .Tools }}`
-                    // must not fire. An empty list is falsy here too, so the
-                    // observable behaviour matches.
-                    Value::List(Vec::new())
-                } else {
-                    Value::List(v.tools.iter().map(Value::from_json).collect())
-                },
+                Value::List(v.tools.iter().map(Tool::to_template_value).collect()),
             );
             m.insert("Response".into(), Value::Str(String::new()));
             insert_think(&mut m, v);
@@ -588,15 +541,22 @@ mod tests {
         assert_eq!(render(src, &v), "none");
     }
 
+    /// Tools reach a template under their **Go-exported** field names
+    /// (`.Function.Name`), because that is what real templates write.
     #[test]
-    fn tools_render_from_their_json() {
-        let src = "{{ range .Messages }}{{ end }}{{ range .Tools }}{{ .function.name }};{{ end }}";
+    fn tools_render_under_their_go_field_names() {
+        let src = "{{ range .Messages }}{{ end }}{{ range .Tools }}{{ .Function.Name }}:{{ .Function.Description }};{{ end }}";
+        let tool: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "search", "description": "look it up"}
+        }))
+        .unwrap();
         let v = Values {
             messages: msgs(&[("user", "hi")]),
-            tools: vec![serde_json::json!({"function": {"name": "search"}})],
+            tools: vec![tool],
             ..Default::default()
         };
-        assert_eq!(render(src, &v), "search;");
+        assert_eq!(render(src, &v), "search:look it up;");
     }
 
     // ---- mode 3: legacy ----

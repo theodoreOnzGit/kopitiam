@@ -63,14 +63,29 @@
 //!
 //! Ported against ollama `4713800b08b2ddf5e14acf8398953cf7b12f169b` (2026-07-28).
 
+// Every module is declared here up front, including ones still being written,
+// so that concurrent porting work never has to touch this file. A module that
+// is still a stub says so in its own header.
+pub mod api;
+pub mod envconfig;
 pub mod format;
 pub mod gotmpl;
+pub mod manifest;
+pub mod memory;
 pub mod modelfile;
 pub mod name;
 pub mod options;
+pub mod parsers;
+pub mod prompt;
+pub mod renderers;
 pub mod template;
+pub mod thinking;
 
+pub use api::{
+    Capability, ConfigV2, Message, ThinkLevel, ThinkValue, Tool, ToolCall, ToolCallArguments,
+    ToolCallFunction, ToolFunction, ToolProperty,
+};
 pub use modelfile::{Command, Modelfile, ModelfileError};
 pub use name::{Name, ParseNameFromFilepathError, MISSING_PART};
 pub use options::{Options, OptionsError, Runner};
-pub use template::{Message, Template, Values};
+pub use template::{Template, Values};
