@@ -70,7 +70,7 @@ impl SpawnedDaemon {
 // ============================================================================
 //
 // The autostarted daemon is long-lived. If it inherits the client's handles it
-// keeps them open, so a caller such as `x=$(bd list)` or `bd list | grep` blocks
+// keeps them open, so a caller such as `x=$(bn list)` or `bn list | grep` blocks
 // forever waiting for EOF on a pipe the daemon still holds. `std::process`
 // cannot spawn with `bInheritHandles = FALSE`, so on Windows we go straight to
 // `CreateProcessW`, detached and with no inherited handles — the moral

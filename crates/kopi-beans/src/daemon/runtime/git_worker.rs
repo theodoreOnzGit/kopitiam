@@ -124,7 +124,7 @@ pub(crate) enum GitOp {
         checkpoint_groups: BTreeMap<String, String>,
     },
 
-    /// Initialize beads ref (blocking - bd init command).
+    /// Initialize beads ref (blocking - bn init command).
     Init {
         repo: PathBuf,
         root_slug: Option<BeadSlug>,

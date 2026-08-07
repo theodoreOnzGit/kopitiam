@@ -33,9 +33,11 @@ pub struct StoreMigrateArgs {
     #[arg(long = "no-push")]
     pub no_push: bool,
 
-    /// Proceed even when local and remote store refs have diverged with no
-    /// common ancestor. Refused by default, because migrating across a
-    /// divergence can drop beads that exist on only one side.
+    /// Proceed despite a condition that is refused by default: local and remote
+    /// store refs diverged with no common ancestor (migrating across that can
+    /// drop beads existing on only one side), or the source store raised
+    /// warnings about records the reader could not fully interpret. Purely
+    /// cosmetic normalisations are reported as notices and do NOT need this.
     #[arg(long)]
     pub force: bool,
 
@@ -157,6 +159,7 @@ fn render_store_migrate_json(
             crate::git::sync::MigratePushDisposition::SkippedNoRemote => "skipped_no_remote",
         },
         "warnings": outcome.warnings,
+        "notices": outcome.notices,
     })
 }
 
@@ -204,10 +207,19 @@ pub fn render_store_migrate(
                 "skipped (no remote configured)",
         }
     ));
+    // Two channels, deliberately labelled differently: `warnings` may mean data
+    // was dropped and blocks the migration unless forced; `notices` are
+    // lossless normalisations the caller cannot avoid and need not act on.
     if !outcome.warnings.is_empty() {
-        out.push_str("  warnings:\n");
+        out.push_str("  warnings (possible data loss — migration is refused unless --force):\n");
         for warning in &outcome.warnings {
             out.push_str(&format!("    - {warning}\n"));
+        }
+    }
+    if !outcome.notices.is_empty() {
+        out.push_str("  notices (normalised, nothing lost):\n");
+        for notice in &outcome.notices {
+            out.push_str(&format!("    - {notice}\n"));
         }
     }
     out
@@ -462,7 +474,7 @@ mod tests {
                         offset: Some(128),
                     }],
                     suggested_actions: vec![
-                        "run `bd store fsck --repair` to truncate tail corruption".to_string(),
+                        "run `bn store fsck --repair` to truncate tail corruption".to_string(),
                     ],
                 },
                 FsckCheck {
@@ -493,7 +505,7 @@ mod tests {
             "    - segment_frames: fail (severity=high, issues=1)\n",
             "      * frame_crc_mismatch: crc mismatch path=/tmp/wal/segment-1 namespace=core origin=07070707-0707-0707-0707-070707070707 seq=5 offset=128\n",
             "      actions:\n",
-            "        - run `bd store fsck --repair` to truncate tail corruption\n",
+            "        - run `bn store fsck --repair` to truncate tail corruption\n",
             "    - index_offsets: pass (severity=low, issues=0)\n",
         );
         assert_eq!(output, expected);

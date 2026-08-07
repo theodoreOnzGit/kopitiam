@@ -678,7 +678,12 @@ pub struct LoadedStoreMigration {
     pub state: CanonicalState,
     pub meta: wire::SupportedStoreMeta,
     pub deps_format: wire::DepsFormat,
+    /// Possibly-lossy tolerances; these block the migration unless forced.
+    /// See [`wire::MigrationParse::warnings`].
     pub warnings: Vec<String>,
+    /// Lossless normalisations; reported but never blocking.
+    /// See [`wire::MigrationParse::notices`].
+    pub notices: Vec<String>,
     pub notes_present: bool,
 }
 
@@ -811,14 +816,15 @@ pub fn read_state_at_oid_for_migration(
         )?;
     }
 
-    let (state, deps_format, warnings) =
+    let parsed =
         wire::parse_state_allow_legacy_deps(&state_bytes, &tombs_bytes, &deps_bytes, &notes_bytes)?;
 
     Ok(LoadedStoreMigration {
-        state,
+        state: parsed.state,
         meta,
-        deps_format,
-        warnings,
+        deps_format: parsed.deps_format,
+        warnings: parsed.warnings,
+        notices: parsed.notices,
         notes_present,
     })
 }
@@ -1072,7 +1078,10 @@ pub struct MigrateStoreToV2Outcome {
     pub wrote_checksums: bool,
     pub commit_oid: Option<Oid>,
     pub push: MigratePushDisposition,
+    /// Possibly-lossy tolerances. Non-empty means the migration was forced.
     pub warnings: Vec<String>,
+    /// Lossless normalisations that were applied. Informational.
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1083,6 +1092,7 @@ struct MigrationSourceSummary {
     added_notes_file: bool,
     wrote_checksums: bool,
     warnings: Vec<String>,
+    notices: Vec<String>,
 }
 
 struct ResolvedMigrationInputs {
@@ -1498,14 +1508,19 @@ fn resolve_migration_inputs(
             .cloned(),
     );
     let mut warnings = Vec::new();
+    let mut notices = Vec::new();
     if let Some(local) = local_loaded {
         warnings.extend(local.warnings.clone());
+        notices.extend(local.notices.clone());
     }
     if let Some(remote) = remote_loaded {
         warnings.extend(remote.warnings.clone());
+        notices.extend(remote.notices.clone());
     }
     warnings.sort();
     warnings.dedup();
+    notices.sort();
+    notices.dedup();
 
     ResolvedMigrationInputs {
         merged_state,
@@ -1518,6 +1533,7 @@ fn resolve_migration_inputs(
             added_notes_file: !notes_present_before,
             wrote_checksums: true,
             warnings,
+            notices,
         },
     }
 }
@@ -1536,6 +1552,7 @@ fn migration_outcome(
         commit_oid,
         push,
         warnings: summary.warnings.clone(),
+        notices: summary.notices.clone(),
     }
 }
 
@@ -3006,6 +3023,137 @@ mod tests {
         )
         .unwrap();
         assert!(loaded.state.dep_store().contains(&dep_key));
+    }
+
+    /// Write a store tree in the exact shape beads-rs (`bd` 0.1.26) produces,
+    /// as observed on a real 355-bead store (kopitiam#16):
+    ///
+    /// - `meta.json` at `format_version: 1` with **no** `*_sha256` checksums,
+    /// - `deps.jsonl` as legacy line-per-edge records (no OR-Set `cc`/`dots`),
+    /// - **no** `notes.jsonl` at all,
+    /// - `state.jsonl` beads carrying `_at`/`_by` bead-level stamps, legacy
+    ///   status names, and `closed_at`/`closed_by` as independent data.
+    ///
+    /// `bd-drifted` deliberately reproduces the case that made the real store
+    /// unmigratable: an already-closed bead that was edited afterwards, so its
+    /// bead-level stamp (2000) has advanced past its `closed_at` (1500).
+    fn write_beads_rs_v1_store(repo: &Repository) -> Oid {
+        let state_bytes = concat!(
+            r#"{"id":"bd-clean","created_at":[1000,0],"created_by":"alice","title":"clean","description":"","priority":2,"type":"task","labels":[],"status":"open","_at":[1000,0],"_by":"alice"}"#,
+            "\n",
+            r#"{"id":"bd-drifted","created_at":[1000,0],"created_by":"alice","title":"drifted","description":"","priority":2,"type":"task","labels":[],"status":"closed","closed_at":[1500,0],"closed_by":"alice","closed_reason":"Closed","_at":[2000,0],"_by":"alice"}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let tombs_bytes = Vec::<u8>::new();
+        let deps_bytes = concat!(
+            r#"{"from":"bd-drifted","to":"bd-clean","kind":"blocks","created_at":[1000,0],"created_by":"alice"}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let meta_bytes =
+            br#"{"format_version":1,"root_slug":"bd","last_write_stamp":[2000,0]}"#.to_vec();
+
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder
+            .insert("state.jsonl", repo.blob(&state_bytes).unwrap(), 0o100644)
+            .unwrap();
+        builder
+            .insert("tombstones.jsonl", repo.blob(&tombs_bytes).unwrap(), 0o100644)
+            .unwrap();
+        builder
+            .insert("deps.jsonl", repo.blob(&deps_bytes).unwrap(), 0o100644)
+            .unwrap();
+        builder
+            .insert("meta.json", repo.blob(&meta_bytes).unwrap(), 0o100644)
+            .unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+
+        let sig = Signature::now("test", "test@example.com").unwrap();
+        let commit_oid = repo
+            .commit(None, &sig, &sig, "beads-rs v1 store", &tree, &[])
+            .unwrap();
+        update_ref(
+            repo,
+            "refs/heads/beads/store",
+            commit_oid,
+            "beads test: seed v1 store",
+        )
+        .unwrap();
+        commit_oid
+    }
+
+    /// Regression test for kopitiam#16.
+    ///
+    /// A store written by beads-rs was unreadable *and* unmigratable by
+    /// kopi-beans: the strict loader refused `format_version 1` with a dead-end
+    /// message, and `store migrate` — the documented cure — died on the first
+    /// closed bead whose `closed_at` had drifted from its status stamp. This
+    /// pins the whole recovery path: the refusal must be actionable, the
+    /// migration must succeed unforced, and the result must load strictly.
+    #[test]
+    fn beads_rs_v1_store_is_refused_actionably_then_migrates_and_loads() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let v1_oid = write_beads_rs_v1_store(&repo);
+
+        // 1. The strict runtime loader still refuses it — but says what to do.
+        let err = match read_state_at_oid(&repo, v1_oid) {
+            Ok(_) => panic!("v1 store must not load through the strict path"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("format_version 1"), "{msg}");
+        assert!(msg.contains("this build reads 2"), "{msg}");
+        assert!(msg.contains("bn store migrate"), "{msg}");
+        assert!(msg.contains("ONE-WAY"), "{msg}");
+
+        // 2. The migration succeeds WITHOUT --force. The drifted closed_at is a
+        //    lossless normalisation, so it must be a notice, never a warning:
+        //    warnings gate on --force, which also disables the unrelated
+        //    divergence check.
+        let outcome = migrate_store_ref_to_v2(&repo, tmp.path(), false, false, true, 0)
+            .expect("beads-rs v1 store must migrate without --force");
+        assert!(
+            outcome.warnings.is_empty(),
+            "drifted mirror must not be a blocking warning: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            outcome.notices.len(),
+            1,
+            "expected exactly one drift notice: {:?}",
+            outcome.notices
+        );
+        assert!(outcome.notices[0].contains("bd-drifted"), "{:?}", outcome.notices);
+        assert!(outcome.converted_deps);
+        assert!(outcome.added_notes_file);
+        assert!(outcome.wrote_checksums);
+
+        // 3. The pre-migration ref is preserved before anything is rewritten.
+        assert!(
+            repo.refname_to_id(&format!("refs/beads/backup/{v1_oid}"))
+                .is_ok(),
+            "migration must back up the v1 ref"
+        );
+
+        // 4. The migrated store loads through the strict runtime path, with
+        //    every bead and dependency intact.
+        let commit_oid = outcome.commit_oid.expect("migration commit oid");
+        let loaded = read_state_at_oid(&repo, commit_oid).expect("strict load after migration");
+        assert_eq!(loaded.state.iter_live().count(), 2);
+        assert!(loaded.state.get_live(&BeadId::parse("bd-clean").unwrap()).is_some());
+        assert!(
+            loaded
+                .state
+                .get_live(&BeadId::parse("bd-drifted").unwrap())
+                .is_some()
+        );
+        assert_eq!(loaded.state.dep_store().values().count(), 1);
+        assert_eq!(loaded.meta.root_slug().map(|slug| slug.as_str()), Some("bd"));
     }
 
     #[test]

@@ -21,6 +21,38 @@ use crate::git::core::{
 // Wire format types (intermediate representation for JSON)
 // =============================================================================
 
+/// How strictly the redundant mirror fields on a `state.jsonl` bead line
+/// (`closed_at`, `closed_by`, `assignee_at`) must agree with the authoritative
+/// per-field stamps (`_at`/`_by`/`_v`).
+///
+/// These three fields are a **human-readable mirror, never an input**: the
+/// deserializer builds a [`BeadSnapshotWireV1`] and discards them, and the
+/// serializer regenerates them from the field stamps in
+/// [`WireBeadFullCompat::from_wire`]. So the policy only decides whether a
+/// disagreement aborts the parse or is reported and ignored — no bead data
+/// changes either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirrorFieldPolicy {
+    /// A disagreement is a hard error.
+    ///
+    /// Correct for stores kopi-beans itself wrote, where the mirrors are always
+    /// regenerated from the stamps and so can only disagree if the file was
+    /// corrupted or hand-edited.
+    Strict,
+    /// A disagreement is recorded as a warning and the mirror is ignored in
+    /// favour of the authoritative stamp.
+    ///
+    /// Correct only when importing a store written by a *different*
+    /// implementation of this format — notably beads-rs (`bd`), which treats
+    /// `closed_at`/`closed_by` as independent data rather than a mirror. When a
+    /// `bd` user edits an already-closed bead, the bead-level `_at`/`_by` stamp
+    /// advances but `closed_at` stays at the real close time, so the two
+    /// legitimately diverge. Refusing such a store would make it permanently
+    /// unreadable and unmigratable (see kopitiam#16), which is why the migration
+    /// read path — and only the migration read path — uses this policy.
+    ReportAndIgnore,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WireBeadFullCompat {
     #[serde(flatten)]
@@ -57,10 +89,37 @@ impl WireBeadFullCompat {
         }
     }
 
-    fn validate_redundant_fields(&self, raw: &serde_json::Value) -> Result<(), WireError> {
+    /// Check the redundant mirror fields against the authoritative field stamps.
+    ///
+    /// Under [`MirrorFieldPolicy::Strict`] any disagreement returns an error.
+    /// Under [`MirrorFieldPolicy::ReportAndIgnore`] it is pushed onto
+    /// `warnings` (naming the bead) and parsing continues; the mirror value is
+    /// discarded either way, so the resulting bead is identical.
+    fn validate_redundant_fields(
+        &self,
+        raw: &serde_json::Value,
+        policy: MirrorFieldPolicy,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), WireError> {
         let obj = raw.as_object().ok_or_else(|| {
             WireError::InvalidValue("state.jsonl bead must be a JSON object".to_string())
         })?;
+
+        // A mirror disagreement is fatal under `Strict` and a warning under
+        // `ReportAndIgnore`. The bead id is included so a 355-line state.jsonl
+        // can be traced back to the offending record.
+        let mut mismatch = |detail: String| -> Result<(), WireError> {
+            match policy {
+                MirrorFieldPolicy::Strict => Err(WireError::InvalidValue(detail)),
+                MirrorFieldPolicy::ReportAndIgnore => {
+                    warnings.push(format!(
+                        "state.jsonl [{}]: {detail}; ignoring the mirror field and using the authoritative stamp",
+                        self.wire.id
+                    ));
+                    Ok(())
+                }
+            }
+        };
 
         let workflow_closed = self.wire.status.is_terminal();
         if workflow_closed {
@@ -69,22 +128,16 @@ impl WireBeadFullCompat {
                     let workflow_stamp = wire_field_stamp(&self.wire, "status");
                     let closed_stamp = Stamp::new(wire_to_stamp(*closed_at), closed_by.clone());
                     if closed_stamp != workflow_stamp {
-                        return Err(WireError::InvalidValue(
-                            "closed_at/closed_by does not match status stamp".to_string(),
-                        ));
+                        mismatch("closed_at/closed_by does not match status stamp".to_string())?;
                     }
                 }
                 (None, None) => {}
                 _ => {
-                    return Err(WireError::InvalidValue(
-                        "closed_at/closed_by must be provided together".to_string(),
-                    ));
+                    mismatch("closed_at/closed_by must be provided together".to_string())?;
                 }
             }
         } else if self.closed_at.is_some() || self.closed_by.is_some() {
-            return Err(WireError::InvalidValue(
-                "closed_at/closed_by present for non-closed status".to_string(),
-            ));
+            mismatch("closed_at/closed_by present for non-closed status".to_string())?;
         }
 
         let claim_claimed = matches!(&self.wire.claim, crate::git::core::WireClaimSnapshot::Claimed(_));
@@ -94,15 +147,11 @@ impl WireBeadFullCompat {
             if let Some(assignee_at) = self.assignee_at.as_ref() {
                 let claim_stamp = wire_field_stamp(&self.wire, "claim");
                 if wire_to_stamp(*assignee_at) != claim_stamp.at {
-                    return Err(WireError::InvalidValue(
-                        "assignee_at does not match claim stamp".to_string(),
-                    ));
+                    mismatch("assignee_at does not match claim stamp".to_string())?;
                 }
             }
         } else if assignee_present || assignee_expires_present || self.assignee_at.is_some() {
-            return Err(WireError::InvalidValue(
-                "assignee_at/expires present without assignee".to_string(),
-            ));
+            mismatch("assignee_at/expires present without assignee".to_string())?;
         }
 
         Ok(())
@@ -257,6 +306,7 @@ pub fn parse_state(bytes: &[u8]) -> Result<Vec<Bead>, WireError> {
 fn parse_state_current_full(bytes: &[u8]) -> Result<Vec<BeadSnapshotWireV1>, WireError> {
     let content = parse_utf8(bytes)?;
     let mut beads = Vec::new();
+    let mut warnings = Vec::new();
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -264,17 +314,34 @@ fn parse_state_current_full(bytes: &[u8]) -> Result<Vec<BeadSnapshotWireV1>, Wir
         }
         let raw: serde_json::Value = serde_json::from_str(line)?;
         let compat: WireBeadFullCompat = serde_json::from_value(raw.clone())?;
-        compat.validate_redundant_fields(&raw)?;
+        compat.validate_redundant_fields(&raw, MirrorFieldPolicy::Strict, &mut warnings)?;
         beads.push(compat.wire);
     }
+    debug_assert!(
+        warnings.is_empty(),
+        "MirrorFieldPolicy::Strict must never produce warnings"
+    );
 
     SnapshotCodec::validate_beads(&beads).map_err(|err| map_snapshot_error("state.jsonl", err))?;
     Ok(beads)
 }
 
-fn parse_state_migration_full(bytes: &[u8]) -> Result<Vec<BeadSnapshotWireV1>, WireError> {
+/// Parse `state.jsonl` for the migration/import path.
+///
+/// Differs from [`parse_state_current_full`] in two tolerances, both needed to
+/// read a store written by beads-rs (`bd`) rather than by kopi-beans:
+/// the legacy rich `tracker_state` field name is accepted (see
+/// [`inject_legacy_status`]), and a `closed_at`/`closed_by`/`assignee_at` mirror
+/// that disagrees with its field stamp is warned about instead of rejected (see
+/// [`MirrorFieldPolicy`]).
+///
+/// Returns the beads plus one warning per tolerated inconsistency.
+fn parse_state_migration_full(
+    bytes: &[u8],
+) -> Result<(Vec<BeadSnapshotWireV1>, Vec<String>), WireError> {
     let content = parse_utf8(bytes)?;
     let mut beads = Vec::new();
+    let mut warnings = Vec::new();
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -283,12 +350,16 @@ fn parse_state_migration_full(bytes: &[u8]) -> Result<Vec<BeadSnapshotWireV1>, W
         let mut raw: serde_json::Value = serde_json::from_str(line)?;
         inject_legacy_status(&mut raw)?;
         let compat: WireBeadFullCompat = serde_json::from_value(raw.clone())?;
-        compat.validate_redundant_fields(&raw)?;
+        compat.validate_redundant_fields(
+            &raw,
+            MirrorFieldPolicy::ReportAndIgnore,
+            &mut warnings,
+        )?;
         beads.push(compat.wire);
     }
 
     SnapshotCodec::validate_beads(&beads).map_err(|err| map_snapshot_error("state.jsonl", err))?;
-    Ok(beads)
+    Ok((beads, warnings))
 }
 
 fn inject_legacy_status(raw: &mut serde_json::Value) -> Result<(), WireError> {
@@ -510,14 +581,19 @@ pub fn parse_notes(bytes: &[u8]) -> Result<Vec<NoteAppendV1>, WireError> {
     Ok(notes)
 }
 
-/// Parse git JSONL files into a canonical state.
+/// Parse git JSONL files into a canonical state, using the migration-tolerant
+/// `state.jsonl` reader but the strict OR-Set `deps.jsonl` reader.
+///
+/// Any warnings raised by the tolerant state reader are **discarded** here.
+/// Use [`parse_state_allow_legacy_deps`] when the caller needs to see them —
+/// that is the entry point the store migration uses.
 pub fn parse_legacy_state(
     state_bytes: &[u8],
     tombstones_bytes: &[u8],
     deps_bytes: &[u8],
     notes_bytes: &[u8],
 ) -> Result<CanonicalState, WireError> {
-    let beads = parse_state_migration_full(state_bytes)?;
+    let (beads, _warnings) = parse_state_migration_full(state_bytes)?;
     let tombstones = parse_tombstones(tombstones_bytes)?;
     let deps = parse_deps(deps_bytes)?;
     let notes = parse_notes(notes_bytes)?;
@@ -554,6 +630,31 @@ pub fn parse_current_state(
         .map_err(|err| WireError::InvalidValue(format!("snapshot decode failed: {err}")))
 }
 
+/// Result of a migration-tolerant parse of a store's JSONL files.
+///
+/// The two message channels are deliberately separate because the store
+/// migration treats them differently, and conflating them would force a user
+/// past a safety check they never needed to bypass.
+#[derive(Debug, Clone)]
+pub struct MigrationParse {
+    pub state: CanonicalState,
+    pub deps_format: DepsFormat,
+    /// Tolerated problems that **may have dropped data** — currently only
+    /// `deps.jsonl` records that the legacy reader could not interpret, or
+    /// conflicting active/deleted records where the last one won. The store
+    /// migration refuses to run while this is non-empty unless `--force` is
+    /// given, because a human should decide whether losing those edges is
+    /// acceptable.
+    pub warnings: Vec<String>,
+    /// Tolerated inconsistencies that **lose nothing**: redundant mirror fields
+    /// (`closed_at`/`closed_by`/`assignee_at`) that disagreed with their
+    /// authoritative stamp and were re-derived from it. Reported so the change
+    /// is visible, but never blocking — there is no alternative outcome for a
+    /// user to choose, since the canonical model has no place to store an
+    /// independent close timestamp.
+    pub notices: Vec<String>,
+}
+
 /// Parse git JSONL files into canonical state, allowing legacy deps conversion.
 ///
 /// This is migration-only. Runtime strict loads should continue using
@@ -563,8 +664,8 @@ pub fn parse_state_allow_legacy_deps(
     tombstones_bytes: &[u8],
     deps_bytes: &[u8],
     notes_bytes: &[u8],
-) -> Result<(CanonicalState, DepsFormat, Vec<String>), WireError> {
-    let beads = parse_state_migration_full(state_bytes)?;
+) -> Result<MigrationParse, WireError> {
+    let (beads, notices) = parse_state_migration_full(state_bytes)?;
     let tombstones = parse_tombstones(tombstones_bytes)?;
     let notes = parse_notes(notes_bytes)?;
     let (deps, deps_format, warnings) = match parse_deps_wire(deps_bytes) {
@@ -587,7 +688,12 @@ pub fn parse_state_allow_legacy_deps(
     };
     let state = SnapshotCodec::into_state(snapshot)
         .map_err(|err| WireError::InvalidValue(format!("snapshot decode failed: {err}")))?;
-    Ok((state, deps_format, warnings))
+    Ok(MigrationParse {
+        state,
+        deps_format,
+        warnings,
+        notices,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -858,9 +964,8 @@ impl SupportedStoreMeta {
                 }
             }
             _ => {
-                return Err(WireError::InvalidValue(format!(
-                    "unsupported meta format_version {}",
-                    meta.format_version
+                return Err(WireError::InvalidValue(unreadable_meta_version_message(
+                    meta.format_version,
                 )));
             }
         };
@@ -909,19 +1014,53 @@ impl SupportedStoreMeta {
     }
 }
 
+/// Build the message shown when a store's `meta.json` cannot be read by the
+/// current runtime.
+///
+/// The old message was just `unsupported meta format_version N`, which is a
+/// dead end: it names neither what this build supports nor what to do about it.
+/// Every store-touching command (`list`, `ready`, `status`, `show`) surfaces
+/// this string, so it is the only guidance most users will ever get — see
+/// kopitiam#16, where a store written by beads-rs (`bd`) at format_version 1
+/// left the user with no documented next step.
+///
+/// The one-way caveat is not hedging: a v2 store's `deps.jsonl` is an OR-Set
+/// object where v1's is a sequence of edges, and beads-rs 0.1.26 rejects it
+/// outright (`invalid type: map, expected a sequence`). Anyone still sharing
+/// the store with a `bd` user needs to know that before they migrate.
+pub(crate) fn unreadable_meta_version_message(found: u32) -> String {
+    let current = crate::git::core::FormatVersion::CURRENT.get();
+    format!(
+        "store uses meta format_version {found}; this build reads {current}. \
+         Older stores (including any written by beads-rs `bd`) must be upgraded: \
+         run `bn store migrate --dry-run` to preview, then `bn store migrate` to apply. \
+         The migration saves the pre-migration ref under refs/beads/backup/ before it writes, \
+         but it is ONE-WAY: `bd` cannot read the upgraded store, so migrate only once every \
+         user of this repository has moved to `bn`."
+    )
+}
+
 /// Parse meta.json bytes into a supported meta type.
+///
+/// Accepts every format version this build can *interpret* (1 and the current
+/// version), which is wider than what the runtime store loader accepts — see
+/// [`parse_current_meta`]. Migration and detection paths use this one.
 pub fn parse_supported_meta(bytes: &[u8]) -> Result<SupportedStoreMeta, WireError> {
     SupportedStoreMeta::parse(bytes)
 }
 
+/// Parse meta.json bytes, requiring the current format version.
+///
+/// This is the strict runtime gate: the daemon and every read command go
+/// through it, so an older store is refused here rather than being silently
+/// upgraded on the next write. The error explains how to upgrade.
 pub fn parse_current_meta(bytes: &[u8]) -> Result<SupportedStoreMeta, WireError> {
     let meta = SupportedStoreMeta::parse(bytes)?;
     if meta.meta().format_version() == Some(crate::git::core::FormatVersion::CURRENT.get()) {
         Ok(meta)
     } else {
-        Err(WireError::InvalidValue(format!(
-            "unsupported meta format_version {}",
-            meta.meta().format_version().unwrap_or(0)
+        Err(WireError::InvalidValue(unreadable_meta_version_message(
+            meta.meta().format_version().unwrap_or(0),
         )))
     }
 }
@@ -2223,11 +2362,20 @@ mod tests {
             other => panic!("unexpected strict error: {other:?}"),
         }
 
-        let (state, deps_format, warnings) =
-            parse_state_allow_legacy_deps(state_bytes, tomb_bytes, deps_bytes, notes_bytes)
-                .expect("migration parse should accept legacy deps");
-        assert_eq!(deps_format, DepsFormat::LegacyEdges);
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let parsed = parse_state_allow_legacy_deps(state_bytes, tomb_bytes, deps_bytes, notes_bytes)
+            .expect("migration parse should accept legacy deps");
+        assert_eq!(parsed.deps_format, DepsFormat::LegacyEdges);
+        assert!(
+            parsed.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            parsed.warnings
+        );
+        assert!(
+            parsed.notices.is_empty(),
+            "unexpected notices: {:?}",
+            parsed.notices
+        );
+        let state = parsed.state;
         let deps = state.dep_store();
         assert_eq!(deps.values().count(), 1);
         let key = DepKey::new_local(
@@ -2238,6 +2386,101 @@ mod tests {
         )
         .unwrap();
         assert!(deps.contains(&key));
+    }
+
+    /// The v1 `meta.json` beads-rs actually writes: no checksum fields at all.
+    const BEADS_RS_V1_META: &[u8] =
+        br#"{"format_version":1,"root_slug":"op","last_write_stamp":[1784614634202,1]}"#;
+
+    #[test]
+    fn parse_supported_meta_accepts_beads_rs_v1_meta() {
+        let meta = parse_supported_meta(BEADS_RS_V1_META).expect("v1 meta must be interpretable");
+        assert_eq!(meta.meta().format_version(), Some(1));
+        assert_eq!(meta.root_slug().map(|slug| slug.as_str()), Some("op"));
+        assert!(
+            meta.checksums().is_none(),
+            "beads-rs v1 meta carries no checksums"
+        );
+    }
+
+    /// kopitiam#16: the refusal used to read `unsupported meta format_version 1`
+    /// and nothing else, which told the user neither what was supported nor how
+    /// to proceed. It is the only guidance most users ever see, so pin its
+    /// contents rather than just its error variant.
+    #[test]
+    fn parse_current_meta_refusal_names_versions_and_the_remedy() {
+        let err = parse_current_meta(BEADS_RS_V1_META).expect_err("v1 must not pass the strict gate");
+        let WireError::InvalidValue(msg) = err else {
+            panic!("expected InvalidValue, got {err:?}");
+        };
+        assert!(msg.contains("format_version 1"), "names the version found: {msg}");
+        assert!(msg.contains("this build reads 2"), "names what is supported: {msg}");
+        assert!(msg.contains("bn store migrate"), "names the remedy: {msg}");
+        assert!(msg.contains("refs/beads/backup/"), "names the safety net: {msg}");
+        assert!(
+            msg.contains("ONE-WAY"),
+            "warns that bd cannot read the result: {msg}"
+        );
+    }
+
+    /// A closed bead whose `closed_at` mirror has drifted from its status stamp
+    /// — the shape a beads-rs store acquires when an already-closed bead is
+    /// edited afterwards. Strict parsing must still reject it; the migration
+    /// parser must accept it and say so.
+    fn drifted_closed_bead_jsonl() -> Vec<u8> {
+        let stamp = Stamp::new(WriteStamp::new(2000, 0), actor_id("alice"));
+        let bead = make_bead_with(&bead_id("bd-drift"), &stamp, IssueStatus::Done, Claim::default());
+        let mut state = CanonicalState::new();
+        state.insert(bead).unwrap();
+
+        let bytes = serialize_state(&state).expect("serialize_state");
+        let mut lines = jsonl_lines(&bytes);
+        let mut value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("closed_at".to_string(), serde_json::json!([1500, 0]));
+        lines[0] = serde_json::to_string(&value).unwrap();
+        join_jsonl(&lines)
+    }
+
+    #[test]
+    fn strict_state_parse_still_rejects_a_drifted_closed_mirror() {
+        let err = parse_state(&drifted_closed_bead_jsonl())
+            .expect_err("stores kopi-beans wrote must stay strictly validated");
+        let WireError::InvalidValue(msg) = err else {
+            panic!("expected InvalidValue, got {err:?}");
+        };
+        assert!(msg.contains("closed_at/closed_by"), "{msg}");
+    }
+
+    #[test]
+    fn migration_state_parse_reports_a_drifted_closed_mirror_as_a_notice() {
+        let state_bytes = drifted_closed_bead_jsonl();
+        let parsed = parse_state_allow_legacy_deps(&state_bytes, b"", b"", b"")
+            .expect("migration parse must tolerate a drifted mirror");
+
+        assert!(
+            parsed.warnings.is_empty(),
+            "a re-derivable mirror is not possible data loss: {:?}",
+            parsed.warnings
+        );
+        assert_eq!(parsed.notices.len(), 1, "{:?}", parsed.notices);
+        assert!(parsed.notices[0].contains("bd-drift"), "{:?}", parsed.notices);
+        assert!(
+            parsed.notices[0].contains("closed_at/closed_by"),
+            "{:?}",
+            parsed.notices
+        );
+
+        // The bead itself is unaffected: `closed_at` is a mirror the
+        // deserializer discards in every path, so tolerating it changes nothing
+        // about the resulting state.
+        let bead = parsed
+            .state
+            .bead_view(&bead_id("bd-drift"))
+            .expect("bead survives the tolerated mirror");
+        assert!(bead.bead.fields.status.value.is_terminal());
     }
 
     #[test]

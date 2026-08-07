@@ -81,7 +81,7 @@ fn full_context(stealth: bool) -> String {
         r#"# Beads Workflow
 
 Track ALL work in beads. No TodoWrite, no markdown TODOs.
-Sync is automatic (~500ms). Run `bd prime` after context compaction.
+Sync is automatic (~500ms). Run `bn prime` after context compaction.
 
 ## Session Close
 
@@ -90,41 +90,41 @@ Sync is automatic (~500ms). Run `bd prime` after context compaction.
 ## Finding Work
 
 ```bash
-bd ready                          # Unblocked, unclaimed — start here
-bd list --status=in_progress      # Your active work
-bd blocked                        # What's stuck and why
-bd stale                          # Forgotten (30+ days untouched)
+bn ready                          # Unblocked, unclaimed — start here
+bn list --status=in_progress      # Your active work
+bn blocked                        # What's stuck and why
+bn stale                          # Forgotten (30+ days untouched)
 ```
 
 Search and filter:
 ```bash
-bd search auth                    # Text search in title/description
-bd list --type=bug --priority=0   # Critical bugs
-bd list --status=todo -l security # Todo issues labeled security
+bn search auth                    # Text search in title/description
+bn list --type=bug --priority=0   # Critical bugs
+bn list --status=todo -l security # Todo issues labeled security
 ```
 
-Combine filters: `bd list --status=todo --type=feature --assignee=me`
+Combine filters: `bn list --status=todo --type=feature --assignee=me`
 
 ## Understanding Structure
 
 ```bash
-bd show <id>                      # Full details, what blocks it, what it blocks
-bd dep tree <id>                  # Visualize dependency graph
-bd status                         # Project overview
-bd epic status                    # Epic completion percentages
+bn show <id>                      # Full details, what blocks it, what it blocks
+bn dep tree <id>                  # Visualize dependency graph
+bn status                         # Project overview
+bn epic status                    # Epic completion percentages
 ```
 
 ## Working on Issues
 
 ```bash
-bd claim <id>                     # Claim it (I'm working on this)
+bn claim <id>                     # Claim it (I'm working on this)
 # ... do the work ...
-bd close <id>                     # Done (or: --reason duplicate --note "duplicate of ...")
+bn close <id>                     # Done (or: --reason duplicate --note "duplicate of ...")
 ```
 
 Found something while working? Capture it and keep going:
 ```bash
-bd create "Timeout hardcoded in auth.rs:45" --type=bug --deps discovered_from:<current-id>
+bn create "Timeout hardcoded in auth.rs:45" --type=bug --deps discovered_from:<current-id>
 ```
 
 The `discovered_from` link preserves where you found it without blocking your current work.
@@ -134,7 +134,7 @@ The `discovered_from` link preserves where you found it without blocking your cu
 A bead should have enough context to pick up cold — what, where, why. Can be one sentence if that's enough.
 
 ```bash
-bd create "Timeout hardcoded in auth.rs:45" --type=bug --priority=1 \
+bn create "Timeout hardcoded in auth.rs:45" --type=bug --priority=1 \
   --desc="30s timeout causes 504s on slow connections. Make configurable."
 ```
 
@@ -143,25 +143,25 @@ bd create "Timeout hardcoded in auth.rs:45" --type=bug --priority=1 \
 
 Epics and subtasks:
 ```bash
-bd create "Auth overhaul" --type=epic
-bd create "Add OAuth" --parent=<epic-id>   # Creates bd-xxx.1
+bn create "Auth overhaul" --type=epic
+bn create "Add OAuth" --parent=<epic-id>   # Creates <epic-id>.1
 ```
 
 For complex work: `--design` for approach, `--acceptance` for done criteria.
 
 ## Dependencies
 
-`bd dep add A B` — A depends on B (A waits for B to complete).
+`bn dep add A B` — A depends on B (A waits for B to complete).
 
-"Phase 2 depends on Phase 1" → `bd dep add phase2 phase1`
+"Phase 2 depends on Phase 1" → `bn dep add phase2 phase1`
 
-Verify with `bd blocked` — tasks should be blocked by their prerequisites.
+Verify with `bn blocked` — tasks should be blocked by their prerequisites.
 
 ## Labels
 
 Type + priority + status covers most organization. Labels are for cross-cutting concerns:
 ```bash
-bd label add <id> tech-debt
+bn label add <id> tech-debt
 ```
 "#,
         close_protocol
@@ -178,10 +178,10 @@ fn mcp_context(stealth: bool) -> String {
     format!(
         r#"# Beads Workflow
 
-- Track all work in `bd`, not markdown TODOs.
-- Start with `bd ready`, inspect with `bd show <id>`, and create follow-up work with `bd create`.
-- Sync is automatic; rerun `bd prime` after context compaction.
-- Use `bd help` for grouped command discovery and `bd help --advanced <cmd>` for transport flags.
+- Track all work in `bn`, not markdown TODOs.
+- Start with `bn ready`, inspect with `bn show <id>`, and create follow-up work with `bn create`.
+- Sync is automatic; rerun `bn prime` after context compaction.
+- Use `bn help` for grouped command discovery and `bn help --advanced <cmd>` for transport flags.
 - {}
 "#,
         close_protocol
@@ -260,8 +260,8 @@ mod tests {
         });
         assert!(!ctx.is_empty());
         assert!(ctx.contains("Beads Workflow"));
-        assert!(ctx.contains("bd ready"));
-        assert!(ctx.contains("bd create"));
+        assert!(ctx.contains("bn ready"));
+        assert!(ctx.contains("bn create"));
     }
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
             ..PrimeArgs::default()
         });
         assert!(rendered.contains("Close protocol:"));
-        assert!(rendered.contains("bd ready"));
+        assert!(rendered.contains("bn ready"));
     }
 
     #[test]
@@ -318,7 +318,7 @@ mod tests {
         std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdirs");
         std::fs::write(
             &settings,
-            r#"{"mcpServers":{"beads":{"command":"bd","args":["mcp","serve"]}}}"#,
+            r#"{"mcpServers":{"beads":{"command":"bn","args":["mcp","serve"]}}}"#,
         )
         .expect("write settings");
         assert!(is_mcp_active_in(Some(dir.path()), None));

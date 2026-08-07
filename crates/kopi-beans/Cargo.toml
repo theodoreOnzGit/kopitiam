@@ -18,7 +18,7 @@
 # keeps the rmux fork's own pins).
 [package]
 name = "kopi-beans"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.91"
 publish = true
@@ -54,10 +54,13 @@ whoami = "1.4"
 dirs = "6.0.0"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 chrono = "0.4"
-flate2 = "1"
-tar = "0.4"
+# `flate2`, `tar` and `ureq` were removed in kopitiam#14 together with the
+# self-upgrade machinery that was their only consumer (it downloaded and unpacked
+# a release tarball over HTTPS). Dropping `ureq` also drops its TLS stack — `ring`
+# / `aws-lc-sys` — and with it a C toolchain requirement, which matters because
+# this crate is meant to build natively on Termux/Android. Do not re-add them
+# without a consumer.
 toml = "0.8"
-ureq = { version = "2", default-features = true }
 tempfile = "3"
 bytes = "1"
 minicbor = { version = "0.24", features = ["std"] }
@@ -92,10 +95,18 @@ wal-fs = []
 test-harness = []
 slow-tests = []
 model-testing = []
-e2e-tests = ["test-harness"]
+# Dev-only gate for the `bn-tailnet-proxy` fault-injection binary (see the [[bin]]
+# section below and kopitiam#15). NOT in `default`, so `cargo install kopi-beans`
+# installs `bn` and nothing else. Deliberately a feature of its own rather than a
+# reuse of `test-harness`: it turns on one extra binary and no library `cfg`, so it
+# stays buildable independently of the `test-harness` code paths.
+fault-proxy = []
+# The end-to-end suite wants both the in-process harness hooks and the out-of-process
+# fault proxy, so it enables them together.
+e2e-tests = ["test-harness", "fault-proxy"]
 
 # The library keeps the upstream crate name `beads_rs`: the folded source, the
-# `bn` binary, and the fault-injection `tailnet_proxy` binary refer to
+# `bn` binary, and the fault-injection `bn-tailnet-proxy` binary refer to
 # `beads_rs::...`. The published PACKAGE is `kopi-beans`; the lib name is a
 # separate namespace and squats nothing on crates.io.
 [lib]
@@ -107,11 +118,36 @@ name = "bn"
 path = "src/bin/main.rs"
 required-features = ["cli"]
 
-# Tailnet-style replication proxy for fault injection (dev tooling). Kept from the
-# upstream fork; refers to the library as `beads_rs::core` / `beads_rs::daemon_core`.
+# Tailnet-style replication proxy for deterministic network fault injection. This
+# is DEV/TEST TOOLING, not part of the `bn` issue tracker: it exists to exercise the
+# daemon's replication layer under latency, loss, reordering and blackholes. Kept
+# from the upstream fork; refers to the library as `beads_rs::core` /
+# `beads_rs::daemon_core`.
+#
+# Two deliberate properties (see kopitiam#15):
+#   1. `required-features = ["fault-proxy"]` — `fault-proxy` is NOT in `default`, so
+#      `cargo install kopi-beans` skips this binary entirely and installs only `bn`.
+#      Build it with `--features fault-proxy` when you actually want it.
+#   2. The binary is named `bn-tailnet-proxy`, not the bare `tailnet_proxy` it used
+#      to be. Even when someone opts in with `--all-features`, the name is prefixed
+#      so it cannot collide with (or be clobbered by) another crate's binary, and a
+#      user reading `~/.cargo/bin` can tell which package owns it.
+#
+# Why `required-features` and not `examples/`: this file carries its own
+# `#[cfg(test)]` unit tests (the fault-profile constants), which `cargo test` runs
+# for a `[[bin]]` but NOT for an example, and an example would also be rebuilt on
+# every plain `cargo build`/`cargo test`.
+#
+# Why a dedicated `fault-proxy` feature and not the existing `test-harness`: gating
+# on `test-harness` would make this binary unbuildable whenever the `test-harness`
+# library paths are broken, which is the case at the time of writing
+# (`src/daemon/testkit/e2e.rs:3` has `use crate as crate::daemon;`, a bad artifact of
+# the sub-crate collapse, so `--features test-harness` does not compile). Keeping the
+# gate independent means the proxy can be built and verified on its own.
 [[bin]]
-name = "tailnet_proxy"
-path = "src/bin/tailnet_proxy.rs"
+name = "bn-tailnet-proxy"
+path = "src/bin/bn_tailnet_proxy.rs"
+required-features = ["fault-proxy"]
 
 [dev-dependencies]
 proptest = "1"

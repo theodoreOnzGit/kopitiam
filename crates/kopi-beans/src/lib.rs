@@ -38,7 +38,7 @@ pub use error::{Effect, Error, OpError, Transience};
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(feature = "cli")]
-/// Thin orchestration shim for the `bd` binary.
+/// Thin orchestration shim for the `bn` binary.
 ///
 /// Entry-point binaries should stay as minimal wiring while command behavior
 /// lives behind crate boundaries.

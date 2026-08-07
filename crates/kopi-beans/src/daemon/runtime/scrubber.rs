@@ -280,7 +280,7 @@ fn list_segments(
                             offset: None,
                             segment_id: Some(header.segment_id),
                         },
-                        Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                        Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                     );
                     continue;
                 }
@@ -309,7 +309,7 @@ fn list_segments(
                         offset: None,
                         segment_id: None,
                     },
-                    Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                    Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                 );
             }
         }
@@ -385,7 +385,7 @@ fn scan_segment_records(
                     offset: None,
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
             );
             return 0;
         }
@@ -406,7 +406,7 @@ fn scan_segment_records(
                 offset: Some(segment.header_len),
                 segment_id: Some(segment.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+            Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
         );
         return 0;
     }
@@ -432,7 +432,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to truncate tail corruption"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to truncate tail corruption"),
             );
             break;
         }
@@ -453,7 +453,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to truncate tail corruption"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to truncate tail corruption"),
             );
             break;
         }
@@ -479,7 +479,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
             );
             break;
         }
@@ -498,7 +498,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
             );
             break;
         }
@@ -519,7 +519,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to truncate tail corruption"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to truncate tail corruption"),
             );
             break;
         }
@@ -540,7 +540,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to truncate tail corruption"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to truncate tail corruption"),
             );
             break;
         }
@@ -570,7 +570,7 @@ fn scan_segment_records(
                     offset: Some(offset),
                     segment_id: Some(segment.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
             );
             break;
         }
@@ -592,7 +592,7 @@ fn scan_segment_records(
                         offset: Some(offset),
                         segment_id: Some(segment.segment_id),
                     },
-                    Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                    Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                 );
                 break;
             }
@@ -616,7 +616,7 @@ fn scan_segment_records(
                         offset: Some(offset),
                         segment_id: Some(segment.segment_id),
                     },
-                    Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                    Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                 );
                 break;
             }
@@ -639,7 +639,7 @@ fn scan_segment_records(
                         offset: Some(offset),
                         segment_id: Some(segment.segment_id),
                     },
-                    Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                    Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                 );
                 break;
             }
@@ -658,7 +658,7 @@ fn scan_segment_records(
                         offset: Some(offset),
                         segment_id: Some(segment.segment_id),
                     },
-                    Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                    Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                 );
                 break;
             }
@@ -677,7 +677,7 @@ fn scan_segment_records(
                         offset: Some(offset),
                         segment_id: Some(segment.segment_id),
                     },
-                    Some("run `bd admin maintenance on` then `bd store fsck --repair` to quarantine corrupted segments"),
+                    Some("run `bn admin maintenance on` then `bn store fsck --repair` to quarantine corrupted segments"),
                 );
                 break;
             }
@@ -716,7 +716,7 @@ fn scrub_index_offsets(
                     offset: None,
                     segment_id: None,
                 },
-                Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+                Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
             );
             return;
         }
@@ -760,7 +760,7 @@ fn scrub_index_offsets(
                             offset: None,
                             segment_id: None,
                         },
-                        Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+                        Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
                     );
                     break;
                 }
@@ -818,7 +818,7 @@ fn verify_index_offset(
                     offset: Some(item.offset),
                     segment_id: Some(item.segment_id),
                 },
-                Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+                Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
             );
             return;
         }
@@ -849,7 +849,7 @@ fn verify_index_offset(
                         offset: Some(item.offset),
                         segment_id: Some(item.segment_id),
                     },
-                    Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+                    Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
                 );
                 return;
             }
@@ -871,7 +871,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -891,7 +891,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -912,7 +912,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -936,7 +936,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -957,7 +957,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -978,7 +978,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -999,7 +999,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
         return;
     }
@@ -1019,7 +1019,7 @@ fn verify_index_offset(
                 offset: Some(item.offset),
                 segment_id: Some(item.segment_id),
             },
-            Some("run `bd admin maintenance on` then `bd admin rebuild-index`"),
+            Some("run `bn admin maintenance on` then `bn admin rebuild-index`"),
         );
     }
 }

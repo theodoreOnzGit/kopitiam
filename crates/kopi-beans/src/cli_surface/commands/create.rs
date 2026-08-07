@@ -110,7 +110,7 @@ pub struct CreateArgs {
     #[arg(short = 'e', long)]
     pub estimate: Option<u32>,
 
-    /// No-op (compat). `bd` doesn't require forcing.
+    /// No-op (compat). `bn` doesn't require forcing.
     #[arg(long)]
     pub force: bool,
 }
@@ -193,7 +193,7 @@ pub fn handle(ctx: &CliRuntimeCtx, mut args: CreateArgs) -> CommandResult<()> {
     labels.extend(args.label);
 
     if args.force && !ctx.json {
-        tracing::warn!("note: --force is ignored in bd (not required)");
+        tracing::warn!("note: --force is ignored in bn (not required)");
     }
 
     // Warn if creating without description (unless title contains "test")

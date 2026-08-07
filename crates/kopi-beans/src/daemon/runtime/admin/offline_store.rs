@@ -10,7 +10,7 @@ impl Daemon {
     pub fn admin_store_fsck(&self, store_id: StoreId, repair: bool) -> Response {
         // Repair modifies WAL files (truncate, quarantine, rebuild index).
         // Reject when running inside the daemon to avoid races with live writes.
-        // Users must stop the daemon first: `bd daemon stop && bd store fsck --repair`.
+        // Users must stop the daemon first: `bn daemon stop && bn store fsck --repair`.
         if repair {
             return Response::err_from(OpError::InvalidRequest {
                 field: Some("repair".into()),

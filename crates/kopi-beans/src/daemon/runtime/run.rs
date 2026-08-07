@@ -1,6 +1,6 @@
 //! Daemon runner (single-binary mode).
 //!
-//! `bd daemon run` starts the background service.
+//! `bn daemon run` starts the background service.
 
 use crate::surface::ipc::uds::{UnixListener, UnixStream};
 use std::path::Path;
@@ -113,7 +113,7 @@ pub fn run_daemon(
     }
     // TODO(windows): the autostarted daemon runs detached without a console, so
     // there is no POSIX signal to hook. It shuts down when its state loop exits
-    // or on an IPC `Shutdown` request; `bd`'s client stops it via
+    // or on an IPC `Shutdown` request; `bn`'s client stops it via
     // `proc_util::terminate` (TerminateProcess). Graceful console-Ctrl-C
     // handling (SetConsoleCtrlHandler) is not wired up.
 

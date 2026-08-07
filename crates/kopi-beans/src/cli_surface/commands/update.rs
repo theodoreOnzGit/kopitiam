@@ -353,7 +353,7 @@ pub fn handle(ctx: &CliRuntimeCtx, mut args: UpdateArgs) -> CommandResult<()> {
             {
                 return Err(validation_error(
                     "assignee",
-                    "cannot assign other actors; run bd as that actor",
+                    "cannot assign other actors; run bn as that actor",
                 )
                 .into());
             }

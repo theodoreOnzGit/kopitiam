@@ -250,7 +250,7 @@ impl IpcClient {
     }
 
     /// Override the program/args used for autostart.
-    /// Default spawns `bd daemon run`.
+    /// Default spawns `bn daemon run`.
     ///
     /// Override programs are treated as launcher-compatible wrappers: the
     /// client waits for the socket instead of assuming the process itself must
@@ -518,7 +518,7 @@ fn daemon_command() -> AutostartCommand {
     }
 
     AutostartCommand::direct(
-        PathBuf::from("bd"),
+        PathBuf::from("bn"),
         vec![OsString::from("daemon"), OsString::from("run")],
     )
 }

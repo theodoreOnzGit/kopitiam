@@ -1,47 +1,61 @@
-# beads-rs
+# kopi-beans (`bn`)
 
-a rust redesign of [beads](https://github.com/steveyegge/beads). distributed issue tracker for agent swarms, backed by git. conflicts are impossible.
+a distributed, git-backed work-item tracker for agent swarms. conflicts are
+impossible. the binary is **`bn`**.
+
+kopi-beans is a **fork of [beads-rs](https://github.com/delightful-ai/beads-rs)**
+(MIT, © 2025 Darin Kishore), itself a rust redesign of
+[beads](https://github.com/steveyegge/beads). it adds Windows and Termux/Android
+support, is shipped as part of [KOPITIAM](https://github.com/theodoreOnzGit/kopitiam),
+and is relicensed **AGPL-3.0-only**. see `NOTICE` for full provenance and the
+list of changes.
+
+> **kopi-beans is a separate tool from beads-rs.** `bn` and `bd` can be
+> installed side by side. `bn` never reads, writes, upgrades, or removes the
+> `bd` binary, and it will not touch beads-rs's editor hooks.
 
 ## install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/delightful-ai/beads-rs/main/scripts/install.sh | bash
+cargo install kopi-beans          # binary: bn
 ```
 
-prebuilt binaries for x86_64 linux and apple silicon. other platforms auto-fallback to cargo.
-
-```bash
-cargo install beads-rs                              # cargo
-mise use -g ubi:delightful-ai/beads-rs[exe=bd]      # mise
-nix run github:delightful-ai/beads-rs               # nix
-```
+crates.io is the only distribution channel — there are no prebuilt release
+binaries, no install script, and no nix flake for this fork.
 
 ## quick start
 
 in any git repo:
 
 ```bash
-bd init
-bd setup claude # or cursor or aider
+bn init
+bn setup claude # or cursor or aider
 ```
 
-then, ask your coding agent to run `bd onboard`, and you're done!
+then, ask your coding agent to run `bn onboard`, and you're done!
 
 ## why
 
-beads lets agents coordinate work and defer problems to the next session with a fresh context window. 50 agents on one codebase need to see the same task list - who's working on what, what's blocked, what's done.
+beads lets agents coordinate work and defer problems to the next session with a
+fresh context window. 50 agents on one codebase need to see the same task list -
+who's working on what, what's blocked, what's done.
 
-the go version works for one human with occasional sync. beads-rs is designed for swarms: one daemon per machine shares state across all clones instantly. no sqlite, everything lives in git on `refs/heads/beads/store`.
+the go version works for one human with occasional sync. this lineage is
+designed for swarms: one daemon per machine shares state across all clones
+instantly. no sqlite, everything lives in git on `refs/heads/beads/store`.
 
-this means agents never push to main when updating beads. no merge conflicts on your code branches. beads-rs just works, and gets out of the way.
+this means agents never push to main when updating beads. no merge conflicts on
+your code branches. it just works, and gets out of the way.
 
 ## status
 
-alpha, but designed for reliability first. stress tested on my workflows.
+alpha. designed for reliability first.
 
 ## differences from beads-go
 
-beads-rs is a **drop-in replacement** for core workflows. the main difference is the sync model - agents never need to run `bd sync`, beads can't have merge conflicts, and it works across machines automatically.
+a **drop-in replacement** for core workflows. the main difference is the sync
+model - agents never need to run `bn sync`, beads can't have merge conflicts,
+and it works across machines automatically.
 
 **what's missing:**
 
@@ -51,28 +65,30 @@ beads-rs is a **drop-in replacement** for core workflows. the main difference is
 | multi-repo state sharing | not yet |
 | jira integration | not yet |
 | doctor/repair commands | not yet |
-| config system | partial (auto-upgrade) |
 | templates | not yet |
 | compaction/decay | not yet |
+| self-upgrade (`bn upgrade`) | removed on purpose - see [upgrade](#upgrade) |
 
-if you need agent mail or multi-repo, use [the original](https://github.com/steveyegge/beads).
+if you need agent mail or multi-repo, use
+[the original](https://github.com/steveyegge/beads).
 
 ## migration path
 
 ```bash
-bd migrate from-go --input .beads/issues.jsonl --dry-run
+bn migrate from-go --input .beads/issues.jsonl --dry-run
 # if that looks good, run
-bd migrate from-go --input .beads/issues.jsonl
+bn migrate from-go --input .beads/issues.jsonl
 # and you're good!
 ```
-more details in `MIGRATION.md`.
 
+`migrate` is hidden from the top-level help; run `bn migrate --help` for the
+full set (`detect`, `to`, `from-go`).
 
 ## technical details
 
 **requirements:**
 - git repo with an `origin` remote (recommended; local-only works too)
-- linux + macos supported; windows not yet
+- linux, macos, windows, and termux/android
 
 **where data lives:**
 - canonical state: `refs/heads/beads/store`
@@ -80,68 +96,68 @@ more details in `MIGRATION.md`.
 - files: `state.jsonl`, `tombstones.jsonl`, `deps.jsonl`, `meta.json`
 - daemon socket: `$XDG_RUNTIME_DIR/beads/daemon.sock` or `~/.beads/daemon.sock` or `/tmp/beads-$uid/daemon.sock`
 
+these paths and file names are **deliberately identical to beads-rs's** — it is
+the same on-disk format, not a coincidence.
+
 **sync model:**
 - cli auto-starts a local daemon on demand
 - mutations are debounced and pushed in the background
-- `bd sync` is just "wait for flush", not a workflow step
+- `bn sync` is just "wait for flush", not a workflow step
 - backup ref maintenance is best-effort under lock contention and uses age/PID-aware stale lock cleanup
 
 ## editor integration
 
 ```bash
-bd setup claude
-bd setup cursor
-bd setup aider
+bn setup claude
+bn setup cursor
+bn setup aider
 ```
+
+these register a `bn prime` hook. if you also run beads-rs, `bn` will report a
+pre-existing `bd prime` hook but will never edit or delete it — removing another
+tool's configuration is your call, not `bn`'s.
 
 ## upgrade
 
 ```bash
-bd upgrade
+cargo install kopi-beans
 ```
 
-auto-upgrade is enabled by default and controlled by a toml config:
-`$XDG_CONFIG_HOME/beads-rs/config.toml` (or `~/.config/beads-rs/config.toml`).
+`bn` does **not** self-upgrade, and `bn upgrade` installs nothing — it prints
+the line above and exits non-zero.
+
+self-upgrade was removed deliberately. the implementation inherited from
+beads-rs downloaded **beads-rs's** GitHub releases and installed them over a
+binary named **`bd`**, so on a machine running both trackers `bn upgrade` would
+have overwritten the other tool. kopi-beans also publishes no release artifacts
+of its own, so there was nothing to re-point it at. auto-upgrade is likewise a
+no-op.
 
 ## config
 
-beads reads a single config file:
+kopi-beans reads a single config file:
 
 ```
 ~/.config/beads-rs/config.toml
 ```
 
-example:
+override the location with `BD_CONFIG_DIR`. the `BD_*` environment variables and
+the config directory name are inherited from beads-rs and kept unchanged for
+compatibility with existing setups.
 
-```toml
-auto_upgrade = true
-```
-
-override location with `BD_CONFIG_DIR`. disable auto-upgrade for a single run with
-`BD_NO_AUTO_UPGRADE=1`.
+the `auto_upgrade` key is still parsed but has no effect (see
+[upgrade](#upgrade)).
 
 ## docs
 
-- `CLI_SPEC.md` - cli surface / compatibility goals
-- `SPEC.md` - storage model + invariants
-- `MIGRATION.md` - migrate from beads-go
-- `BENCHMARKING.md` - hotpath benchmark workflow and artifact interpretation
-
-## nix flake
-
-```nix
-{
-  inputs.beads-rs.url = "github:delightful-ai/beads-rs";
-
-  outputs = { self, nixpkgs, beads-rs, ... }: {
-    nixpkgs.overlays = [ beads-rs.overlays.default ];
-    # then pkgs.beads-rs or pkgs.bd is available
-  };
-}
-```
-
-to update: `nix flake update beads-rs`
+- `NOTICE` - upstream attribution and the full list of fork changes
+- `bn --help` / `bn <cmd> --help` - command reference
+- `bn prime` - the workflow context `bn` hands to coding agents
 
 ## license
 
-MIT
+**AGPL-3.0-only** (see `LICENSE`).
+
+upstream beads-rs is MIT and remains available from its author under that
+licence; its unmodified licence text is kept alongside this file as
+`LICENSE-MIT`. relicensing this fork does not relicense upstream beads-rs.
