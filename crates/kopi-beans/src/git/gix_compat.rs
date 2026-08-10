@@ -18,11 +18,16 @@
 //!   repo lacks into its object database and updates the destination refs with
 //!   fast-forward + lock semantics, entirely in-process via gix (no `git`
 //!   subprocess, no network protocol). **Network** transports
-//!   (`http(s)`/`ssh`/`git`/scp-like) remain GATED and return
-//!   [`ErrorCode::PushUnsupported`]: gix 0.86 exposes no high-level push and no
+//!   (`http(s)`/`ssh`/`git`/scp-like) are delegated to the system `git`
+//!   binary, because gix 0.86 exposes no high-level push and no
 //!   `gix-protocol` send-pack helper (upstream #306), so a protocol push cannot
-//!   be built without a `[patch.crates-io]` (which would not survive
-//!   `cargo publish`).
+//!   be built in-process without a `[patch.crates-io]` (which would not survive
+//!   `cargo publish`). Shelling out keeps the *build* pure-Rust — `git` is a
+//!   runtime dependency of network push only, not a linked C toolchain — and
+//!   inherits the user's existing credential configuration (helpers, netrc,
+//!   SSH agent), which an in-process implementation would have to reproduce.
+//!   [`ErrorCode::PushUnsupported`] is still returned when no usable `git` is
+//!   found on `PATH`, so callers that gate on it keep working.
 //! - Remote *configuration* (create/read `remote.<name>.url`) is managed by
 //!   this shim directly against the on-disk git config, so a freshly opened
 //!   handle observes remotes added through it without a reload.
@@ -866,19 +871,83 @@ impl Repository {
     /// semantics. No `git` subprocess is spawned and no network protocol runs.
     ///
     /// **Network** remotes (`http(s)`/`ssh`/`git`/scp-like `user@host:path`)
-    /// return [`ErrorCode::PushUnsupported`]: gix 0.86 has no high-level push or
-    /// `gix-protocol` send-pack helper (upstream #306).
+    /// are delegated to the system `git` binary — see [`Self::subprocess_push`].
+    /// gix 0.86 has no high-level push or `gix-protocol` send-pack helper
+    /// (upstream #306), so there is no in-process path for these.
     pub fn push_refspecs(&self, url: &str, refspecs: &[String]) -> Result<(), Error> {
         match local_repo_path(url) {
             Some(path) => self.local_push(&path, refspecs),
-            None => Err(Error::new(
-                ErrorCode::PushUnsupported,
-                format!(
-                    "push to non-local remote '{url}' is unsupported: gix 0.86 has no high-level \
-                     push / send-pack (upstream #306); only local (file://) push is implemented"
-                ),
-            )),
+            None => self.subprocess_push(url, refspecs),
         }
+    }
+
+    /// Push `refspecs` to a network remote by invoking the system `git`.
+    ///
+    /// # Why a subprocess
+    /// gix 0.86 implements no high-level push and no `gix-protocol` send-pack
+    /// helper (upstream #306). Reintroducing `git-2`/libgit-2 would restore the
+    /// C toolchain this shim exists to remove, and would break the Windows /
+    /// Android-Termux builds that motivated the fork. Delegating only this one
+    /// operation keeps the build pure-Rust and, just as importantly, inherits
+    /// the user's credential setup (credential helpers, netrc, SSH agent)
+    /// rather than reimplementing it.
+    ///
+    /// # Behaviour
+    /// Refspecs are passed through verbatim; `git push` accepts the same
+    /// `[+]<src>:<dst>` syntax [`parse_refspec`] handles, including the empty
+    /// source (`:dst`) form meaning delete.
+    ///
+    /// `GIT_TERMINAL_PROMPT=0` is set deliberately. stdout/stderr are captured
+    /// for error reporting, so an interactive credential prompt would be
+    /// invisible and would hang the caller indefinitely — a particularly bad
+    /// failure mode under the daemon. Failing fast with git's own
+    /// "could not read Username" message is the better trade. Users with a
+    /// configured credential helper, netrc, or SSH agent are unaffected.
+    ///
+    /// A missing `git` yields [`ErrorCode::PushUnsupported`], preserving the
+    /// error code callers already gate on.
+    fn subprocess_push(&self, url: &str, refspecs: &[String]) -> Result<(), Error> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg(format!("--git-dir={}", self.path().display()));
+        if let Some(workdir) = self.workdir() {
+            cmd.arg(format!("--work-tree={}", workdir.display()));
+        }
+        cmd.arg("push").arg(url).args(refspecs);
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+        let output = cmd.output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::new(
+                    ErrorCode::PushUnsupported,
+                    format!(
+                        "push to non-local remote '{url}' requires the `git` binary, which was \
+                         not found on PATH: gix 0.86 has no high-level push / send-pack \
+                         (upstream #306), so only local (file://) push is in-process"
+                    ),
+                )
+            } else {
+                Error::new(
+                    ErrorCode::Other,
+                    format!("failed to run `git push` for remote '{url}': {e}"),
+                )
+            }
+        })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            detail.to_string()
+        };
+        Err(Error::new(
+            ErrorCode::Other,
+            format!("`git push` to '{url}' failed ({}): {detail}", output.status),
+        ))
     }
 
     /// Push every refspec to a local (on-disk) target repository.
@@ -1329,9 +1398,9 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     }
 }
 
-/// Message for the still-gated case: push to a *network* remote. Local (file://)
-/// push is implemented; only `http(s)`/`ssh`/`git`/scp-like remotes are gated,
-/// because gix 0.86 has no high-level push / `gix-protocol` send-pack (upstream
-/// #306).
+/// Message for the one remaining gated case: a *network* push attempted on a
+/// host with no `git` binary on `PATH`. Local (`file://`) push runs in-process
+/// via gix; network push delegates to `git`, because gix 0.86 has no
+/// high-level push / `gix-protocol` send-pack (upstream #306).
 pub const PUSH_UNSUPPORTED_MSG: &str =
-    "push to non-local remote unsupported: gix 0.86 has no high-level push / send-pack (upstream #306)";
+    "push to non-local remote requires the `git` binary, which was not found on PATH: gix 0.86 has no high-level push / send-pack (upstream #306)";
