@@ -88,7 +88,11 @@ fn open_jj_backing_repo(workspace_root: &Path) -> Option<Repository> {
 }
 
 fn jj_git_dir(workspace_root: &Path) -> Option<PathBuf> {
-    let output = Command::new("jj")
+    let mut cmd = Command::new("jj");
+    // No console window on Windows (kopitiam#29): this detection can run under
+    // the daemon, which owns no console, so a console-subsystem `jj.exe` would
+    // otherwise get handed a brand new console window. See `crate::proc`.
+    let output = crate::proc::dun_popup(&mut cmd)
         .current_dir(workspace_root)
         .args(["git", "root"])
         .output()

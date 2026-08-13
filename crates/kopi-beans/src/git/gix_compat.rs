@@ -906,8 +906,22 @@ impl Repository {
     ///
     /// A missing `git` yields [`ErrorCode::PushUnsupported`], preserving the
     /// error code callers already gate on.
+    ///
+    /// # Windows: no popup window
+    /// The child is spawned through [`crate::proc::dun_popup`]
+    /// (`CREATE_NO_WINDOW`). Without it the daemon — which owns no console —
+    /// would make Windows allocate `git.exe` a fresh console window on every
+    /// debounced auto-sync (kopitiam#29). Safe to suppress precisely because
+    /// stdout/stderr are captured and `GIT_TERMINAL_PROMPT=0` rules out any
+    /// interactive prompt that would need a visible window.
     fn subprocess_push(&self, url: &str, refspecs: &[String]) -> Result<(), Error> {
         let mut cmd = std::process::Command::new("git");
+        // No console window on Windows. This is THE hot site for kopitiam#29:
+        // the daemon has no console of its own (it was spawned
+        // `DETACHED_PROCESS | CREATE_NO_WINDOW`), so a console-subsystem
+        // `git.exe` launched from it would get a fresh console window — one
+        // popup per debounced auto-sync. See `crate::proc`.
+        crate::proc::dun_popup(&mut cmd);
         cmd.arg(format!("--git-dir={}", self.path().display()));
         if let Some(workdir) = self.workdir() {
             cmd.arg(format!("--work-tree={}", workdir.display()));

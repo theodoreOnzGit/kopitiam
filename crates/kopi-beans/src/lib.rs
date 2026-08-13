@@ -28,6 +28,7 @@ pub mod error;
 #[cfg(feature = "model-testing")]
 pub mod model;
 pub mod paths;
+mod proc;
 mod repo;
 pub(crate) mod store_admin;
 mod telemetry;
