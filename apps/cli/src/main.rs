@@ -287,15 +287,22 @@ enum Command {
     /// List a trait's `impl` sites — token-max Task II-1.
     Impls(semq::Locator),
 
-    /// Run `cargo check` and report one deduplicated line per distinct
-    /// diagnostic, sorted by file — token-max Task II-4.
+    /// Run `cargo check`, streaming cargo's own output; add `--compact`/`--json`
+    /// for one deduplicated line per distinct diagnostic — token-max Task II-4.
     ///
-    /// The dedup is the win: one bad type produces the same diagnostic across
-    /// every target, and this collapses them. See `apps/cli/src/diagnostics.rs`.
+    /// The dedup is the win, but it is opt-in: one bad type produces the same
+    /// diagnostic across every target, and `--compact` collapses them. Use
+    /// `--release`/`--profile <NAME>` to ask the profile you actually build
+    /// with, and `-- <cargo args>` for anything else. See
+    /// `apps/cli/src/diagnostics.rs`.
     Check(diagnostics::CheckArgs),
 
-    /// Run `cargo test` and report each failure as `name — assertion @
-    /// file:line`, not the full captured stdout — token-max Task II-4.
+    /// Run `cargo test`, streaming cargo's own output; add `--compact`/`--json`
+    /// to report each failure as `name — assertion @ file:line` instead of the
+    /// full captured stdout — token-max Task II-4.
+    ///
+    /// Takes `--release`/`--profile <NAME>` too: a dev-green suite is not
+    /// evidence that the release suite is green.
     Test(diagnostics::TestArgs),
 
     /// Estimate the BPE token cost of a file or directory, so an agent chooses
