@@ -18,7 +18,7 @@
 # keeps the rmux fork's own pins).
 [package]
 name = "kopi-beans"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.91"
 publish = true
@@ -140,10 +140,17 @@ required-features = ["cli"]
 #
 # Why a dedicated `fault-proxy` feature and not the existing `test-harness`: gating
 # on `test-harness` would make this binary unbuildable whenever the `test-harness`
-# library paths are broken, which is the case at the time of writing
-# (`src/daemon/testkit/e2e.rs:3` has `use crate as crate::daemon;`, a bad artifact of
-# the sub-crate collapse, so `--features test-harness` does not compile). Keeping the
-# gate independent means the proxy can be built and verified on its own.
+# library paths are broken. Keeping the gate independent means the proxy can always
+# be built and verified on its own, no matter what state the harness code is in.
+#
+# That is not hypothetical, hor — it already happened once. Until kopitiam#17 was
+# fixed, `src/daemon/testkit/e2e.rs:3` carried `use crate as crate::daemon;` (the
+# sub-crate collapse rewrote BOTH sides of an old `use crate as beads_daemon;`
+# self-alias, and `as` only takes a plain identifier, never a path). So
+# `--features test-harness` could not even PARSE, and had this binary been gated on
+# it, we would have shipped a binary nobody could build. `test-harness` compiles
+# again now, but the argument for keeping the two gates independent stands on its
+# own and this separation should NOT be tidied away.
 [[bin]]
 name = "bn-tailnet-proxy"
 path = "src/bin/bn_tailnet_proxy.rs"
