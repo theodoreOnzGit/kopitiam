@@ -241,7 +241,8 @@ pub enum Command {
         cmd: commands::migrate::MigrateCmd,
     },
 
-    /// Daemon control (hidden). `bn daemon run` starts the service.
+    /// Daemon control (hidden). `bn daemon run` starts the service in the
+    /// foreground; `bn daemon stop` / `bn daemon restart` bounce it.
     #[command(hide = true)]
     Daemon {
         #[command(subcommand)]
@@ -362,6 +363,13 @@ where
     match command {
         Command::Daemon { cmd } => match cmd {
             commands::daemon::DaemonCmd::Run => host.run_daemon_command(),
+            // `stop` / `restart` need no runtime: they act on the socket and
+            // the daemon process, not on a loaded store. Building a runtime
+            // first would mean talking to the very daemon we are about to
+            // kill — which is exactly the thing that is wedged when somebody
+            // reaches for these.
+            commands::daemon::DaemonCmd::Stop => commands::daemon::handle_stop(json),
+            commands::daemon::DaemonCmd::Restart => commands::daemon::handle_restart(json),
         },
         Command::Prime(args) => handle_prime(host, args),
         Command::Setup { cmd } => handle_setup::<H>(cmd),
@@ -621,6 +629,8 @@ fn migrate_cmd_name(cmd: &commands::migrate::MigrateCmd) -> &'static str {
 fn daemon_cmd_name(cmd: &commands::daemon::DaemonCmd) -> &'static str {
     match cmd {
         commands::daemon::DaemonCmd::Run => "run",
+        commands::daemon::DaemonCmd::Stop => "stop",
+        commands::daemon::DaemonCmd::Restart => "restart",
     }
 }
 
