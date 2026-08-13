@@ -11,7 +11,7 @@ use super::dispatch::process_request_message;
 use super::engine::StateLoopEngine;
 use super::spans::{record_ipc_request_metric, request_span};
 use super::waiters::{
-    CheckpointWaiter, DurabilityWaiter, ReadGateWaiter, RequestOutcome, RequestWaiters,
+    CheckpointWaiter, DurabilityWaiter, ReadGateWaiter, RequestOutcome, RequestWaiters, SyncWaiters,
     flush_checkpoint_waiters, flush_durability_waiters, flush_read_gate_waiters,
     flush_sync_waiters,
 };
@@ -28,7 +28,7 @@ pub(in crate::daemon::runtime) fn run_state_loop(
     git_tx: Sender<GitOp>,
     git_result_rx: Receiver<GitResult>,
 ) {
-    let mut sync_waiters: HashMap<RemoteUrl, Vec<Sender<ServerReply>>> = HashMap::new();
+    let mut sync_waiters: SyncWaiters = HashMap::new();
     let mut checkpoint_waiters: Vec<CheckpointWaiter> = Vec::new();
     let mut read_gate_waiters: Vec<ReadGateWaiter> = Vec::new();
     let mut durability_waiters: Vec<DurabilityWaiter> = Vec::new();
@@ -37,7 +37,12 @@ pub(in crate::daemon::runtime) fn run_state_loop(
     daemon.set_repl_ingest_tx(repl_tx);
 
     loop {
-        let tick = StateLoopEngine::next_tick(&mut daemon, &read_gate_waiters, &durability_waiters);
+        let tick = StateLoopEngine::next_tick(
+            &mut daemon,
+            &read_gate_waiters,
+            &durability_waiters,
+            &sync_waiters,
+        );
 
         crossbeam::select! {
             // Client request
@@ -305,7 +310,7 @@ pub(in crate::daemon::runtime) fn run_state_loop(
 fn run_housekeeping(
     daemon: &mut Daemon,
     git_tx: &Sender<GitOp>,
-    sync_waiters: &mut HashMap<RemoteUrl, Vec<Sender<ServerReply>>>,
+    sync_waiters: &mut SyncWaiters,
     checkpoint_waiters: &mut Vec<CheckpointWaiter>,
     read_gate_waiters: &mut Vec<ReadGateWaiter>,
     durability_waiters: &mut Vec<DurabilityWaiter>,

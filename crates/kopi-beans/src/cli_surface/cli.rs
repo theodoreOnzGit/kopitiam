@@ -135,7 +135,7 @@ pub enum Command {
     Deleted(commands::deleted::DeletedArgs),
 
     /// Wait for debounced sync flush to complete.
-    Sync,
+    Sync(commands::sync::SyncArgs),
 
     /// Subscribe to realtime events.
     Subscribe(commands::subscribe::SubscribeArgs),
@@ -300,7 +300,7 @@ pub fn command_name(command: &Command) -> String {
         Command::Stale(_) => "stale".to_string(),
         Command::Count(_) => "count".to_string(),
         Command::Deleted(_) => "deleted".to_string(),
-        Command::Sync => "sync".to_string(),
+        Command::Sync(_) => "sync".to_string(),
         Command::Subscribe(_) => "subscribe".to_string(),
         Command::Store { cmd } => format!("store.{}", store_cmd_name(cmd)),
         Command::Admin { cmd } => match cmd {
@@ -413,7 +413,7 @@ where
         Command::Stale(args) => commands::stale::handle(ctx, args).map_err(Into::into),
         Command::Count(args) => commands::count::handle(ctx, args).map_err(Into::into),
         Command::Deleted(args) => commands::deleted::handle(ctx, args).map_err(Into::into),
-        Command::Sync => commands::sync::handle(ctx).map_err(Into::into),
+        Command::Sync(args) => commands::sync::handle(ctx, args).map_err(Into::into),
         Command::Subscribe(args) => commands::subscribe::handle(ctx, args).map_err(Into::into),
         Command::Update(args) => commands::update::handle(ctx, args).map_err(Into::into),
         Command::Close(args) => commands::close::handle(ctx, args).map_err(Into::into),

@@ -4,12 +4,12 @@ use crossbeam::channel::{Receiver, Sender};
 
 use super::super::git_worker::{GitOp, GitResult};
 use super::daemon_api::StateLoopDaemon;
-use super::waiters::{DurabilityWaiter, ReadGateWaiter};
+use super::waiters::{DurabilityWaiter, ReadGateWaiter, SyncWaiters, next_sync_waiter_deadline};
 
 pub(super) struct StateLoopEngine;
 
 impl StateLoopEngine {
-    fn earliest_deadline(deadlines: [Option<Instant>; 7]) -> Option<Instant> {
+    fn earliest_deadline(deadlines: [Option<Instant>; 8]) -> Option<Instant> {
         deadlines.into_iter().flatten().min()
     }
 
@@ -17,6 +17,7 @@ impl StateLoopEngine {
         daemon: &mut D,
         read_gate_waiters: &[ReadGateWaiter],
         durability_waiters: &[DurabilityWaiter],
+        sync_waiters: &SyncWaiters,
     ) -> Option<Instant> {
         let next_sync = daemon.next_sync_deadline();
         let next_checkpoint = daemon.next_checkpoint_deadline();
@@ -28,6 +29,10 @@ impl StateLoopEngine {
             .iter()
             .map(|waiter| waiter.deadline)
             .min();
+        // Without this the loop can park on `never()` while a `bn sync` waiter
+        // sits there past its deadline — nothing else scheduled means nothing
+        // wakes us to expire it (kopitiam#25).
+        let next_sync_waiter = next_sync_waiter_deadline(sync_waiters);
 
         Self::earliest_deadline([
             next_sync,
@@ -37,6 +42,7 @@ impl StateLoopEngine {
             next_export,
             next_read_gate,
             next_durability,
+            next_sync_waiter,
         ])
     }
 
@@ -44,8 +50,9 @@ impl StateLoopEngine {
         daemon: &mut D,
         read_gate_waiters: &[ReadGateWaiter],
         durability_waiters: &[DurabilityWaiter],
+        sync_waiters: &SyncWaiters,
     ) -> Receiver<Instant> {
-        match Self::next_deadline(daemon, read_gate_waiters, durability_waiters) {
+        match Self::next_deadline(daemon, read_gate_waiters, durability_waiters, sync_waiters) {
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(Instant::now());
                 crossbeam::channel::after(wait)
@@ -144,6 +151,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ];
 
         assert_eq!(
@@ -165,7 +173,8 @@ mod tests {
             git_results_applied: 0,
         };
 
-        let deadline = StateLoopEngine::next_deadline(&mut daemon, &[], &[]);
+        let deadline =
+            StateLoopEngine::next_deadline(&mut daemon, &[], &[], &Default::default());
         assert_eq!(deadline, Some(now + std::time::Duration::from_millis(20)));
     }
 
