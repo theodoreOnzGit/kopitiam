@@ -576,6 +576,53 @@ Concretely, and this is a hard rule, not a preference:
   own tracker. Reaching for an external tool instead hides the bugs we most need
   to find.
 
+### HARD RULE — every tracked issue lives in BOTH `kopi-beans` and GitHub Issues
+
+**`bn` stays the tool you reach for first, always** — the rule above does not
+change. What changes: `bn` is no longer the *only* place work gets tracked.
+Every bead that represents real, findable work also gets a mirrored **GitHub
+Issue** on `theodoreOnzGit/kopitiam`, and every such bead carries that issue's
+number in its `--external-ref` (`gh-<N>`). This is a hard rule, not a
+preference — it exists because 37 of 62 local beads had accumulated with no
+public record at all before the 2026-08-24 migration that backfilled them
+(see gh-32 through gh-66, and `bd-fc1`/`bd-wd0`, which turned out to already
+duplicate gh-20/gh-31 by content and got backfilled rather than re-filed).
+Losing that public trail is the failure mode this rule closes.
+
+Concretely:
+
+* **File in `bn` first, as always** — it is faster, offline-capable, and the
+  canonical work-tracking surface (`bd prime`, `bn ready`, `bn show`, etc. all
+  still apply exactly as the managed Beads block above says).
+* **Then mirror it to GitHub**, using the GitHub MCP tools
+  (`mcp__github__issue_write` or your session's equivalent) — title, the
+  bead's description as the body, and the attribution footer every GitHub
+  post carries per this file's GitHub-posting rules. Record the mapping back
+  onto the bead immediately: `bn update <id> --external-ref gh-<N>`. A bead
+  with no `external_ref` is an incomplete filing, not a finished one.
+* **Before creating a new GitHub issue, check for an existing one covering
+  the same thing** (by title/content, `list_issues` or `search_issues`) —
+  backfill `external_ref` onto the existing issue instead of duplicating it.
+  Two of the 35 migrated beads turned out to already have a matching issue
+  under a different number; check first, the way that migration eventually
+  did.
+* **A bead resolved locally (`bn close`) gets its mirrored GitHub issue
+  closed too**, with `state_reason` set and, where useful, a short comment
+  explaining the resolution — not left open and stale on the public tracker
+  while the local tracker has already moved on.
+* **On explicit user request, GitHub Issues is not optional.** If the
+  maintainer asks for something to be "filed as a GitHub issue," "put on
+  GitHub," "migrated," or otherwise names GitHub explicitly, that request
+  governs — file/update the GitHub issue as asked, not merely the local bead,
+  and do not substitute "I filed a bead" as if it satisfied the ask. The
+  reverse also holds: a plain "track this" with no tracker named still gets
+  both, per the hard rule above, but naming GitHub explicitly means GitHub
+  is not skippable, deferred, or treated as secondary busywork.
+* **`bn` remains the source of truth for status/priority/notes/dependencies**
+  — GitHub Issues is the public mirror, not a second place to maintain
+  conflicting state. When the two disagree, `bn`'s state wins and GitHub gets
+  updated to match, not the other way round.
+
 ---
 
 # Working Practices
