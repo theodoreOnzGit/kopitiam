@@ -27,13 +27,15 @@
 //!
 //! ## The fidelity ceiling (what is stubbed -- read before trusting a render)
 //!
-//! * **Glyph shapes.** This port has *no glyph outlines* -- [`Font`] deliberately
-//!   avoids FreeType (see [`font`](super::font)), so there is nothing to fill.
-//!   [`show_glyph`](DrawDevice::show_glyph) therefore paints a **filled advance
-//!   box** per visible glyph (whitespace is skipped): text renders as legible
-//!   *blocks* at the right positions and sizes, not letterforms. True glyph
-//!   rendering needs an embedded-font outline decoder (a FreeType-equivalent),
-//!   which is out of scope. `// TODO(draw): glyph outlines`.
+//! * **Glyph shapes.** [`Font`] deliberately avoids FreeType (see
+//!   [`font`](super::font)); instead pure-Rust outline decoders fill real
+//!   letterforms for TrueType `glyf` ([`glyph_truetype`](super::glyph_truetype)),
+//!   CFF / Type2 charstrings including the predefined-Standard-encoding
+//!   fallback ([`glyph_cff`](super::glyph_cff)), and Type1 charstrings
+//!   ([`glyph_type1`](super::glyph_type1)). [`show_glyph`](DrawDevice::show_glyph)
+//!   falls back to a **filled advance box** only when [`Font::glyph_outline`]
+//!   returns `None` -- a non-embedded font, an undecodable/predefined-Expert
+//!   program, or a genuinely empty glyph (whitespace is skipped outright).
 //! * **Invisible text.** The glyph sink has no render-mode, so `Tr 3/7`
 //!   (invisible, e.g. an OCR text layer over a scan) still paints a box. A future
 //!   render-mode-aware sink should suppress it.
@@ -250,8 +252,9 @@ impl TextDevice for DrawDevice {
 
         // Fallback: no decodable outline, so paint the glyph's advance box -- a
         // legible block at the correct position/size, inset so adjacent glyphs
-        // stay visually distinct and lines do not merge vertically. TODO(glyph):
-        // Type1 (`/FontFile`) and predefined-encoding simple CFF still land here.
+        // stay visually distinct and lines do not merge vertically. Lands here
+        // for a non-embedded font, a predefined-Expert-encoding simple CFF (see
+        // the glyph_cff module ceiling), or a genuinely undecodable program.
         let asc = font.ascender().min(0.9); // ~cap height mass
         let x0 = adv * 0.08;
         let x1 = adv * 0.92;
@@ -327,9 +330,10 @@ pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
 ///
 /// This is the public entry the terminal PDF viewer (`tdf-parity`) and the kmux
 /// LaTeX live-preview call. It drives the content interpreter
-/// ([`run_page`](super::run_page)) over a [`DrawDevice`], which now paints vector
-/// fills/strokes, colour and images as well as placeholder glyph boxes (see the
-/// fidelity-ceiling note on [`DrawDevice`] -- glyph outlines remain pending).
+/// ([`run_page`](super::run_page)) over a [`DrawDevice`], which paints vector
+/// fills/strokes, colour, images and real glyph letterforms wherever an
+/// embedded font program decodes (see the fidelity-ceiling note on
+/// [`DrawDevice`] for the remaining stubs and the advance-box fallback).
 pub fn rasterize_page(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<Pixmap> {
     let scale = (dpi / 72.0).max(0.01);
     let page = doc.page(page_index)?.clone();
@@ -723,6 +727,53 @@ mod tests {
         // The ring wall (left of the hole) must be painted dark.
         assert!(pix.luma(40, 95).unwrap() < 120, "ring wall should be dark, got {}", pix.luma(40, 95).unwrap());
         // Sanity: the page is not blank.
+        let any_dark = (0..200).any(|y| (0..200).any(|x| pix.luma(x, y).unwrap() < 100));
+        assert!(any_dark, "glyph should paint some dark pixels");
+    }
+
+    /// Wrap raw font-program bytes as a `/FontFile` (Type1) stream object, with
+    /// no `/Length1`/`/Length2` so the decoder exercises its `eexec`-keyword
+    /// search fallback rather than the length-hint fast path.
+    fn fontfile_body(pfa: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(format!("<< /Length {} >>\nstream\n", pfa.len()).as_bytes());
+        v.extend_from_slice(pfa);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+
+    #[test]
+    fn embedded_type1_renders_letterform_with_interior_white() {
+        // Issue #31: Type1 (`/FontFile`) glyphs used to render as solid filled
+        // boxes. Same ring-glyph discriminator as the TrueType test above: a
+        // real outline leaves the ring's centre a white hole; the old
+        // advance-box fallback would fill it solid. The font has no PDF-level
+        // /Encoding, so code 0x41 resolves through the Type1 program's own
+        // built-in StandardEncoding (the common symbolic-Type1 case).
+        let pfa = super::super::glyph_type1::ring_type1_pfa();
+        let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Ring \
+/FirstChar 65 /LastChar 65 /Widths [1000] /FontDescriptor 6 0 R >>";
+        let descriptor = b"<< /Type /FontDescriptor /FontName /Ring /Flags 4 /FontFile 7 0 R >>";
+        let content = b"<< /Length 32 >>\nstream\nBT /F1 150 Tf 20 30 Td (A) Tj ET\nendstream";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>";
+        let ff = fontfile_body(&pfa);
+        let bodies: [&[u8]; 7] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            page,
+            content,
+            font,
+            descriptor,
+            &ff,
+        ];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+
+        // Same device geometry as the TrueType ring test (identical Tf/Td and
+        // em-space square coordinates).
+        assert!(pix.luma(95, 95).unwrap() > 200, "glyph counter should be white (interior), got {}", pix.luma(95, 95).unwrap());
+        assert!(pix.luma(40, 95).unwrap() < 120, "ring wall should be dark, got {}", pix.luma(40, 95).unwrap());
         let any_dark = (0..200).any(|y| (0..200).any(|x| pix.luma(x, y).unwrap() < 100));
         assert!(any_dark, "glyph should paint some dark pixels");
     }

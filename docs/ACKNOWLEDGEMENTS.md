@@ -144,16 +144,26 @@ translation above, and is recorded here and in **AID-0052**:
   pure-Rust `zune-jpeg` (with `zune-core`) rather than by `load-jpeg.c`'s
   libjpeg. `MIT OR Apache-2.0 OR Zlib`; no C in the build.
 * **Embedded-font outlines / FreeType → spec re-implementation (no crate).**
-  MuPDF reads `/FontFile2` / `/FontFile3` programs through FreeType. This port
-  **avoids FreeType entirely**: `glyph.rs` keeps MuPDF's outline→`Path`
-  *callback shape* (the `move_to` / `line_to` / `conic_to` / `cubic_to`
-  decompose of `font.c`), but the actual font-program parsing is written
-  **clean-room from the format specifications** — the OpenType `glyf`/`loca`
-  tables (`glyph_truetype.rs`) and the Adobe CFF / Type2 Charstring format,
-  Technical Note #5177 (`glyph_cff.rs`). One narrow exception is recorded at the
+  MuPDF reads `/FontFile2` / `/FontFile3` / `/FontFile` programs through
+  FreeType. This port **avoids FreeType entirely**: `glyph.rs` keeps MuPDF's
+  outline→`Path` *callback shape* (the `move_to` / `line_to` / `conic_to` /
+  `cubic_to` decompose of `font.c`), but the actual font-program parsing is
+  written **clean-room from the format specifications** — the OpenType
+  `glyf`/`loca` tables (`glyph_truetype.rs`), the Adobe CFF / Type2 Charstring
+  format, Technical Note #5177 (`glyph_cff.rs`), and the **Adobe Type 1 Font
+  Format specification** (Adobe Systems Inc., 1990 — `glyph_type1.rs`, the
+  `/FontFile` decoder: PFA/PFB unwrapping, `eexec`/charstring decryption, the
+  Type1 charstring interpreter including `seac` and the `OtherSubrs`
+  flex/hint-replacement convention). One narrow exception is recorded at the
   point of use: the CFF *container* parse (`INDEX` / `DICT` / charset / FDSelect
   / `subr_bias`) is a close adaptation of MuPDF's own non-FreeType CFF reader in
   `source/fitz/subset-cff.c` (still MuPDF, still `19f1284`), not of FreeType.
+  The CFF **Standard Strings** table (`glyph_cff.rs`, `CFF_STANDARD_STRINGS`,
+  Adobe TN#5176 Appendix A — used to resolve a predefined-Standard-encoding
+  simple CFF font's `code -> name -> gid`) is the spec's own fixed 391-entry
+  list, not creative expression to attribute; it was cross-checked against
+  fontTools' `cffLib.cffStandardStrings` (`fonttools`, BSD-3-Clause) for
+  transcription accuracy rather than typed from memory. See **AID-0055**.
 
 The consequence for provenance is that these subsystems are **not** derivative
 of FreeType or libjpeg: the glyph decoders are spec-based original Rust (plus one

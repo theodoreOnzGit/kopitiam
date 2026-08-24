@@ -32,11 +32,17 @@
 //!   simple + composite glyphs, decoded here ([`glyph_truetype`](super::glyph_truetype)).
 //! * **CFF / Type2 charstrings** (`/FontFile3` `Type1C` / `CIDFontType0C` /
 //!   OpenType-`CFF `): a Type2 charstring interpreter
-//!   ([`glyph_cff`](super::glyph_cff)).
-//! * **Type1 (`/FontFile`)** and any font program that fails to parse: **no**
-//!   outline is produced; the draw device keeps its advance-box fallback. Never a
-//!   panic, never a corrupted pixmap. See the `// TODO(glyph): Type1` marker in
-//!   [`FontProgram::parse`].
+//!   ([`glyph_cff`](super::glyph_cff)), including the predefined-Standard-encoding
+//!   `code -> name -> gid` fallback for simple CFF fonts.
+//! * **Type1 (`/FontFile`)**: a Type1 charstring interpreter
+//!   ([`glyph_type1`](super::glyph_type1)) -- selected **by glyph name**, not
+//!   GID, so it is not part of this module's `gid -> outline` [`FontProgram`]
+//!   shape; [`Font::glyph_outline`](super::font::Font) resolves the name and
+//!   calls [`Type1Program::outline`](super::glyph_type1::Type1Program::outline)
+//!   directly.
+//! * Any font program that still fails to parse: **no** outline is produced;
+//!   the draw device keeps its advance-box fallback. Never a panic, never a
+//!   corrupted pixmap.
 
 use super::draw_path::Path;
 use super::geometry::Matrix;
@@ -52,14 +58,27 @@ use super::glyph_truetype::TrueTypeProgram;
 pub enum FontProgram {
     /// A TrueType (`glyf`) outline source.
     TrueType(TrueTypeProgram),
-    /// A CFF / Type2 charstring outline source.
-    Cff(CffProgram),
+    /// A CFF / Type2 charstring outline source. Boxed: `CffProgram` (charset /
+    /// encoding / FDArray tables) is much larger than `TrueTypeProgram`, and an
+    /// unboxed variant would size every `FontProgram` -- including the common
+    /// TrueType case -- to the larger one.
+    Cff(Box<CffProgram>),
 }
 
 impl FontProgram {
-    /// Parse an embedded font program, sniffing the format from its leading
-    /// bytes. Returns `None` for anything not decodable here (Type1, corrupt or
-    /// unsupported programs) so the caller falls back to the advance box.
+    /// Parse a `/FontFile2` or `/FontFile3` embedded font program, sniffing the
+    /// format from its leading bytes. Returns `None` for anything not decodable
+    /// here (corrupt or unsupported programs) so the caller falls back to the
+    /// advance box.
+    ///
+    /// **Not Type1**: `/FontFile` (Type1, `%!` PostScript / PFB `0x80`) is a
+    /// different, name-keyed shape with no numeric GID (a `CharStrings` dict,
+    /// not an array) and is decoded through
+    /// [`Type1Program`](super::glyph_type1::Type1Program) directly by
+    /// [`Font::load`](super::font::Font::load) — never through this function or
+    /// wrapped in [`FontProgram`]. This function still rejects a `%!`/`0x80`
+    /// tag defensively (returning `None`) in case it's ever called on one, but
+    /// that path is not exercised in practice.
     ///
     /// * sfnt magic (`0x00010000`, `true`, `ttcf`) -> TrueType `glyf` (or the
     ///   `CFF ` table inside an OpenType wrapper).
@@ -74,20 +93,17 @@ impl FontProgram {
             // sfnt wrappers: could carry either `glyf` or a `CFF ` table.
             b"\x00\x01\x00\x00" | b"true" | b"ttcf" | b"OTTO" => {
                 if let Some(cff) = TrueTypeProgram::cff_table(bytes) {
-                    return CffProgram::parse(&cff).map(FontProgram::Cff);
+                    return CffProgram::parse(&cff).map(|c| FontProgram::Cff(Box::new(c)));
                 }
                 TrueTypeProgram::parse(bytes).map(FontProgram::TrueType)
             }
             // A bare CFF font program (typ. version 1.0 -> first byte 0x01), or a
-            // Type1/PostScript program we cannot decode.
+            // Type1/PostScript program (handled elsewhere -- see above).
             _ => {
-                // TODO(glyph): Type1 (`/FontFile`, `%!` PostScript / PFB `0x80`)
-                // charstrings are not decoded this wave; such fonts fall back to
-                // the advance box. Bare CFF is handled.
                 if tag[0] == b'%' || tag[0] == 0x80 {
-                    return None; // Type1 / PFB
+                    return None; // Type1 / PFB: not this function's job.
                 }
-                CffProgram::parse(bytes).map(FontProgram::Cff)
+                CffProgram::parse(bytes).map(|c| FontProgram::Cff(Box::new(c)))
             }
         }
     }

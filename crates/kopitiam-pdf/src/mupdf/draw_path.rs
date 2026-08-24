@@ -94,6 +94,13 @@ impl Path {
         self.move_to(x0, y0).line_to(x1, y0).line_to(x1, y1).line_to(x0, y1).close()
     }
 
+    /// Append another path's commands to the end of this one, preserving its
+    /// sub-path structure. Used to merge composite glyph outlines (Type 1
+    /// `seac`: a base glyph's path plus a translated accent glyph's path).
+    pub(crate) fn append(&mut self, mut other: Path) {
+        self.cmds.append(&mut other.cmds);
+    }
+
     // MuPDF: fz_flatten_fill_path (draw-path.c) driving fz_walk_path with the
     // bezier() subdivision; each generated point is transformed by ctm ("in
     // device space") before it enters the polygon.

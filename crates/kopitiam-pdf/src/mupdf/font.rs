@@ -54,6 +54,7 @@ use super::draw_path::Path;
 use super::encodings::BaseEncoding;
 use super::error::Result;
 use super::glyph::FontProgram;
+use super::glyph_type1::Type1Program;
 use super::object::Object;
 use super::xref::PdfDocument;
 use std::sync::Arc;
@@ -116,11 +117,22 @@ pub struct Font {
     /// simple fonts, `/DW` -- default 1000 -- for CID fonts).
     dhmtx_w: i32,
     /// The decoded embedded font program (glyph outlines), when the descriptor
-    /// embeds a decodable `/FontFile2` (TrueType) or `/FontFile3` (CFF/OpenType).
-    /// `None` for non-embedded / Type1 / undecodable programs -- the draw device
-    /// then keeps its advance-box fallback. Shared (`Arc`) across the font's
-    /// clones so the font cache does not duplicate the program bytes.
+    /// embeds a decodable `/FontFile2` (TrueType) or `/FontFile3` (CFF/OpenType)
+    /// -- selected **by GID**. `None` for a Type1 program (see [`Font::type1`])
+    /// or an undecodable one -- the draw device then keeps its advance-box
+    /// fallback. Shared (`Arc`) across the font's clones so the font cache does
+    /// not duplicate the program bytes.
     program: Option<Arc<FontProgram>>,
+    /// The decoded embedded Type1 (`/FontFile`) program, selected **by glyph
+    /// name** rather than GID (a Type1 `CharStrings` dict has no numeric
+    /// index) -- see [`Font::glyph_outline`]. Mutually exclusive with
+    /// `program`: a font embeds exactly one kind of font file.
+    type1: Option<Arc<Type1Program>>,
+    /// Per-code glyph names from the PDF `/Encoding` (base encoding +
+    /// `/Differences`), simple fonts only. Used to select a [`Type1Program`]
+    /// glyph by name; `None` for CID fonts (Type1 programs are never
+    /// CID-keyed) or when no code names a glyph.
+    glyph_names: Option<Vec<Option<String>>>,
     /// `true` for a Type0/CID font (glyph selection is by CID via the charset /
     /// `/CIDToGIDMap`); `false` for a simple font (selection is by character code
     /// through the embedded font's cmap / CFF encoding).
@@ -203,6 +215,15 @@ impl Font {
             load_encoding(&mut estrings, b"StandardEncoding");
         }
 
+        // The embedded font program (glyph outlines); simple fonts select by
+        // code through the program's own cmap / CFF encoding (GID-based) or, for
+        // Type1, by glyph name (see `type1` below).
+        let (program, type1) = match load_font_program(doc, &descriptor) {
+            Some(LoadedFontProgram::Gid(p)) => (Some(Arc::new(p)), None),
+            Some(LoadedFontProgram::Type1(t)) => (None, Some(Arc::new(t))),
+            None => (None, None),
+        };
+
         let mut font = Font {
             // Simple fonts use an Identity 1-byte encoding: code == CID.
             encoding: CMap::new_identity(0, 1),
@@ -211,9 +232,9 @@ impl Font {
             wmode: 0,
             hmtx: Vec::new(),
             dhmtx_w: missing_width,
-            // The embedded font program (glyph outlines); simple fonts select by
-            // code through the program's own cmap / CFF encoding.
-            program: load_font_program(doc, &descriptor),
+            program,
+            type1,
+            glyph_names: None,
             is_cid: false,
             cid_to_gid: CidToGid::Identity,
         };
@@ -227,6 +248,9 @@ impl Font {
             };
         }
         font.cid_to_ucs = Some(cid_to_ucs);
+        // Retain the per-code glyph names too: a Type1 program is selected by
+        // name, not GID (see `glyph_outline`).
+        font.glyph_names = Some(estrings);
 
         // /ToUnicode stream (remapped through the identity encoding).
         font.to_unicode = load_to_unicode(doc, dict.dict_gets("ToUnicode"), &font.encoding);
@@ -287,7 +311,15 @@ impl Font {
         // The embedded font program lives on the descendant CID font's descriptor;
         // CIDFontType2 additionally carries a /CIDToGIDMap (CID -> GID).
         let descriptor = doc.resolve_get(&dfont, "FontDescriptor")?;
-        let program = load_font_program(doc, &descriptor);
+        // A CID font's descendant is CIDFontType0 (CFF) or CIDFontType2
+        // (TrueType); Type1 (`/FontFile`) is a simple-font-only program (it has
+        // no CID-keyed form), so any Type1 program here is ignored rather than
+        // wired up -- consistent with `load_font_program` never being asked for
+        // a name-based `Font::type1`/`glyph_names` selection on the CID path.
+        let program = match load_font_program(doc, &descriptor) {
+            Some(LoadedFontProgram::Gid(p)) => Some(Arc::new(p)),
+            Some(LoadedFontProgram::Type1(_)) | None => None,
+        };
         let cid_to_gid = load_cid_to_gid(doc, &dfont);
 
         let mut font = Font {
@@ -298,6 +330,8 @@ impl Font {
             hmtx: Vec::new(),
             dhmtx_w: 1000,
             program,
+            type1: None,
+            glyph_names: None,
             is_cid: true,
             cid_to_gid,
         };
@@ -433,6 +467,20 @@ impl Font {
     /// font (selected through the embedded cmap / CFF encoding) or the *CID* for a
     /// Type0 font (selected through `/CIDToGIDMap` or the CFF charset).
     pub fn glyph_outline(&self, cid: u32) -> Option<Path> {
+        if let Some(t1) = &self.type1 {
+            // Type1 selection is by glyph name, not GID: the PDF's own
+            // /Encoding (+ /Differences) wins when it names a glyph for this
+            // code; otherwise fall back to the font program's own built-in
+            // encoding (spec section 7.1 -- the common case for a symbolic
+            // Type1 font with no PDF-level /Encoding override).
+            let name = self
+                .glyph_names
+                .as_ref()
+                .and_then(|gn| gn.get(cid as usize))
+                .and_then(|o| o.as_deref())
+                .or_else(|| t1.encoding_name(cid as u8));
+            return name.and_then(|n| t1.outline(n));
+        }
         let program = self.program.as_ref()?;
         let gid = self.select_gid(cid, program);
         program.outline(gid)
@@ -601,24 +649,51 @@ fn has_font_file(descriptor: &Object) -> bool {
         || descriptor.dict_gets("FontFile3").is_some()
 }
 
+/// An embedded font program, decoded from whichever `/FontFile*` key held it:
+/// GID-selected (TrueType/CFF, via [`FontProgram`]) or name-selected (Type1,
+/// via [`Type1Program`] -- a Type1 `CharStrings` dict has no numeric index).
+enum LoadedFontProgram {
+    Gid(FontProgram),
+    Type1(Type1Program),
+}
+
 // MuPDF: pdf_load_font_descriptor -> fz_new_font_from_buffer over the embedded
 // /FontFile* stream (pdf-font.c). MuPDF hands the bytes to FreeType; this port
-// hands them to the pure-Rust [`FontProgram`] outline decoders.
-/// Decode the embedded font program from `descriptor` (`/FontFile2` = TrueType,
-/// `/FontFile3` = CFF/OpenType; `/FontFile` = Type1, not decoded this wave).
-/// Returns `None` when no decodable program is embedded (the draw device then
-/// keeps its advance-box fallback). Never fails the font load.
-fn load_font_program(doc: &PdfDocument, descriptor: &Object) -> Option<Arc<FontProgram>> {
-    // FontFile2 (TrueType) and FontFile3 (CFF/OpenType) are decoded; FontFile
-    // (Type1) is tried last and currently returns None (see FontProgram::parse).
-    for key in ["FontFile2", "FontFile3", "FontFile"] {
+// hands them to the pure-Rust [`FontProgram`] / [`Type1Program`] decoders.
+/// Decode the embedded font program from `descriptor` (`/FontFile2` =
+/// TrueType, `/FontFile3` = CFF/OpenType, `/FontFile` = Type1). Returns `None`
+/// when no decodable program is embedded (the draw device then keeps its
+/// advance-box fallback). Never fails the font load.
+fn load_font_program(doc: &PdfDocument, descriptor: &Object) -> Option<LoadedFontProgram> {
+    for key in ["FontFile2", "FontFile3"] {
         let Some(obj) = descriptor.dict_gets(key) else { continue };
         let Ok(bytes) = doc.open_stream(obj) else { continue };
         if let Some(prog) = FontProgram::parse(&bytes) {
-            return Some(Arc::new(prog));
+            return Some(LoadedFontProgram::Gid(prog));
         }
     }
-    None
+    let obj = descriptor.dict_gets("FontFile")?;
+    let bytes = doc.open_stream(obj).ok()?;
+    // /Length1 (cleartext bytes) + /Length2 (eexec-encrypted bytes) are an
+    // exact boundary when present, preferred over Type1Program's `eexec`
+    // keyword search.
+    let (length1, length2) = stream_lengths(doc, obj);
+    Type1Program::parse(&bytes, length1, length2).map(LoadedFontProgram::Type1)
+}
+
+/// The PDF stream dict's `/Length1`/`/Length2` (a Type1 `/FontFile`'s
+/// cleartext / encrypted byte counts), when present and non-null.
+fn stream_lengths(doc: &PdfDocument, obj: &Object) -> (Option<usize>, Option<usize>) {
+    let Ok(dict) = doc.resolve(obj) else { return (None, None) };
+    let len = |key: &str| -> Option<usize> {
+        let v = doc.resolve_get(&dict, key).ok()?;
+        if v.is_null() {
+            None
+        } else {
+            usize::try_from(v.to_int()).ok()
+        }
+    };
+    (len("Length1"), len("Length2"))
 }
 
 // MuPDF: the /CIDToGIDMap branch of load_cid_font (pdf-font.c:1230).
@@ -806,6 +881,8 @@ endcmap\nend\nend";
             hmtx: Vec::new(),
             dhmtx_w: 500,
             program: None,
+            type1: None,
+            glyph_names: None,
             is_cid: false,
             cid_to_gid: CidToGid::Identity,
         };

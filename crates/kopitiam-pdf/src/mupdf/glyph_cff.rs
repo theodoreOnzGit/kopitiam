@@ -30,12 +30,19 @@
 //!   here to select a glyph by CID ([`CffProgram::gid_for_cid`]).
 //! * **Simple** CFF (`Type1C`): the CFF's own custom `Encoding` maps character
 //!   code -> GID directly ([`CffProgram::gid_for_code`]) — the common subset-font
-//!   case. A CFF that relies on a *predefined* (Standard/Expert) encoding + the
-//!   standard-string charset is **not** name-resolved this wave (would need the
-//!   391-entry standard-strings table); such a glyph falls back to the advance box
+//!   case. When the encoding is instead the **predefined Standard** encoding
+//!   (`Encoding` offset `0`, or absent) -- common for Type1-converted-to-CFF
+//!   subset fonts with an unmodified encoding -- `gid_for_code` resolves
+//!   `code -> name` via [`super::encodings::STANDARD`] (identical to Adobe
+//!   StandardEncoding, CFF spec Appendix B) and then `name -> GID` via the
+//!   charset (SIDs below 391 resolve through [`CFF_STANDARD_STRINGS`]; SIDs at
+//!   or above 391 through the font's own String INDEX). The predefined
+//!   **Expert**/**ExpertSubset** encodings (offset `1`) are not resolved this
+//!   wave — rare in practice — and such a glyph falls back to the advance box
 //!   at the call site. Documented ceiling, never a crash.
 
 use super::draw_path::Path;
+use super::encodings::BaseEncoding;
 use super::glyph::{Affine, Reader};
 use std::collections::HashMap;
 
@@ -64,6 +71,11 @@ pub struct CffProgram {
     /// `code -> gid` from a custom CFF Encoding (simple fonts). Empty for
     /// predefined encodings / CID fonts.
     encoding: HashMap<u32, u16>,
+    /// `name -> gid` from the charset (simple fonts only, built whenever
+    /// `encoding` is empty -- i.e. a predefined encoding -- so
+    /// [`CffProgram::gid_for_code`] can resolve `code -> name -> gid`). Empty
+    /// for CID fonts and for fonts with a custom `Encoding`.
+    name_to_gid: HashMap<String, u16>,
     /// `cid -> gid` from the charset (CID-keyed fonts only).
     cid_to_gid: HashMap<u16, u16>,
     /// Whether this is a CID-keyed CFF (`ROS` present).
@@ -88,7 +100,7 @@ impl CffProgram {
         pos = p;
         let (top_dicts, p) = parse_index(bytes, pos)?;
         pos = p;
-        let (_strings, p) = parse_index(bytes, pos)?;
+        let (strings, p) = parse_index(bytes, pos)?;
         pos = p;
         let (gsubrs, _p) = parse_index(bytes, pos)?;
 
@@ -119,10 +131,10 @@ impl CffProgram {
 
         // charset: GID -> SID/CID.
         let charset_off = top.get(&15).and_then(|v| v.first()).copied().unwrap_or(0.0) as usize;
+        let gid_to_sid = parse_charset(bytes, charset_off, nglyphs);
         let cid_to_gid = if is_cid {
-            let gid_to_cid = parse_charset(bytes, charset_off, nglyphs);
-            let mut m = HashMap::with_capacity(gid_to_cid.len());
-            for (gid, cid) in gid_to_cid.into_iter().enumerate() {
+            let mut m = HashMap::with_capacity(gid_to_sid.len());
+            for (gid, &cid) in gid_to_sid.iter().enumerate() {
                 m.entry(cid).or_insert(gid as u16);
             }
             m
@@ -136,6 +148,21 @@ impl CffProgram {
         } else {
             let enc_off = top.get(&16).and_then(|v| v.first()).copied().unwrap_or(0.0) as usize;
             parse_encoding(bytes, enc_off)
+        };
+
+        // Predefined encoding (no custom Encoding table): resolve `name -> GID`
+        // via the charset's SIDs, so `gid_for_code` can chain
+        // `code -> name -> GID` for the (common) predefined-Standard case.
+        let name_to_gid = if !is_cid && encoding.is_empty() {
+            let mut m = HashMap::with_capacity(gid_to_sid.len());
+            for (gid, &sid) in gid_to_sid.iter().enumerate() {
+                if let Some(name) = sid_name(sid, &strings, bytes) {
+                    m.entry(name).or_insert(gid as u16);
+                }
+            }
+            m
+        } else {
+            HashMap::new()
         };
 
         // CID fonts: FDSelect (GID -> fd) + FDArray (per-fd Private -> local subrs).
@@ -166,6 +193,7 @@ impl CffProgram {
             default_width,
             matrix,
             encoding,
+            name_to_gid,
             cid_to_gid,
             is_cid,
             fd_select,
@@ -188,11 +216,20 @@ impl CffProgram {
         }
     }
 
-    /// Map a character code to a GID through the CFF's custom Encoding (simple
-    /// fonts). `None` when the font uses a predefined encoding (see the module
-    /// ceiling note) so the caller can fall back.
+    /// Map a character code to a GID: through the CFF's custom Encoding when it
+    /// has one, otherwise through the predefined-Standard-encoding fallback
+    /// chain `code -> name -> gid` (see the module docs). `None` when neither
+    /// resolves the code (e.g. a predefined Expert encoding) so the caller can
+    /// fall back to the advance box.
     pub fn gid_for_code(&self, code: u32) -> Option<u16> {
-        self.encoding.get(&code).copied()
+        if let Some(&g) = self.encoding.get(&code) {
+            return Some(g);
+        }
+        if code < 256 {
+            let name = BaseEncoding::Standard.glyph_name(code as u8)?;
+            return self.name_to_gid.get(name).copied();
+        }
+        None
     }
 
     /// Decode glyph `gid` to an em-space [`Path`] (y-up, 1 em = 1.0), or `None`
@@ -816,6 +853,92 @@ fn parse_charset(bytes: &[u8], off: usize, nglyphs: usize) -> Vec<u16> {
     out
 }
 
+/// The CFF Standard Strings (Adobe Technical Note #5176, Appendix A): SID 0
+/// (`.notdef`) through SID 390 (`Semibold`). A charset SID at or above 391
+/// instead indexes the font's own String INDEX ([`sid_name`]). Cross-checked
+/// against fontTools' `cffLib.cffStandardStrings` (BSD-3-Clause, the same list
+/// verbatim -- these are the fixed strings the CFF spec itself defines, not
+/// fontTools' own expression).
+static CFF_STANDARD_STRINGS: [&str; 391] = [
+    ".notdef", "space", "exclam", "quotedbl", "numbersign", "dollar",
+    "percent", "ampersand", "quoteright", "parenleft", "parenright", "asterisk",
+    "plus", "comma", "hyphen", "period", "slash", "zero",
+    "one", "two", "three", "four", "five", "six",
+    "seven", "eight", "nine", "colon", "semicolon", "less",
+    "equal", "greater", "question", "at", "A", "B",
+    "C", "D", "E", "F", "G", "H",
+    "I", "J", "K", "L", "M", "N",
+    "O", "P", "Q", "R", "S", "T",
+    "U", "V", "W", "X", "Y", "Z",
+    "bracketleft", "backslash", "bracketright", "asciicircum", "underscore", "quoteleft",
+    "a", "b", "c", "d", "e", "f",
+    "g", "h", "i", "j", "k", "l",
+    "m", "n", "o", "p", "q", "r",
+    "s", "t", "u", "v", "w", "x",
+    "y", "z", "braceleft", "bar", "braceright", "asciitilde",
+    "exclamdown", "cent", "sterling", "fraction", "yen", "florin",
+    "section", "currency", "quotesingle", "quotedblleft", "guillemotleft", "guilsinglleft",
+    "guilsinglright", "fi", "fl", "endash", "dagger", "daggerdbl",
+    "periodcentered", "paragraph", "bullet", "quotesinglbase", "quotedblbase", "quotedblright",
+    "guillemotright", "ellipsis", "perthousand", "questiondown", "grave", "acute",
+    "circumflex", "tilde", "macron", "breve", "dotaccent", "dieresis",
+    "ring", "cedilla", "hungarumlaut", "ogonek", "caron", "emdash",
+    "AE", "ordfeminine", "Lslash", "Oslash", "OE", "ordmasculine",
+    "ae", "dotlessi", "lslash", "oslash", "oe", "germandbls",
+    "onesuperior", "logicalnot", "mu", "trademark", "Eth", "onehalf",
+    "plusminus", "Thorn", "onequarter", "divide", "brokenbar", "degree",
+    "thorn", "threequarters", "twosuperior", "registered", "minus", "eth",
+    "multiply", "threesuperior", "copyright", "Aacute", "Acircumflex", "Adieresis",
+    "Agrave", "Aring", "Atilde", "Ccedilla", "Eacute", "Ecircumflex",
+    "Edieresis", "Egrave", "Iacute", "Icircumflex", "Idieresis", "Igrave",
+    "Ntilde", "Oacute", "Ocircumflex", "Odieresis", "Ograve", "Otilde",
+    "Scaron", "Uacute", "Ucircumflex", "Udieresis", "Ugrave", "Yacute",
+    "Ydieresis", "Zcaron", "aacute", "acircumflex", "adieresis", "agrave",
+    "aring", "atilde", "ccedilla", "eacute", "ecircumflex", "edieresis",
+    "egrave", "iacute", "icircumflex", "idieresis", "igrave", "ntilde",
+    "oacute", "ocircumflex", "odieresis", "ograve", "otilde", "scaron",
+    "uacute", "ucircumflex", "udieresis", "ugrave", "yacute", "ydieresis",
+    "zcaron", "exclamsmall", "Hungarumlautsmall", "dollaroldstyle", "dollarsuperior", "ampersandsmall",
+    "Acutesmall", "parenleftsuperior", "parenrightsuperior", "twodotenleader", "onedotenleader", "zerooldstyle",
+    "oneoldstyle", "twooldstyle", "threeoldstyle", "fouroldstyle", "fiveoldstyle", "sixoldstyle",
+    "sevenoldstyle", "eightoldstyle", "nineoldstyle", "commasuperior", "threequartersemdash", "periodsuperior",
+    "questionsmall", "asuperior", "bsuperior", "centsuperior", "dsuperior", "esuperior",
+    "isuperior", "lsuperior", "msuperior", "nsuperior", "osuperior", "rsuperior",
+    "ssuperior", "tsuperior", "ff", "ffi", "ffl", "parenleftinferior",
+    "parenrightinferior", "Circumflexsmall", "hyphensuperior", "Gravesmall", "Asmall", "Bsmall",
+    "Csmall", "Dsmall", "Esmall", "Fsmall", "Gsmall", "Hsmall",
+    "Ismall", "Jsmall", "Ksmall", "Lsmall", "Msmall", "Nsmall",
+    "Osmall", "Psmall", "Qsmall", "Rsmall", "Ssmall", "Tsmall",
+    "Usmall", "Vsmall", "Wsmall", "Xsmall", "Ysmall", "Zsmall",
+    "colonmonetary", "onefitted", "rupiah", "Tildesmall", "exclamdownsmall", "centoldstyle",
+    "Lslashsmall", "Scaronsmall", "Zcaronsmall", "Dieresissmall", "Brevesmall", "Caronsmall",
+    "Dotaccentsmall", "Macronsmall", "figuredash", "hypheninferior", "Ogoneksmall", "Ringsmall",
+    "Cedillasmall", "questiondownsmall", "oneeighth", "threeeighths", "fiveeighths", "seveneighths",
+    "onethird", "twothirds", "zerosuperior", "foursuperior", "fivesuperior", "sixsuperior",
+    "sevensuperior", "eightsuperior", "ninesuperior", "zeroinferior", "oneinferior", "twoinferior",
+    "threeinferior", "fourinferior", "fiveinferior", "sixinferior", "seveninferior", "eightinferior",
+    "nineinferior", "centinferior", "dollarinferior", "periodinferior", "commainferior", "Agravesmall",
+    "Aacutesmall", "Acircumflexsmall", "Atildesmall", "Adieresissmall", "Aringsmall", "AEsmall",
+    "Ccedillasmall", "Egravesmall", "Eacutesmall", "Ecircumflexsmall", "Edieresissmall", "Igravesmall",
+    "Iacutesmall", "Icircumflexsmall", "Idieresissmall", "Ethsmall", "Ntildesmall", "Ogravesmall",
+    "Oacutesmall", "Ocircumflexsmall", "Otildesmall", "Odieresissmall", "OEsmall", "Oslashsmall",
+    "Ugravesmall", "Uacutesmall", "Ucircumflexsmall", "Udieresissmall", "Yacutesmall", "Thornsmall",
+    "Ydieresissmall", "001.000", "001.001", "001.002", "001.003", "Black",
+    "Bold", "Book", "Light", "Medium", "Regular", "Roman",
+    "Semibold",
+];
+
+/// Resolve a charset SID to a glyph name: the fixed [`CFF_STANDARD_STRINGS`]
+/// table for SID < 391, otherwise the font's own String INDEX at
+/// `sid - 391`.
+fn sid_name(sid: u16, strings: &[Span], data: &[u8]) -> Option<String> {
+    if (sid as usize) < CFF_STANDARD_STRINGS.len() {
+        return Some(CFF_STANDARD_STRINGS[sid as usize].to_string());
+    }
+    let (s, e) = *strings.get(sid as usize - CFF_STANDARD_STRINGS.len())?;
+    Some(String::from_utf8_lossy(&data[s..e]).into_owned())
+}
+
 /// Parse a custom CFF Encoding (`code -> gid`). Predefined encodings (offset
 /// 0/1) return an empty map (the caller falls back — see the module ceiling).
 fn parse_encoding(bytes: &[u8], off: usize) -> HashMap<u32, u16> {
@@ -1024,6 +1147,51 @@ mod tests {
         assert!(prog.outline(0).is_none());
         assert!(prog.outline(1).is_none());
         assert!(prog.outline(50).is_none()); // out of range, no panic
+    }
+
+    #[test]
+    fn predefined_standard_encoding_resolves_via_charset() {
+        // No custom Encoding (Top DICT omits op 16 -> predefined Standard) and
+        // an explicit charset mapping gid 1 -> SID 34 ("A", per
+        // CFF_STANDARD_STRINGS). `gid_for_code(0x41)` should chain
+        // code 'A' -> name "A" -> SID 34 -> gid 1 through the charset.
+        let header = vec![1u8, 0, 4, 1];
+        let name = cff_index(&[b"KOPITEST".to_vec()]);
+        let strings = cff_index(&[]);
+        let gsubr = cff_index(&[]);
+        let cs_index = cff_index(&[vec![14], triangle_charstring()]);
+        let charset_bytes = vec![0u8, 0x00, 34]; // format 0, gid1 -> SID 34
+
+        let make_top = |charset_off: u32, cs_off: u32| -> Vec<u8> {
+            let mut d = Vec::new();
+            d.push(29u8);
+            d.extend_from_slice(&charset_off.to_be_bytes());
+            d.push(15); // charset
+            d.push(29u8);
+            d.extend_from_slice(&cs_off.to_be_bytes());
+            d.push(17); // CharStrings
+            d
+        };
+        let top_len = cff_index(&[make_top(0, 0)]).len();
+        let base = (header.len() + name.len() + top_len + strings.len() + gsubr.len()) as u32;
+        let charset_off = base;
+        let cs_off = charset_off + charset_bytes.len() as u32;
+        let top = cff_index(&[make_top(charset_off, cs_off)]);
+
+        let mut cff = Vec::new();
+        cff.extend_from_slice(&header);
+        cff.extend_from_slice(&name);
+        cff.extend_from_slice(&top);
+        cff.extend_from_slice(&strings);
+        cff.extend_from_slice(&gsubr);
+        cff.extend_from_slice(&charset_bytes);
+        cff.extend_from_slice(&cs_index);
+
+        let prog = CffProgram::parse(&cff).expect("parse cff");
+        assert_eq!(prog.gid_for_code(0x41), Some(1), "'A' -> SID 34 -> gid 1");
+        let path = prog.outline(prog.gid_for_code(0x41).unwrap()).expect("outline");
+        let (x0, y0, x1, y1) = bbox(&path);
+        assert!((x0 - 0.1).abs() < 1e-4 && y0.abs() < 1e-4 && (x1 - 0.4).abs() < 1e-4 && (y1 - 0.6).abs() < 1e-4);
     }
 
     #[test]
