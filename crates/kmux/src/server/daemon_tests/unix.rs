@@ -18,7 +18,11 @@ fn default_socket_path_uses_the_spec_layout() {
     let path_string = path.to_string_lossy();
 
     assert!(path_string.ends_with("/default"));
-    assert!(path_string.contains("/rmux-"));
+    // `kmux-`, not `rmux-`: bbaefbe gave the fork its OWN IPC namespace on
+    // purpose, so a kmux daemon can run alongside an upstream rmux one
+    // without either stealing the other's socket. An assertion for `/rmux-`
+    // here would be asserting the bug that change fixed.
+    assert!(path_string.contains("/kmux-"));
 }
 
 #[test]

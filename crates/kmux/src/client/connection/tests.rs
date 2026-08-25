@@ -107,9 +107,13 @@ fn default_socket_path_uses_spec_layout() {
         path_text.ends_with("/default"),
         "path should end with /default: {path_text}"
     );
+    // `kmux-`, not `rmux-`: bbaefbe gave the fork its OWN IPC namespace on
+    // purpose, so a kmux daemon can run alongside an upstream rmux one
+    // without either stealing the other's socket. An assertion for `/rmux-`
+    // here would be asserting the bug that change fixed.
     assert!(
-        path_text.contains("/rmux-"),
-        "path should contain /rmux-: {path_text}"
+        path_text.contains("/kmux-"),
+        "path should contain /kmux-: {path_text}"
     );
 }
 
