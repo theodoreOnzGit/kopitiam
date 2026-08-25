@@ -157,7 +157,7 @@ sysinfo = "0.37"
 # `cargo publish` can strip the (registry-meaningless) local path and embed
 # a real dependency version in the published manifest -- see
 # scripts/publish.sh for the required publish order.
-kopitiam-pdf = { path = "crates/kopitiam-pdf", version = "0.2.5" }
+kopitiam-pdf = { path = "crates/kopitiam-pdf", version = "0.2.6" }
 kopitiam-plot = { path = "crates/kopitiam-plot", version = "0.2.5" }
 kopitiam-document = { path = "crates/kopitiam-document", version = "0.2.5" }
 kopitiam-markdown = { path = "crates/kopitiam-markdown", version = "0.2.5" }
