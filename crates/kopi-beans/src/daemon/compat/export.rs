@@ -1,7 +1,9 @@
 //! JSONL export for Go compatibility.
 //!
-//! Handles writing issues.jsonl to the data directory and creating
-//! symlinks in each clone's .beads/ directory.
+//! Writes the canonical `issues.jsonl` into the daemon's data directory, then
+//! mirrors it into each known clone's `.beads/` directory as a **real file**.
+//! It used to symlink instead; [`ensure_clone_exports`] explains at length why
+//! that had to stop (gh-68).
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -156,20 +158,58 @@ pub fn export_jsonl(
     Ok(final_path)
 }
 
-/// Ensure symlinks exist from each clone's .beads/ to the canonical export file.
+/// Mirror the canonical export into each known clone's `.beads/issues.jsonl`,
+/// as a real file.
 ///
-/// Creates `.beads/issues.jsonl` symlink in each known clone path.
-pub fn ensure_symlinks(export_path: &Path, known_paths: &HashSet<PathBuf>) -> io::Result<()> {
+/// The write is atomic (staged alongside the destination, then renamed), and a
+/// clone whose copy is already byte-identical is left completely untouched --
+/// no rewrite, no mtime bump, nothing for `git status` to notice.
+///
+/// # Why this copies and does not symlink (gh-68 -- don't "optimise" it back)
+///
+/// This function used to point `.beads/issues.jsonl` at
+/// `$XDG_DATA_HOME/beads-rs/exports/{remote_hash}/issues.jsonl` and, when a
+/// real file was already sitting there, rename it aside to `issues.jsonl.bak`
+/// first. That is wrong for the way beads is actually used, on three counts:
+///
+/// * **`.beads/issues.jsonl` is a tracked file in the consuming repository.**
+///   Replacing it with a symlink makes every clone commit a link to an
+///   absolute path that exists on exactly one machine, under one user's home
+///   directory. Nobody else's checkout can resolve it -- and git stores the
+///   link, not the content, so the export stops being exported at all.
+/// * **It happened silently, on any write command.** A `bn update` that
+///   touched export state was enough. The repo went from "real file" to
+///   "symlink + stray `.bak`" with no output, so a session would commit the
+///   corruption without ever being told. It bit this repository twice
+///   (`f7e89cc`, then `ac32a5d`), and the daemon does it asynchronously, so
+///   restoring the file by hand loses the race unless the daemon is stopped.
+/// * **A symlink is a footgun for every later writer.** Anything that opens
+///   the path for writing writes *through* the link into the data directory,
+///   so a well-meaning repair can quietly corrupt the canonical export too.
+///
+/// Copying costs one write of a file that is measured in hundreds of KB, only
+/// when the content actually changed. That is nothing next to silently
+/// breaking the export for every other clone. Note the non-Unix branch was
+/// always a plain copy for this same reason (symlinks need privileges on
+/// Windows); this just makes every platform agree.
+pub fn ensure_clone_exports(export_path: &Path, known_paths: &HashSet<PathBuf>) -> io::Result<()> {
+    if known_paths.is_empty() {
+        return Ok(());
+    }
+
+    // Read once: every clone gets the same bytes, and comparing against what is
+    // already on disk needs them anyway.
+    let payload = fs::read(export_path)?;
+
     for clone_path in known_paths {
         if !clone_path.exists() {
-            tracing::debug!("Skipping symlink for non-existent clone: {:?}", clone_path);
+            tracing::debug!("Skipping export mirror for non-existent clone: {:?}", clone_path);
             continue;
         }
 
         let beads_dir = clone_path.join(".beads");
-        let symlink_path = beads_dir.join("issues.jsonl");
+        let dest = beads_dir.join("issues.jsonl");
 
-        // Create .beads directory if it doesn't exist
         if !beads_dir.exists()
             && let Err(e) = fs::create_dir_all(&beads_dir)
         {
@@ -177,69 +217,59 @@ pub fn ensure_symlinks(export_path: &Path, known_paths: &HashSet<PathBuf>) -> io
             continue;
         }
 
-        // Check if symlink already points to the right place
-        if symlink_path.is_symlink() {
-            if let Ok(target) = fs::read_link(&symlink_path)
-                && target == export_path
-            {
-                continue; // Already correct
+        if dest.is_symlink() {
+            // Left over from the old behaviour (or an older kopi-beans still
+            // running elsewhere). It must go before we write: renaming onto a
+            // symlink replaces the link, but any *other* writer that opened the
+            // path first would be writing through it into the data directory.
+            if let Err(e) = fs::remove_file(&dest) {
+                tracing::warn!("Failed to remove legacy symlink {:?}: {}", dest, e);
+                continue;
             }
-            // Remove incorrect symlink
-            let _ = fs::remove_file(&symlink_path);
-        } else if symlink_path.exists() {
-            // Regular file exists - back it up and replace
-            let backup = beads_dir.join("issues.jsonl.bak");
-            match fs::rename(&symlink_path, &backup) {
-                Ok(()) => {
-                    tracing::info!("Backed up existing issues.jsonl to {:?}", backup);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to backup {:?}: {}, trying to remove",
-                        symlink_path,
-                        e
-                    );
-                    // If backup fails, try to just remove the file
-                    if let Err(e2) = fs::remove_file(&symlink_path) {
-                        tracing::warn!("Failed to remove {:?}: {}, skipping", symlink_path, e2);
-                        continue;
-                    }
-                }
-            }
+            tracing::info!("Replaced legacy symlink {:?} with a real file", dest);
+        } else if fs::read(&dest).is_ok_and(|current| current == payload) {
+            continue; // already current -- leave mtime and git status alone
         }
 
-        // Create symlink
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            if let Err(e) = symlink(export_path, &symlink_path) {
-                tracing::warn!(
-                    "Failed to create symlink {:?} -> {:?}: {}",
-                    symlink_path,
-                    export_path,
-                    e
-                );
-            } else {
-                tracing::debug!("Created symlink {:?} -> {:?}", symlink_path, export_path);
-            }
+        // Stage beside the destination so the rename stays within one
+        // filesystem and is therefore atomic: a concurrent reader sees either
+        // the whole old export or the whole new one, never a half-written file.
+        let staged = beads_dir.join(".issues.jsonl.tmp");
+        if let Err(e) = fs::write(&staged, &payload) {
+            tracing::warn!("Failed to stage export at {:?}: {}", staged, e);
+            let _ = fs::remove_file(&staged);
+            continue;
+        }
+        if let Err(e) = fs::rename(&staged, &dest) {
+            tracing::warn!("Failed to install export at {:?}: {}", dest, e);
+            let _ = fs::remove_file(&staged);
+            continue;
         }
 
-        #[cfg(not(unix))]
+        // Clean up after the old behaviour, but only when it is provably safe:
+        // a `.bak` holding exactly the bytes we just wrote carries nothing the
+        // repo does not now have. One that differs is precisely the case where
+        // somebody may still need it, so that one stays.
+        let backup = beads_dir.join("issues.jsonl.bak");
+        if fs::read(&backup).is_ok_and(|b| b == payload)
+            && let Err(e) = fs::remove_file(&backup)
         {
-            // On Windows, copy the file instead of symlinking
-            // (symlinks require admin privileges)
-            if let Err(e) = fs::copy(export_path, &symlink_path) {
-                tracing::warn!(
-                    "Failed to copy {:?} -> {:?}: {}",
-                    export_path,
-                    symlink_path,
-                    e
-                );
-            }
+            tracing::debug!("Failed to remove redundant {:?}: {}", backup, e);
         }
     }
 
     Ok(())
+}
+
+/// Former name of [`ensure_clone_exports`], from back when this really did
+/// create symlinks. Kept so the rename is not a breaking change for anything
+/// outside this crate; it just forwards.
+#[deprecated(
+    since = "0.1.8",
+    note = "renamed to `ensure_clone_exports`: the clone copy is a real file now, not a symlink (gh-68)"
+)]
+pub fn ensure_symlinks(export_path: &Path, known_paths: &HashSet<PathBuf>) -> io::Result<()> {
+    ensure_clone_exports(export_path, known_paths)
 }
 
 /// Hash a remote URL to a short, filesystem-safe identifier.
@@ -376,82 +406,29 @@ mod tests {
     }
 
     #[test]
-    fn test_symlink_created_when_none_exists() {
+    fn writes_a_real_file_when_none_exists() {
         let tmp = TempDir::new().unwrap();
         let clone_path = tmp.path().join("clone1");
         fs::create_dir_all(&clone_path).unwrap();
 
         let export_file = tmp.path().join("canonical.jsonl");
-        fs::write(&export_file, "{}").unwrap();
+        fs::write(&export_file, "{\"canonical\": true}").unwrap();
 
         let mut known_paths = HashSet::new();
         known_paths.insert(clone_path.clone());
 
-        ensure_symlinks(&export_file, &known_paths).unwrap();
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
 
-        let symlink_path = clone_path.join(".beads").join("issues.jsonl");
-        assert!(symlink_path.is_symlink());
-        assert_eq!(fs::read_link(&symlink_path).unwrap(), export_file);
+        let dest = clone_path.join(".beads").join("issues.jsonl");
+        assert!(!dest.is_symlink(), "gh-68: the clone copy must never be a symlink");
+        assert!(dest.is_file());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"canonical\": true}");
+        // Nothing left staged behind.
+        assert!(!clone_path.join(".beads").join(".issues.jsonl.tmp").exists());
     }
 
     #[test]
-    fn test_symlink_skipped_when_correct() {
-        let tmp = TempDir::new().unwrap();
-        let clone_path = tmp.path().join("clone1");
-        let beads_dir = clone_path.join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let export_file = tmp.path().join("canonical.jsonl");
-        fs::write(&export_file, "{}").unwrap();
-
-        let symlink_path = beads_dir.join("issues.jsonl");
-
-        // Create correct symlink first
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&export_file, &symlink_path).unwrap();
-
-        let mut known_paths = HashSet::new();
-        known_paths.insert(clone_path.clone());
-
-        // Should succeed without modifying anything
-        ensure_symlinks(&export_file, &known_paths).unwrap();
-
-        // Symlink should still exist and be correct
-        assert!(symlink_path.is_symlink());
-        assert_eq!(fs::read_link(&symlink_path).unwrap(), export_file);
-    }
-
-    #[test]
-    fn test_symlink_replaced_when_wrong_target() {
-        let tmp = TempDir::new().unwrap();
-        let clone_path = tmp.path().join("clone1");
-        let beads_dir = clone_path.join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let export_file = tmp.path().join("canonical.jsonl");
-        fs::write(&export_file, "{}").unwrap();
-
-        let wrong_target = tmp.path().join("wrong.jsonl");
-        fs::write(&wrong_target, "{}").unwrap();
-
-        let symlink_path = beads_dir.join("issues.jsonl");
-
-        // Create symlink pointing to wrong target
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&wrong_target, &symlink_path).unwrap();
-
-        let mut known_paths = HashSet::new();
-        known_paths.insert(clone_path.clone());
-
-        ensure_symlinks(&export_file, &known_paths).unwrap();
-
-        // Symlink should now point to correct target
-        assert!(symlink_path.is_symlink());
-        assert_eq!(fs::read_link(&symlink_path).unwrap(), export_file);
-    }
-
-    #[test]
-    fn test_regular_file_backed_up_and_replaced() {
+    fn identical_copy_is_left_completely_untouched() {
         let tmp = TempDir::new().unwrap();
         let clone_path = tmp.path().join("clone1");
         let beads_dir = clone_path.join(".beads");
@@ -460,25 +437,106 @@ mod tests {
         let export_file = tmp.path().join("canonical.jsonl");
         fs::write(&export_file, "{\"canonical\": true}").unwrap();
 
-        let symlink_path = beads_dir.join("issues.jsonl");
-        let backup_path = beads_dir.join("issues.jsonl.bak");
-
-        // Create regular file with some content
-        fs::write(&symlink_path, "{\"original\": true}").unwrap();
+        let dest = beads_dir.join("issues.jsonl");
+        fs::write(&dest, "{\"canonical\": true}").unwrap();
+        let before = fs::metadata(&dest).unwrap().modified().unwrap();
 
         let mut known_paths = HashSet::new();
         known_paths.insert(clone_path.clone());
 
-        ensure_symlinks(&export_file, &known_paths).unwrap();
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
 
-        // Original file should be backed up
-        assert!(backup_path.exists());
-        let backup_content = fs::read_to_string(&backup_path).unwrap();
-        assert!(backup_content.contains("original"));
+        // Same bytes in, no rewrite: the mtime must not move, or every export
+        // would dirty `git status` in the consuming repo for no reason.
+        assert_eq!(fs::metadata(&dest).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"canonical\": true}");
+    }
 
-        // Symlink should now exist
-        assert!(symlink_path.is_symlink());
-        assert_eq!(fs::read_link(&symlink_path).unwrap(), export_file);
+    #[test]
+    fn stale_content_is_refreshed_in_place_without_a_backup() {
+        let tmp = TempDir::new().unwrap();
+        let clone_path = tmp.path().join("clone1");
+        let beads_dir = clone_path.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let export_file = tmp.path().join("canonical.jsonl");
+        fs::write(&export_file, "{\"canonical\": true}").unwrap();
+
+        let dest = beads_dir.join("issues.jsonl");
+        fs::write(&dest, "{\"stale\": true}").unwrap();
+
+        let mut known_paths = HashSet::new();
+        known_paths.insert(clone_path.clone());
+
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
+
+        assert!(dest.is_file());
+        assert!(!dest.is_symlink());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"canonical\": true}");
+        // The old behaviour renamed the tracked file aside; nothing should now.
+        assert!(
+            !beads_dir.join("issues.jsonl.bak").exists(),
+            "gh-68: refreshing the export must not leave a stray .bak"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_symlink_is_replaced_by_a_real_file() {
+        let tmp = TempDir::new().unwrap();
+        let clone_path = tmp.path().join("clone1");
+        let beads_dir = clone_path.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let export_file = tmp.path().join("canonical.jsonl");
+        fs::write(&export_file, "{\"canonical\": true}").unwrap();
+
+        // Exactly what a pre-fix kopi-beans (or upstream beads-rs) leaves here.
+        let dest = beads_dir.join("issues.jsonl");
+        std::os::unix::fs::symlink(&export_file, &dest).unwrap();
+
+        let mut known_paths = HashSet::new();
+        known_paths.insert(clone_path.clone());
+
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
+
+        assert!(!dest.is_symlink(), "gh-68: the legacy symlink must be replaced");
+        assert!(dest.is_file());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"canonical\": true}");
+        // The canonical export is untouched by the swap.
+        assert_eq!(fs::read_to_string(&export_file).unwrap(), "{\"canonical\": true}");
+    }
+
+    #[test]
+    fn redundant_backup_is_cleaned_up_but_a_differing_one_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let export_file = tmp.path().join("canonical.jsonl");
+        fs::write(&export_file, "{\"canonical\": true}").unwrap();
+
+        // Clone A: .bak holds exactly what we are about to write -> redundant.
+        let clone_a = tmp.path().join("cloneA");
+        let beads_a = clone_a.join(".beads");
+        fs::create_dir_all(&beads_a).unwrap();
+        fs::write(beads_a.join("issues.jsonl.bak"), "{\"canonical\": true}").unwrap();
+
+        // Clone B: .bak holds something else -> the one case somebody may need.
+        let clone_b = tmp.path().join("cloneB");
+        let beads_b = clone_b.join(".beads");
+        fs::create_dir_all(&beads_b).unwrap();
+        fs::write(beads_b.join("issues.jsonl.bak"), "{\"irreplaceable\": true}").unwrap();
+
+        let mut known_paths = HashSet::new();
+        known_paths.insert(clone_a.clone());
+        known_paths.insert(clone_b.clone());
+
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
+
+        assert!(!beads_a.join("issues.jsonl.bak").exists());
+        assert_eq!(
+            fs::read_to_string(beads_b.join("issues.jsonl.bak")).unwrap(),
+            "{\"irreplaceable\": true}",
+            "a .bak that differs from the export must never be deleted"
+        );
     }
 
     #[test]
@@ -493,9 +551,9 @@ mod tests {
         known_paths.insert(nonexistent_path.clone());
 
         // Should succeed without error
-        ensure_symlinks(&export_file, &known_paths).unwrap();
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
 
-        // No symlink should be created
+        // Nothing should be created for a clone that isn't there
         assert!(
             !nonexistent_path
                 .join(".beads")
@@ -523,22 +581,15 @@ mod tests {
         known_paths.insert(clone2.clone());
         known_paths.insert(clone3.clone());
 
-        ensure_symlinks(&export_file, &known_paths).unwrap();
+        ensure_clone_exports(&export_file, &known_paths).unwrap();
 
-        // All clones should have symlinks to the same canonical file
+        // Every clone gets its own real copy of the same content -- each one
+        // has to survive being committed and cloned somewhere else.
         for clone in [&clone1, &clone2, &clone3] {
-            let symlink_path = clone.join(".beads").join("issues.jsonl");
-            assert!(
-                symlink_path.is_symlink(),
-                "Expected symlink at {:?}",
-                symlink_path
-            );
-            assert_eq!(
-                fs::read_link(&symlink_path).unwrap(),
-                export_file,
-                "Symlink at {:?} points to wrong target",
-                symlink_path
-            );
+            let dest = clone.join(".beads").join("issues.jsonl");
+            assert!(dest.is_file(), "Expected a real file at {:?}", dest);
+            assert!(!dest.is_symlink(), "gh-68: {:?} must not be a symlink", dest);
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"shared\": true}");
         }
     }
 

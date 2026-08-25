@@ -6,5 +6,7 @@
 mod export;
 mod go_schema;
 
-pub use export::{ExportContext, ensure_symlinks, export_jsonl};
+#[allow(deprecated)]
+pub use export::ensure_symlinks;
+pub use export::{ExportContext, ensure_clone_exports, export_jsonl};
 pub use go_schema::{GoComment, GoDependency, GoIssue};

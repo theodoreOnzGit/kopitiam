@@ -6,7 +6,7 @@ use std::thread;
 
 use crossbeam::channel::{Receiver, Sender};
 
-use crate::daemon::compat::{ExportContext, ensure_symlinks, export_jsonl};
+use crate::daemon::compat::{ExportContext, ensure_clone_exports, export_jsonl};
 use crate::daemon::core::CanonicalState;
 use crate::daemon::remote::RemoteUrl;
 
@@ -64,12 +64,12 @@ fn run_export_loop(ctx: ExportContext, rx: Receiver<ExportCommand>) {
                 };
 
                 if !job.known_paths.is_empty()
-                    && let Err(err) = ensure_symlinks(&export_path, &job.known_paths)
+                    && let Err(err) = ensure_clone_exports(&export_path, &job.known_paths)
                 {
                     tracing::warn!(
                         remote = %job.remote,
                         error = %err,
-                        "Go-compat symlink update failed"
+                        "Go-compat clone export mirror failed"
                     );
                 }
             }
@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn export_worker_writes_jsonl_and_symlink() {
+    fn export_worker_writes_jsonl_and_clone_copy() {
         let temp = TempDir::new().unwrap();
         let exports_dir = temp.path().join("exports");
         let ctx = ExportContext::with_dir(exports_dir).unwrap();
@@ -151,20 +151,23 @@ mod tests {
         let contents = fs::read_to_string(&export_path).unwrap();
         assert!(contents.contains("bd-abc"));
 
-        let link_path = clone_path.join(".beads").join("issues.jsonl");
+        let clone_copy = clone_path.join(".beads").join("issues.jsonl");
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if link_path.exists() {
+            if clone_copy.exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(link_path.exists());
-        #[cfg(unix)]
-        {
-            let target = fs::read_link(&link_path).unwrap();
-            assert_eq!(target, export_path);
-        }
+        assert!(clone_copy.exists());
+        // gh-68: the clone's copy is a real file holding the same bytes, never
+        // a symlink into the daemon's data directory -- it gets committed.
+        assert!(!clone_copy.is_symlink());
+        assert!(clone_copy.is_file());
+        assert_eq!(
+            fs::read_to_string(&clone_copy).unwrap(),
+            fs::read_to_string(&export_path).unwrap()
+        );
 
         worker.shutdown();
     }
