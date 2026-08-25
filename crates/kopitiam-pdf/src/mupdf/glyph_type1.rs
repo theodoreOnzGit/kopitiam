@@ -74,27 +74,34 @@ pub struct Type1Program {
 impl Type1Program {
     /// Parse a `/FontFile` (Type 1) program. `length1`/`length2` are the PDF
     /// stream dict's `/Length1`/`/Length2` (cleartext / encrypted byte counts)
-    /// when known -- an exact boundary, preferred over searching for `eexec`.
-    /// Returns `None` on anything unparseable (never a panic; the caller falls
-    /// back to the advance box).
+    /// when known -- an exact boundary, tried first. Returns `None` on
+    /// anything unparseable (never a panic; the caller falls back to the
+    /// advance box).
+    ///
+    /// The `eexec` cipher is a stream cipher: a `/Length1` that is off by even
+    /// one byte (a real-world producer quirk, not hypothetical) decrypts to
+    /// total garbage from that point on, so a length-hint attempt that fails
+    /// to yield any charstrings is **not** trusted as the final answer -- this
+    /// always falls back to the `eexec`-keyword search over the whole buffer,
+    /// which needs no length hint to be right. Two independent ways to find
+    /// the same boundary is cheap insurance against a single wrong number
+    /// turning an otherwise-decodable font into a page of advance-box glyphs.
     pub fn parse(bytes: &[u8], length1: Option<usize>, length2: Option<usize>) -> Option<Type1Program> {
         if bytes.first() == Some(&0x80) {
             return Type1Program::parse_pfb(bytes);
         }
-        let (cleartext, enc_region): (&[u8], &[u8]) = match length1.filter(|&l| l <= bytes.len()) {
-            Some(l1) => {
-                let rest = &bytes[l1..];
-                match length2.filter(|&l2| l2 <= rest.len()) {
-                    Some(l2) => (&bytes[..l1], &rest[..l2]),
-                    None => (&bytes[..l1], rest),
-                }
+        if let Some(l1) = length1.filter(|&l| l <= bytes.len()) {
+            let rest = &bytes[l1..];
+            let enc_region = match length2.filter(|&l2| l2 <= rest.len()) {
+                Some(l2) => &rest[..l2],
+                None => rest,
+            };
+            if let Some(prog) = Type1Program::from_parts(&bytes[..l1], enc_region) {
+                return Some(prog);
             }
-            None => {
-                let pos = find(bytes, b"eexec")?;
-                (&bytes[..pos], &bytes[pos + 5..])
-            }
-        };
-        Type1Program::from_parts(cleartext, enc_region)
+        }
+        let pos = find(bytes, b"eexec")?;
+        Type1Program::from_parts(&bytes[..pos], &bytes[pos + 5..])
     }
 
     /// Unwrap a PFB (`0x80`-segmented) program: concatenate the ASCII (type 1)
@@ -1079,6 +1086,25 @@ mod tests {
         let prog = Type1Program::parse(&pfa, Some(length1), Some(length2)).unwrap();
         let path = prog.outline("A").unwrap();
         assert!(!path_is_empty(&path));
+    }
+
+    #[test]
+    fn wrong_length1_falls_back_to_eexec_search() {
+        // A /Length1 that is off by a few bytes (a real-world PDF producer
+        // quirk) must not sink the whole font: the eexec cipher is a stream
+        // cipher, so decrypting from the wrong offset yields garbage, and
+        // Type1Program::parse must retry via the eexec-keyword search instead
+        // of returning None.
+        let pfa = build_type1("A", &triangle_charstring());
+        let eexec_kw = find(&pfa, b"eexec").unwrap();
+        let correct_length1 = eexec_kw + 5;
+        for bad_offset in [-3i64, -1, 1, 3] {
+            let wrong_length1 = (correct_length1 as i64 + bad_offset) as usize;
+            let prog = Type1Program::parse(&pfa, Some(wrong_length1), None)
+                .unwrap_or_else(|| panic!("parse failed to recover from a Length1 off by {bad_offset}"));
+            let path = prog.outline("A").unwrap_or_else(|| panic!("no outline recovered for Length1 off by {bad_offset}"));
+            assert!(!path_is_empty(&path));
+        }
     }
 
     #[test]
