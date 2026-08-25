@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-pdf"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "lopdf",
  "miniz_oxide",

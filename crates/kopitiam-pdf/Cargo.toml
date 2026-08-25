@@ -1,6 +1,13 @@
 [package]
 name = "kopitiam-pdf"
-version.workspace = true
+# Pinned, not `version.workspace = true` -- per CLAUDE.md's "no new commits, no
+# version bump" hard rule, a crate's version moves only when that crate's own
+# code moved, not in lockstep with the shared workspace version. Completes
+# 6facc3b ("bumping kopitiam pdf to version 0.2.6"), which only updated the
+# `[workspace.dependencies]` requirement string other crates depend on
+# (root Cargo.toml) -- that alone doesn't change what `cargo publish` uploads;
+# this is the other half, the crate's own `[package] version`.
+version = "0.2.6"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
