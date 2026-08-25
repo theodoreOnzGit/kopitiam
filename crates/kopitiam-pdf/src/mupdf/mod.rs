@@ -84,6 +84,7 @@ pub mod glyph;
 pub mod glyph_cff;
 pub mod glyph_truetype;
 pub mod glyph_type1;
+pub mod hayro_fallback;
 pub mod hash;
 pub mod interpret;
 pub mod lex;
@@ -110,7 +111,14 @@ pub use agl::{unicode_from_glyph_name, unicode_from_glyph_name_strict};
 pub use buffer::Buffer;
 pub use cmap::CMap;
 pub use doc_stream::decode_stream;
-pub use draw_device::{cmyk_to_rgb, gray_to_rgb, rasterize_page, DrawDevice};
+pub use draw_device::{cmyk_to_rgb, gray_to_rgb, rasterize_page_ex, rasterize_page_native, DrawDevice};
+// The crate's `rasterize_page` is the graceful (hayro-fallback-aware) one --
+// see hayro_fallback.rs's module docs for why the plain-kopitiam-engine
+// render (`rasterize_page_native`) isn't the default name. Every existing
+// caller across the workspace already calls `mupdf::rasterize_page`, so this
+// re-export is what makes the fallback apply everywhere with no call-site
+// changes.
+pub use hayro_fallback::rasterize_page_graceful as rasterize_page;
 pub use draw_edge::{fill_polygons, FillRule};
 pub use draw_path::Path;
 pub use encodings::BaseEncoding;

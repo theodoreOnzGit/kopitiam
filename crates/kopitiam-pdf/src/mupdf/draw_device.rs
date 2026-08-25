@@ -70,12 +70,18 @@ pub struct DrawDevice {
     pix: Pixmap,
     /// A device-space transform applied *after* every incoming CTM -- used to
     /// scale a 72-dpi page transform up to the requested output resolution
-    /// ([`rasterize_page`]).
+    /// ([`rasterize_page_native`]).
     base: Matrix,
     /// The rectangular clip (device pixels). Defaults to the whole pixmap.
     clip: IRect,
     /// The current fill colour (DeviceRGB, 0..=255). Defaults to black.
     fill: [u8; 3],
+    /// How many glyphs on this page fell back to the solid advance box
+    /// ([`show_glyph`](DrawDevice::show_glyph)'s fallback branch) because
+    /// [`Font::glyph_outline`] returned `None`. `0` means every glyph got a
+    /// real outline. See [`rasterize_page_ex`] / the `hayro_fallback` module
+    /// for what this is used for.
+    fallback_glyphs: usize,
 }
 
 impl DrawDevice {
@@ -85,12 +91,18 @@ impl DrawDevice {
         let mut pix = Pixmap::new_rgb(w.max(1), h.max(1));
         pix.clear_with_value(0xff); // white page
         let clip = pix.bbox();
-        DrawDevice { pix, base, clip, fill: [0, 0, 0] }
+        DrawDevice { pix, base, clip, fill: [0, 0, 0], fallback_glyphs: 0 }
     }
 
     /// Borrow the current pixmap.
     pub fn pixmap(&self) -> &Pixmap {
         &self.pix
+    }
+
+    /// How many glyphs painted so far fell back to the solid advance box
+    /// instead of a real outline. See the `fallback_glyphs` field doc.
+    pub fn fallback_glyph_count(&self) -> usize {
+        self.fallback_glyphs
     }
 
     /// Consume the device, returning the painted pixmap.
@@ -255,6 +267,7 @@ impl TextDevice for DrawDevice {
         // stay visually distinct and lines do not merge vertically. Lands here
         // for a non-embedded font, a predefined-Expert-encoding simple CFF (see
         // the glyph_cff module ceiling), or a genuinely undecodable program.
+        self.fallback_glyphs += 1;
         let asc = font.ascender().min(0.9); // ~cap height mass
         let x0 = adv * 0.08;
         let x1 = adv * 0.92;
@@ -320,21 +333,40 @@ pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
 }
 
 // ---------------------------------------------------------------------------
-// The public rasterize_page entry point
+// The rasterize_page entry points
 // ---------------------------------------------------------------------------
 
 // MuPDF: fz_run_page + fz_new_draw_device onto a fresh fz_pixmap sized by the
 // requested resolution (the pattern in the `mutool draw` tool / fz_new_pixmap).
 /// Rasterize page `page_index` (0-based) of `doc` at `dpi` into a fresh white
-/// DeviceRGB [`Pixmap`]. The scale is `dpi / 72`.
+/// DeviceRGB [`Pixmap`], using **only** kopitiam-pdf's own engine -- no
+/// cross-engine fallback. The scale is `dpi / 72`.
 ///
-/// This is the public entry the terminal PDF viewer (`tdf-parity`) and the kmux
-/// LaTeX live-preview call. It drives the content interpreter
-/// ([`run_page`](super::run_page)) over a [`DrawDevice`], which paints vector
-/// fills/strokes, colour, images and real glyph letterforms wherever an
-/// embedded font program decodes (see the fidelity-ceiling note on
-/// [`DrawDevice`] for the remaining stubs and the advance-box fallback).
-pub fn rasterize_page(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<Pixmap> {
+/// Most callers want the crate-level `rasterize_page`
+/// ([`hayro_fallback::rasterize_page_graceful`](super::hayro_fallback::rasterize_page_graceful),
+/// re-exported at `kopitiam_pdf::mupdf::rasterize_page`) instead, which wraps
+/// this and transparently re-renders with `hayro` when this engine had to
+/// fall back to an advance box. This native-only entry point still exists
+/// for anyone who specifically wants kopitiam's own engine (e.g. comparing
+/// the two, or a context where the extra dependency isn't wanted) and as the
+/// building block `rasterize_page_ex` / the graceful wrapper are built on.
+///
+/// It drives the content interpreter ([`run_page`](super::run_page)) over a
+/// [`DrawDevice`], which paints vector fills/strokes, colour, images and real
+/// glyph letterforms wherever an embedded font program decodes (see the
+/// fidelity-ceiling note on [`DrawDevice`] for the remaining stubs and the
+/// advance-box fallback).
+pub fn rasterize_page_native(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<Pixmap> {
+    rasterize_page_ex(doc, page_index, dpi).map(|(pix, _fallback_glyphs)| pix)
+}
+
+/// [`rasterize_page_native`], additionally reporting how many glyphs on the
+/// page fell back to the solid advance box
+/// ([`DrawDevice::fallback_glyph_count`]) -- `0` means the page rendered with
+/// real outlines throughout. This is the seam
+/// [`hayro_fallback`](super::hayro_fallback) uses to decide whether a
+/// second, cross-engine render is worth attempting.
+pub fn rasterize_page_ex(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<(Pixmap, usize)> {
     let scale = (dpi / 72.0).max(0.01);
     let page = doc.page(page_index)?.clone();
 
@@ -370,7 +402,8 @@ pub fn rasterize_page(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::
 
     let mut dev = DrawDevice::new(iw, ih, Matrix::scale(scale, scale));
     super::run_page(doc, page_index, &mut dev)?;
-    Ok(dev.into_pixmap())
+    let fallback_glyphs = dev.fallback_glyph_count();
+    Ok((dev.into_pixmap(), fallback_glyphs))
 }
 
 /// The MediaBox width/height in points (normalised), falling back to US Letter
@@ -485,9 +518,9 @@ mod tests {
     #[test]
     fn rasterize_page_dims_scale_with_dpi() {
         let doc = text_page_doc();
-        let p72 = rasterize_page(&doc, 0, 72.0).unwrap();
+        let p72 = rasterize_page_native(&doc, 0, 72.0).unwrap();
         assert_eq!((p72.w, p72.h), (200, 200), "72 dpi -> 1:1 with the 200pt MediaBox");
-        let p144 = rasterize_page(&doc, 0, 144.0).unwrap();
+        let p144 = rasterize_page_native(&doc, 0, 144.0).unwrap();
         assert_eq!((p144.w, p144.h), (400, 400), "144 dpi -> 2x");
     }
 
@@ -502,20 +535,20 @@ mod tests {
             page,
         ];
         let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
-        let err = rasterize_page(&doc, 0, 72.0).unwrap_err();
+        let err = rasterize_page_native(&doc, 0, 72.0).unwrap_err();
         assert!(
             err.message().contains("limit"),
             "expected a limit error, got: {}",
             err.message()
         );
         // A sane page at a sane dpi still succeeds (guard doesn't over-reject).
-        assert!(rasterize_page(&text_page_doc(), 0, 300.0).is_ok());
+        assert!(rasterize_page_native(&text_page_doc(), 0, 300.0).is_ok());
     }
 
     #[test]
     fn rasterize_page_has_content_and_clean_margins() {
         let doc = text_page_doc();
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // The page is not blank: some pixel is darkened by the text.
         let any_dark = (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 200));
@@ -575,7 +608,7 @@ mod tests {
     fn rasterize_fills_red_rectangle_via_interpreter() {
         // `1 0 0 rg` -> red fill; `re f` fills the path-space (20,20)..(80,80) box.
         let doc = op_doc(b"1 0 0 rg 20 20 60 60 re f", "<< >>", &[]);
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // Inside the rectangle: red (high R, low G/B) -- not the old default black.
         let c = pix.pixel(50, 50).unwrap();
@@ -589,8 +622,8 @@ mod tests {
         // The same geometry filled black (default) vs green must differ.
         let black = op_doc(b"20 20 60 60 re f", "<< >>", &[]);
         let green = op_doc(b"0 1 0 rg 20 20 60 60 re f", "<< >>", &[]);
-        let pb = rasterize_page(&black, 0, 72.0).unwrap();
-        let pg = rasterize_page(&green, 0, 72.0).unwrap();
+        let pb = rasterize_page_native(&black, 0, 72.0).unwrap();
+        let pg = rasterize_page_native(&green, 0, 72.0).unwrap();
 
         let cb = pb.pixel(50, 50).unwrap();
         let cg = pg.pixel(50, 50).unwrap();
@@ -603,7 +636,7 @@ mod tests {
     fn rasterize_strokes_a_line() {
         // A 2pt-wide horizontal line at path y=50 (device y=50 after the flip).
         let doc = op_doc(b"2 w 10 50 m 90 50 l S", "<< >>", &[]);
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // On the line: dark pixels.
         assert!(pix.luma(50, 50).unwrap() < 150, "stroke should darken the line");
@@ -623,8 +656,8 @@ mod tests {
         let mut eo_ops = star.to_vec();
         eo_ops.extend_from_slice(b"f*");
 
-        let nz = rasterize_page(&op_doc(&nz_ops, "<< >>", &[]), 0, 72.0).unwrap();
-        let eo = rasterize_page(&op_doc(&eo_ops, "<< >>", &[]), 0, 72.0).unwrap();
+        let nz = rasterize_page_native(&op_doc(&nz_ops, "<< >>", &[]), 0, 72.0).unwrap();
+        let eo = rasterize_page_native(&op_doc(&eo_ops, "<< >>", &[]), 0, 72.0).unwrap();
 
         // Centre pentagon: filled under nonzero, a hole under even-odd.
         assert!(nz.luma(50, 50).unwrap() < 100, "nonzero centre should be filled");
@@ -656,7 +689,7 @@ mod tests {
             "<< /XObject << /Im0 5 0 R >> >>",
             &[&img],
         );
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // The image covers device (20,20)..(80,80): its centre is red.
         let c = pix.pixel(50, 50).unwrap();
@@ -674,7 +707,7 @@ mod tests {
             "<< >>",
             &[],
         );
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // Inside the clip window: red.
         let c = pix.pixel(50, 50).unwrap();
@@ -718,7 +751,7 @@ mod tests {
             &ff,
         ];
         let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // The glyph outer ring spans device ~(35,35)-(155,155); its counter (hole)
         // spans device ~(65,65)-(125,125). Centre of the hole must stay WHITE --
@@ -768,7 +801,7 @@ mod tests {
             &ff,
         ];
         let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // Same device geometry as the TrueType ring test (identical Tf/Td and
         // em-space square coordinates).
@@ -783,7 +816,7 @@ mod tests {
         // A standard-14 font with NO embedded program: show_glyph must fall back to
         // the advance box (a solid block), never panic. The centre is filled.
         let doc = text_page_doc(); // Helvetica, no FontFile
-        let pix = rasterize_page(&doc, 0, 72.0).unwrap();
+        let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
         // "HELLO" at size 24 near the top-left paints solid blocks (no outlines).
         let any_dark = (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 100));
         assert!(any_dark, "advance-box fallback should still paint text");

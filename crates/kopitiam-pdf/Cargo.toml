@@ -36,6 +36,18 @@ miniz_oxide = { workspace = true }
 # XObjects. Substitutes MuPDF's C `<jpeglib.h>` (source/fitz/load-jpeg.c); no C
 # toolchain (build = false). See the workspace Cargo.toml note and AID-0051.
 zune-jpeg = { workspace = true }
+# Cross-engine graceful fallback (mupdf/hayro_fallback.rs): when
+# kopitiam-pdf's own glyph decoders hit their documented ceiling and would
+# otherwise paint an advance box, `rasterize_page` re-renders the page with
+# `hayro` (https://github.com/LaurenzV/hayro) instead of returning boxes.
+# Pure Rust top to bottom (verified: no C/C++/Fortran anywhere in its own
+# dependency chain), per CLAUDE.md's Pure Rust Core "prefer an existing
+# crate" hard rule. Mandatory, not optional: per the maintainer's explicit
+# instruction, this is load-bearing for every renderer in the workspace, not
+# an opt-in extra. Pinned exactly (not a semver range) per the maintainer's
+# instruction -- this crate moves fast (0.1.0 to 0.7.1 in about seven
+# months) and we bump deliberately rather than drift with it.
+hayro = "=0.7.1"
 
 [dev-dependencies]
 # `examples/kpdf.rs` -- a lightweight native GUI viewer, dev-dependency only so
@@ -44,3 +56,8 @@ zune-jpeg = { workspace = true }
 # library). MIT OR Apache-2.0, pure Rust.
 eframe = "0.36"
 egui = "0.36"
+# Native "Open a PDF" file picker for kpdf. MIT. Default features
+# (xdg-portal + wayland on Linux) are pure Rust to build -- no GTK/C toolchain
+# needed, per the Pure Rust Core hard rule's "prefer an existing pure-Rust
+# crate" and "avoid a C dependency's own complex build system" guidance.
+rfd = "0.17"

@@ -124,6 +124,14 @@ impl PdfDocument {
         Ok(doc)
     }
 
+    /// The original PDF bytes this document was opened from. Used by
+    /// `hayro_fallback.rs` to hand the same file to a second, independent
+    /// parser (`hayro-syntax`) without the caller needing to keep its own
+    /// copy around just for that.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Open a PDF from a borrowed byte slice (copies into an owned buffer).
     pub fn open_slice(bytes: &[u8]) -> Result<PdfDocument> {
         PdfDocument::open(bytes.to_vec())

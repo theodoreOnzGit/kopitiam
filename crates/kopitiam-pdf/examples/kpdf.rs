@@ -14,8 +14,15 @@
 //! public API, exactly as any other consumer of the crate would.
 //!
 //! ```text
-//! cargo run --release -p kopitiam-pdf --example kpdf -- path/to/file.pdf
+//! cargo run --release -p kopitiam-pdf --example kpdf                      # native file picker
+//! cargo run --release -p kopitiam-pdf --example kpdf -- path/to/file.pdf  # open directly
 //! ```
+//!
+//! With no path argument, a native "Open" dialog ([`rfd`], pure Rust: the
+//! default `xdg-portal` + `wayland` features on Linux, native Win32/Cocoa
+//! pickers elsewhere -- no GTK or other C toolchain needed to build it) opens
+//! before the viewer window does, so there is nothing to specify up front.
+//! Cancelling it exits quietly (not an error).
 //!
 //! # Keybindings (mirrors `kopitiam view`)
 //!
@@ -31,8 +38,11 @@
 //! * `PageDown` / `PageUp` -- scroll by a viewport.
 //! * `i` / `Tab` -- switch to image mode.
 //!
-//! Global: `q` / `Esc` quit (when not mid-`goto`, where `Esc` cancels the
-//! entry instead, matching the terminal viewer's `is_capturing_text` guard);
+//! Global: `o` -- open a different PDF via the same native file picker
+//! (replaces the current document in place; on cancel or a failed open, the
+//! current document keeps showing and the status bar reports the error).
+//! `q` / `Esc` quit (when not mid-`goto`, where `Esc` cancels the entry
+//! instead, matching the terminal viewer's `is_capturing_text` guard);
 //! `Ctrl+C` always quits.
 //!
 //! # Not carried over from `kopitiam view`
@@ -86,12 +96,7 @@ struct KpdfApp {
 
 impl KpdfApp {
     fn open(path: PathBuf) -> Result<KpdfApp, String> {
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let doc = PdfDocument::open(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        let page_count = doc.page_count();
-        if page_count == 0 {
-            return Err(format!("{}: no pages", path.display()));
-        }
+        let (doc, page_count) = load_doc(&path)?;
         Ok(KpdfApp {
             doc,
             path,
@@ -106,6 +111,38 @@ impl KpdfApp {
             reflow_scroll: 0.0,
             status: None,
         })
+    }
+
+    /// Load `path` into the *current* window in place -- used by the `o`
+    /// keybinding. Keeps the user's current zoom/mode preference rather than
+    /// resetting to [`DPI_DEFAULT`]/[`Mode::Image`]; everything document-
+    /// specific (page position, cached texture, extracted reflow text) is
+    /// reset. On failure the current document keeps showing; the error goes
+    /// to the status bar instead of losing the open document over a bad pick.
+    fn open_path(&mut self, path: PathBuf) {
+        match load_doc(&path) {
+            Ok((doc, page_count)) => {
+                self.doc = doc;
+                self.path = path;
+                self.page_count = page_count;
+                self.page = 0;
+                self.texture = None;
+                self.texture_key = None;
+                self.goto = None;
+                self.reflow_pages = None;
+                self.reflow_scroll = 0.0;
+                self.status = None;
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Prompt with the native file picker and, if a file was chosen, open it
+    /// in place via [`KpdfApp::open_path`].
+    fn open_via_dialog(&mut self) {
+        if let Some(path) = pick_pdf() {
+            self.open_path(path);
+        }
     }
 
     fn next_page(&mut self) {
@@ -224,6 +261,7 @@ impl KpdfApp {
                     return;
                 }
                 egui::Key::Tab => self.toggle_mode(),
+                egui::Key::O => self.open_via_dialog(),
                 _ => match self.mode {
                     Mode::Image => self.handle_key_image(key),
                     Mode::Reflow => self.handle_key_reflow(key),
@@ -255,6 +293,26 @@ impl KpdfApp {
             _ => {}
         }
     }
+}
+
+/// Read and open `path` as a [`PdfDocument`], returning it with its page
+/// count. Shared by [`KpdfApp::open`] (startup) and [`KpdfApp::open_path`]
+/// (the `o` keybinding's in-place reload) so the two stay in sync.
+fn load_doc(path: &std::path::Path) -> Result<(PdfDocument, usize), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = PdfDocument::open(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let page_count = doc.page_count();
+    if page_count == 0 {
+        return Err(format!("{}: no pages", path.display()));
+    }
+    Ok((doc, page_count))
+}
+
+/// The native "Open a PDF" file picker ([`rfd`] -- pure Rust to build: the
+/// default `xdg-portal` + `wayland` features on Linux, native Win32/Cocoa
+/// pickers on Windows/macOS). `None` if the user cancelled.
+fn pick_pdf() -> Option<PathBuf> {
+    rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_title("Open a PDF").pick_file()
 }
 
 fn digit_char(key: egui::Key) -> Option<char> {
@@ -373,12 +431,14 @@ impl eframe::App for KpdfApp {
 }
 
 fn main() -> eframe::Result {
+    // No path argument: prompt with the native file picker instead of
+    // requiring one up front. Cancelling it exits quietly, not an error.
     let path = match std::env::args().nth(1) {
         Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("usage: kpdf <file.pdf>");
-            std::process::exit(2);
-        }
+        None => match pick_pdf() {
+            Some(p) => p,
+            None => return Ok(()),
+        },
     };
 
     let app = match KpdfApp::open(path) {
