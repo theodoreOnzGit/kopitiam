@@ -99,7 +99,12 @@ fn claude_install_skill_backs_up_existing_custom_skill() -> Result<(), Box<dyn E
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fs::read_to_string(&skill)?, REPO_SKILL);
-    let backup = skill.with_file_name("SKILL.md.rmux-backup");
+    // `kmux-backup`, not `rmux-backup`: the fork writes its own backup suffix
+    // (see backup_path_candidates in src/cli/claude_skill.rs). Note the skill
+    // DIRECTORY is still `rmux` on purpose -- that is the upstream skill's
+    // published name, and product and test agree on it -- so only the suffix
+    // moved with the fork.
+    let backup = skill.with_file_name("SKILL.md.kmux-backup");
     assert_eq!(fs::read_to_string(&backup)?, "custom user skill\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("updated:"), "stdout: {stdout:?}");

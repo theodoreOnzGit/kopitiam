@@ -35,7 +35,7 @@ type SharedPipeBuffer = Arc<Mutex<Vec<u8>>>;
 type PipeCollector = JoinHandle<io::Result<Vec<u8>>>;
 const TOP_LEVEL_USAGE: &str = "usage: kmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
 const LONG_OPTION_USAGE: &str = "usage: kmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
-const LONG_OPTION_HELP: &str = "usage: kmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.\n";
+const LONG_OPTION_HELP: &str = "usage: kmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nKMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `kmux list-commands` for the tmux-compatible command surface.\n";
 
 fn assert_nested_switch_client_error(output: &Output) {
     let stderr = stderr(output);
@@ -163,7 +163,7 @@ fn incompatible_wire_error_uses_simple_default_kill_server_command() -> Result<(
         "stderr should explain protocol incompatibility, got: {stderr}"
     );
     assert!(
-        stderr.contains("rmux: run `rmux kill-server` to stop it, then retry."),
+        stderr.contains("kmux: run `kmux kill-server` to stop it, then retry."),
         "default socket should use simple kill-server command, got: {stderr}"
     );
     server
@@ -211,7 +211,7 @@ fn alias_fallback_incompatible_wire_error_keeps_socket_context() -> Result<(), B
         "stderr should explain protocol incompatibility, got: {stderr}"
     );
     assert!(
-        stderr.contains("rmux: run `rmux kill-server` to stop it, then retry."),
+        stderr.contains("kmux: run `kmux kill-server` to stop it, then retry."),
         "alias fallback should keep default socket restart guidance, got: {stderr}"
     );
     server
@@ -228,7 +228,7 @@ fn version_flag_reports_rmux_version_without_server_contact() -> Result<(), Box<
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         stdout(&output).trim(),
-        format!("rmux {}", env!("CARGO_PKG_VERSION"))
+        format!("kmux {}", env!("CARGO_PKG_VERSION"))
     );
     assert!(stderr(&output).is_empty());
     assert!(!harness.socket_path().exists());
@@ -659,7 +659,7 @@ fn invalid_top_level_cluster_with_h_does_not_exit_successfully() -> Result<(), B
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         stderr(&output),
-        format!("rmux: unknown option -- x\n{TOP_LEVEL_USAGE}")
+        format!("kmux: unknown option -- x\n{TOP_LEVEL_USAGE}")
     );
     assert!(stdout(&output).is_empty());
     assert!(!harness.socket_path().exists());
