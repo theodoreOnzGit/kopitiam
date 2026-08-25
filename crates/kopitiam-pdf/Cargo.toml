@@ -36,3 +36,11 @@ miniz_oxide = { workspace = true }
 # XObjects. Substitutes MuPDF's C `<jpeglib.h>` (source/fitz/load-jpeg.c); no C
 # toolchain (build = false). See the workspace Cargo.toml note and AID-0051.
 zune-jpeg = { workspace = true }
+
+[dev-dependencies]
+# `examples/kpdf.rs` -- a lightweight native GUI viewer, dev-dependency only so
+# egui/eframe never enter the published library's own dependency graph (a
+# `cargo publish` consumer never needs a GUI toolkit to use kopitiam-pdf as a
+# library). MIT OR Apache-2.0, pure Rust.
+eframe = "0.36"
+egui = "0.36"
