@@ -7,7 +7,7 @@ name = "kopitiam-pdf"
 # (issue #31), so it gets its own bump here rather than inheriting whatever
 # the workspace version is next, which would silently re-version every
 # untouched crate too.
-version = "0.2.6"
+version = "0.2.7"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
