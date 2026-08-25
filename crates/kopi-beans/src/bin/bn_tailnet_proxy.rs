@@ -1,4 +1,18 @@
-//! Tailnet-style replication proxy for fault injection.
+//! Tailnet-style replication proxy for deterministic network fault injection.
+//!
+//! **This is dev/test tooling, not part of the `bn` issue-tracker CLI.** It sits
+//! between a kopi-beans daemon and its replication peer, forwards the framed sync
+//! protocol in both directions, and injects latency, jitter, packet loss,
+//! duplication, reordering, blackholes and connection resets from a seeded RNG so
+//! that sync-layer tests are reproducible.
+//!
+//! It is gated behind the non-default `fault-proxy` Cargo feature, so a plain
+//! `cargo install kopi-beans` never puts it on a user's PATH (see kopitiam#15).
+//! Build it explicitly with:
+//!
+//! ```text
+//! cargo build --release -p kopi-beans --features fault-proxy --bin bn-tailnet-proxy
+//! ```
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -20,46 +34,105 @@ use beads_rs::core::Limits;
 use beads_rs::daemon_core::repl::frame::{FrameError, FrameLimitState, FrameReader, FrameWriter};
 
 #[derive(Parser, Debug)]
-#[command(name = "tailnet_proxy")]
+#[command(
+    name = "bn-tailnet-proxy",
+    about = "Deterministic network fault-injection proxy for the kopi-beans sync layer (dev/test tooling).",
+    long_about = "Deterministic network fault-injection proxy for the kopi-beans replication \
+(sync) layer.\n\n\
+DEV/TEST TOOLING — this is NOT part of the `bn` issue tracker and is not needed to \
+use it. It is shipped inside the kopi-beans crate only so the project's own \
+sync-layer tests can run against a degraded link, and it is gated behind the \
+non-default `fault-proxy` Cargo feature so `cargo install kopi-beans` never puts \
+it on your PATH.\n\n\
+It listens on --listen, forwards the framed sync protocol to --upstream in both \
+directions, and injects latency, jitter, loss, duplication, reordering, blackholes \
+and connection resets. All randomness is driven by --seed, so the same seed replays \
+the same fault sequence.\n\n\
+Example:\n  \
+bn-tailnet-proxy --listen 127.0.0.1:0 --upstream 127.0.0.1:7777 \\\n    \
+--profile pathological --seed 7 --ready-file /tmp/proxy.ready"
+)]
 struct Args {
+    /// Address the proxy binds its client-facing listener on, e.g. `127.0.0.1:0`
+    /// (port 0 picks a free port; combine with --ready-file to learn which).
     #[arg(long)]
     listen: String,
+    /// Address of the real replication peer to forward frames to, as `host:port`.
     #[arg(long)]
     upstream: String,
+    /// Named fault profile: `tailnet` (latency and jitter only), `none`
+    /// (transparent pass-through), or `pathological` / `pathology` (adds loss,
+    /// reordering, blackholes and resets). The individual knobs below override
+    /// whichever profile is selected.
     #[arg(long, default_value = "tailnet")]
     profile: String,
+    /// Seed for the RNG that decides loss, duplication and reordering
+    /// [default: 42]. The same seed reproduces the same fault sequence.
     #[arg(long)]
     seed: Option<u64>,
+    /// Fixed one-way delay added to every forwarded frame, in milliseconds.
     #[arg(long)]
     base_latency_ms: Option<u64>,
+    /// Upper bound of the extra uniform-random delay added on top of
+    /// --base-latency-ms, in milliseconds (0 means no jitter).
     #[arg(long)]
     jitter_ms: Option<u64>,
+    /// Probability in [0.0, 1.0] that a frame is dropped instead of forwarded.
     #[arg(long)]
     loss_rate: Option<f64>,
+    /// Probability in [0.0, 1.0] that a forwarded frame is also delivered a
+    /// second time, one millisecond later.
     #[arg(long)]
     duplicate_rate: Option<f64>,
+    /// Probability in [0.0, 1.0] that a frame skips its scheduled delay and is
+    /// delivered immediately, so it overtakes earlier frames and arrives out of
+    /// order.
     #[arg(long)]
     reorder_rate: Option<f64>,
+    /// Start silently discarding frames once this many frames have been seen in
+    /// one direction (simulates a link that goes dark mid-transfer).
     #[arg(long)]
     blackhole_after_frames: Option<u64>,
+    /// Start silently discarding frames once this many payload bytes have been
+    /// seen in one direction.
     #[arg(long)]
     blackhole_after_bytes: Option<u64>,
+    /// How long a triggered blackhole lasts, in milliseconds. Omitted, or 0, means
+    /// it never lifts for the rest of the connection.
     #[arg(long)]
     blackhole_for_ms: Option<u64>,
+    /// Abruptly tear the connection down after this many frames, simulating a TCP
+    /// reset rather than a clean close.
     #[arg(long)]
     reset_after_frames: Option<u64>,
+    /// Abruptly tear the connection down after this many payload bytes.
     #[arg(long)]
     reset_after_bytes: Option<u64>,
+    /// Apply --loss-rate to one direction only: `a->b` (client to upstream) or
+    /// `b->a` (upstream to client). Also accepts `a-to-b` / `a2b` and the `b->a`
+    /// equivalents. The other direction is left lossless.
     #[arg(long)]
     one_way_loss: Option<String>,
+    /// Maximum accepted frame size in bytes. Defaults to the library's
+    /// `Limits::default().max_frame_bytes`; must match the daemon under test.
     #[arg(long)]
     max_frame_bytes: Option<usize>,
+    /// Write `pid=<pid>` and `listen_addr=<addr>` to this path once the listener is
+    /// bound, so a test harness can wait for readiness and discover the port that
+    /// `--listen 127.0.0.1:0` actually chose.
     #[arg(long)]
     ready_file: Option<PathBuf>,
+    /// Frame-trace mode. `off` runs normal fault injection; `record` forwards
+    /// frames unmodified and logs the sequence to --trace-path; `replay` reads that
+    /// file back and checks the observed frames match it. Both non-`off` modes
+    /// handle exactly one connection, then exit.
     #[arg(long, default_value = "off", value_enum)]
     trace_mode: TraceMode,
+    /// Trace file to write (`--trace-mode record`) or read
+    /// (`--trace-mode replay`). Required whenever --trace-mode is not `off`.
     #[arg(long)]
     trace_path: Option<PathBuf>,
+    /// Per-frame read timeout during `--trace-mode replay`, in milliseconds.
     #[arg(long, default_value_t = 5_000)]
     trace_timeout_ms: u64,
 }

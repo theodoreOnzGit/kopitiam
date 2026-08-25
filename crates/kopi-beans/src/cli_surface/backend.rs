@@ -108,7 +108,12 @@ pub struct MigrateToOutcome {
     pub wrote_checksums: bool,
     pub commit_oid: Option<String>,
     pub push: PushDisposition,
+    /// Tolerances that may have dropped data. Non-empty here means the caller
+    /// passed `--force`, because these block the migration otherwise.
     pub warnings: Vec<String>,
+    /// Lossless normalisations that were applied (e.g. a `closed_at` mirror
+    /// re-derived from its status stamp). Informational, never blocking.
+    pub notices: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

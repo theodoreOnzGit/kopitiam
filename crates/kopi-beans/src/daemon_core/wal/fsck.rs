@@ -388,9 +388,9 @@ struct SegmentScanResult {
 }
 
 const REPAIR_ACTION_PREFIX_SALVAGE_TRUNCATE: &str =
-    "run `bd store fsck --repair` to salvage valid prefix and truncate corrupted suffix";
+    "run `bn store fsck --repair` to salvage valid prefix and truncate corrupted suffix";
 const REPAIR_ACTION_QUARANTINE_NO_VALID_PREFIX: &str =
-    "run `bd store fsck --repair` to quarantine segments with unreadable headers (no valid prefix)";
+    "run `bn store fsck --repair` to quarantine segments with unreadable headers (no valid prefix)";
 
 fn suggested_scan_repair_action(offset: u64, header_len: u64) -> &'static str {
     if offset > header_len {

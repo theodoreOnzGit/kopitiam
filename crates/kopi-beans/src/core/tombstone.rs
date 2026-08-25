@@ -55,10 +55,39 @@ impl Crdt for Tombstone {
     /// Merge: keep later deletion stamp; on equal stamps, keep lexicographically
     /// greater reason to preserve commutativity.
     ///
-    /// Panics if IDs or lineages mismatch (developer error).
+    /// # Panics — and why these are HARD `assert_eq!`, not `debug_assert_eq!`
+    ///
+    /// Panics if the two tombstones disagree on `id` or on `lineage`. Don't
+    /// "optimise" these back into `debug_assert_eq!` ah — that was the old code
+    /// and it was wrong twice over (see kopitiam#18, bead `bd-ef2`):
+    ///
+    /// 1. **CRDT correctness.** A join is only defined as the least-upper-bound
+    ///    over one lattice — here, one `TombstoneKey`, meaning one `(id, lineage)`
+    ///    pair. Joining across two different keys is not a merge at all, it is
+    ///    data corruption: the loser's deletion stamp and reason just disappear,
+    ///    and worse, a lineage-scoped collision tombstone can get silently
+    ///    flattened into a global one, killing a bead lineage that was supposed
+    ///    to survive. Under `debug_assert!` that corruption happens **quietly in
+    ///    release**, which is the whole shape of bug we can least afford: no
+    ///    panic, no log, just wrong data that syncs out to every peer and cannot
+    ///    be told apart from a legitimate delete afterwards. Loud panic now beats
+    ///    silent wrong data forever.
+    /// 2. **Release-only builds.** This workspace builds and tests release-only
+    ///    (see CLAUDE.md), so `debug_assert!` here was compiled out of every
+    ///    build we actually ship *and* every test we actually run — the invariant
+    ///    was decorative, and the two `#[should_panic]` tests below could never
+    ///    pass. Real asserts make both the guarantee and the tests real.
+    ///
+    /// Cost is two equality compares (a short `BeadId` string plus an
+    /// `Option<Stamp>`) against a body that already does a full `self.clone()`
+    /// — heap allocation dominates, so this is noise. And no caller is hot:
+    /// every call site (`TombstoneStore::upsert`, `CanonicalState::delete`,
+    /// `insert_tombstone`, and the two joins inside `CanonicalState::join`) is a
+    /// single merge per map entry, keyed by `TombstoneKey` or `BeadId`, never an
+    /// inner loop over a big collection.
     fn join(&self, other: &Self) -> Self {
-        debug_assert_eq!(self.id, other.id, "join requires same id");
-        debug_assert_eq!(self.lineage, other.lineage, "join requires same lineage");
+        assert_eq!(self.id, other.id, "join requires same id");
+        assert_eq!(self.lineage, other.lineage, "join requires same lineage");
         if self.deleted > other.deleted {
             self.clone()
         } else if other.deleted > self.deleted {

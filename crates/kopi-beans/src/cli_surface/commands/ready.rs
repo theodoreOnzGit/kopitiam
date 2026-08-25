@@ -73,7 +73,7 @@ pub fn render_ready(
     }
 
     out.push_str(&format!(
-        "{} blocked, {} closed — run `bd blocked` to see what's stuck\n",
+        "{} blocked, {} closed — run `bn blocked` to see what's stuck\n",
         blocked_count, closed_count
     ));
     out
@@ -116,7 +116,7 @@ mod tests {
             "\n📋 Ready work (1 issues with no blockers):\n\n",
             "1. [P1] wf/bd-123: Title\n",
             "\n",
-            "0 blocked, 0 closed — run `bd blocked` to see what's stuck\n",
+            "0 blocked, 0 closed — run `bn blocked` to see what's stuck\n",
         );
         assert_eq!(output, expected);
     }

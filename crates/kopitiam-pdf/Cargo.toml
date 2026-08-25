@@ -2,11 +2,17 @@
 name = "kopitiam-pdf"
 # Pinned, not `version.workspace = true`: per CLAUDE.md's "no new commits, no
 # version bump" hard rule, a crate's version moves only when that crate's own
-# code moved. kopitiam-pdf was untouched since the workspace-wide 0.2.5
-# publish (2026-07-29) until this Type1/predefined-CFF glyph-outline change
-# (issue #31), so it gets its own bump here rather than inheriting whatever
-# the workspace version is next, which would silently re-version every
-# untouched crate too.
+# code moved, not in lockstep with the shared workspace version. kopitiam-pdf
+# was untouched since the workspace-wide 0.2.5 publish (2026-07-29) until the
+# Type1/predefined-CFF glyph-outline change (issue #31) took it to 0.2.6, and
+# the mandatory `hayro` graceful fallback then took it to 0.2.7.
+#
+# The wrinkle worth remembering (it has already caught us once, on develop's
+# 6facc3b "bumping kopitiam pdf to version 0.2.6"): bumping the
+# `[workspace.dependencies]` requirement string in the root Cargo.toml only
+# changes what *other* crates resolve against -- it does NOT change what
+# `cargo publish` uploads. The crate's own `[package] version` here is the
+# other half, and both have to move together.
 version = "0.2.7"
 edition.workspace = true
 authors.workspace = true

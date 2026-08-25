@@ -143,6 +143,17 @@ pub enum OpError {
         eligible_replica_ids: Option<Vec<ReplicaId>>,
     },
 
+    /// `bn sync` stopped waiting — either the sync failed under it, or the
+    /// deadline ran out. Carries the whole lane state so the caller can print
+    /// something actionable instead of hanging silently (kopitiam#25).
+    #[error("sync wait gave up after {waited_ms}ms for {remote}: {reason}")]
+    SyncWaitFailed {
+        remote: String,
+        reason: String,
+        waited_ms: u64,
+        details: Box<error_details::SyncWaitDetails>,
+    },
+
     #[error("require_min_seen not satisfied within {waited_ms}ms")]
     RequireMinSeenTimeout {
         waited_ms: u64,
@@ -230,6 +241,7 @@ impl OpError {
             OpError::DurabilityUnavailable { .. } => {
                 ProtocolErrorCode::DurabilityUnavailable.into()
             }
+            OpError::SyncWaitFailed { .. } => CliErrorCode::SyncFailed.into(),
             OpError::RequireMinSeenTimeout { .. } => {
                 ProtocolErrorCode::RequireMinSeenTimeout.into()
             }
@@ -285,6 +297,9 @@ impl OpError {
             OpError::StoreRuntime(err) => err.transience(),
             OpError::DurabilityTimeout { .. } => Transience::Retryable,
             OpError::DurabilityUnavailable { .. } => Transience::Permanent,
+            // Retryable: the daemon keeps syncing in the background after we
+            // stop waiting, so running `bn sync` again can well succeed.
+            OpError::SyncWaitFailed { .. } => Transience::Retryable,
             OpError::RequireMinSeenTimeout { .. } => Transience::Retryable,
             OpError::RequireMinSeenUnsatisfied { .. } => Transience::Retryable,
             OpError::NamespaceInvalid { .. } | OpError::NamespaceUnknown { .. } => {
@@ -493,6 +508,10 @@ impl IntoErrorPayload for OpError {
                 pending_replica_ids,
             })
             .with_receipt(receipt),
+            OpError::SyncWaitFailed { details, .. } => {
+                ErrorPayload::new(CliErrorCode::SyncFailed.into(), message, retryable)
+                    .with_details(*details)
+            }
             OpError::RequireMinSeenTimeout {
                 waited_ms,
                 required,
@@ -613,7 +632,7 @@ fn legacy_deps_migration_hint(err: &SyncError) -> Option<OpError> {
     }
     Some(OpError::ValidationFailed {
         field: "migrate".into(),
-        reason: "legacy deps store detected; run `bd migrate detect` and then `bd migrate to 2`"
+        reason: "legacy deps store detected; run `bn migrate detect` and then `bn migrate to 2`"
             .into(),
     })
 }
@@ -732,7 +751,7 @@ mod tests {
         match mapped {
             OpError::ValidationFailed { field, reason } => {
                 assert_eq!(field, "migrate");
-                assert!(reason.contains("bd migrate to 2"), "{reason}");
+                assert!(reason.contains("bn migrate to 2"), "{reason}");
             }
             other => panic!("expected validation hint, got {other:?}"),
         }

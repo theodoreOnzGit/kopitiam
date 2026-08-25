@@ -1,6 +1,24 @@
 //! E2E replication and daemon harness support.
 
-use crate as crate::daemon;
+// Sub-crate-collapse history, so nobody scratch head next time:
+//
+// Last time this file sat inside the standalone `beads-daemon` crate, and line 3
+// here was `use crate as beads_daemon;` — a self-alias, so harness code inside the
+// crate could still spell its own items with the *external* name (`beads_daemon::…`),
+// same as the cross-crate integration tests did. Convenient then.
+//
+// When `beads-daemon` / `beads-core` got collapsed into modules of this one crate,
+// the mechanical rewrite swapped `beads_daemon` -> `crate::daemon` on BOTH sides of
+// the `as`, and out came `use crate as crate::daemon;`. That one is not even valid
+// Rust — `as` wants a plain identifier, cannot take a path — so the whole file never
+// parse, and `--features test-harness` (plus `e2e-tests`, which turn it on) was dead
+// since the collapse. Default build never kena, because `mod e2e` is cfg-gated.
+//
+// Fix is to just drop the alias, don't resurrect it. Every path in this file is
+// already fully qualified as `crate::daemon::…`, so there is nothing left for the
+// alias to serve — adding `use crate::daemon;` back would only earn an
+// `unused_imports` warning. If you ever want short `daemon::…` paths in here, import
+// it properly (`use crate::daemon;`) and actually use it; never `use X as <path>`.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

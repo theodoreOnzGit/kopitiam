@@ -8,12 +8,87 @@ pub(super) fn load_timeout() -> Duration {
     Duration::from_secs(override_secs.unwrap_or(LOAD_TIMEOUT_SECS))
 }
 
+/// Anything at or past this gap between the two comparands gets flagged.
+///
+/// Five minutes. Take note hor: this threshold is *also* smaller than a normal
+/// coffee break, which is exactly why the positive side of the comparison fires
+/// so easily on a perfectly healthy clock — see [`detect_clock_skew`].
 pub(super) const CLOCK_SKEW_WARN_MS: u64 = 5 * 60 * 1000;
 
+/// Kaypoh check on whether the local system clock and the newest write stamp we
+/// know about have drifted apart. Returns `None` when they agree close enough.
+///
+/// # The two comparands — got no third clock here, don't anyhow guess
+///
+/// * `now_ms` — the **raw local system wall clock**, Unix milliseconds, straight
+///   from `WallClock::now` (which is just `SystemTime::now()`). This is NOT the
+///   HLC. Untouched host clock, whatever rubbish NTP left behind.
+/// * `reference_ms` — a `WriteStamp::wall_ms`, i.e. the *physical* half of an
+///   HLC stamp. **Which** stamp depends on who call us, and the four callers do
+///   not all mean the same thing:
+///   - `repo_load.rs` — newest stamp across every bead loaded out of the git repo.
+///   - `coord/sync.rs` (two sites) — the running max of every stamp this daemon
+///     has seen for the store, so it never goes down.
+///   - `repl_ingest.rs` — newest stamp inside the replication batch that *just*
+///     landed. This one is a plain assignment, so it can go down again.
+///   - `executor.rs` — the stamp of the write this daemon just made itself
+///     (local HLC right after tick). Because the HLC never goes below the wall
+///     clock, this site basically can only ever report a *negative* delta.
+///
+///   A `WriteStamp` carries **no actor id** — only `Stamp` has `by`, and
+///   `max_write_stamp()` throws the `by` away when it takes the max. So we
+///   genuinely cannot say *whose* write it was. Don't promise the user an actor
+///   name we don't have; say "the newest write stamp bn has seen" and stop there.
+///
+/// # Sign convention — very easy to read backwards, so read slowly
+///
+/// `delta_ms = now_ms - reference_ms`, so:
+///
+/// * **positive** → the local system clock is **ahead of** the write stamp;
+/// * **negative** → the local system clock is **behind** the write stamp.
+///
+/// # Why the warning can disappear by itself, with nobody doing anything
+///
+/// This bit is the one that wastes people's night, so here it is properly.
+///
+/// HLC stamps are wall-clock-at-write-time. So a **positive** delta is, in the
+/// ordinary case, nothing more than *how old the newest write is*. Store sit
+/// idle for six minutes on a perfectly correct clock and `now_ms -
+/// reference_ms` already blow past [`CLOCK_SKEW_WARN_MS`]. No skew at all —
+/// just nobody wrote anything.
+///
+/// And it clears the same way it came. Every caller listed above **assigns**
+/// `git_lane.last_clock_skew` outright; not one of them accumulates or latches
+/// it. The moment any write lands, the reference stamp become fresh, the delta
+/// collapse to roughly zero, this function return `None`, and the warning is
+/// gone — no restart, no clock change, no user action. That is the whole
+/// mechanism behind "it vanished after twenty minutes and I did nothing".
+///
+/// The **negative** side is the one worth waking up for: a stamp dated in the
+/// future cannot be explained by an idle store. Either this host's clock is
+/// slow, or whoever wrote that stamp had a fast clock.
+///
+/// # What the skew actually affects
+///
+/// Not cosmetic. `Lww::join` (`core/crdt.rs`) resolves conflicts by picking the
+/// higher `Stamp`, and `Stamp` orders on `WriteStamp::wall_ms` first. A host
+/// with a fast clock therefore wins merges it should have lost, and a slow host
+/// loses merges it should have won. Note ordering (`core/state/notes.rs`) and
+/// the delete-vs-recreate resurrection rule (`core/state/canonical.rs`) ride on
+/// the same comparison. Claim lease expiry is plain wall clock too.
+///
+/// The local HLC does absorb *some* of this: `Clock::tick` clamps a forward jump
+/// bigger than `hlc_max_forward_drift_ms` (default 600_000 ms) and logs it as a
+/// `ForwardJumpClamped` anomaly. That keeps our own stamps monotonic; it does
+/// not make a wrong wall clock right.
 pub(crate) fn detect_clock_skew(now_ms: u64, reference_ms: u64) -> Option<ClockSkewRecord> {
     let delta_ms = now_ms as i64 - reference_ms as i64;
     if delta_ms.unsigned_abs() >= CLOCK_SKEW_WARN_MS {
         Some(ClockSkewRecord {
+            // `wall_ms` is `now_ms` itself, not some separate "when" reading.
+            // The renderer in `cli_surface/commands/status.rs` leans on that: it
+            // recovers `reference_ms` exactly as `wall_ms - delta_ms`. Change
+            // this and you break that reconstruction.
             delta_ms,
             wall_ms: now_ms,
         })

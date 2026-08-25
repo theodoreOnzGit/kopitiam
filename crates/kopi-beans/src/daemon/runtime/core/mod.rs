@@ -4088,4 +4088,69 @@ mod tests {
         let reference = now - (CLOCK_SKEW_WARN_MS - 1);
         assert!(detect_clock_skew(now, reference).is_none());
     }
+
+    /// Sign convention, pinned down: `delta_ms = now_ms - reference_ms`.
+    ///
+    /// Local wall clock AHEAD of the write stamp gives a POSITIVE delta; local
+    /// wall clock BEHIND gives a NEGATIVE one. Every reading of this warning
+    /// hangs off that, and GitHub issue #21 was partly people guessing it
+    /// backwards, so it is now asserted instead of assumed.
+    #[test]
+    fn detect_clock_skew_sign_says_local_clock_is_ahead() {
+        let reference = 1_700_000_000_000u64;
+        let now = reference + CLOCK_SKEW_WARN_MS + 1;
+        let skew = detect_clock_skew(now, reference).expect("above threshold");
+        assert_eq!(skew.delta_ms, (CLOCK_SKEW_WARN_MS + 1) as i64);
+        assert!(
+            skew.delta_ms > 0,
+            "local ahead of reference must be positive"
+        );
+    }
+
+    #[test]
+    fn detect_clock_skew_sign_says_local_clock_is_behind() {
+        let now = 1_700_000_000_000u64;
+        let reference = now + CLOCK_SKEW_WARN_MS + 1;
+        let skew = detect_clock_skew(now, reference).expect("above threshold");
+        assert_eq!(skew.delta_ms, -((CLOCK_SKEW_WARN_MS + 1) as i64));
+        assert!(skew.delta_ms < 0, "local behind reference must be negative");
+    }
+
+    /// The threshold is inclusive on both sides — `>=`, not `>`.
+    #[test]
+    fn detect_clock_skew_threshold_is_inclusive_both_directions() {
+        let base = 1_700_000_000_000u64;
+        assert!(detect_clock_skew(base + CLOCK_SKEW_WARN_MS, base).is_some());
+        assert!(detect_clock_skew(base, base + CLOCK_SKEW_WARN_MS).is_some());
+        assert!(detect_clock_skew(base + CLOCK_SKEW_WARN_MS - 1, base).is_none());
+        assert!(detect_clock_skew(base, base + CLOCK_SKEW_WARN_MS - 1).is_none());
+        assert!(detect_clock_skew(base, base).is_none());
+    }
+
+    /// `wall_ms` on the record IS `now_ms`, not a separate "when did we notice"
+    /// reading. The CLI renderer recovers the other comparand as
+    /// `wall_ms - delta_ms`, so this identity is load-bearing, not incidental.
+    #[test]
+    fn detect_clock_skew_record_lets_caller_recover_the_reference() {
+        let reference = 1_700_000_000_000u64;
+        let now = reference + 3_657_601;
+        let skew = detect_clock_skew(now, reference).expect("above threshold");
+        assert_eq!(skew.wall_ms, now);
+        let recovered = (skew.wall_ms as i64 - skew.delta_ms) as u64;
+        assert_eq!(recovered, reference);
+    }
+
+    /// Regression guard on the false positive behind GitHub issue #21: an idle
+    /// store with a perfectly correct clock still trips this, because a positive
+    /// delta is just the age of the newest write. Documented behaviour for now —
+    /// if anybody ever change the detection so staleness no longer warns, this
+    /// test is the one to update, on purpose, with an eyeball on the message.
+    #[test]
+    fn detect_clock_skew_positive_side_also_fires_on_a_merely_idle_store() {
+        let last_write = 1_700_000_000_000u64;
+        let six_minutes_later = last_write + 6 * 60 * 1000;
+        let skew = detect_clock_skew(six_minutes_later, last_write)
+            .expect("idle store trips the threshold, correct clock or not");
+        assert!(skew.delta_ms > 0);
+    }
 }

@@ -2,7 +2,8 @@ use super::ServerReply;
 use super::socket::stream_event_response;
 use super::spans::{ReadConsistencyTag, read_consistency_tag, request_span};
 use super::waiters::{
-    DurabilityWaiter, ReadGateWaiter, flush_durability_waiters, flush_read_gate_waiters,
+    DurabilityWaiter, ReadGateWaiter, SyncWaiter, SyncWaiters, flush_durability_waiters,
+    flush_read_gate_waiters, flush_sync_waiters, next_sync_waiter_deadline,
 };
 use bytes::Bytes;
 use crossbeam::channel::{Receiver, Sender};
@@ -685,4 +686,228 @@ fn durability_waiter_times_out() {
         .unwrap()
         .expect("receipt");
     assert!(receipt.outcome().is_pending());
+}
+
+// =============================================================================
+// SyncWait waiters - kopitiam#25
+// =============================================================================
+
+/// The remote `TestEnv` registers its one store against.
+fn test_remote() -> RemoteUrl {
+    RemoteUrl::new("example.com/test/repo")
+}
+
+/// Put the lane into "a sync is running right now" — dirty work was picked up,
+/// `start_sync()` cleared `dirty` and set `sync_in_progress`.
+fn begin_sync(env: &mut TestEnv) {
+    let mut loaded = env
+        .daemon
+        .ensure_repo_fresh(&env.repo_path, &env.git_tx)
+        .unwrap();
+    let lane = loaded.lane_mut();
+    lane.mark_dirty();
+    lane.start_sync();
+}
+
+fn park_sync_waiter(
+    env: &TestEnv,
+    deadline: Instant,
+) -> (SyncWaiters, Receiver<ServerReply>) {
+    let (respond_tx, respond_rx) = crossbeam::channel::bounded(1);
+    let failures_at_park = env
+        .daemon
+        .git_lane_state_by_url(&test_remote())
+        .expect("lane")
+        .sync_failures_total;
+    let mut waiters: SyncWaiters = HashMap::new();
+    waiters.entry(test_remote()).or_default().push(SyncWaiter {
+        respond: respond_tx,
+        started_at: Instant::now(),
+        deadline,
+        failures_at_park,
+    });
+    (waiters, respond_rx)
+}
+
+fn expect_sync_wait_error(reply: ServerReply) -> error_details::SyncWaitDetails {
+    let ServerReply::Response(response) = reply else {
+        panic!("expected a response");
+    };
+    let Response::Err { err } = response else {
+        panic!("expected an error response, got {response:?}");
+    };
+    assert_eq!(err.code, crate::daemon::core::CliErrorCode::SyncFailed.into());
+    err.details_as::<error_details::SyncWaitDetails>()
+        .expect("details decode")
+        .expect("sync wait details present")
+}
+
+/// **The regression test for kopitiam#25.**
+///
+/// A failing sync sets `dirty = true` so the scheduler retries it. That made
+/// the old release condition (`!dirty && !sync_in_progress`) permanently false,
+/// so the parked `bn sync` client was never answered — for any number of
+/// failures, forever. Here the sync fails once and the waiter must be woken
+/// with a verdict.
+#[test]
+fn failing_sync_wakes_a_parked_sync_waiter() {
+    let mut env = TestEnv::new();
+    begin_sync(&mut env);
+
+    // Deadline far away, so anything that happens here is the FAILURE path and
+    // not the timeout path quietly covering for it.
+    let (mut waiters, respond_rx) = park_sync_waiter(&env, Instant::now() + Duration::from_secs(3600));
+
+    // Sync still running: the waiter must stay put. Waking here would be a
+    // premature answer, not a fix.
+    flush_sync_waiters(&env.daemon, &mut waiters);
+    assert_eq!(waiters.values().flatten().count(), 1);
+    assert!(respond_rx.try_recv().is_err());
+
+    // The sync blows up. This is the exact state that used to strand the
+    // waiter: sync_in_progress back to false, dirty back to true.
+    {
+        let mut loaded = env
+            .daemon
+            .ensure_repo_fresh(&env.repo_path, &env.git_tx)
+            .unwrap();
+        loaded
+            .lane_mut()
+            .fail_sync("remote rejected refs/dolt/data".to_string(), 1234);
+    }
+    let lane_is_deadlocky = {
+        let lane = env.daemon.git_lane_state_by_url(&test_remote()).unwrap();
+        lane.dirty && !lane.sync_in_progress
+    };
+    assert!(
+        lane_is_deadlocky,
+        "precondition: a failed sync must leave dirty=true, which is what the old \
+         release condition could never satisfy"
+    );
+
+    flush_sync_waiters(&env.daemon, &mut waiters);
+    assert!(
+        waiters.values().flatten().count() == 0,
+        "a failed sync must release the waiter, not strand it"
+    );
+
+    let details = expect_sync_wait_error(respond_rx.recv().unwrap());
+    assert_eq!(details.outcome, error_details::SyncWaitOutcome::Failed);
+    assert_eq!(details.remote, "example.com/test/repo");
+    assert!(details.dirty, "report must admit the store is still dirty");
+    assert!(!details.sync_in_progress);
+    assert_eq!(details.consecutive_failures, 1);
+    assert_eq!(
+        details.last_error.as_deref(),
+        Some("remote rejected refs/dolt/data"),
+        "the git error is the whole point - without it the user learns nothing"
+    );
+}
+
+/// A waiter that parked BEFORE an earlier failure must not be woken by that old
+/// failure — only by one that happens after it parked.
+#[test]
+fn sync_waiter_ignores_failures_that_predate_it() {
+    let mut env = TestEnv::new();
+    begin_sync(&mut env);
+    {
+        let mut loaded = env
+            .daemon
+            .ensure_repo_fresh(&env.repo_path, &env.git_tx)
+            .unwrap();
+        loaded.lane_mut().fail_sync("old news".to_string(), 1);
+        // Retry picked up, running again.
+        loaded.lane_mut().start_sync();
+    }
+
+    let (mut waiters, respond_rx) =
+        park_sync_waiter(&env, Instant::now() + Duration::from_secs(3600));
+    flush_sync_waiters(&env.daemon, &mut waiters);
+
+    assert_eq!(waiters.values().flatten().count(), 1);
+    assert!(
+        respond_rx.try_recv().is_err(),
+        "a stale failure must not answer a waiter parked after it"
+    );
+}
+
+/// Deadline path: nothing fails, nothing succeeds, the clock just runs out. The
+/// waiter must still be answered, and the answer must carry the live lane state
+/// so the user can see the sync is genuinely still running.
+#[test]
+fn sync_waiter_times_out_and_reports_the_lane_state() {
+    let mut env = TestEnv::new();
+    begin_sync(&mut env);
+
+    // Deadline already in the past - same trick the read-gate timeout test uses.
+    let (mut waiters, respond_rx) = park_sync_waiter(&env, Instant::now() - Duration::from_millis(1));
+
+    flush_sync_waiters(&env.daemon, &mut waiters);
+    assert_eq!(waiters.values().flatten().count(), 0);
+
+    let details = expect_sync_wait_error(respond_rx.recv().unwrap());
+    assert_eq!(details.outcome, error_details::SyncWaitOutcome::Timeout);
+    assert!(
+        details.sync_in_progress,
+        "timing out must not pretend the daemon stopped working"
+    );
+    assert_eq!(details.consecutive_failures, 0);
+    assert_eq!(details.last_error, None);
+}
+
+/// The happy path must be untouched: lane goes clean, waiter gets `ok`.
+#[test]
+fn clean_lane_still_releases_sync_waiters_with_ok() {
+    let mut env = TestEnv::new();
+    begin_sync(&mut env);
+    let (mut waiters, respond_rx) =
+        park_sync_waiter(&env, Instant::now() + Duration::from_secs(3600));
+
+    {
+        let mut loaded = env
+            .daemon
+            .ensure_repo_fresh(&env.repo_path, &env.git_tx)
+            .unwrap();
+        loaded.lane_mut().complete_sync(99);
+    }
+
+    flush_sync_waiters(&env.daemon, &mut waiters);
+    assert_eq!(waiters.values().flatten().count(), 0);
+
+    let ServerReply::Response(response) = respond_rx.recv().unwrap() else {
+        panic!("expected a response");
+    };
+    assert!(matches!(response, Response::Ok { .. }));
+}
+
+/// The state loop selects on the earliest deadline; if sync waiters were left
+/// out of that calculation the loop could park on `never()` and no one would
+/// ever expire them.
+#[test]
+fn next_sync_waiter_deadline_is_the_earliest_one() {
+    let env = TestEnv::new();
+    let now = Instant::now();
+    let (respond_a, _rx_a) = crossbeam::channel::bounded(1);
+    let (respond_b, _rx_b) = crossbeam::channel::bounded(1);
+    let soon = now + Duration::from_secs(5);
+    let later = now + Duration::from_secs(500);
+
+    let mut waiters: SyncWaiters = HashMap::new();
+    let list = waiters.entry(test_remote()).or_default();
+    list.push(SyncWaiter {
+        respond: respond_a,
+        started_at: now,
+        deadline: later,
+        failures_at_park: 0,
+    });
+    list.push(SyncWaiter {
+        respond: respond_b,
+        started_at: now,
+        deadline: soon,
+        failures_at_park: 0,
+    });
+
+    assert_eq!(next_sync_waiter_deadline(&waiters), Some(soon));
+    assert_eq!(next_sync_waiter_deadline(&HashMap::new()), None);
+    drop(env);
 }

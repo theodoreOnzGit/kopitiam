@@ -1,8 +1,80 @@
 # Session state — resumable handoff
 
-**Last updated:** 2026-07-29 (0.2.5 SHIPPED; kvim cleared to ship next; Q4_K_M bug open)
+**Last updated:** 2026-08-25 (`develop` merged into `main`: kopi-beans 0.1.2–0.1.7,
+the CJK PDF field report, and kopitiam-pdf's mandatory hayro fallback now on one branch)
 **Purpose:** if the session dies, this file plus `bn ready` is enough to pick up
 without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md.)
+
+> ## ⏳ LATEST — 2026-08-13 (Thu ~07:45 SGT, Arch box — GH issue sweep, 4 agents in flight)
+>
+> Maintainer: *"look at the gh issues, file beans, let's fix what we can"* then
+> *"spawn agent fleets to sort this out. push a new kopi-beans version to github
+> and cargo"*. Publish instruction is **explicit and in-session**, so it clears
+> the crates.io gate in CLAUDE.md — but only for **kopi-beans**, nothing else.
+>
+> ### Triage result — 21 open GH issues, 18 new beads
+>
+> Tracker went **16 → 34 beads**. Every GH issue now has a bead carrying its
+> verbatim body, linked by `--external-ref gh-N`.
+>
+> | Bead | GH | State |
+> |---|---|---|
+> | `bd-7ab` | #1 | kopitiam `check`/`test` have no `--release` — **agent D** |
+> | `bd-yy1` | #17 | `--features test-harness` cannot parse — **agent A** |
+> | `bd-ef2` | #18 | `should_panic` on `debug_assert!` — **agent B** |
+> | `bd-pl2` | #21 | `clock_skew` warning not actionable — **agent C** |
+> | `bd-p1d` | #18 | flaky `daemon::runtime` WAL/HLC (split out; reporter never filed) |
+> | `bd-cw3` | #22 | `bn tui` — HUMAN dogfood only, never auto-"fix" |
+> | `bd-aif` | #19 | pts 2/3/4 unverified (pt 1 IS fixed in 0.1.3) |
+> | `bd-ski` + `.1`–`.11` | #2–#13 | CJK/annotated-PDF field report, epic + 11 children |
+>
+> **Closed on GitHub, already fixed, no work owed:**
+> * **#14** (bd branding) — fixed in 0.1.2. `bn upgrade` self-upgrade was
+>   *removed*, not reworded: the inherited beads-rs code fetched beads-rs's own
+>   releases and installed them over a binary named `bd`. On a both-trackers box
+>   it would have clobbered the other tool.
+> * **#15** (`tailnet_proxy`) — fixed in 0.1.2. Now `bn-tailnet-proxy`, gated
+>   `required-features = ["fault-proxy"]`, and `fault-proxy` is NOT in `default`
+>   (`default = ["cli", "wal-fs"]`), so `cargo install kopi-beans` ships only `bn`.
+>
+> ### RELEASE GATE — read this before bumping anything
+>
+> `git log --since='2026-08-10T09:13:30Z' -- crates/kopi-beans` is **EMPTY**.
+> 0.1.3 went up 2026-08-10T09:13:30Z; the network-push commits (`f06e642`,
+> `653c22f`, 17:11 SGT = 09:11 UTC) landed **two minutes before** it and are
+> therefore already shipped. So on the tree as it stood this morning, the
+> CLAUDE.md hard rule *"no new commits, no version bump"* **forbids** a 0.1.4.
+>
+> The bump becomes legitimate **only once agents A/B/C land real changes**.
+> Order is: agents land → `cargo test --release` + `clippy --release` over the
+> COMBINED tree (per "Verify, then report") → commit → bump kopi-beans 0.1.3 →
+> 0.1.4 → push → publish.
+>
+> **`apps/cli` (agent D) is the `kopitiam` crate, NOT kopi-beans.** Its version
+> is a separate decision and the maintainer did not ask for a kopitiam publish.
+> Do not fold it into the kopi-beans release.
+>
+> ### Frozen ownership — 4 agents, SHARED tree, disjoint paths
+>
+> | Agent | Owns EXCLUSIVELY | Bead |
+> |---|---|---|
+> | A | `crates/kopi-beans/src/daemon/testkit/` | `bd-yy1` |
+> | B | `crates/kopi-beans/src/core/tombstone.rs` | `bd-ef2` |
+> | C | `crates/kopi-beans/src/daemon/` **except** `testkit/`, plus `cli_surface/commands/status.rs` | `bd-pl2` |
+> | D | `apps/cli/` | `bd-7ab` |
+>
+> **The ORCHESTRATOR owns `crates/kopi-beans/Cargo.toml`** (version bump) — all
+> four agents were told not to touch it. A and C both sit under `daemon/`; the
+> `testkit/` boundary between them is the thing to watch on merge.
+>
+> All four were told: no commit, no push, no publish. Leave it in the tree.
+>
+> ### Standing hazard for whoever verifies
+>
+> `cargo test --release -p kopi-beans` has **pre-existing** reds: ~10–12 that
+> vary run-to-run (`bd-p1d`) plus 2 permanent tombstone ones (`bd-ef2`, being
+> fixed). Take a baseline on a clean worktree BEFORE attributing any failure to
+> this session's work.
 
 > ## ⏹ WHERE THE 2026-07-29 SESSION ENDED (maintainer stopped, tired)
 >
@@ -35,7 +107,6 @@ without re-deriving anything. (`bn`, not `bd` — see the hard rule in CLAUDE.md
 > **Confirmed NOT bugs, do not re-investigate:** TUI vs CLI chat plumbing is
 > genuinely identical (same adapter, same `CompletionRequest`, same system
 > prompt, `drain_stream` correctly restores the receiver). Model picking works.
-
 
 > ## ⏳ LATEST — 2026-07-29 (Wed ~06:00+ SGT, maintainer's Windows box — **0.2.5 publish BLOCKED**)
 >

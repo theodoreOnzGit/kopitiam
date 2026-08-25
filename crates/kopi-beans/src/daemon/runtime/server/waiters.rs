@@ -15,6 +15,8 @@ use super::super::ops::OpError;
 use super::ServerReply;
 use super::dispatch::process_request_message;
 use crate::daemon::api::{AdminCheckpointGroup, AdminCheckpointOutput};
+use crate::daemon::core::error::details as error_details;
+use crate::daemon::core::error::details::SyncWaitOutcome;
 use crate::daemon::core::{DurabilityClass, NamespaceId, StoreId};
 use crate::daemon::remote::RemoteUrl;
 use crate::daemon::runtime::metrics;
@@ -37,6 +39,29 @@ pub(super) struct DurabilityWaiter {
     pub(super) deadline: Instant,
 }
 
+/// One parked `bn sync` (`Request::SyncWait`) client.
+///
+/// Used to be a bare `Sender<ServerReply>` with no deadline and no way of
+/// hearing about a failure — see [`flush_sync_waiters`] for the full story of
+/// kopitiam#25.
+pub(super) struct SyncWaiter {
+    pub(super) respond: Sender<ServerReply>,
+    pub(super) started_at: Instant,
+    /// Hard stop. Once we are past this we answer with the lane state, we do
+    /// NOT keep waiting. Note this does not cancel the sync — the daemon keeps
+    /// retrying in the background; we just stop holding the client hostage.
+    pub(super) deadline: Instant,
+    /// `GitLaneState::sync_failures_total` read at the moment we parked.
+    ///
+    /// The lane's counter going ABOVE this is what "a sync failed while you
+    /// were waiting" means. Snapshot-and-compare rather than a flag, because
+    /// several clients can be parked on the same remote at different times and
+    /// each only cares about failures after its own park.
+    pub(super) failures_at_park: u64,
+}
+
+pub(super) type SyncWaiters = HashMap<RemoteUrl, Vec<SyncWaiter>>;
+
 pub(super) struct CheckpointWaiter {
     pub(super) respond: Sender<ServerReply>,
     pub(super) store_id: StoreId,
@@ -51,7 +76,7 @@ pub(super) enum RequestOutcome {
 }
 
 pub(super) struct RequestWaiters<'a> {
-    pub(super) sync_waiters: &'a mut HashMap<RemoteUrl, Vec<Sender<ServerReply>>>,
+    pub(super) sync_waiters: &'a mut SyncWaiters,
     pub(super) checkpoint_waiters: &'a mut Vec<CheckpointWaiter>,
     pub(super) durability_waiters: &'a mut Vec<DurabilityWaiter>,
 }
@@ -60,7 +85,7 @@ pub(super) fn flush_read_gate_waiters(
     daemon: &mut Daemon,
     waiters: &mut Vec<ReadGateWaiter>,
     git_tx: &Sender<GitOp>,
-    sync_waiters: &mut HashMap<RemoteUrl, Vec<Sender<ServerReply>>>,
+    sync_waiters: &mut SyncWaiters,
     checkpoint_waiters: &mut Vec<CheckpointWaiter>,
     durability_waiters: &mut Vec<DurabilityWaiter>,
 ) {
@@ -311,28 +336,128 @@ pub(super) fn flush_checkpoint_waiters(daemon: &Daemon, waiters: &mut Vec<Checkp
     *waiters = remaining;
 }
 
-pub(super) fn flush_sync_waiters(
-    daemon: &Daemon,
-    waiters: &mut HashMap<RemoteUrl, Vec<Sender<ServerReply>>>,
-) {
-    let ready: Vec<RemoteUrl> = waiters
-        .keys()
-        .filter(|remote| {
-            daemon
-                .git_lane_state_by_url(remote)
-                .map(|s| !s.dirty && !s.sync_in_progress)
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
+/// Answer every parked `bn sync` that now has an answer.
+///
+/// Three ways a waiter gets its answer, checked in this order:
+///
+/// 1. **Clean** (`!dirty && !sync_in_progress`) - the sync landed, reply `ok`.
+/// 2. **Failed** - the lane's `sync_failures_total` has moved past what the
+///    waiter snapshotted, i.e. a sync attempt blew up while this client was
+///    parked. Reply with the error and the whole lane state.
+/// 3. **Deadline** - clock ran out, reply with the lane state as it stands.
+///
+/// # Why a single failure wakes the waiter instead of riding out the retry
+/// (kopitiam#25 — this is the decision the fix turns on.)
+///
+/// The lane retries a failed sync after [`GitLaneState::backoff_ms`], forever,
+/// with the backoff capping at ~32s. So "keep waiting, the retry might work" is
+/// a bet with no time limit on it: an auth failure or a rejected
+/// non-fast-forward push fails identically on every retry, and the client waits
+/// until the heat death of the universe. That is precisely the reported bug.
+///
+/// Waking on the first failure is the right trade because:
+/// * the information is actionable NOW — the user can read the git error and go
+///   fix their credentials / rebase, rather than staring at a blank terminal;
+/// * nothing is lost — the daemon does NOT stop retrying just because we
+///   answered. `dirty` stays set, backoff stays scheduled. The reply says
+///   "still failing", not "gave up";
+/// * a transient failure is cheap to re-check — the error is marked retryable
+///   and `bn sync` is one command away.
+///
+/// What would make this wrong: if failures were overwhelmingly transient AND a
+/// retry were near-instant, waking on the first one would turn a self-healing
+/// blip into a scary error. Neither holds here — backoff starts at 500ms and
+/// doubles, and the common real failures (auth, rejected ref, no network) are
+/// all sticky.
+///
+/// [`GitLaneState::backoff_ms`]: crate::daemon::git_lane::GitLaneState::backoff_ms
+pub(super) fn flush_sync_waiters(daemon: &Daemon, waiters: &mut SyncWaiters) {
+    if waiters.is_empty() {
+        return;
+    }
 
-    for remote in ready {
-        if let Some(list) = waiters.remove(&remote) {
-            for respond in list {
-                let _ = respond.send(ServerReply::Response(Response::ok(
+    let now = Instant::now();
+    waiters.retain(|remote, parked| {
+        // No lane for this remote means nothing is pending against it, so treat
+        // it as clean — same call the old code made.
+        let Some(lane) = daemon.git_lane_state_by_url(remote) else {
+            for waiter in parked.drain(..) {
+                let _ = waiter.respond.send(ServerReply::Response(Response::ok(
                     ResponsePayload::synced(),
                 )));
             }
+            return false;
+        };
+
+        let clean = !lane.dirty && !lane.sync_in_progress;
+        let mut remaining = Vec::with_capacity(parked.len());
+        for waiter in parked.drain(..) {
+            if clean {
+                let _ = waiter.respond.send(ServerReply::Response(Response::ok(
+                    ResponsePayload::synced(),
+                )));
+                continue;
+            }
+
+            let failed_since_park = lane.sync_failures_total > waiter.failures_at_park;
+            let expired = now >= waiter.deadline;
+            if !failed_since_park && !expired {
+                remaining.push(waiter);
+                continue;
+            }
+
+            let waited_ms = now.duration_since(waiter.started_at).as_millis().min(u64::MAX as u128)
+                as u64;
+            let outcome = if failed_since_park {
+                SyncWaitOutcome::Failed
+            } else {
+                SyncWaitOutcome::Timeout
+            };
+            let last_error = lane
+                .last_sync_error
+                .as_ref()
+                .map(|record| record.message.clone());
+            let reason = match (outcome, last_error.as_deref()) {
+                (SyncWaitOutcome::Failed, Some(message)) => message.to_string(),
+                (SyncWaitOutcome::Failed, None) => "sync failed (no error recorded)".to_string(),
+                (SyncWaitOutcome::Timeout, _) => {
+                    "timed out waiting for the sync to finish".to_string()
+                }
+            };
+            let details = error_details::SyncWaitDetails {
+                outcome,
+                remote: remote.as_str().to_string(),
+                waited_ms,
+                dirty: lane.dirty,
+                sync_in_progress: lane.sync_in_progress,
+                consecutive_failures: lane.consecutive_failures,
+                last_error,
+            };
+            let err = OpError::SyncWaitFailed {
+                remote: remote.as_str().to_string(),
+                reason,
+                waited_ms,
+                details: Box::new(details),
+            };
+            let _ = waiter
+                .respond
+                .send(ServerReply::Response(Response::err_from(err)));
         }
-    }
+
+        *parked = remaining;
+        !parked.is_empty()
+    });
+}
+
+/// Earliest deadline across all parked sync waiters.
+///
+/// The state loop needs this so `crossbeam::select!` wakes up to expire a
+/// waiter. Without it the loop can block on `never()` — nothing scheduled,
+/// nothing to receive — and the deadline never gets checked.
+pub(super) fn next_sync_waiter_deadline(waiters: &SyncWaiters) -> Option<Instant> {
+    waiters
+        .values()
+        .flatten()
+        .map(|waiter| waiter.deadline)
+        .min()
 }

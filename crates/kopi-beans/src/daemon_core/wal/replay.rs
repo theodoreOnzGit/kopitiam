@@ -148,7 +148,7 @@ pub enum WalReplayError {
     #[error("segment header mismatch at {path:?}: {reason}")]
     SegmentHeaderMismatch { path: PathBuf, reason: String },
     #[error(
-        "mid-file WAL corruption at {path:?} offset {offset}: {reason}. Run `bd store fsck` to repair."
+        "mid-file WAL corruption at {path:?} offset {offset}: {reason}. Run `bn store fsck` to repair."
     )]
     MidFileCorruption {
         path: PathBuf,
@@ -165,7 +165,7 @@ pub enum WalReplayError {
         len: u64,
     },
     #[error(
-        "sealed segment length mismatch at {path:?}: expected {expected}, got {actual}. Run `bd store fsck` to repair."
+        "sealed segment length mismatch at {path:?}: expected {expected}, got {actual}. Run `bn store fsck` to repair."
     )]
     SealedSegmentLenMismatch {
         path: PathBuf,

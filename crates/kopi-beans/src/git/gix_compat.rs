@@ -18,11 +18,16 @@
 //!   repo lacks into its object database and updates the destination refs with
 //!   fast-forward + lock semantics, entirely in-process via gix (no `git`
 //!   subprocess, no network protocol). **Network** transports
-//!   (`http(s)`/`ssh`/`git`/scp-like) remain GATED and return
-//!   [`ErrorCode::PushUnsupported`]: gix 0.86 exposes no high-level push and no
+//!   (`http(s)`/`ssh`/`git`/scp-like) are delegated to the system `git`
+//!   binary, because gix 0.86 exposes no high-level push and no
 //!   `gix-protocol` send-pack helper (upstream #306), so a protocol push cannot
-//!   be built without a `[patch.crates-io]` (which would not survive
-//!   `cargo publish`).
+//!   be built in-process without a `[patch.crates-io]` (which would not survive
+//!   `cargo publish`). Shelling out keeps the *build* pure-Rust — `git` is a
+//!   runtime dependency of network push only, not a linked C toolchain — and
+//!   inherits the user's existing credential configuration (helpers, netrc,
+//!   SSH agent), which an in-process implementation would have to reproduce.
+//!   [`ErrorCode::PushUnsupported`] is still returned when no usable `git` is
+//!   found on `PATH`, so callers that gate on it keep working.
 //! - Remote *configuration* (create/read `remote.<name>.url`) is managed by
 //!   this shim directly against the on-disk git config, so a freshly opened
 //!   handle observes remotes added through it without a reload.
@@ -33,9 +38,74 @@ use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gix::bstr::{BStr, ByteSlice};
+
+// =============================================================================
+// Push stall guards (kopitiam#25)
+// =============================================================================
+//
+// # Provenance, honestly stated
+//
+// There is no upstream default to copy here, and that IS the finding: **git
+// ships its own stall detection switched off.** In `http.c` git only calls
+// `curl_easy_setopt(CURLOPT_LOW_SPEED_LIMIT/_TIME)` when
+// `http.lowSpeedLimit`/`http.lowSpeedTime` are configured; on a stock install
+// both are unset (`git config --get http.lowSpeedLimit` prints nothing), so
+// curl's low-speed abort never arms and a transfer that goes quiet hangs until
+// the TCP stack gives up — which can be many minutes, or never. git-config(1)
+// documents the pair as opt-in for exactly this purpose: "if the HTTP transfer
+// speed is less than `http.lowSpeedLimit` for longer than
+// `http.lowSpeedTime` seconds, the transfer is aborted."
+//
+// So these three numbers are ours, not borrowed, and each is justified below
+// along with what would make it wrong. They are passed per-invocation with
+// `-c`, so the user's own config is never modified and an explicit user
+// setting can still be layered on by editing this call site if it ever matters.
+
+/// Bytes/sec below which an HTTP push counts as stalled.
+///
+/// 1000 B/s. Rationale: this must sit far below any link on which a push is
+/// worth attempting (even a bad mobile connection sustains tens of KB/s) yet
+/// far above zero, so that a transfer genuinely dribbling along is not killed.
+/// A bead store push is kilobytes, so a healthy push never spends 30s under
+/// 1 KB/s — it is finished long before.
+///
+/// What would make this wrong: pushing a genuinely huge pack over a link slower
+/// than 1 KB/s sustained. That push would be aborted here. If that ever becomes
+/// a real workload, this needs to be configurable rather than merely lowered.
+const PUSH_LOW_SPEED_LIMIT_BYTES: u64 = 1000;
+
+/// Seconds a push may sit under [`PUSH_LOW_SPEED_LIMIT_BYTES`] before git kills
+/// it.
+///
+/// 30 s. Deliberately shorter than the daemon's 60 s `SyncWait` default
+/// deadline, so a stalled HTTP push surfaces as a real *failure carrying git's
+/// own message* well inside the window a waiting `bn sync` is prepared to sit
+/// for — instead of an uninformative client-side timeout. Long enough to ride
+/// out a slow server-side pack negotiation on a big repo.
+const PUSH_LOW_SPEED_TIME_SECS: u64 = 30;
+
+/// Hard ceiling on one `git push` invocation, enforced by killing the process.
+///
+/// 120 s. This is the backstop for everything
+/// [`PUSH_LOW_SPEED_LIMIT_BYTES`]/[`PUSH_LOW_SPEED_TIME_SECS`] cannot see:
+/// ssh transports (the `http.*` settings simply do not apply), DNS resolution,
+/// TCP connect, and TLS handshake — all of which happen before curl has any
+/// transfer rate to measure.
+///
+/// Sized at 4x the low-speed window so it never pre-empts the cleaner
+/// mechanism: for an http remote git should always abort itself first and hand
+/// us a real error message, and this watchdog should only ever fire on the
+/// cases git cannot self-abort. Killing a push is the blunt option — we lose
+/// git's diagnosis and learn only "it never answered" — so it is the last
+/// resort, not the first.
+///
+/// What would make this wrong: a legitimate push that takes over two minutes
+/// (very large initial history over a thin link). It would be killed mid-flight
+/// and retried on backoff, never converging. The store would need this raised.
+const PUSH_WATCHDOG: Duration = Duration::from_secs(120);
 
 // =============================================================================
 // Error + ErrorCode
@@ -866,19 +936,144 @@ impl Repository {
     /// semantics. No `git` subprocess is spawned and no network protocol runs.
     ///
     /// **Network** remotes (`http(s)`/`ssh`/`git`/scp-like `user@host:path`)
-    /// return [`ErrorCode::PushUnsupported`]: gix 0.86 has no high-level push or
-    /// `gix-protocol` send-pack helper (upstream #306).
+    /// are delegated to the system `git` binary — see [`Self::subprocess_push`].
+    /// gix 0.86 has no high-level push or `gix-protocol` send-pack helper
+    /// (upstream #306), so there is no in-process path for these.
     pub fn push_refspecs(&self, url: &str, refspecs: &[String]) -> Result<(), Error> {
         match local_repo_path(url) {
             Some(path) => self.local_push(&path, refspecs),
-            None => Err(Error::new(
-                ErrorCode::PushUnsupported,
-                format!(
-                    "push to non-local remote '{url}' is unsupported: gix 0.86 has no high-level \
-                     push / send-pack (upstream #306); only local (file://) push is implemented"
-                ),
-            )),
+            None => self.subprocess_push(url, refspecs),
         }
+    }
+
+    /// Push `refspecs` to a network remote by invoking the system `git`.
+    ///
+    /// # Why a subprocess
+    /// gix 0.86 implements no high-level push and no `gix-protocol` send-pack
+    /// helper (upstream #306). Reintroducing `git-2`/libgit-2 would restore the
+    /// C toolchain this shim exists to remove, and would break the Windows /
+    /// Android-Termux builds that motivated the fork. Delegating only this one
+    /// operation keeps the build pure-Rust and, just as importantly, inherits
+    /// the user's credential setup (credential helpers, netrc, SSH agent)
+    /// rather than reimplementing it.
+    ///
+    /// # Behaviour
+    /// Refspecs are passed through verbatim; `git push` accepts the same
+    /// `[+]<src>:<dst>` syntax [`parse_refspec`] handles, including the empty
+    /// source (`:dst`) form meaning delete.
+    ///
+    /// `GIT_TERMINAL_PROMPT=0` is set deliberately. stdout/stderr are captured
+    /// for error reporting, so an interactive credential prompt would be
+    /// invisible and would hang the caller indefinitely — a particularly bad
+    /// failure mode under the daemon. Failing fast with git's own
+    /// "could not read Username" message is the better trade. Users with a
+    /// configured credential helper, netrc, or SSH agent are unaffected.
+    ///
+    /// A missing `git` yields [`ErrorCode::PushUnsupported`], preserving the
+    /// error code callers already gate on.
+    ///
+    /// # Windows: no popup window
+    /// The child is spawned through [`crate::proc::output_before_deadline`],
+    /// which applies [`crate::proc::dun_popup`] (`CREATE_NO_WINDOW`) itself.
+    /// Without it the daemon — which owns no console — would make Windows
+    /// allocate `git.exe` a fresh console window on every debounced auto-sync
+    /// (kopitiam#29). Safe to suppress precisely because stdout/stderr are
+    /// captured and `GIT_TERMINAL_PROMPT=0` rules out any interactive prompt
+    /// that would need a visible window.
+    ///
+    /// # Two independent stall guards (kopitiam#25)
+    /// A `git push` that stalls used to hang the daemon's sync lane forever,
+    /// which in turn hung `bn sync` forever. Both belts are worn:
+    ///
+    /// 1. **git's own low-speed abort** — `http.lowSpeedLimit` /
+    ///    `http.lowSpeedTime`, passed with `-c` so we never touch the user's
+    ///    config. This is the *better* mechanism for the common case: it is
+    ///    curl aborting a transfer it knows has gone quiet, so we get git's own
+    ///    error message rather than a corpse and a guess.
+    /// 2. **A process watchdog** — [`PUSH_WATCHDOG`]. Covers everything the
+    ///    low-speed check cannot see: ssh transports (not http, so the
+    ///    `http.*` settings do not apply), DNS, and any hang before a byte of
+    ///    transfer starts.
+    fn subprocess_push(&self, url: &str, refspecs: &[String]) -> Result<(), Error> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg(format!("--git-dir={}", self.path().display()));
+        if let Some(workdir) = self.workdir() {
+            cmd.arg(format!("--work-tree={}", workdir.display()));
+        }
+        // `-c` must come before the subcommand. These only bind http(s)
+        // transports; on ssh/file remotes git ignores them and the watchdog
+        // below is the only guard.
+        cmd.arg("-c")
+            .arg(format!("http.lowSpeedLimit={PUSH_LOW_SPEED_LIMIT_BYTES}"))
+            .arg("-c")
+            .arg(format!("http.lowSpeedTime={PUSH_LOW_SPEED_TIME_SECS}"));
+        cmd.arg("push").arg(url).args(refspecs);
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+        let outcome = crate::proc::output_before_deadline(&mut cmd, PUSH_WATCHDOG).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::new(
+                    ErrorCode::PushUnsupported,
+                    format!(
+                        "push to non-local remote '{url}' requires the `git` binary, which was \
+                         not found on PATH: gix 0.86 has no high-level push / send-pack \
+                         (upstream #306), so only local (file://) push is in-process"
+                    ),
+                )
+            } else {
+                Error::new(
+                    ErrorCode::Other,
+                    format!("failed to run `git push` for remote '{url}': {e}"),
+                )
+            }
+        })?;
+
+        let output = match outcome {
+            crate::proc::DeadlineOutcome::Finished(output) => output,
+            crate::proc::DeadlineOutcome::TimedOut {
+                waited,
+                stdout,
+                stderr,
+            } => {
+                // Whatever git managed to say before we shot it is the only
+                // clue the user gets, so take it from either stream — progress
+                // reporting lands on stderr, but a stalled `push` can leave its
+                // last words on stdout.
+                let stderr = String::from_utf8_lossy(&stderr);
+                let tail = match stderr.trim() {
+                    "" => String::from_utf8_lossy(&stdout).trim().to_string(),
+                    text => text.to_string(),
+                };
+                let tail = if tail.is_empty() {
+                    "(git printed nothing before it was killed)".to_string()
+                } else {
+                    tail
+                };
+                return Err(Error::new(
+                    ErrorCode::Other,
+                    format!(
+                        "`git push` to '{url}' was killed after {}s with no result: {tail}",
+                        waited.as_secs()
+                    ),
+                ));
+            }
+        };
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            detail.to_string()
+        };
+        Err(Error::new(
+            ErrorCode::Other,
+            format!("`git push` to '{url}' failed ({}): {detail}", output.status),
+        ))
     }
 
     /// Push every refspec to a local (on-disk) target repository.
@@ -1329,9 +1524,9 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     }
 }
 
-/// Message for the still-gated case: push to a *network* remote. Local (file://)
-/// push is implemented; only `http(s)`/`ssh`/`git`/scp-like remotes are gated,
-/// because gix 0.86 has no high-level push / `gix-protocol` send-pack (upstream
-/// #306).
+/// Message for the one remaining gated case: a *network* push attempted on a
+/// host with no `git` binary on `PATH`. Local (`file://`) push runs in-process
+/// via gix; network push delegates to `git`, because gix 0.86 has no
+/// high-level push / `gix-protocol` send-pack (upstream #306).
 pub const PUSH_UNSUPPORTED_MSG: &str =
-    "push to non-local remote unsupported: gix 0.86 has no high-level push / send-pack (upstream #306)";
+    "push to non-local remote requires the `git` binary, which was not found on PATH: gix 0.86 has no high-level push / send-pack (upstream #306)";

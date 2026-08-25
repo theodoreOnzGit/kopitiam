@@ -10,6 +10,27 @@ use crate::surface::query::Filters;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmptyPayload {}
 
+/// How long `bn sync` is willing to sit and wait.
+///
+/// Serialised flattened into `Request::SyncWait`, and `#[serde(default)]` so an
+/// old client that sends nothing still talks to a new daemon — it just gets the
+/// daemon's own default deadline instead of an unbounded park.
+///
+/// Semantics of `timeout_ms`:
+/// * `None`   - client didn't say; daemon applies its default.
+/// * `Some(0)` - don't wait one bit, answer with whatever the lane state is
+///   right now. Same "0 means poll, don't block" convention as
+///   `ReadConsistency::wait_timeout_ms`.
+/// * `Some(n)` - park at most `n` ms, then answer with the lane state.
+///
+/// There is deliberately NO "wait forever" value. That was the old behaviour
+/// and it is exactly the bug (kopitiam#25).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncWaitPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InitPayload {
     #[serde(default)]

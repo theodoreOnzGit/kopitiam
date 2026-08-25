@@ -250,7 +250,7 @@ impl IpcClient {
     }
 
     /// Override the program/args used for autostart.
-    /// Default spawns `bd daemon run`.
+    /// Default spawns `bn daemon run`.
     ///
     /// Override programs are treated as launcher-compatible wrappers: the
     /// client waits for the socket instead of assuming the process itself must
@@ -518,7 +518,7 @@ fn daemon_command() -> AutostartCommand {
     }
 
     AutostartCommand::direct(
-        PathBuf::from("bd"),
+        PathBuf::from("bn"),
         vec![OsString::from("daemon"), OsString::from("run")],
     )
 }
@@ -1268,6 +1268,308 @@ fn try_restart_daemon_by_socket(socket: &PathBuf) -> Result<(), IpcError> {
     Ok(())
 }
 
+// =============================================================================
+// Daemon lifecycle — the supported way to bounce the daemon
+// =============================================================================
+//
+// Everything below is a thin, PUBLIC wrapper over the kill/restart machinery
+// that already sat privately in this file, reachable only from the IPC retry
+// path. No new stopping mechanism was invented here — `kill_daemon_forcefully`
+// and `try_restart_daemon_by_socket` still own the actual behaviour, so the
+// retry path and `bn daemon stop` cannot drift apart.
+//
+// Why this exists at all: `bn sync` once hung and there was no supported way to
+// bounce the daemon. The only recovery was `pkill -f "bn daemon run"` and hope
+// the next command autostarts a clean one. For a user's own issue tracker, that
+// is not an acceptable recovery path, so the mechanism got a front door.
+
+/// What [`stop_daemon_at`] actually did, so the caller can tell the user straight.
+///
+/// All three outcomes are `Ok`. Stopping a daemon that is already gone is not a
+/// failure — it is the end state you asked for, so it is success. This matters
+/// more than it sounds: scripts and session-close hooks call stop blind, and if
+/// "already stopped" were an error everybody would just append `|| true` and
+/// throw away the real errors along with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonStopOutcome {
+    /// Got a live one and now it's gone. `pid` is the process we signalled.
+    Stopped { pid: u32 },
+    /// Nothing alive, but got leftover rubbish — a socket file, a meta file, or
+    /// both — from a daemon that died badly. We cleared it. `pid` is the dead
+    /// pid the meta file named, `None` when no meta file was there to name one.
+    StaleCleaned { pid: Option<u32> },
+    /// Nothing running, nothing to clean. Already clean slate.
+    NotRunning,
+}
+
+impl DaemonStopOutcome {
+    /// The pid this outcome talks about, if any. `Stopped` always has one, a
+    /// `StaleCleaned` may (it read the dead pid out of the meta file),
+    /// `NotRunning` never does.
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            DaemonStopOutcome::Stopped { pid } => Some(*pid),
+            DaemonStopOutcome::StaleCleaned { pid } => *pid,
+            DaemonStopOutcome::NotRunning => None,
+        }
+    }
+
+    /// True only when a live daemon got stopped by this call. Use this, not
+    /// `pid().is_some()` — a `StaleCleaned` also carries a pid, but that one
+    /// was already dead before we showed up.
+    pub fn stopped_a_live_daemon(&self) -> bool {
+        matches!(self, DaemonStopOutcome::Stopped { .. })
+    }
+}
+
+/// Stop whatever daemon is serving `socket`. Idempotent — see [`DaemonStopOutcome`].
+///
+/// # The contract: when this returns Ok, the process is GONE
+///
+/// Not "the socket stopped answering" — gone, reaped, holding nothing. See
+/// [`wait_for_daemon_pid_gone`] for the bug that taught us the difference. Any
+/// caller may immediately start a replacement and expect it to take the store
+/// lock. If we cannot make that true, this returns `Err` rather than lie.
+///
+/// # Where the pid come from, and the one caveat
+///
+/// From `daemon.meta.json` sitting next to the socket, which is what the daemon
+/// itself wrote at startup. Same source the IPC retry path has always trusted.
+/// The caveat, stated plainly because it is a real (if small) hazard: if a
+/// daemon died without cleaning up **and** the OS recycled its pid onto some
+/// unrelated process, we would signal that innocent process. Cannot rule this
+/// out portably — Linux `/proc/<pid>/cmdline` is no help on Windows — the
+/// window is tiny, and the exposure is exactly what it already was before this
+/// function existed. If it ever bites, the fix is for the daemon to write
+/// something unforgeable into the meta (exe path + process start time) and for
+/// this function to check it before signalling.
+///
+/// # Why we don't ping the socket first
+///
+/// Pinging would give us the pid straight from the horse's mouth, no reuse
+/// hazard. But a *hung* daemon accepts the connection and then never answers —
+/// and a hung daemon is precisely the state this command exists to rescue. A
+/// ping-first design would therefore hang in the one case that matters most.
+/// So: meta file, no round trip.
+pub fn stop_daemon_at(socket: &PathBuf) -> Result<DaemonStopOutcome, IpcError> {
+    let meta_path = socket.with_file_name("daemon.meta.json");
+
+    let Some(meta) = read_daemon_meta_at(socket) else {
+        // No meta, but a socket (or an unreadable meta) still lying around:
+        // that's a corpse. Clear it so the next autostart gets a clean run.
+        if socket.exists() || meta_path.exists() {
+            try_restart_daemon_by_socket(socket)?;
+            return Ok(DaemonStopOutcome::StaleCleaned { pid: None });
+        }
+        return Ok(DaemonStopOutcome::NotRunning);
+    };
+
+    let was_alive = daemon_pid_alive(meta.pid);
+    kill_daemon_forcefully(meta.pid, socket)?;
+    wait_for_daemon_pid_gone(meta.pid)?;
+
+    // `kill_daemon_forcefully` can leave `daemon.meta.json` behind. Clear both
+    // once the process is confirmed dead, otherwise every later `stop` keeps
+    // reporting "cleaned stale state" forever instead of the honest
+    // "nothing running".
+    let _ = fs::remove_file(socket);
+    let _ = fs::remove_file(&meta_path);
+
+    if was_alive {
+        Ok(DaemonStopOutcome::Stopped { pid: meta.pid })
+    } else {
+        Ok(DaemonStopOutcome::StaleCleaned {
+            pid: Some(meta.pid),
+        })
+    }
+}
+
+/// Grace period for the daemon process to actually exit after
+/// `kill_daemon_forcefully` reports its socket has gone.
+///
+/// Provenance for the number, because a magic constant with no source is a bug
+/// that hasn't fired yet: measured on this workspace (55-bead store), a healthy
+/// daemon exits **54-60 ms** after SIGTERM — three runs, 60/54/54 ms. Ten
+/// seconds is ~170x that, headroom for a much bigger store flushing its WAL and
+/// checkpointing on the way out. Waiting is strictly better than killing early
+/// here: SIGKILL mid-flush costs recovery work on the next open.
+const DAEMON_GRACEFUL_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long we give it after SIGKILL before admitting defeat. SIGKILL cannot be
+/// caught, so anything past a second or two means the process is stuck in
+/// uninterruptible I/O, which no amount of extra waiting fixes.
+const DAEMON_FORCED_EXIT_WAIT: Duration = Duration::from_secs(3);
+
+/// Block until process `pid` is really gone, escalating to SIGKILL if it drags.
+///
+/// # Why this exists — a bug the dogfood run actually caught
+///
+/// `kill_daemon_forcefully` waits for the **socket** to stop accepting, not for
+/// the **process** to exit. Those are not the same instant, and the gap is
+/// where the damage lives: `bn daemon stop` reported `daemon stopped (pid
+/// 109982)` while 109982 was still winding down, the very next command
+/// autostarted a fresh daemon, and that one died with
+/// `store lock already held for f81c87f3-… at …/store.lock`. The old process
+/// hadn't released the store lock yet, because it hadn't finished exiting.
+///
+/// So `stop` has to mean *stopped*. Socket-gone is not good enough, and neither
+/// is a "usually fine" sleep — the whole point of this command is to be the one
+/// recovery path you can trust when the daemon is misbehaving.
+///
+/// Escalation is not paranoia either: during the same session an orphaned
+/// daemon (one whose socket file had been removed out from under it) sat
+/// through a SIGTERM for over ten seconds and only died to SIGKILL.
+fn wait_for_daemon_pid_gone(pid: u32) -> Result<(), IpcError> {
+    if wait_for_pid_exit(pid, DAEMON_GRACEFUL_EXIT_WAIT) {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "daemon pid {} still alive {:?} after stop, sending SIGKILL",
+        pid,
+        DAEMON_GRACEFUL_EXIT_WAIT
+    );
+    force_kill_pid(pid);
+
+    if wait_for_pid_exit(pid, DAEMON_FORCED_EXIT_WAIT) {
+        return Ok(());
+    }
+
+    // Refuse to claim success. A caller told "stopped" here would go on to
+    // start a replacement that then loses the store lock — exactly the failure
+    // this function was written to stop.
+    Err(IpcError::DaemonUnavailable(format!(
+        "daemon pid {pid} is still running after SIGTERM and SIGKILL; \
+         it may be stuck in uninterruptible I/O"
+    )))
+}
+
+/// Poll until `pid` is gone or `timeout` runs out. `true` means gone.
+///
+/// 25 ms poll against a ~55 ms typical exit: fine-grained enough that the
+/// common case costs one or two polls, coarse enough not to spin the CPU while
+/// waiting out a slow shutdown.
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = SystemTime::now() + timeout;
+    while SystemTime::now() < deadline {
+        if !daemon_pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    !daemon_pid_alive(pid)
+}
+
+/// The strongest "die now" the platform gives us. Best effort: a process that
+/// already exited is the outcome we wanted, so a failed signal is not an error
+/// here — the caller re-checks liveness rather than trusting this return.
+fn force_kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        // No signals on Windows; `terminate` is the TerminateProcess path
+        // `kill_daemon_forcefully` already uses, so behaviour stays matched.
+        let _ = super::proc_util::terminate(pid);
+    }
+}
+
+/// [`stop_daemon_at`] on the default socket, i.e. what `bn daemon stop` calls.
+pub fn stop_daemon() -> Result<DaemonStopOutcome, IpcError> {
+    let socket = socket_path();
+    stop_daemon_at(&socket)
+}
+
+/// Ask a running daemon who it is, without autostarting one.
+///
+/// `Ping` skips the version handshake (see `send_request_over_stream`), so this
+/// still gets an answer out of a daemon whose version we would otherwise
+/// reject. Falls back to the meta file when the daemon cannot be reached — the
+/// answer is then second-hand, so treat it as "who was here", not "who is
+/// serving".
+fn live_daemon_info_at(socket: &PathBuf) -> Option<crate::api::DaemonInfo> {
+    match send_request_no_autostart_at(socket, &Request::Ping) {
+        Ok(Response::Ok {
+            ok: ResponsePayload::Query(QueryResult::DaemonInfo(info)),
+        }) => Some(info),
+        _ => read_daemon_meta_at(socket),
+    }
+}
+
+/// Make sure a daemon of *this* build's version is up and serving `socket`,
+/// starting one if there is none, and only come back once it really answers.
+///
+/// The order of the two steps is the whole point:
+///
+/// 1. `connect()` is what triggers autostart — it spawns `<current_exe> daemon
+///    run` (see `daemon_command`). Nothing else here starts a process.
+/// 2. `wait_for_daemon_ready` is what makes the promise true. Without it we
+///    would return while the child is still opening its store, and the very
+///    next command would race a daemon that isn't serving yet. Fire-and-hope is
+///    not good enough for a restart the user is watching.
+///
+/// Returns the identity of the daemon now serving — pid included, which is how
+/// `bn daemon restart` can show the caller it genuinely bounced.
+pub fn ensure_daemon_at(socket: &PathBuf) -> Result<crate::api::DaemonInfo, IpcError> {
+    let expected = env!("CARGO_PKG_VERSION");
+    let client = IpcClient::for_socket_path(socket.clone()).with_autostart(true);
+    // Only wanted the autostart side effect; close the connection straight away.
+    drop(client.connect()?);
+    client.wait_for_daemon_ready(expected)?;
+    live_daemon_info_at(socket).ok_or_else(|| {
+        IpcError::DaemonUnavailable(format!(
+            "daemon on {} is serving but would not say who it is",
+            socket.display()
+        ))
+    })
+}
+
+/// [`ensure_daemon_at`] on the default socket.
+pub fn ensure_daemon() -> Result<crate::api::DaemonInfo, IpcError> {
+    let socket = socket_path();
+    ensure_daemon_at(&socket)
+}
+
+/// Both halves of a restart, so the caller can prove the bounce really happened.
+#[derive(Debug, Clone)]
+pub struct DaemonRestartOutcome {
+    /// What the stop half found and did. `NotRunning` here is fine — restart
+    /// with nothing running just means start.
+    pub stopped: DaemonStopOutcome,
+    /// The daemon now serving, confirmed ready.
+    pub started: crate::api::DaemonInfo,
+}
+
+impl DaemonRestartOutcome {
+    /// pid of the daemon we killed, if there was one to kill.
+    pub fn old_pid(&self) -> Option<u32> {
+        self.stopped.pid()
+    }
+
+    /// pid of the daemon now serving.
+    pub fn new_pid(&self) -> u32 {
+        self.started.pid
+    }
+}
+
+/// Stop then start the daemon on `socket`, returning only once the new one is
+/// serving. If nothing was running, this is just a start — not an error.
+pub fn restart_daemon_at(socket: &PathBuf) -> Result<DaemonRestartOutcome, IpcError> {
+    let stopped = stop_daemon_at(socket)?;
+    let started = ensure_daemon_at(socket)?;
+    Ok(DaemonRestartOutcome { stopped, started })
+}
+
+/// [`restart_daemon_at`] on the default socket, i.e. what `bn daemon restart` calls.
+pub fn restart_daemon() -> Result<DaemonRestartOutcome, IpcError> {
+    let socket = socket_path();
+    restart_daemon_at(&socket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,5 +1788,170 @@ mod tests {
             "default socket parent perms changed to {:o}",
             mode
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Daemon lifecycle
+    //
+    // Every one of these runs against a socket path inside a TempDir where no
+    // daemon ever existed, so nothing here can touch the real daemon of
+    // whoever is running the tests. That isolation is the point: the whole
+    // contract being tested is "stop must be safe to call blind".
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn stop_daemon_on_empty_dir_reports_not_running() {
+        let temp = TempDir::new().expect("temp dir");
+        let socket = temp.path().join("daemon.sock");
+
+        let outcome = stop_daemon_at(&socket).expect("stop must not error when nothing is running");
+        assert_eq!(outcome, DaemonStopOutcome::NotRunning);
+        assert_eq!(outcome.pid(), None);
+        assert!(!outcome.stopped_a_live_daemon());
+    }
+
+    #[test]
+    fn stop_daemon_is_idempotent() {
+        // Scripts and session-close hooks call `stop` blind. Calling it twice
+        // must not start being an error on the second go.
+        let temp = TempDir::new().expect("temp dir");
+        let socket = temp.path().join("daemon.sock");
+
+        for _ in 0..3 {
+            assert_eq!(
+                stop_daemon_at(&socket).expect("repeat stop stays Ok"),
+                DaemonStopOutcome::NotRunning
+            );
+        }
+    }
+
+    #[test]
+    fn stop_daemon_clears_stale_socket_without_meta() {
+        // A socket file with no `daemon.meta.json` next to it: a daemon died
+        // badly and left a corpse. Nothing to signal, so just clear it — and
+        // say so, rather than claiming we stopped something.
+        let temp = TempDir::new().expect("temp dir");
+        let socket = temp.path().join("daemon.sock");
+        fs::write(&socket, b"").expect("write stale socket file");
+
+        let outcome = stop_daemon_at(&socket).expect("stale socket cleanup is not an error");
+        assert_eq!(outcome, DaemonStopOutcome::StaleCleaned { pid: None });
+        assert!(!socket.exists(), "stale socket file should be gone");
+
+        // Second call: nothing left at all.
+        assert_eq!(
+            stop_daemon_at(&socket).expect("second stop stays Ok"),
+            DaemonStopOutcome::NotRunning
+        );
+    }
+
+    #[test]
+    fn stop_daemon_clears_meta_naming_a_dead_pid() {
+        // Meta file naming a pid that is long gone. We must NOT report
+        // `Stopped` — we stopped nothing — but we must clear the leftovers and
+        // still exit Ok.
+        let temp = TempDir::new().expect("temp dir");
+        let socket = temp.path().join("daemon.sock");
+        let meta_path = socket.with_file_name("daemon.meta.json");
+        // pid 0 is never a normal user process on unix, and `kill(0, ...)`
+        // means "the whole process group", so use a pid we can be confident is
+        // both invalid to signal and not alive.
+        let dead_pid = dead_pid_for_test();
+        let meta = crate::api::DaemonInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: IPC_PROTOCOL_VERSION,
+            pid: dead_pid,
+            started_at_ms: None,
+        };
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).expect("write meta");
+
+        let outcome = stop_daemon_at(&socket).expect("dead-pid cleanup is not an error");
+        assert_eq!(
+            outcome,
+            DaemonStopOutcome::StaleCleaned {
+                pid: Some(dead_pid)
+            }
+        );
+        assert!(!outcome.stopped_a_live_daemon());
+        assert!(!meta_path.exists(), "stale meta file should be gone");
+
+        assert_eq!(
+            stop_daemon_at(&socket).expect("second stop stays Ok"),
+            DaemonStopOutcome::NotRunning
+        );
+    }
+
+    /// A pid that is reliably not a live process on this machine.
+    ///
+    /// Walking down from the max pid is the trick: fresh pids are handed out
+    /// from the low end and wrap, so the very top of the range is almost never
+    /// occupied. We still check liveness and keep walking, so the test cannot
+    /// go flaky if some process really is sitting up there.
+    fn dead_pid_for_test() -> u32 {
+        let mut candidate = 4_194_303u32; // Linux PID_MAX_LIMIT
+        while candidate > 1_000 {
+            if !daemon_pid_alive(candidate) {
+                return candidate;
+            }
+            candidate -= 1;
+        }
+        panic!("could not find a dead pid to test with");
+    }
+
+    #[test]
+    fn wait_for_pid_exit_returns_immediately_for_a_dead_pid() {
+        let dead = dead_pid_for_test();
+        let started = Instant::now();
+        assert!(wait_for_pid_exit(dead, Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a dead pid must not cost us the whole timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn wait_for_pid_exit_gives_up_on_a_live_pid() {
+        // Ourselves: guaranteed alive, guaranteed we won't kill it.
+        let started = Instant::now();
+        assert!(!wait_for_pid_exit(
+            std::process::id(),
+            Duration::from_millis(120)
+        ));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "must actually wait out the timeout before declaring the pid alive, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_outcome_pid_accessors_are_honest() {
+        assert_eq!(DaemonStopOutcome::Stopped { pid: 42 }.pid(), Some(42));
+        assert!(DaemonStopOutcome::Stopped { pid: 42 }.stopped_a_live_daemon());
+        assert_eq!(
+            DaemonStopOutcome::StaleCleaned { pid: Some(42) }.pid(),
+            Some(42)
+        );
+        // A StaleCleaned carries a pid but stopped nothing — callers that want
+        // "did we actually kill something" must not read `pid().is_some()`.
+        assert!(!DaemonStopOutcome::StaleCleaned { pid: Some(42) }.stopped_a_live_daemon());
+        assert_eq!(DaemonStopOutcome::StaleCleaned { pid: None }.pid(), None);
+        assert_eq!(DaemonStopOutcome::NotRunning.pid(), None);
+    }
+
+    #[test]
+    fn restart_outcome_reports_both_pids() {
+        let outcome = DaemonRestartOutcome {
+            stopped: DaemonStopOutcome::Stopped { pid: 4242 },
+            started: crate::api::DaemonInfo {
+                version: "0.1.4".to_string(),
+                protocol_version: IPC_PROTOCOL_VERSION,
+                pid: 9999,
+                started_at_ms: None,
+            },
+        };
+        assert_eq!(outcome.old_pid(), Some(4242));
+        assert_eq!(outcome.new_pid(), 9999);
     }
 }

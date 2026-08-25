@@ -366,11 +366,17 @@ impl Daemon {
             }
             Err(e) => {
                 tracing::error!("sync failed for {:?}: {:?}", remote, e);
+                // Capture the reason BEFORE we take the &mut borrow — a parked
+                // `bn sync` waiter gets woken with this string, so losing it
+                // here means the user is back to "hangs and says nothing"
+                // (kopitiam#25).
+                let reason = e.to_string();
+                let failed_at_wall_ms = self.clock().wall_ms();
                 let Some(session) = self.store_session_by_id_mut(store_id) else {
                     return;
                 };
                 let repo_state = session.lane_mut();
-                repo_state.fail_sync();
+                repo_state.fail_sync(reason, failed_at_wall_ms);
                 backoff_ms = Some(repo_state.backoff_ms());
             }
         }

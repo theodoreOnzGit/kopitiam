@@ -1,4 +1,10 @@
-//! `bd upgrade` - install latest binary and restart daemon.
+//! `bn upgrade` - report how to upgrade `bn`.
+//!
+//! The host side no longer installs anything: kopi-beans ships no release
+//! artifacts and the inherited beads-rs self-upgrade targeted the wrong binary
+//! entirely (see `crate::upgrade` and kopitiam#14). `run_upgrade` therefore
+//! always fails with a message naming `cargo install kopi-beans`, and the
+//! rendering below is kept only so the CLI/host protocol stays whole.
 
 use clap::Args;
 use serde::Serialize;
@@ -51,13 +57,13 @@ where
 fn render_human(outcome: &UpgradeOutcome) -> crate::cli_surface::Result<()> {
     if !outcome.updated {
         return print_line(&format!(
-            "bd is up to date (version {}).",
+            "bn is up to date (version {}).",
             outcome.from_version
         ));
     }
 
     print_line(&format!(
-        "Upgraded bd from {} to {} using {}.",
+        "Upgraded bn from {} to {} using {}.",
         outcome.from_version,
         outcome.to_version.as_deref().unwrap_or("unknown"),
         method_str(outcome.method),

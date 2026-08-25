@@ -103,7 +103,7 @@ impl CliHostBackend for BeadsRsCliBackend {
                 return Err(Error::Op(OpError::ValidationFailed {
                     field: "migrate".into(),
                     reason: format!(
-                        "{ref_name} is missing; run `bd migrate from-go --input <path>` or sync from remote first"
+                        "{ref_name} is missing; run `bn migrate from-go --input <path>` or sync from remote first"
                     ),
                 }));
             }
@@ -123,11 +123,14 @@ impl CliHostBackend for BeadsRsCliBackend {
             Err(err) => return Err(err.into()),
         };
 
-        let mut warnings = migrated.warnings;
+        let warnings = migrated.warnings;
+        // The cache-reset note is a consequence of a successful migration, not
+        // a reason to refuse one, so it belongs with the non-blocking notices.
+        let mut notices = migrated.notices;
         let previous_store_format =
             crate::core::StoreMetaVersions::STORE_FORMAT_VERSION.saturating_sub(1);
         if previous_store_format > 0 {
-            warnings.push(format!(
+            notices.push(format!(
                 "local daemon-store caches at store_format_version {previous_store_format} will reset and rebuild from repo truth on next load"
             ));
         }
@@ -147,6 +150,7 @@ impl CliHostBackend for BeadsRsCliBackend {
                 sync::MigratePushDisposition::SkippedNoRemote => PushDisposition::SkippedNoRemote,
             },
             warnings,
+            notices,
         })
     }
 

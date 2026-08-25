@@ -777,6 +777,43 @@ pub mod details {
         pub current_applied: Watermarks<Applied>,
     }
 
+    /// Why `bn sync` stopped waiting.
+    ///
+    /// Every field here exists so the user can act on it without going to dig
+    /// in the daemon log. `bn sync` used to just hang and print nothing
+    /// (kopitiam#25) — that is the thing this struct is here to prevent, so
+    /// don't quietly drop fields from it.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SyncWaitDetails {
+        /// Did we give up on the clock (`timeout`), or did the sync itself blow
+        /// up (`failed`)?
+        pub outcome: SyncWaitOutcome,
+        /// Remote the lane is syncing to, verbatim.
+        pub remote: String,
+        /// How long the waiter actually sat parked before we answered.
+        pub waited_ms: u64,
+        /// Lane still has unpushed local changes.
+        pub dirty: bool,
+        /// A git sync attempt is running RIGHT NOW (so a timeout here does not
+        /// mean nothing is happening — the daemon keeps going).
+        pub sync_in_progress: bool,
+        /// Failures in a row since the last success. 0 means the lane is just
+        /// slow, not broken.
+        pub consecutive_failures: u32,
+        /// Rendered error from the most recent failed attempt, if there was one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub last_error: Option<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SyncWaitOutcome {
+        /// A sync attempt failed while we were waiting on it.
+        Failed,
+        /// Deadline hit before the lane went clean.
+        Timeout,
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RequireMinSeenUnsatisfiedDetails {
         pub required: Watermarks<Applied>,

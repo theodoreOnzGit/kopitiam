@@ -1,10 +1,10 @@
-//! `bd setup` - Setup integration with AI editors.
+//! `bn setup` - Setup integration with AI editors.
 //!
 //! Subcommands:
-//! - `bd setup claude` - Claude Code hooks
-//! - `bd setup cursor` - Cursor IDE rules
-//! - `bd setup aider` - Aider configuration
-//! - `bd setup codex|gemini|opencode|windsurf` - Additional file-based recipes
+//! - `bn setup claude` - Claude Code hooks
+//! - `bn setup cursor` - Cursor IDE rules
+//! - `bn setup aider` - Aider configuration
+//! - `bn setup codex|gemini|opencode|windsurf` - Additional file-based recipes
 
 use std::fs;
 use std::io::Write;
@@ -53,7 +53,7 @@ pub struct SetupClaudeArgs {
     #[arg(long)]
     pub check: bool,
 
-    /// Remove bd hooks from Claude settings.
+    /// Remove bn hooks from Claude settings.
     #[arg(long)]
     pub remove: bool,
 }
@@ -72,6 +72,27 @@ pub struct SetupRecipeArgs {
 // =============================================================================
 // Claude Code integration
 // =============================================================================
+
+/// The hook command `bn setup claude` registers with Claude Code.
+///
+/// It must name the binary that is actually installed. kopi-beans up to and
+/// including 0.1.1 inherited beads-rs's [`LEGACY_HOOK_COMMAND`] verbatim, so
+/// `bn setup claude` wrote a hook invoking `bd` — a binary a kopi-beans-only
+/// machine does not have, making the generated hook fail on every session start
+/// (kopitiam#14).
+const HOOK_COMMAND: &str = "bn prime";
+
+/// The hook command kopi-beans <= 0.1.1 wrote by mistake.
+///
+/// Detected and reported, never rewritten or deleted: on a machine that has
+/// beads-rs installed this exact hook may be a deliberate, working `bd` hook
+/// belonging to the other tracker, and silently removing another tool's
+/// configuration is the same class of cross-tool damage as the `bn upgrade`
+/// bug. The user is told about it and decides.
+const LEGACY_HOOK_COMMAND: &str = "bd prime";
+
+/// Hook events `bn` registers itself for.
+const HOOK_EVENTS: [&str; 2] = ["SessionStart", "PreCompact"];
 
 #[derive(Clone, Copy)]
 struct FileRecipe {
@@ -123,7 +144,7 @@ fn install_claude(project: bool) -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| validation_error("hooks", "hooks is not an object"))?;
 
-    let command = "bd prime";
+    let command = HOOK_COMMAND;
 
     // Add SessionStart hook
     match add_hook_command(hooks, "SessionStart", command) {
@@ -143,6 +164,8 @@ fn install_claude(project: bool) -> Result<()> {
         HookAddOutcome::Skipped => {}
     }
 
+    let legacy = legacy_hook_events(hooks);
+
     // Write back
     let data = serde_json::to_string_pretty(&settings)
         .map_err(|e| validation_error("setup", format!("failed to serialize settings: {e}")))?;
@@ -151,9 +174,44 @@ fn install_claude(project: bool) -> Result<()> {
     print_line("")?;
     print_line("✓ Claude Code integration installed")?;
     print_line(&format!("  Settings: {}", settings_path.display()))?;
+    print_legacy_hook_warning(&legacy)?;
     print_line("")?;
     print_line("Restart Claude Code for changes to take effect.")?;
 
+    Ok(())
+}
+
+/// Events whose hooks still invoke [`LEGACY_HOOK_COMMAND`].
+fn legacy_hook_events(hooks: &Map<String, Value>) -> Vec<&'static str> {
+    HOOK_EVENTS
+        .iter()
+        .copied()
+        .filter(|event| {
+            hooks
+                .get(*event)
+                .and_then(|h| h.as_array())
+                .is_some_and(|event_hooks| {
+                    event_hooks
+                        .iter()
+                        .any(|hook| hook_contains_command(hook, LEGACY_HOOK_COMMAND))
+                })
+        })
+        .collect()
+}
+
+/// Tell the user about a stale `bd prime` hook without touching it.
+fn print_legacy_hook_warning(events: &[&str]) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    print_line("")?;
+    print_line(&format!(
+        "! Found a legacy `{LEGACY_HOOK_COMMAND}` hook on: {}",
+        events.join(", ")
+    ))?;
+    print_line("  kopi-beans <= 0.1.1 wrote that hook; it invokes beads-rs, not `bn`.")?;
+    print_line("  It was left in place in case it belongs to a real beads-rs install.")?;
+    print_line("  If it does not, remove it from the settings file by hand.")?;
     Ok(())
 }
 
@@ -182,7 +240,7 @@ fn check_claude_at(global_settings: &Path, project_settings: &Path) -> Result<()
         Ok(())
     } else {
         print_line("✗ No hooks installed")?;
-        print_line("  Run: bd setup claude")?;
+        print_line("  Run: bn setup claude")?;
         Err(validation_error(
             "setup",
             "claude integration not installed",
@@ -215,9 +273,10 @@ fn remove_claude(project: bool) -> Result<()> {
         return Ok(());
     };
 
-    // Remove bd prime hooks
-    let removed_session = remove_hook_command(hooks, "SessionStart", "bd prime");
-    let removed_precompact = remove_hook_command(hooks, "PreCompact", "bd prime");
+    // Remove only OUR hooks. A `bd prime` hook is reported, never removed --
+    // see LEGACY_HOOK_COMMAND.
+    let removed_session = remove_hook_command(hooks, "SessionStart", HOOK_COMMAND);
+    let removed_precompact = remove_hook_command(hooks, "PreCompact", HOOK_COMMAND);
     if removed_session {
         print_line("✓ Removed SessionStart hook")?;
     }
@@ -225,12 +284,15 @@ fn remove_claude(project: bool) -> Result<()> {
         print_line("✓ Removed PreCompact hook")?;
     }
 
+    let legacy = legacy_hook_events(hooks);
+
     // Write back
     let data = serde_json::to_string_pretty(&settings)
         .map_err(|e| validation_error("setup", format!("failed to serialize settings: {e}")))?;
     atomic_write(&settings_path, data.as_bytes())?;
 
     print_line("✓ Claude hooks removed")?;
+    print_legacy_hook_warning(&legacy)?;
     Ok(())
 }
 
@@ -268,14 +330,14 @@ fn add_hook_command(hooks: &mut Map<String, Value>, event: &str, command: &str) 
         return HookAddOutcome::Skipped;
     };
 
-    // Check if bd hook already registered
+    // Check if bn hook already registered
     for hook in event_hooks.iter() {
         if hook_contains_command(hook, command) {
             return HookAddOutcome::AlreadyPresent;
         }
     }
 
-    // Add bd hook
+    // Add bn hook
     let new_hook = json!({
         "matcher": "",
         "hooks": [{
@@ -313,13 +375,17 @@ fn has_beads_hooks(settings_path: &Path) -> bool {
         return false;
     };
 
-    for event in ["SessionStart", "PreCompact"] {
+    // Only a hook that invokes `bn` counts as installed. A leftover
+    // `bd prime` hook is another tool's (or an old, broken kopi-beans') hook,
+    // and reporting it as "installed" would hide the fact that `bn` has no
+    // working hook -- exactly the kopitiam#14 failure.
+    for event in HOOK_EVENTS {
         let Some(event_hooks) = hooks.get(event).and_then(|h| h.as_array()) else {
             continue;
         };
 
         for hook in event_hooks {
-            if hook_contains_command(hook, "bd prime") {
+            if hook_contains_command(hook, HOOK_COMMAND) {
                 return true;
             }
         }
@@ -333,36 +399,36 @@ fn has_beads_hooks(settings_path: &Path) -> bool {
 // =============================================================================
 
 const CURSOR_RULES: &str = r#"# Beads Issue Tracking
-# Auto-generated by 'bd setup cursor' - do not remove these markers
+# Auto-generated by 'bn setup cursor' - do not remove these markers
 # BEGIN BEADS INTEGRATION
 
-This project uses [Beads (bd)](https://github.com/steveyegge/beads) for issue tracking.
+This project uses [kopi-beans (bn)](https://github.com/theodoreOnzGit/kopitiam) for issue tracking.
 
 ## Core Rules
-- Track ALL work in bd (never use markdown TODOs or comment-based task lists)
-- Use `bd ready` to find available work
-- Use `bd create` to track new issues/tasks/bugs
+- Track ALL work in bn (never use markdown TODOs or comment-based task lists)
+- Use `bn ready` to find available work
+- Use `bn create` to track new issues/tasks/bugs
 - Sync is automatic (~500ms) - no manual sync needed
 
 ## Quick Reference
 ```bash
-bd prime                              # Load complete workflow context
-bd ready                              # Show issues ready to work (no blockers)
-bd list --status=todo                 # List Todo issues
-bd create --title="..." --type=task  # Create new issue
-bd update <id> --status=in_progress  # Move work to In Progress
-bd close <id>                         # Mark complete
-bd dep add <issue> <depends-on>       # Add dependency
+bn prime                              # Load complete workflow context
+bn ready                              # Show issues ready to work (no blockers)
+bn list --status=todo                 # List Todo issues
+bn create --title="..." --type=task  # Create new issue
+bn update <id> --status=in_progress  # Move work to In Progress
+bn close <id>                         # Mark complete
+bn dep add <issue> <depends-on>       # Add dependency
 ```
 
 ## Workflow
-1. Check for ready work: `bd ready`
-2. Move an issue into progress: `bd update <id> --status=in_progress`
+1. Check for ready work: `bn ready`
+2. Move an issue into progress: `bn update <id> --status=in_progress`
 3. Do the work
-4. Mark complete: `bd close <id>`
+4. Mark complete: `bn close <id>`
 
 ## Context Loading
-Run `bd prime` to get complete workflow documentation in AI-optimized format.
+Run `bn prime` to get complete workflow documentation in AI-optimized format.
 
 # END BEADS INTEGRATION
 "#;
@@ -413,7 +479,7 @@ fn check_cursor_at(rules_path: &Path) -> Result<()> {
         Ok(())
     } else {
         print_line("✗ Cursor integration not installed")?;
-        print_line("  Run: bd setup cursor")?;
+        print_line("  Run: bn setup cursor")?;
         Err(validation_error(
             "setup",
             "cursor integration not installed",
@@ -449,7 +515,7 @@ fn remove_cursor() -> Result<()> {
 // =============================================================================
 
 const AIDER_CONFIG: &str = r#"# Beads Issue Tracking Integration for Aider
-# Auto-generated by 'bd setup aider'
+# Auto-generated by 'bn setup aider'
 
 # Load Beads workflow instructions for the AI
 # This file is marked read-only and cached for efficiency
@@ -459,35 +525,35 @@ read:
 
 const AIDER_INSTRUCTIONS: &str = r#"# Beads Issue Tracking Instructions for AI
 
-This project uses **Beads (bd)** for issue tracking. Aider requires explicit command execution - suggest commands to the user.
+This project uses **kopi-beans (`bn`)** for issue tracking. Aider requires explicit command execution - suggest commands to the user.
 
 ## Core Workflow Rules
 
-1. **Track ALL work in bd** (never use markdown TODOs or comment-based task lists)
-2. **Suggest 'bd ready'** to find available work
-3. **Suggest 'bd create'** for new issues/tasks/bugs
+1. **Track ALL work in bn** (never use markdown TODOs or comment-based task lists)
+2. **Suggest 'bn ready'** to find available work
+3. **Suggest 'bn create'** for new issues/tasks/bugs
 4. **Sync is automatic** - no manual sync needed
 5. **ALWAYS suggest commands** - user will run them via /run
 
 ## Quick Command Reference (suggest these to user)
 
-- `bd ready` - Show unblocked issues
-- `bd list --status=todo` - List Todo issues
-- `bd create --title="..." --type=task` - Create new issue
-- `bd update <id> --status=in_progress` - Move work to In Progress
-- `bd close <id>` - Mark complete
-- `bd dep add <issue> <depends-on>` - Add dependency
+- `bn ready` - Show unblocked issues
+- `bn list --status=todo` - List Todo issues
+- `bn create --title="..." --type=task` - Create new issue
+- `bn update <id> --status=in_progress` - Move work to In Progress
+- `bn close <id>` - Mark complete
+- `bn dep add <issue> <depends-on>` - Add dependency
 
 ## Workflow Pattern to Suggest
 
-1. **Check ready work**: "Let's run `/run bd ready` to see what's available"
-2. **Move task into progress**: "Run `/run bd update <id> --status=in_progress` to start it"
+1. **Check ready work**: "Let's run `/run bn ready` to see what's available"
+2. **Move task into progress**: "Run `/run bn update <id> --status=in_progress` to start it"
 3. **Do the work**
-4. **Complete**: "Run `/run bd close <id>` when done"
+4. **Complete**: "Run `/run bn close <id>` when done"
 
 ## Context Loading
 
-Suggest `/run bd prime` for complete workflow documentation.
+Suggest `/run bn prime` for complete workflow documentation.
 
 ## Issue Types
 
@@ -514,39 +580,39 @@ Suggest `/run bd prime` for complete workflow documentation.
 
 const AIDER_README: &str = r#"# Aider + Beads Integration
 
-This project uses [Beads (bd)](https://github.com/steveyegge/beads) for issue tracking.
+This project uses [kopi-beans (bn)](https://github.com/theodoreOnzGit/kopitiam) for issue tracking.
 
 ## How This Works with Aider
 
 **Important**: Aider requires you to explicitly run commands using the `/run` command.
-The AI will **suggest** bd commands, but you must confirm them.
+The AI will **suggest** bn commands, but you must confirm them.
 
 ## Quick Start
 
 1. Check for available work:
    ```bash
-   /run bd ready
+   /run bn ready
    ```
 
 2. Create new issues:
    ```bash
-   /run bd create "Issue title" --description="Details" -t bug|feature|task -p 1
+   /run bn create "Issue title" --description="Details" -t bug|feature|task -p 1
    ```
 
 3. Move work into progress:
    ```bash
-   /run bd update bd-42 --status in_progress
+   /run bn update bd-42 --status in_progress
    ```
 
 4. Complete work:
    ```bash
-   /run bd close bd-42 --reason done --note "implemented in current branch"
+   /run bn close bd-42 --reason done --note "implemented in current branch"
    ```
 
 ## Configuration
 
-The `.aider.conf.yml` file contains instructions for the AI about bd workflow.
-The AI will read these instructions and suggest appropriate bd commands.
+The `.aider.conf.yml` file contains instructions for the AI about bn workflow.
+The AI will read these instructions and suggest appropriate bn commands.
 
 ## Workflow
 
@@ -556,7 +622,7 @@ Ask the AI questions like:
 - "Show me the details of bd-42"
 - "Mark bd-42 as complete"
 
-The AI will suggest the appropriate `bd` command, which you run via `/run`.
+The AI will suggest the appropriate `bn` command, which you run via `/run`.
 
 ## Issue Types
 
@@ -576,8 +642,8 @@ The AI will suggest the appropriate `bd` command, which you run via `/run`.
 
 ## More Information
 
-- Run `bd --help` for full command reference
-- Run `bd prime` for AI-optimized workflow context
+- Run `bn --help` for full command reference
+- Run `bn prime` for AI-optimized workflow context
 "#;
 
 pub fn handle_aider(check: bool, remove: bool) -> Result<()> {
@@ -621,7 +687,7 @@ fn install_aider() -> Result<()> {
     print_line("")?;
     print_line("Usage:")?;
     print_line("  1. Start aider in this directory")?;
-    print_line("  2. Ask AI for available work (it will suggest: /run bd ready)")?;
+    print_line("  2. Ask AI for available work (it will suggest: /run bn ready)")?;
     print_line("  3. Run suggested commands using /run")?;
     print_line("")?;
     print_line("Note: Aider requires you to explicitly run commands via /run")?;
@@ -643,7 +709,7 @@ fn check_aider_at(config_path: &Path) -> Result<()> {
         Ok(())
     } else {
         print_line("✗ Aider integration not installed")?;
-        print_line("  Run: bd setup aider")?;
+        print_line("  Run: bn setup aider")?;
         Err(validation_error("setup", "aider integration not installed"))
     }
 }
@@ -685,42 +751,42 @@ fn remove_aider() -> Result<()> {
 
 const CODEX_INSTRUCTIONS: &str = r#"# Beads Workflow for Codex
 
-This repository tracks work in `bd`.
+This repository tracks work in `bn`.
 
-- Use `bd ready` to find unblocked work.
-- Use `bd show <id>` to inspect a bead in detail.
-- Use `bd create` to capture newly discovered work.
-- Use `bd prime` whenever you need the full workflow context refreshed.
+- Use `bn ready` to find unblocked work.
+- Use `bn show <id>` to inspect a bead in detail.
+- Use `bn create` to capture newly discovered work.
+- Use `bn prime` whenever you need the full workflow context refreshed.
 "#;
 
 const GEMINI_INSTRUCTIONS: &str = r#"# Beads Workflow for Gemini
 
-Use `bd` for all task tracking in this repository.
+Use `bn` for all task tracking in this repository.
 
-- Start with `bd ready`.
-- Inspect with `bd show <id>`.
-- Capture new work with `bd create`.
-- Reload context with `bd prime`.
+- Start with `bn ready`.
+- Inspect with `bn show <id>`.
+- Capture new work with `bn create`.
+- Reload context with `bn prime`.
 "#;
 
 const OPENCODE_INSTRUCTIONS: &str = r#"# Beads Workflow for OpenCode
 
-This repository uses `bd` as the source of truth for work tracking.
+This repository uses `bn` as the source of truth for work tracking.
 
-- `bd ready` surfaces unblocked work.
-- `bd list --all` shows the broader backlog.
-- `bd show <id>` gives full context for one bead.
-- `bd prime --mcp` provides a compact agent-facing refresher.
+- `bn ready` surfaces unblocked work.
+- `bn list --all` shows the broader backlog.
+- `bn show <id>` gives full context for one bead.
+- `bn prime --mcp` provides a compact agent-facing refresher.
 "#;
 
 const WINDSURF_RULES: &str = r#"# Beads Workflow
 
-Track all work in `bd`.
+Track all work in `bn`.
 
-- Use `bd ready` before starting work.
-- Use `bd create` for newly discovered work.
-- Use `bd show <id>` for details.
-- Use `bd prime` for a full workflow refresher.
+- Use `bn ready` before starting work.
+- Use `bn create` for newly discovered work.
+- Use `bn show <id>` for details.
+- Use `bn prime` for a full workflow refresher.
 "#;
 
 const FILE_RECIPES: &[FileRecipe] = &[
@@ -852,7 +918,7 @@ fn check_file_recipe_at(recipe: &FileRecipe, base_dir: &Path) -> Result<()> {
         Ok(())
     } else {
         print_line(&format!("✗ {} integration not installed", recipe.name))?;
-        print_line(&format!("  Run: bd setup {}", recipe.name))?;
+        print_line(&format!("  Run: bn setup {}", recipe.name))?;
         Err(validation_error(
             "setup",
             format!("{} integration not installed", recipe.name),
@@ -886,13 +952,13 @@ mod tests {
     #[test]
     fn cursor_rules_contains_beads() {
         assert!(CURSOR_RULES.contains("Beads"));
-        assert!(CURSOR_RULES.contains("bd ready"));
+        assert!(CURSOR_RULES.contains("bn ready"));
     }
 
     #[test]
     fn aider_instructions_contains_beads() {
         assert!(AIDER_INSTRUCTIONS.contains("Beads"));
-        assert!(AIDER_INSTRUCTIONS.contains("bd ready"));
+        assert!(AIDER_INSTRUCTIONS.contains("bn ready"));
     }
 
     #[test]
@@ -915,7 +981,7 @@ mod tests {
                     {
                         "hooks": [
                             {
-                                "command": "bd prime"
+                                "command": "bn prime"
                             }
                         ]
                     }
@@ -928,6 +994,59 @@ mod tests {
         let other_path = dir.path().join("other.json");
         let result = check_claude_at(&settings_path, &other_path);
         assert!(result.is_ok());
+    }
+
+    /// Regression guard for kopitiam#14 (the second live defect in it).
+    ///
+    /// `bn setup claude` used to register `"command": "bd prime"` — a binary a
+    /// kopi-beans install does not ship — so the hook it generated was broken
+    /// out of the box. The command it writes must name `bn`.
+    #[test]
+    fn installed_hook_command_invokes_bn_not_bd() {
+        assert_eq!(HOOK_COMMAND, "bn prime");
+
+        let mut hooks = Map::new();
+        add_hook_command(&mut hooks, "SessionStart", HOOK_COMMAND);
+
+        let written = serde_json::to_string(&Value::Object(hooks)).expect("serialize");
+        assert!(written.contains("bn prime"), "got: {written}");
+        assert!(!written.contains("bd prime"), "got: {written}");
+    }
+
+    /// A leftover `bd prime` hook must not be reported as a working `bn` hook.
+    #[test]
+    fn legacy_bd_hook_does_not_count_as_installed() {
+        let dir = tempdir().expect("temp dir");
+        let settings_path = dir.path().join("settings.json");
+        let settings = json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "command": LEGACY_HOOK_COMMAND }] }]
+            }
+        });
+        fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
+
+        assert!(!has_beads_hooks(&settings_path));
+    }
+
+    /// `bn` reports a legacy `bd prime` hook but never deletes it: on a machine
+    /// with beads-rs installed that hook may be the other tracker's, and
+    /// removing another tool's config is the damage this issue is about.
+    #[test]
+    fn legacy_bd_hook_is_detected_but_never_removed() {
+        let mut hooks = Map::new();
+        add_hook_command(&mut hooks, "SessionStart", LEGACY_HOOK_COMMAND);
+        add_hook_command(&mut hooks, "SessionStart", HOOK_COMMAND);
+
+        assert_eq!(legacy_hook_events(&hooks), vec!["SessionStart"]);
+
+        // Removing bn's own hook leaves the legacy one untouched.
+        assert!(remove_hook_command(
+            &mut hooks,
+            "SessionStart",
+            HOOK_COMMAND
+        ));
+        assert_eq!(legacy_hook_events(&hooks), vec!["SessionStart"]);
+        assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -950,7 +1069,7 @@ mod tests {
     fn test_hook_add_remove_logic() {
         let mut hooks = Map::new();
         let event = "SessionStart";
-        let command = "bd prime";
+        let command = "bn prime";
 
         // Initial add
         let outcome = add_hook_command(&mut hooks, event, command);

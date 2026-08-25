@@ -470,12 +470,13 @@ pub enum Request {
         payload: EmptyPayload,
     },
 
-    /// Wait until repo is clean (debounced sync flushed).
+    /// Wait until repo is clean (debounced sync flushed), or until the
+    /// deadline in `payload` runs out — whichever comes first.
     SyncWait {
         #[serde(flatten)]
         ctx: RepoCtx,
         #[serde(flatten)]
-        payload: EmptyPayload,
+        payload: SyncWaitPayload,
     },
 
     /// Initialize beads ref.

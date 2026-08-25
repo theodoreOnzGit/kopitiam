@@ -6,7 +6,7 @@ use crate::cli_surface::validation::normalize_bead_slug_for;
 
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct InitArgs {
-    /// Compatibility flag accepted from Go beads/Gas City; server startup is handled by bd daemon.
+    /// Compatibility flag accepted from Go beads/Gas City; server startup is handled by bn daemon.
     #[arg(long, default_value_t = false)]
     pub server: bool,
 

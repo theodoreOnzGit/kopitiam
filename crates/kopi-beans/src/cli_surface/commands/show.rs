@@ -729,7 +729,11 @@ fn resolve_current_issue_id(ctx: &CliRuntimeCtx) -> CommandResult<BeadId> {
 }
 
 fn current_jj_bead_id(repo: &Path) -> Option<BeadId> {
-    let output = ProcessCommand::new("jj")
+    let mut cmd = ProcessCommand::new("jj");
+    // No console window on Windows (kopitiam#29) — same reason as every other
+    // `.output()` child here: we capture stdout, so nobody wants a console, and
+    // a caller with no console of its own would get a popup. See `crate::proc`.
+    let output = crate::proc::dun_popup(&mut cmd)
         .current_dir(repo)
         .args(["log", "-r", "@", "--no-graph", "-T", "description"])
         .output()

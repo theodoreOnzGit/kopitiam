@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::core::{
     ActorId, Applied, ClientRequestId, DurabilityClass, ErrorPayload, NamespaceId,
@@ -162,16 +163,80 @@ pub fn send_raw(req: &Request) -> crate::cli_surface::Result<Response> {
 }
 
 fn send_raw_once(req: &Request) -> std::result::Result<Response, crate::surface::ipc::IpcError> {
+    send_raw_once_with_read_timeout(req, None)
+}
+
+fn send_raw_once_with_read_timeout(
+    req: &Request,
+    read_timeout: Option<Duration>,
+) -> std::result::Result<Response, crate::surface::ipc::IpcError> {
     COMMAND_CONNECTION.with(|conn| {
         let mut conn = conn.borrow_mut();
         if conn.is_none() {
             let client = IpcClient::new();
             *conn = Some(client.connect()?);
         }
-        conn.as_mut()
-            .expect("command connection initialized")
-            .send_request(req)
+        let connection = conn.as_mut().expect("command connection initialized");
+        // Always set it, `None` included: the connection is thread-local and
+        // reused, so a timeout left over from a previous command would silently
+        // apply to the next one.
+        connection.set_read_timeout(read_timeout)?;
+        let result = connection.send_request(req);
+        // Put it back however the call went, otherwise a later command on this
+        // thread inherits our deadline.
+        let _ = connection.set_read_timeout(None);
+
+        // A read that timed out may have stopped halfway through a response
+        // frame, leaving the rest of it sitting in the buffer. Reusing that
+        // connection would hand the NEXT command someone else's bytes, so bin
+        // it — worst case the next command pays one reconnect.
+        if result.as_ref().err().is_some_and(is_read_timeout) {
+            *conn = None;
+        }
+        result
     })
+}
+
+/// Is this the socket read watchdog going off, rather than a real IO fault?
+///
+/// `set_read_timeout` surfaces as `WouldBlock` on unix and `TimedOut` on
+/// Windows — both mean the same thing here, and neither is worth retrying,
+/// because a retry would just serve the same sentence twice.
+fn is_read_timeout(err: &crate::surface::ipc::IpcError) -> bool {
+    let crate::surface::ipc::IpcError::Transport { source } = err else {
+        return false;
+    };
+    matches!(
+        source.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Send a request with a hard ceiling on how long we will sit on the socket.
+///
+/// Belt-and-braces for `bn sync` (kopitiam#25). The daemon owns the real
+/// deadline and is expected to answer with a proper diagnostic; this watchdog
+/// only fires when the daemon never answers at all — a wedged state loop, say —
+/// and its whole job is making sure the terminal comes back.
+///
+/// Deliberately does NOT retry on a timeout, unlike [`send_raw`]. A retry would
+/// double the wall time the user waits and could not tell them anything new.
+/// A non-timeout transient error (stale connection to a restarted daemon) still
+/// gets the usual one reconnect-and-retry.
+pub fn send_with_read_timeout(
+    req: &Request,
+    read_timeout: Duration,
+) -> std::result::Result<ResponsePayload, RuntimeError> {
+    let response = send_raw_once_with_read_timeout(req, Some(read_timeout)).or_else(|err| {
+        if is_read_timeout(&err) || !err.transience().is_retryable() {
+            return Err(err);
+        }
+        COMMAND_CONNECTION.with(|conn| {
+            *conn.borrow_mut() = None;
+        });
+        send_raw_once_with_read_timeout(req, Some(read_timeout))
+    })?;
+    response_payload(response)
 }
 
 fn response_payload(response: Response) -> std::result::Result<ResponsePayload, RuntimeError> {

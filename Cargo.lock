@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "kopi-beans"
-version = "0.1.1"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "chrono",
@@ -3979,7 +3979,6 @@ dependencies = [
  "crc32c",
  "crossbeam",
  "dirs",
- "flate2",
  "fs2",
  "gix",
  "hex",
@@ -3992,7 +3991,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
- "tar",
  "tempfile",
  "thiserror 1.0.69",
  "time",
@@ -4003,7 +4001,6 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tree",
  "uds_windows",
- "ureq 2.12.1",
  "uuid",
  "whoami",
  "windows-sys 0.61.2",
@@ -4242,7 +4239,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "ureq 3.3.0",
+ "ureq",
 ]
 
 [[package]]
@@ -4449,7 +4446,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "ureq 3.3.0",
+ "ureq",
 ]
 
 [[package]]
@@ -7222,17 +7219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tar"
-version = "0.4.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
-dependencies = [
- "filetime",
- "libc",
- "xattr",
-]
-
-[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7833,22 +7819,6 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "2.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
-dependencies = [
- "base64",
- "flate2",
- "log",
- "once_cell",
- "rustls",
- "rustls-pki-types",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "ureq"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
@@ -7860,7 +7830,7 @@ dependencies = [
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
- "webpki-roots 1.0.8",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -8331,15 +8301,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -9069,16 +9030,6 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "zeroize",
-]
-
-[[package]]
-name = "xattr"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
-dependencies = [
- "libc",
- "rustix 1.1.4",
 ]
 
 [[package]]

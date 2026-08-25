@@ -12,18 +12,19 @@ use crate::cli_surface::commands::setup::{
 use crate::cli_surface::runtime::CliRuntimeCtx;
 use crate::surface::ipc::{InitPayload, IpcError, RepoCtx, Request, Response, send_request};
 
-const CREATE_AFTER_HELP: &str = "Examples:\n  bd create \"Write CLI docs\" -p1 -t task\n  printf 'Detailed context\\n' | bd create \"Fix parser\" --stdin\n  bd create \"Refactor parser\" --body-file notes.md --design-file plan.md\n  bd create --file backlog.md";
-const SHOW_AFTER_HELP: &str = "Examples:\n  bd show beads-rs-k8u3\n  bd show --id beads-rs-k8u3 --id beads-rs-k8u3.5\n  bd show --current\n  bd show beads-rs-k8u3 --refs\n  bd show beads-rs-k8u3 --children\n  bd show beads-rs-k8u3 --short\n  bd help --advanced show";
-const LIST_AFTER_HELP: &str = "Examples:\n  bd list\n  bd list --all --long\n  bd list --parent beads-rs-k8u3 --tree\n  bd list --status todo --label cli -L\n  bd list --sort priority:desc";
-const UPDATE_AFTER_HELP: &str = "Examples:\n  bd update beads-rs-k8u3 --status in_progress --priority 1\n  printf 'Refined description\\n' | bd update beads-rs-k8u3 --stdin\n  bd update beads-rs-k8u3 --body-file notes.md --design-file design.md\n  bd update beads-rs-k8u3 --add-label cli --notes \"help UX pass\"";
-const DEP_AFTER_HELP: &str = "Examples:\n  bd dep add beads-rs-k8u3.2 beads-rs-k8u3.9\n  bd dep beads-rs-k8u3.9 --blocks beads-rs-k8u3.2\n  bd dep beads-rs-k8u3.2 --depends-on beads-rs-k8u3.9\n  bd dep tree beads-rs-k8u3";
-const PRIME_AFTER_HELP: &str = "Examples:\n  bd prime\n  bd prime --mcp\n  bd prime --full --stealth\n  bd prime --export > /tmp/beads-context.txt";
-const SETUP_AFTER_HELP: &str = "Examples:\n  bd setup list\n  bd setup claude\n  bd setup cursor --check\n  bd setup codex\n  bd setup windsurf --remove";
+const CREATE_AFTER_HELP: &str = "Examples:\n  bn create \"Write CLI docs\" -p1 -t task\n  printf 'Detailed context\\n' | bn create \"Fix parser\" --stdin\n  bn create \"Refactor parser\" --body-file notes.md --design-file plan.md\n  bn create --file backlog.md";
+const SHOW_AFTER_HELP: &str = "Examples:\n  bn show beads-rs-k8u3\n  bn show --id beads-rs-k8u3 --id beads-rs-k8u3.5\n  bn show --current\n  bn show beads-rs-k8u3 --refs\n  bn show beads-rs-k8u3 --children\n  bn show beads-rs-k8u3 --short\n  bn help --advanced show";
+const LIST_AFTER_HELP: &str = "Examples:\n  bn list\n  bn list --all --long\n  bn list --parent beads-rs-k8u3 --tree\n  bn list --status todo --label cli -L\n  bn list --sort priority:desc";
+const UPDATE_AFTER_HELP: &str = "Examples:\n  bn update beads-rs-k8u3 --status in_progress --priority 1\n  printf 'Refined description\\n' | bn update beads-rs-k8u3 --stdin\n  bn update beads-rs-k8u3 --body-file notes.md --design-file design.md\n  bn update beads-rs-k8u3 --add-label cli --notes \"help UX pass\"";
+const DEP_AFTER_HELP: &str = "Examples:\n  bn dep add beads-rs-k8u3.2 beads-rs-k8u3.9\n  bn dep beads-rs-k8u3.9 --blocks beads-rs-k8u3.2\n  bn dep beads-rs-k8u3.2 --depends-on beads-rs-k8u3.9\n  bn dep tree beads-rs-k8u3";
+const PRIME_AFTER_HELP: &str = "Examples:\n  bn prime\n  bn prime --mcp\n  bn prime --full --stealth\n  bn prime --export > /tmp/beads-context.txt";
+const SETUP_AFTER_HELP: &str = "Examples:\n  bn setup list\n  bn setup claude\n  bn setup cursor --check\n  bn setup codex\n  bn setup windsurf --remove";
 #[derive(Parser, Debug)]
 #[command(
     name = "bn",
     version,
-    about = "Beads distributed issue tracker",
+    about = "kopi-beans (bn) - distributed, git-backed issue tracker",
+    long_about = "kopi-beans (`bn`) - a distributed, git-backed work-item tracker.\n\nA Windows/Termux-capable fork of beads-rs, relicensed AGPL-3.0-only, shipped as part of kopitiam. It is a SEPARATE tool from beads-rs (`bd`): the two can be installed side by side, and `bn` never reads, writes, or upgrades the `bd` binary.",
     infer_subcommands = true,
     infer_long_args = true,
     arg_required_else_help = true
@@ -110,7 +111,7 @@ pub enum Command {
     /// List beads.
     #[command(
         visible_alias = "ls",
-        long_about = "List beads with optional text search, filters, sorting, and output tweaks. Alias: `ls`. Human-mode `bd list` defaults to hiding terminal work; add `--all` for the full backlog, `--long` for multi-line detail, and `--tree` with `--parent` for descendant views.",
+        long_about = "List beads with optional text search, filters, sorting, and output tweaks. Alias: `ls`. Human-mode `bn list` defaults to hiding terminal work; add `--all` for the full backlog, `--long` for multi-line detail, and `--tree` with `--parent` for descendant views.",
         after_help = LIST_AFTER_HELP
     )]
     List(commands::list::ListArgs),
@@ -134,7 +135,7 @@ pub enum Command {
     Deleted(commands::deleted::DeletedArgs),
 
     /// Wait for debounced sync flush to complete.
-    Sync,
+    Sync(commands::sync::SyncArgs),
 
     /// Subscribe to realtime events.
     Subscribe(commands::subscribe::SubscribeArgs),
@@ -151,7 +152,10 @@ pub enum Command {
         cmd: commands::admin::AdminCmd,
     },
 
-    /// Upgrade bd to the latest version.
+    /// Show how to upgrade `bn` (kopi-beans installs from crates.io).
+    #[command(
+        long_about = "Report how to upgrade `bn`. kopi-beans publishes no prebuilt release binaries -- only the crates.io package -- so `bn` does not self-install; run `cargo install kopi-beans` instead.\n\nSelf-upgrade was removed in kopitiam#14: the implementation inherited from beads-rs fetched beads-rs's own GitHub releases and installed them over a binary named `bd`, so on a machine running both trackers it would have overwritten the other tool."
+    )]
     Upgrade(commands::upgrade::UpgradeArgs),
 
     /// Update a bead.
@@ -187,7 +191,7 @@ pub enum Command {
     /// Dependency operations.
     #[command(
         visible_aliases = ["deps", "dependencies"],
-        long_about = "Inspect and edit dependency edges between beads. Aliases: `deps`, `dependencies`. `add` means FROM depends on TO, so TO must complete before FROM is ready. Convenience form: `bd dep <blocker> --blocks <blocked>` means the blocked bead depends on the blocker.",
+        long_about = "Inspect and edit dependency edges between beads. Aliases: `deps`, `dependencies`. `add` means FROM depends on TO, so TO must complete before FROM is ready. Convenience form: `bn dep <blocker> --blocks <blocked>` means the blocked bead depends on the blocker.",
         after_help = DEP_AFTER_HELP
     )]
     Dep {
@@ -237,7 +241,8 @@ pub enum Command {
         cmd: commands::migrate::MigrateCmd,
     },
 
-    /// Daemon control (hidden). `bd daemon run` starts the service.
+    /// Daemon control (hidden). `bn daemon run` starts the service in the
+    /// foreground; `bn daemon stop` / `bn daemon restart` bounce it.
     #[command(hide = true)]
     Daemon {
         #[command(subcommand)]
@@ -295,7 +300,7 @@ pub fn command_name(command: &Command) -> String {
         Command::Stale(_) => "stale".to_string(),
         Command::Count(_) => "count".to_string(),
         Command::Deleted(_) => "deleted".to_string(),
-        Command::Sync => "sync".to_string(),
+        Command::Sync(_) => "sync".to_string(),
         Command::Subscribe(_) => "subscribe".to_string(),
         Command::Store { cmd } => format!("store.{}", store_cmd_name(cmd)),
         Command::Admin { cmd } => match cmd {
@@ -358,6 +363,13 @@ where
     match command {
         Command::Daemon { cmd } => match cmd {
             commands::daemon::DaemonCmd::Run => host.run_daemon_command(),
+            // `stop` / `restart` need no runtime: they act on the socket and
+            // the daemon process, not on a loaded store. Building a runtime
+            // first would mean talking to the very daemon we are about to
+            // kill — which is exactly the thing that is wedged when somebody
+            // reaches for these.
+            commands::daemon::DaemonCmd::Stop => commands::daemon::handle_stop(json),
+            commands::daemon::DaemonCmd::Restart => commands::daemon::handle_restart(json),
         },
         Command::Prime(args) => handle_prime(host, args),
         Command::Setup { cmd } => handle_setup::<H>(cmd),
@@ -401,7 +413,7 @@ where
         Command::Stale(args) => commands::stale::handle(ctx, args).map_err(Into::into),
         Command::Count(args) => commands::count::handle(ctx, args).map_err(Into::into),
         Command::Deleted(args) => commands::deleted::handle(ctx, args).map_err(Into::into),
-        Command::Sync => commands::sync::handle(ctx).map_err(Into::into),
+        Command::Sync(args) => commands::sync::handle(ctx, args).map_err(Into::into),
         Command::Subscribe(args) => commands::subscribe::handle(ctx, args).map_err(Into::into),
         Command::Update(args) => commands::update::handle(ctx, args).map_err(Into::into),
         Command::Close(args) => commands::close::handle(ctx, args).map_err(Into::into),
@@ -617,6 +629,8 @@ fn migrate_cmd_name(cmd: &commands::migrate::MigrateCmd) -> &'static str {
 fn daemon_cmd_name(cmd: &commands::daemon::DaemonCmd) -> &'static str {
     match cmd {
         commands::daemon::DaemonCmd::Run => "run",
+        commands::daemon::DaemonCmd::Stop => "stop",
+        commands::daemon::DaemonCmd::Restart => "restart",
     }
 }
 
@@ -627,7 +641,7 @@ mod tests {
     #[test]
     fn parse_create_accepts_compat_text_input_flags() {
         let cli = parse_from([
-            "bd",
+            "bn",
             "create",
             "Write docs",
             "--desc",
@@ -654,7 +668,7 @@ mod tests {
     #[test]
     fn parse_update_accepts_stdin_and_design_file_flags() {
         let cli = parse_from([
-            "bd",
+            "bn",
             "update",
             "beads-rs-k8u3",
             "--stdin",
@@ -673,7 +687,7 @@ mod tests {
 
     #[test]
     fn parse_update_accepts_desc_alias() {
-        let cli = parse_from(["bd", "update", "beads-rs-k8u3", "--desc", "from desc"]);
+        let cli = parse_from(["bn", "update", "beads-rs-k8u3", "--desc", "from desc"]);
 
         match cli.command {
             Command::Update(args) => {

@@ -1939,7 +1939,7 @@ fn normalize_assignee(value: Option<String>, actor: &ActorId) -> Result<Option<A
         _ if raw == actor.as_str() => Ok(Some(actor.clone())),
         _ => Err(OpError::ValidationFailed {
             field: "assignee".into(),
-            reason: "cannot assign other actors; run bd as that actor".into(),
+            reason: "cannot assign other actors; run bn as that actor".into(),
         }),
     }
 }
