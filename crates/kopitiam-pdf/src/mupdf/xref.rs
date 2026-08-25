@@ -297,14 +297,21 @@ impl PdfDocument {
             offs.push(ooff);
         }
 
-        // Parse each object at `first + offset` and cache it (an existing cached
-        // definition wins, mirroring MuPDF keeping the original entry->obj).
+        // Parse each object at `first + offset` and cache it -- but only if the
+        // xref still says that object number lives in *this* object stream
+        // (see `claimed_by_objstm`). An existing cached definition wins,
+        // mirroring MuPDF keeping the original entry->obj.
         let mut target_cached: Option<Cached> = None;
         for i in 0..count {
+            let onum = nums[i];
+            // Skip before parsing: an object the xref no longer sources from
+            // this stream must not be parsed into the shared cache at all.
+            if !self.claimed_by_objstm(onum, stm_num) {
+                continue;
+            }
             let mut s = Stream::from_slice(&raw);
             s.seek(first + offs[i], Whence::Set)?;
             let obj = parse_stm_obj(&mut s)?;
-            let onum = nums[i];
             let cached = Cached {
                 obj,
                 stm_ofs: None,
@@ -322,6 +329,48 @@ impl PdfDocument {
             obj: Object::Null,
             stm_ofs: None,
         }))
+    }
+
+    // MuPDF: the `(entry->type == 'o' || entry->type == 'O') && entry->ofs == num`
+    // guard inside pdf_load_obj_stm (pdf-xref.c:2213) -- everything failing it is
+    // pdf_drop_obj()'d instead of stored.
+    /// Does the xref still say object `onum` is sourced from object stream
+    /// `stm_num`?
+    ///
+    /// # Why this guard exists -- incremental updates, don't remove it
+    ///
+    /// An object stream is just bytes in the file; it does *not* get rewritten
+    /// when a later incremental update (original body + appended objects + a new
+    /// xref chained via `/Prev` -- what Okular/Acrobat write when you add
+    /// annotations and save) supersedes one of the objects packed inside it. The
+    /// old copy still sits there physically, and [`load_obj_stm`] happily parses
+    /// it out along with everything else in the same stream.
+    ///
+    /// The cross-reference table is the only authority on where an object's
+    /// *current* definition lives (PDF 32000-1:2008, 7.5.4 / 7.5.8.3): after the
+    /// update, that object's newest entry is an `'n'` at a fresh offset, and the
+    /// `'o'` entry naming this stream belongs to the superseded generation. So
+    /// caching whatever the stream happens to contain, unchecked, lands the
+    /// stale copy.
+    ///
+    /// That bites because [`Self::cache`] is keyed by object number alone and is
+    /// first-write-wins: one unchecked insert and *every* later
+    /// [`Self::resolve`] of that number is served the pre-update object, with no
+    /// error anywhere. Worse, it makes the answer depend on access order --
+    /// rasterizing a page first pulls in some unrelated object from the same
+    /// stream, which decompresses the whole stream and poisons the cache, so the
+    /// page's `/Annots` then resolves to its pre-update version (3 entries
+    /// instead of 8). Reading `/Annots` *before* rendering gets the right one.
+    /// That was GitHub issue #70, and "annotations silently invisible" was the
+    /// mild symptom -- annotations used as redactions would render the
+    /// pre-redaction structure just as silently.
+    ///
+    /// [`load_obj_stm`]: Self::load_obj_stm
+    fn claimed_by_objstm(&self, onum: i32, stm_num: i32) -> bool {
+        matches!(
+            self.entries.get(onum as usize).and_then(|e| e.as_ref()),
+            Some(XrefEntry::Compressed { stm_num: claimed, .. }) if *claimed == stm_num
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1169,6 +1218,137 @@ mod tests {
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
         pdf.extend_from_slice(format!("startxref\n{y}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn incremental_update_supersedes_object_stream_copy() {
+        // Regression for GitHub issue #70: object 3 lives inside object stream 4
+        // in the original body, and an appended incremental update replaces it
+        // with a fresh uncompressed definition. Opening the document walks the
+        // page tree, which resolves object 1 out of objstm 4 -- decompressing
+        // that stream and, before the `claimed_by_objstm` guard, caching its
+        // stale copy of object 3 as well. Every later resolve of object 3 was
+        // then served the pre-update version.
+        let pdf = incremental_update_pdf();
+        let doc = PdfDocument::open(pdf).unwrap();
+
+        // The updated definition must win, no matter that objstm 4 was
+        // decompressed first while walking the page tree.
+        let page = doc.page(0).unwrap();
+        assert_eq!(
+            page.dict_gets("MediaBox").unwrap().array_get(2).unwrap().to_int(),
+            400,
+            "page resolved to its pre-update (object-stream) copy"
+        );
+        let annots = doc.resolve_get(page, "Annots").unwrap();
+        assert_eq!(
+            annots.array_len(),
+            5,
+            "/Annots resolved to the pre-update copy (this is issue #70 exactly)"
+        );
+
+        // And directly: the object-stream copy of 3 must never reach the cache,
+        // whichever object of stream 4 is touched first.
+        let obj3 = doc.get_object(3).unwrap();
+        assert_eq!(
+            obj3.dict_gets("MediaBox").unwrap().array_get(2).unwrap().to_int(),
+            400
+        );
+
+        // The objects the update did *not* touch still come from the stream.
+        let root = doc.catalog().unwrap();
+        assert_eq!(root.dict_gets("Type").unwrap().to_name(), b"Catalog");
+    }
+
+    /// Hand-build an incrementally-updated PDF: the original body packs objects
+    /// 1/2/3 into object stream 4 (indexed by xref stream 5), then an appended
+    /// update supersedes object 3 with an uncompressed definition, indexed by a
+    /// second xref stream (object 6) chained back via `/Prev`. This is the shape
+    /// Okular/Acrobat write when annotations are added to an existing file.
+    fn incremental_update_pdf() -> Vec<u8> {
+        let o1 = "<</Type/Catalog/Pages 2 0 R>>";
+        let o2 = "<</Type/Pages/Kids[3 0 R]/Count 1>>";
+        // The soon-to-be-superseded copy: small MediaBox, no /Annots.
+        let o3_old = "<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>";
+
+        let off1 = 0;
+        let off2 = o1.len() + 1;
+        let off3 = o1.len() + 1 + o2.len() + 1;
+        let header = format!("1 {off1} 2 {off2} 3 {off3} ");
+        let first = header.len();
+        let objstm_body = format!("{header}{o1} {o2} {o3_old}");
+        let objstm_len = objstm_body.len();
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+
+        // ---- original body -------------------------------------------------
+        let x = pdf.len() as u64; // offset of "4 0 obj"
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /ObjStm /N 3 /First {first} /Length {objstm_len} >>\nstream\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(objstm_body.as_bytes());
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let row = |t: u8, f2: u64, f3: u8, out: &mut Vec<u8>| {
+            out.push(t);
+            out.push((f2 >> 8) as u8);
+            out.push(f2 as u8);
+            out.push(f3);
+        };
+
+        // Object 5: the original cross-reference stream, W = [1 2 1].
+        let y = pdf.len() as u64; // offset of "5 0 obj"
+        let mut xbody: Vec<u8> = Vec::new();
+        row(0, 0, 0, &mut xbody); // obj 0: free
+        row(2, 4, 0, &mut xbody); // obj 1: compressed in objstm 4, index 0
+        row(2, 4, 1, &mut xbody); // obj 2: index 1
+        row(2, 4, 2, &mut xbody); // obj 3: index 2  <- superseded below
+        row(1, x, 0, &mut xbody); // obj 4: uncompressed at x
+        row(1, y, 0, &mut xbody); // obj 5: uncompressed at y
+        let xref_len = xbody.len();
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 2 1] /Length {xref_len} >>\nstream\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&xbody);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{y}\n%%EOF\n").as_bytes());
+
+        // ---- incremental update --------------------------------------------
+        // Object 3 again, uncompressed: bigger MediaBox and five annotations.
+        // Note the old copy stays physically inside object stream 4 -- nothing
+        // rewrites it -- which is exactly what makes the guard necessary.
+        let w = pdf.len() as u64; // offset of the new "3 0 obj"
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 400]\
+/Annots[1 2 3 4 5]>>\nendobj\n",
+        );
+
+        // Object 6: the update's cross-reference stream. /Index lists only what
+        // this section actually defines (objects 3 and 6), and /Prev chains back
+        // to the original section at y.
+        let z = pdf.len() as u64; // offset of "6 0 obj"
+        let mut ubody: Vec<u8> = Vec::new();
+        row(1, w, 0, &mut ubody); // obj 3: now uncompressed at w
+        row(1, z, 0, &mut ubody); // obj 6: this xref stream
+        let ulen = ubody.len();
+        pdf.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /Prev {y} \
+/Index [3 1 6 1] /W [1 2 1] /Length {ulen} >>\nstream\n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&ubody);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{z}\n%%EOF\n").as_bytes());
         pdf
     }
 
