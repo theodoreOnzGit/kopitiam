@@ -82,25 +82,91 @@ KOPITIAM is committed to a Pure Rust Core.
 
 The core platform should compile using stable Rust and Cargo.
 
+### HARD RULE — prefer an existing pure-Rust crate over writing a new implementation
+
+This is a **hard rule, not a preference**: when a problem is already solved by
+an existing, actively-maintained, pure-Rust crate with a genuinely usable
+public API, **use it** rather than hand-rolling an equivalent from scratch.
+Writing new code — even a careful from-spec clean-room implementation — is
+the *second* choice, reached only when no suitable existing crate exists.
+This is a real change from the project's earlier default (AID-0051/AID-0052
+established "re-implement embedded-font decoding from spec, avoid FreeType"
+for `kopitiam-pdf`'s glyph decoders) — that precedent still explains *why*
+those modules exist and is not retroactively wrong, but it is no longer the
+starting assumption for new work. Check for an existing crate first.
+
+**"Existing crate" has real preconditions — check all of them before adopting one:**
+
+* **Actually pure Rust to build** — no C/C++/Fortran toolchain required just
+  to compile the dependency itself.
+* **A genuinely usable public API** — not `pub(crate)`-only or otherwise
+  unreachable from outside the crate, not explicitly documented as "internal,
+  not meant for direct use," and not a name that has been abandoned/absorbed
+  into a different, larger crate upstream (check the crate's *current*
+  repository, not just its last crates.io publish — a stale published version
+  of code the upstream project itself has since moved off of is worse than
+  writing it ourselves, not better).
+* **Actively maintained**, with a compatible license (see "License
+  compatibility" below) and no undisclosed field-of-use restrictions.
+* **A real fit** — pulling in a large, heavy crate to reach one small piece
+  of functionality can cost more (build time, attack surface, maintenance
+  burden) than it saves; weigh that honestly rather than reaching for the
+  first crate that compiles.
+
+Concrete example of the check failing, worth citing so the pattern is
+recognized again: `hayro-font` (crates.io, last published 0.4.0) looked like
+a ready-made pure-Rust Type1/CFF font parser. Cloning the actual upstream
+repository showed the crate no longer exists as a separate publish target at
+all — its Type1 logic now lives as `pub(crate)`-private code inside
+`hayro-interpret`, unreachable even by a crate that depends on it. The
+crates.io `0.4.0` snapshot is a frozen leftover of code the project itself
+abandoned. "It's on crates.io" is not sufficient evidence of usability; read
+the real, current source before depending on anything.
+
+### Avoid mandatory C++ / Fortran / complex native build systems
+
 Avoid mandatory dependencies on:
 
-* C
 * C++
 * Fortran
 * CMake
 * Makefiles
 * Autotools
 
-Optional integrations are acceptable, but the core platform should remain entirely buildable using Cargo.
+These impose exactly the kind of extensive, install-heavy, complex-to-compile
+native toolchain the Pure Rust Core promise exists to avoid — `git clone` +
+`cargo build` should just work, on every target platform, with nothing extra
+to install first.
 
-When choosing between:
+### When a C dependency is genuinely unavoidable: cross-platform is non-negotiable
 
-* a mature C/C++ dependency, and
-* a good Rust implementation,
+Plain **C** (not C++/Fortran) is sometimes the only practical option — a
+math/linear-algebra library (BLAS/LAPACK-shaped work) is the standing
+example. Where that is true:
 
-prefer the Rust implementation whenever practical.
+* It must be verified to build and run on **all three** target platforms —
+  **Android (Termux/NDK)**, **macOS**, and **Windows** — before it is
+  adopted, not assumed to "probably work" because it builds on desktop Linux.
+  A C dependency that only works on one platform is not acceptable for this
+  workspace; KOPITIAM ships across all three.
+* Prefer a C library with a simple, header-only or single-source build (no
+  CMake/Autotools requirement of its own) over one that drags in its own
+  complex build system — the goal is to keep the *build*, not merely the
+  *language*, simple.
+* Record the cross-platform verification (what was tested, on what) at the
+  point the dependency is introduced, the same way other provenance is
+  recorded per "Provenance Standards" below.
+* This is still the exception, not the default: reach for it only after the
+  existing-pure-Rust-crate check above and a from-spec Rust implementation
+  have both been considered and found wanting.
 
-Long-term ownership of the platform is more important than short-term convenience.
+Optional integrations are acceptable, but the core platform should remain
+entirely buildable using Cargo.
+
+Long-term ownership of the platform is more important than short-term
+convenience — "use an existing library" is not license to grab any crate
+unchecked. A crate adopted under this rule still needs the same scrutiny
+(license, maintenance, real fit) any other dependency gets.
 
 ---
 
