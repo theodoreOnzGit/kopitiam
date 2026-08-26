@@ -97,7 +97,11 @@ start from rather than starting cold.
 * `crates/kopitiam-ai/` gains an ollama-client adapter beside `cloud.rs`.
   `src/local/` — the in-process path — is untouched by this decision and keeps
   working for whatever it already handles.
-* The `ollama-port` branch is deleted; `archive/ollama-port` holds the work.
+* `archive/ollama-port` holds the work. The `ollama-port` branch itself is
+  still present — the session that made this decision lacked permission to
+  delete refs (HTTP 403), so it is left for the maintainer:
+  `git push origin --delete ollama-port`. Deleting it loses nothing; the
+  archive ref is the same commit.
 * `gh-73` (the AID-0055 number collision between the branch and `main`) is moot
   and closed: the branch's AID never reaches `main`, so `main`'s
   `AID-0055-type1-charstrings-from-spec-not-hayro.md` keeps the number.
