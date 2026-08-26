@@ -4,8 +4,12 @@ name = "kopitiam-pdf"
 # version bump" hard rule, a crate's version moves only when that crate's own
 # code moved, not in lockstep with the shared workspace version. kopitiam-pdf
 # was untouched since the workspace-wide 0.2.5 publish (2026-07-29) until the
-# Type1/predefined-CFF glyph-outline change (issue #31) took it to 0.2.6, and
-# the mandatory `hayro` graceful fallback then took it to 0.2.7.
+# Type1/predefined-CFF glyph-outline change (issue #31) took it to 0.2.6, the
+# mandatory `hayro` graceful fallback took it to 0.2.7, and the object-stream
+# cache-poisoning fix (gh-70, `claimed_by_objstm` in xref.rs) takes it to
+# 0.2.8. That last one landed AFTER 0.2.7 was already on crates.io -- verified
+# by diffing the published .crate, which has no such guard -- so it needs its
+# own version rather than riding along on one already spent.
 #
 # The wrinkle worth remembering (it has already caught us once, on develop's
 # 6facc3b "bumping kopitiam pdf to version 0.2.6"): bumping the
@@ -13,7 +17,7 @@ name = "kopitiam-pdf"
 # changes what *other* crates resolve against -- it does NOT change what
 # `cargo publish` uploads. The crate's own `[package] version` here is the
 # other half, and both have to move together.
-version = "0.2.7"
+version = "0.2.8"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
