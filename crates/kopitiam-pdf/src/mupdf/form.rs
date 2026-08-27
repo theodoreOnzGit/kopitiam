@@ -1034,7 +1034,7 @@ fn encode_content_string(text: &str) -> Vec<u8> {
 /// allowed to overflow: losing characters would be worse than an ugly break,
 /// and `char_indices` keeps the split on a character boundary so multi-byte
 /// text cannot panic here.
-fn wrap_lines<'a>(value: &'a str, abbrev: &str, size: f32, max_w: f32) -> Vec<String> {
+fn wrap_lines(value: &str, abbrev: &str, size: f32, max_w: f32) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     // A non-positive width (a degenerate widget) has no meaningful wrap point;
     // fall back to hard breaks only rather than looping forever.
@@ -1060,7 +1060,8 @@ fn wrap_lines<'a>(value: &'a str, abbrev: &str, size: f32, max_w: f32) -> Vec<St
             }
             // A single word wider than the whole line: break it mid-word so no
             // characters are silently lost.
-            while estimate_string_width_em(&line, abbrev) * size > usable && line.chars().count() > 1
+            while estimate_string_width_em(&line, abbrev) * size > usable
+                && line.chars().count() > 1
             {
                 let mut cut = line.len();
                 for (i, _) in line.char_indices() {
@@ -1296,7 +1297,10 @@ mod tests {
         }
         // Wrapping must not lose or invent words.
         let rejoined = lines.join(" ");
-        assert_eq!(rejoined.split_whitespace().collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(
+            rejoined.split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
+        );
     }
 
     /// An author-typed newline is a hard break and survives wrapping.
@@ -1321,7 +1325,10 @@ mod tests {
     /// meaningful wrap point.
     #[test]
     fn wrap_lines_survives_degenerate_width() {
-        assert_eq!(wrap_lines("hello world", "Helv", 10.0, 0.0), vec!["hello world".to_string()]);
+        assert_eq!(
+            wrap_lines("hello world", "Helv", 10.0, 0.0),
+            vec!["hello world".to_string()]
+        );
         assert_eq!(wrap_lines("", "Helv", 10.0, 100.0), vec!["".to_string()]);
         let _ = wrap_lines("日本語のテキストです", "Helv", 10.0, 5.0);
     }
@@ -1335,7 +1342,10 @@ mod tests {
         let content = build_tx_content(long, "Helv", 10.0, &[0.0], 0, true, 1.0, 120.0, 60.0);
         let text = String::from_utf8_lossy(&content);
         let tm_count = text.matches(" Tm\n").count();
-        assert!(tm_count > 1, "multiline appearance drew only {tm_count} line(s)");
+        assert!(
+            tm_count > 1,
+            "multiline appearance drew only {tm_count} line(s)"
+        );
         // Single-line fields must NOT wrap: PDF single-line text does not.
         let single = build_tx_content(long, "Helv", 10.0, &[0.0], 0, false, 1.0, 120.0, 60.0);
         assert_eq!(String::from_utf8_lossy(&single).matches(" Tm\n").count(), 1);

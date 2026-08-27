@@ -362,7 +362,13 @@ fn lookup_ap(doc: &PdfDocument, annot: &Object) -> ApLookup {
         .filter(|o| !o.is_null())
         .map(|o| o.to_name());
 
-    let Some(selected) = select_ap_state(&n_dict, as_name) else {
+    // A button field's /V is a state name and is *inheritable*: a radio kid
+    // normally carries no /V of its own, the group parent holds it. Without
+    // walking up, a widget missing /AS has nothing to fall back on.
+    let v_obj = dict_get_inheritable(doc, annot, "V");
+    let v_name = v_obj.as_ref().filter(|o| o.is_name()).map(|o| o.to_name());
+
+    let Some(selected) = select_ap_state(&n_dict, as_name, v_name) else {
         return ApLookup::AmbiguousOrBroken;
     };
 
@@ -388,14 +394,35 @@ fn lookup_ap(doc: &PdfDocument, annot: &Object) -> ApLookup {
 ///
 /// Pure and document-free by design, so it is unit-testable on hand-built
 /// dicts without a [`PdfDocument`].
-fn select_ap_state<'a>(n_dict: &'a Object, as_name: Option<&[u8]>) -> Option<&'a Object> {
-    if let Some(name) = as_name {
-        return n_dict.dict_get(name);
+fn select_ap_state<'a>(
+    n_dict: &'a Object,
+    as_name: Option<&[u8]>,
+    value_name: Option<&[u8]>,
+) -> Option<&'a Object> {
+    // 1. /AS, when it names a state that actually exists.
+    if let Some(found) = as_name.and_then(|name| n_dict.dict_get(name)) {
+        return found.into();
     }
+    // 2. The field's own value. For a button field /V is a state name, and a
+    //    widget with no /AS is otherwise indistinguishable from one that should
+    //    not be drawn -- but its value still says which state it is in.
+    if let Some(found) = value_name.and_then(|name| n_dict.dict_get(name)) {
+        return found.into();
+    }
+    // 3. /Off, the near-universal name for the unselected state. An unselected
+    //    radio must still draw its empty ring; drawing nothing is what made
+    //    them invisible.
+    if let Some(found) = n_dict.dict_get(b"Off") {
+        return found.into();
+    }
+    // 4. A sole entry is unambiguous whatever it is called.
     if n_dict.dict_len() == 1 {
         return n_dict.dict_get_val(0);
     }
-    None
+    // 5. Last resort: the first state. A malformed widget drawn in the wrong
+    //    state beats a widget the user cannot see at all -- which is the whole
+    //    lesson of this function's history.
+    n_dict.dict_get_val(0)
 }
 
 /// Build a [`SynthAp`] from a real `/AP` stream: `stream_ref` is the indirect
@@ -699,28 +726,78 @@ mod tests {
     #[test]
     fn select_ap_state_by_as_name() {
         let d = states_dict();
-        let picked = select_ap_state(&d, Some(b"On"));
+        let picked = select_ap_state(&d, Some(b"On"), None);
         assert_eq!(picked, Some(&Object::new_indirect(12, 0)));
     }
 
+    /// A widget with **no `/AS`** must still be drawn.
+    ///
+    /// This previously returned `None`, and that was a real, user-visible bug:
+    /// radio buttons were **completely invisible** in the viewer while still
+    /// toggling correctly (the maintainer could click one in kpdf and see the
+    /// change in Okular). A radio's `/N` always has at least two entries
+    /// (`/Off` plus an on-state), so the old "only pick when there is exactly
+    /// one" rule skipped every such widget.
+    ///
+    /// Poppler renders these — it logs *"Invalid or missing AS value in
+    /// annotation containing one or more appearance subdictionaries"* and
+    /// carries on. A malformed widget is a file to recover from, not a reason
+    /// to draw nothing.
     #[test]
-    fn select_ap_state_as_missing_and_ambiguous_returns_none() {
-        let d = states_dict(); // two entries, no /AS given
-        assert!(select_ap_state(&d, None).is_none());
+    fn select_ap_state_falls_back_to_off_when_as_missing() {
+        let d = states_dict(); // /Off + /On, no /AS
+        assert_eq!(
+            select_ap_state(&d, None, None),
+            Some(&Object::new_indirect(11, 0)),
+            "a widget with no /AS must fall back to /Off, not vanish"
+        );
+    }
+
+    /// With no `/AS`, the field's own value says which state it is in. `/V` is
+    /// inheritable, so a radio kid gets it from the group parent.
+    #[test]
+    fn select_ap_state_prefers_field_value_over_off() {
+        let d = states_dict();
+        assert_eq!(
+            select_ap_state(&d, None, Some(b"On")),
+            Some(&Object::new_indirect(12, 0)),
+            "/V should win over the /Off fallback"
+        );
     }
 
     #[test]
     fn select_ap_state_as_missing_but_sole_entry_is_used() {
         let mut d = Object::new_dict();
         d.dict_put("Only", Object::new_indirect(14, 0));
-        let picked = select_ap_state(&d, None);
-        assert_eq!(picked, Some(&Object::new_indirect(14, 0)));
+        assert_eq!(
+            select_ap_state(&d, None, None),
+            Some(&Object::new_indirect(14, 0))
+        );
     }
 
+    /// An `/AS` naming a state that is not there is a malformed file. Recover
+    /// rather than drawing nothing, same reasoning as the missing-`/AS` case.
     #[test]
-    fn select_ap_state_as_name_with_no_match_returns_none() {
+    fn select_ap_state_recovers_when_as_names_a_missing_state() {
         let d = states_dict();
-        assert!(select_ap_state(&d, Some(b"Down")).is_none());
+        assert_eq!(
+            select_ap_state(&d, Some(b"Down"), None),
+            Some(&Object::new_indirect(11, 0)),
+            "a dangling /AS should fall back, not blank the widget"
+        );
+    }
+
+    /// Nothing sensible to pick, but still never a silent blank: the first
+    /// state beats an invisible widget.
+    #[test]
+    fn select_ap_state_last_resort_takes_the_first_state() {
+        let mut d = Object::new_dict();
+        d.dict_put("Alpha", Object::new_indirect(21, 0));
+        d.dict_put("Beta", Object::new_indirect(22, 0));
+        assert_eq!(
+            select_ap_state(&d, None, None),
+            Some(&Object::new_indirect(21, 0))
+        );
     }
 
     // -----------------------------------------------------------------------

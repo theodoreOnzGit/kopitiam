@@ -875,7 +875,12 @@ impl KpdfApp {
     /// bounds both the painted rectangles and the editor to the
     /// `ScrollArea`'s visible viewport, so a field scrolled out of view
     /// doesn't bleed over the toolbar above the page.
-    fn paint_and_edit_form_fields(&mut self, ui: &mut egui::Ui, layout: PageLayout, clip: egui::Rect) {
+    fn paint_and_edit_form_fields(
+        &mut self,
+        ui: &mut egui::Ui,
+        layout: PageLayout,
+        clip: egui::Rect,
+    ) {
         let editing_obj = self.form_edit.as_ref().map(|(n, _)| *n);
 
         if let Some((_, fields)) = &self.form_fields_cache {
@@ -1429,7 +1434,10 @@ fn highlight_colors(style: FieldHighlight) -> (egui::Color32, egui::Stroke) {
     match style {
         FieldHighlight::Editable => (
             egui::Color32::from_rgba_unmultiplied(90, 160, 255, 55),
-            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(40, 110, 230, 200)),
+            egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgba_unmultiplied(40, 110, 230, 200),
+            ),
         ),
         FieldHighlight::Toggleable => (
             egui::Color32::from_rgba_unmultiplied(90, 200, 140, 55),
@@ -1437,11 +1445,17 @@ fn highlight_colors(style: FieldHighlight) -> (egui::Color32, egui::Stroke) {
         ),
         FieldHighlight::ReadOnly => (
             egui::Color32::from_rgba_unmultiplied(150, 150, 150, 35),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 160)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(120, 120, 120, 160),
+            ),
         ),
         FieldHighlight::Unsupported => (
             egui::Color32::from_rgba_unmultiplied(230, 170, 60, 45),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(200, 130, 30, 180)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(200, 130, 30, 180),
+            ),
         ),
         FieldHighlight::None => (egui::Color32::TRANSPARENT, egui::Stroke::NONE),
     }
@@ -1592,7 +1606,13 @@ fn hit_test_field_expanded(
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, f)| rect_contains(min_hit_rect(f.rect, layout, min_screen_size), page_x, page_y))
+        .find(|(_, f)| {
+            rect_contains(
+                min_hit_rect(f.rect, layout, min_screen_size),
+                page_x,
+                page_y,
+            )
+        })
         .map(|(i, _)| i)
 }
 
@@ -2478,8 +2498,10 @@ mod tests {
         // The whole page's rect must map back to exactly the image's
         // on-screen bounds -- this is the same y-flip `page_to_screen`
         // already covers, exercised here through the field-rect wrapper.
-        let (x0, y0, x1, y1) =
-            field_rect_to_screen(Rect::new(0.0, 0.0, layout.page_w_pts, layout.page_h_pts), layout);
+        let (x0, y0, x1, y1) = field_rect_to_screen(
+            Rect::new(0.0, 0.0, layout.page_w_pts, layout.page_h_pts),
+            layout,
+        );
         assert!((x0 - layout.image_x).abs() < 1e-3);
         assert!((y0 - layout.image_y).abs() < 1e-3);
         assert!((x1 - (layout.image_x + layout.image_w)).abs() < 1e-3);
@@ -2551,7 +2573,11 @@ mod tests {
         // A field rendered as a hairline: 40pt wide but 0.1pt tall. The
         // exact test (`hit_test_field`) must miss a click a few points off
         // the hairline; the expanded test must still catch it.
-        let fields = vec![field(1, FieldKind::Text, Rect::new(0.0, 100.0, 40.0, 100.1))];
+        let fields = vec![field(
+            1,
+            FieldKind::Text,
+            Rect::new(0.0, 100.0, 40.0, 100.1),
+        )];
         assert_eq!(hit_test_field(20.0, 105.0, &fields), None);
         assert_eq!(
             hit_test_field_expanded(20.0, 105.0, &fields, layout, MIN_HIT_AREA_SCREEN),
@@ -2562,7 +2588,11 @@ mod tests {
     #[test]
     fn hit_test_field_expanded_still_misses_far_away_clicks() {
         let layout = sample_layout();
-        let fields = vec![field(1, FieldKind::Text, Rect::new(0.0, 100.0, 40.0, 100.1))];
+        let fields = vec![field(
+            1,
+            FieldKind::Text,
+            Rect::new(0.0, 100.0, 40.0, 100.1),
+        )];
         assert_eq!(
             hit_test_field_expanded(500.0, 500.0, &fields, layout, MIN_HIT_AREA_SCREEN),
             None
@@ -2676,9 +2706,6 @@ mod tests {
 
     #[test]
     fn should_commit_on_enter_a_different_key_never_commits() {
-        assert!(!should_commit_on_enter(
-            egui::Key::A,
-            egui::Modifiers::NONE
-        ));
+        assert!(!should_commit_on_enter(egui::Key::A, egui::Modifiers::NONE));
     }
 }

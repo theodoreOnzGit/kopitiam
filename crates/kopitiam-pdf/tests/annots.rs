@@ -248,3 +248,71 @@ fn synthesized_only_pass_skips_real_ap() {
          fallback path this double-draws what hayro already drew"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Widget appearance states (radio buttons)
+// ---------------------------------------------------------------------------
+
+/// `radio-form.pdf`: three `/Widget` annotations whose `/AP` `/N` is a
+/// **dictionary of appearance states**, differing only in whether `/AS` is
+/// present.
+///
+/// | widget | `/AS` |
+/// |---|---|
+/// | radio A, `/Rect [20 150 40 170]` | present (`/Off`) |
+/// | radio B, `/Rect [20 110 40 130]` | **absent** |
+/// | checkbox, `/Rect [20 60 40 80]` | present (`/Off`) |
+///
+/// Regenerate with `fixtures/make-radio-form.py`.
+const RADIO: &[u8] = include_bytes!("fixtures/radio-form.pdf");
+
+/// Every widget draws, including one with **no `/AS`**.
+///
+/// This was a real, user-visible bug: radio buttons were completely invisible
+/// in kpdf while still toggling correctly — you could click one, see nothing,
+/// and then find the change had taken effect when opening the file in Okular.
+/// A radio's `/N` always holds at least two states (`/Off` plus an on-state),
+/// so the old "only pick a state when the dict has exactly one entry" rule
+/// skipped every `/AS`-less widget and drew nothing at all.
+///
+/// Poppler renders these: it logs *"Invalid or missing AS value in annotation
+/// containing one or more appearance subdictionaries"* and carries on, drawing
+/// the same 439 dark pixels for the `/AS`-less radio as for the one with `/AS`.
+/// A malformed widget is a file to recover from, not a reason to show the user
+/// nothing.
+#[test]
+fn widgets_render_even_without_an_appearance_state() {
+    let doc = PdfDocument::open(RADIO.to_vec()).expect("radio fixture must parse");
+    let pix = rasterize_page(&doc, 0, DPI).expect("radio fixture must rasterize");
+    let page_h = 200.0_f32;
+    let scale = DPI / 72.0;
+
+    // Dark pixels inside a user-space rect, y-flipped into device space.
+    let dark_in = |x0: f32, y0: f32, x1: f32, y1: f32| -> usize {
+        let (dx0, dx1) = ((x0 * scale) as i32, (x1 * scale) as i32);
+        let (dy0, dy1) = (
+            ((page_h - y1) * scale) as i32,
+            ((page_h - y0) * scale) as i32,
+        );
+        (dy0..dy1)
+            .flat_map(|y| (dx0..dx1).map(move |x| (x, y)))
+            .filter(|&(x, y)| pix.luma(x, y).map(|l| l < 128).unwrap_or(false))
+            .count()
+    };
+
+    let radio_with_as = dark_in(20.0, 150.0, 40.0, 170.0);
+    let radio_without_as = dark_in(20.0, 110.0, 40.0, 130.0);
+    let checkbox = dark_in(20.0, 60.0, 40.0, 80.0);
+
+    assert!(
+        radio_with_as > 50,
+        "radio WITH /AS not drawn ({radio_with_as} dark px)"
+    );
+    assert!(checkbox > 50, "checkbox not drawn ({checkbox} dark px)");
+    assert!(
+        radio_without_as > 50,
+        "radio with NO /AS was not drawn ({radio_without_as} dark px). It must fall back \
+         to the field's /V, then to /Off, rather than being skipped -- an invisible \
+         widget that still toggles is worse than a wrongly-stated one."
+    );
+}
