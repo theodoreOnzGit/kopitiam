@@ -58,10 +58,20 @@
 //! * `n` / `→` / `PageDown` -- scroll to the next page; `p` / `←` /
 //!   `PageUp` -- scroll to the previous page (via `egui`'s own
 //!   `scroll_to_rect`, so the jump animates rather than snapping instantly).
-//! * `:`, then digits, then `Enter` -- go to a page (`Esc` cancels the entry
-//!   without moving, same as the terminal viewer). Bound to `:` rather than
-//!   a bare `g` specifically so vim's own `gg`/`G` (below) have `g` free --
-//!   `:N<Enter>` is vim's own line-number-jump idiom, not an invention.
+//! * `:` opens a small **command line** (`Esc` cancels without acting). It is
+//!   bound to `:` rather than a bare `g` specifically so vim's own `gg`/`G`
+//!   (below) have `g` free. Commands, parsed by
+//!   [`kopitiam_pdf::gui_frontend::parse_command`]:
+//!
+//!   * `:N<Enter>` -- go to page `N`. Vim's own line-number-jump idiom, not an
+//!     invention. `:0` is reported as an error rather than clamped: PDF pages
+//!     are 1-based to a reader, so `:0` means the user expected 0-based
+//!     indexing and should be told.
+//!   * `:w<Enter>` -- write the file **in place**, identical to `Ctrl+S`.
+//!
+//!   Anything else is reported in the status bar (`not a command: :q`) rather
+//!   than silently ignored -- a command line that swallows input leaves the
+//!   user unable to tell "not a command" from "command failed".
 //! * `h`/`j`/`k`/`l` -- scroll left/down/up/right by a small step
 //!   ([`kopitiam_pdf::gui_frontend::VIM_STEP`]).
 //! * `Ctrl+d` / `Ctrl+u` -- scroll down/up by half a viewport (vim's own
@@ -121,9 +131,15 @@
 //!   is nothing to step to.
 //! * **Save** -- write the current (possibly edited) bytes to a file chosen
 //!   via a native save dialog. Never silently overwrites the original --
-//!   see [`KpdfApp::save_via_dialog`]. **Save in place (Ctrl+S)** -- the
-//!   distinct in-place save described above ([`KpdfApp::save_in_place`]),
-//!   also reachable as a button.
+//!   see [`KpdfApp::save_via_dialog`]. Also on **`Ctrl+Shift+S`**, the
+//!   conventional Save-As chord.
+//!   **Save in place (`Ctrl+S`, or `:w`)** -- the distinct in-place save
+//!   described above ([`KpdfApp::save_in_place`]), also reachable as a button.
+//!
+//!   The two chords are deliberately distinguished: `Ctrl+S` explicitly checks
+//!   that Shift is *not* held, because without that guard the in-place save
+//!   would also fire on the Save-As chord and overwrite the very file the user
+//!   was trying to preserve.
 //! * **Pen** -- drag on the page to draw; releasing commits the stroke as a
 //!   real ink annotation via [`kopitiam_pdf::mupdf::annot_edit::add_ink_annot`].
 //!   An ink stroke belongs to whichever page the drag *started* on -- if the
@@ -210,13 +226,13 @@ use eframe::egui;
 // other egui-based KOPITIAM front ends can reuse them without
 // re-implementing this file.
 use kopitiam_pdf::gui_frontend::{
-    ContinuousSlot, DPI_DEFAULT, DPI_MAX, DPI_MIN, DPI_STEP, FieldHighlight, GPending, Lru,
-    PageLayout, PageSize, Tool, VIM_STEP, consume_commit_enter, continuous_slot_visible,
+    Command, ContinuousSlot, DPI_DEFAULT, DPI_MAX, DPI_MIN, DPI_STEP, FieldHighlight, GPending,
+    Lru, PageLayout, PageSize, Tool, VIM_STEP, consume_commit_enter, continuous_slot_visible,
     current_page_in_view, drawable_annot_count, field_highlight_kind, field_rect_to_screen,
     g_pending_expired, half_viewport_step, highlight_colors, hit_test_annot, hit_test_field,
     hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect, page_size_pts,
-    page_to_screen, rgb_to_rgba, screen_to_page_at, select_tool, toggle_forms_mode, zoom_percent,
-    zoom_steps_from_zoom_delta,
+    page_to_screen, parse_command, rgb_to_rgba, screen_to_page_at, select_tool, toggle_forms_mode,
+    zoom_percent, zoom_steps_from_zoom_delta,
 };
 use kopitiam_pdf::mupdf::annot_edit::{EditHistory, InkAnnotSpec, InkStroke};
 use kopitiam_pdf::mupdf::form::FieldKind;
@@ -346,7 +362,7 @@ struct KpdfApp {
     pending_scroll_delta: egui::Vec2,
     /// `Some(buf)` while a "go to page" number is being typed (image mode,
     /// triggered by `:`).
-    goto: Option<String>,
+    cmdline: Option<String>,
     /// Leftover Ctrl+scroll signal not yet large enough to make a whole
     /// [`DPI_STEP`] move -- see `zoom.rs`'s `ZOOM_DELTA_PER_STEP` and
     /// `zoom_steps_from_zoom_delta`. Persists across frames so a slow or
@@ -492,7 +508,7 @@ impl KpdfApp {
             mode: Mode::Image,
             scroll_to_page: None,
             pending_scroll_delta: egui::Vec2::ZERO,
-            goto: None,
+            cmdline: None,
             scroll_zoom_accum: 0.0,
             last_viewport_h: 800.0,
             page_textures: HashMap::new(),
@@ -535,7 +551,7 @@ impl KpdfApp {
                 self.page = 0;
                 self.scroll_to_page = None;
                 self.pending_scroll_delta = egui::Vec2::ZERO;
-                self.goto = None;
+                self.cmdline = None;
                 self.page_textures.clear();
                 self.page_textures_lru = Lru::new(PAGE_TEXTURE_CACHE_CAPACITY);
                 self.thumbnails.clear();
@@ -631,7 +647,7 @@ impl KpdfApp {
     /// Ctrl on Linux/Windows and Cmd on macOS) is not held -- so plain
     /// scrolling of the page is completely unaffected.
     fn handle_scroll_zoom(&mut self, ctx: &egui::Context) {
-        if self.mode != Mode::Image || self.goto.is_some() {
+        if self.mode != Mode::Image || self.cmdline.is_some() {
             return;
         }
         let zoom_delta = ctx.input(|i| i.zoom_delta());
@@ -955,7 +971,7 @@ impl KpdfApp {
         }
     }
 
-    /// `Ctrl+S` (and the toolbar's "Save in place" button): overwrite
+    /// `Ctrl+S`, `:w`, or the toolbar's "Save in place" button: overwrite
     /// `self.path` directly with the current (possibly edited) bytes.
     ///
     /// A no-op when there is nothing to save -- mirrors
@@ -1346,10 +1362,15 @@ impl KpdfApp {
     }
 
     fn handle_key(&mut self, ctx: &egui::Context) {
-        let (events, ctrl_c, ctrl_s) = ctx.input(|i| {
+        let (events, ctrl_c, ctrl_s, ctrl_shift_s) = ctx.input(|i| {
             let ctrl_c = i.modifiers.ctrl && i.key_pressed(egui::Key::C);
-            let ctrl_s = i.modifiers.ctrl && i.key_pressed(egui::Key::S);
-            (i.events.clone(), ctrl_c, ctrl_s)
+            // Ctrl+S and Ctrl+Shift+S are DIFFERENT commands, so Ctrl+S must
+            // check that Shift is *not* held. Without that guard the in-place
+            // save would also fire on the Save-As chord and silently overwrite
+            // the original file -- exactly what Save As exists to avoid.
+            let ctrl_s = i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::S);
+            let ctrl_shift_s = i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::S);
+            (i.events.clone(), ctrl_c, ctrl_s, ctrl_shift_s)
         });
         if ctrl_c {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1357,6 +1378,9 @@ impl KpdfApp {
         }
         if ctrl_s {
             self.save_in_place();
+        }
+        if ctrl_shift_s {
+            self.save_via_dialog();
         }
 
         for event in &events {
@@ -1378,32 +1402,42 @@ impl KpdfApp {
             // handling (digit entry vs. just Escape-to-cancel) still
             // differs beneath it. See `keys_captured`'s docs: a `j` typed
             // into a form field must insert `j`, never scroll.
-            if keys_captured(self.goto.is_some(), self.form_edit.is_some()) {
+            if keys_captured(self.cmdline.is_some(), self.form_edit.is_some()) {
                 if self.form_edit.is_some() {
                     if key == egui::Key::Escape {
                         self.form_edit = None;
                     }
-                } else if self.goto.is_some() {
+                } else if self.cmdline.is_some() {
                     match key {
-                        egui::Key::Escape => self.goto = None,
+                        egui::Key::Escape => self.cmdline = None,
                         egui::Key::Enter => {
-                            let buf = self.goto.take().unwrap_or_default();
-                            if let Ok(n) = buf.trim().parse::<usize>()
-                                && n >= 1
-                            {
-                                self.goto_page_1based(n);
+                            let buf = self.cmdline.take().unwrap_or_default();
+                            match parse_command(&buf) {
+                                Command::GotoPage(n) => self.goto_page_1based(n),
+                                Command::Write => self.save_in_place(),
+                                Command::Empty => {}
+                                Command::Unknown(what) => {
+                                    // Say so rather than doing nothing: a
+                                    // command line that silently ignores input
+                                    // leaves the user unable to tell "not a
+                                    // command" from "command failed".
+                                    self.status = Some(format!("not a command: :{what}"));
+                                }
                             }
                         }
                         egui::Key::Backspace => {
-                            if let Some(buf) = self.goto.as_mut() {
+                            if let Some(buf) = self.cmdline.as_mut() {
                                 buf.pop();
                             }
                         }
                         _ => {
-                            if let Some(d) = digit_char(key)
-                                && let Some(buf) = self.goto.as_mut()
+                            // Digits for `:N`, letters for `:w`. Anything else
+                            // (arrows, function keys) is ignored rather than
+                            // stuffed into the buffer.
+                            if let Some(c) = cmdline_char(key)
+                                && let Some(buf) = self.cmdline.as_mut()
                             {
-                                buf.push(d);
+                                buf.push(c);
                             }
                         }
                     }
@@ -1451,7 +1485,7 @@ impl KpdfApp {
             // `:N<Enter>` -- vim's own line-number-jump idiom, reused here
             // for "go to page N". Bound to `:` rather than a bare `g` so `g`
             // is free for vim's own `gg`/`G` below.
-            egui::Key::Colon => self.goto = Some(String::new()),
+            egui::Key::Colon => self.cmdline = Some(String::new()),
             // vim `G` -- go to the last page. Shift is what makes this `G`
             // rather than lower-case `g` on a real keyboard; egui reports
             // the same `Key::G` either way; the modifier is how the two are
@@ -1579,18 +1613,53 @@ fn pick_pdf() -> Option<PathBuf> {
         .pick_file()
 }
 
-fn digit_char(key: egui::Key) -> Option<char> {
+/// The character a key contributes to the `:` command line, or `None` for a
+/// key that contributes nothing (arrows, function keys, modifiers).
+///
+/// Accepts digits for `:N` page jumps and lowercase letters for named commands
+/// like `:w`. Letters are lowercased because `egui` reports the physical key,
+/// not the shifted character -- and vim's commands are lowercase anyway, so
+/// folding here means `:w` works whether or not Caps Lock is on, while
+/// [`parse_command`] can still reject a genuinely different command.
+fn cmdline_char(key: egui::Key) -> Option<char> {
+    use egui::Key::*;
     Some(match key {
-        egui::Key::Num0 => '0',
-        egui::Key::Num1 => '1',
-        egui::Key::Num2 => '2',
-        egui::Key::Num3 => '3',
-        egui::Key::Num4 => '4',
-        egui::Key::Num5 => '5',
-        egui::Key::Num6 => '6',
-        egui::Key::Num7 => '7',
-        egui::Key::Num8 => '8',
-        egui::Key::Num9 => '9',
+        Num0 => '0',
+        Num1 => '1',
+        Num2 => '2',
+        Num3 => '3',
+        Num4 => '4',
+        Num5 => '5',
+        Num6 => '6',
+        Num7 => '7',
+        Num8 => '8',
+        Num9 => '9',
+        A => 'a',
+        B => 'b',
+        C => 'c',
+        D => 'd',
+        E => 'e',
+        F => 'f',
+        G => 'g',
+        H => 'h',
+        I => 'i',
+        J => 'j',
+        K => 'k',
+        L => 'l',
+        M => 'm',
+        N => 'n',
+        O => 'o',
+        P => 'p',
+        Q => 'q',
+        R => 'r',
+        S => 's',
+        T => 't',
+        U => 'u',
+        V => 'v',
+        W => 'w',
+        X => 'x',
+        Y => 'y',
+        Z => 'z',
         _ => return None,
     })
 }
@@ -1640,7 +1709,7 @@ impl eframe::App for KpdfApp {
                     // rooted at the document as first opened).
                     if ui
                         .add_enabled(can_undo, egui::Button::new("Save"))
-                        .on_hover_text("Save to a new file")
+                        .on_hover_text("Save as... (Ctrl+Shift+S) -- writes a new file, never touches the original")
                         .clicked()
                     {
                         self.save_via_dialog();
@@ -1764,7 +1833,7 @@ impl eframe::App for KpdfApp {
                                     format!("{n} annot{}", if n == 1 { "" } else { "s" }),
                                 );
                             }
-                            if let Some(buf) = &self.goto {
+                            if let Some(buf) = &self.cmdline {
                                 ui.separator();
                                 ui.colored_label(egui::Color32::GOLD, format!(":{buf}"));
                             }

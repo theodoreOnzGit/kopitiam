@@ -202,3 +202,89 @@ mod tests {
         assert!(!g_pending_expired(Duration::ZERO));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `:` command line
+// ---------------------------------------------------------------------------
+
+/// What the user typed after `:` resolved to a command.
+///
+/// The `:` entry started life as a digits-only "go to page" box. It is a
+/// command line now, because vim users reach for `:w` before they reach for a
+/// toolbar button, and having `:` accept `12` but reject `w` is the kind of
+/// half-a-convention that is worse than either whole one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// `:N` — go to 1-based page `N`. Vim's own line-jump idiom.
+    GotoPage(usize),
+    /// `:w` — write the file in place, same as `Ctrl+S`.
+    Write,
+    /// Typed something we do not implement. The caller should say so rather
+    /// than silently doing nothing: a command line that ignores input leaves
+    /// the user unable to tell "not a command" from "command failed".
+    Unknown(String),
+    /// Nothing was typed (bare `:` then Enter) — do nothing, quietly.
+    Empty,
+}
+
+/// Parse a `:` command line entry.
+///
+/// Whitespace around the command is ignored, and commands are matched
+/// case-sensitively: vim's `:w` is lowercase, and `:W` is a different command
+/// in vim itself, so quietly accepting it would teach the wrong habit.
+///
+/// Note `GotoPage` rejects `0`: PDF pages are 1-based to a reader, and `:0`
+/// almost certainly means the user expected 0-based indexing, which is worth
+/// reporting rather than silently clamping to page 1.
+pub fn parse_command(input: &str) -> Command {
+    let text = input.trim();
+    if text.is_empty() {
+        return Command::Empty;
+    }
+    if text == "w" {
+        return Command::Write;
+    }
+    match text.parse::<usize>() {
+        Ok(n) if n >= 1 => Command::GotoPage(n),
+        _ => Command::Unknown(text.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_page_number() {
+        assert_eq!(parse_command("12"), Command::GotoPage(12));
+        assert_eq!(parse_command("  7 "), Command::GotoPage(7));
+    }
+
+    #[test]
+    fn parses_write() {
+        assert_eq!(parse_command("w"), Command::Write);
+        assert_eq!(parse_command(" w "), Command::Write);
+    }
+
+    /// Page numbers are 1-based for a reader; `:0` is a mistake worth
+    /// reporting rather than silently clamping.
+    #[test]
+    fn rejects_page_zero_rather_than_clamping() {
+        assert_eq!(parse_command("0"), Command::Unknown("0".to_string()));
+    }
+
+    #[test]
+    fn bare_colon_does_nothing() {
+        assert_eq!(parse_command(""), Command::Empty);
+        assert_eq!(parse_command("   "), Command::Empty);
+    }
+
+    /// An unimplemented command must be reported, not swallowed -- otherwise
+    /// the user cannot tell "not a command" from "command silently failed".
+    #[test]
+    fn unknown_commands_are_reported() {
+        assert_eq!(parse_command("q"), Command::Unknown("q".to_string()));
+        assert_eq!(parse_command("wq"), Command::Unknown("wq".to_string()));
+        assert_eq!(parse_command("W"), Command::Unknown("W".to_string()));
+    }
+}

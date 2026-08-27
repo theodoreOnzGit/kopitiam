@@ -49,7 +49,8 @@ pub use geometry::{
 };
 pub use hit_test::{hit_test_annot, hit_test_field, hit_test_field_expanded};
 pub use keys::{
-    G_PENDING_TIMEOUT, GPending, VIM_STEP, g_pending_expired, half_viewport_step, keys_captured,
+    Command, G_PENDING_TIMEOUT, GPending, VIM_STEP, g_pending_expired, half_viewport_step,
+    keys_captured, parse_command,
 };
 pub use lru::Lru;
 pub use pixmap::{drawable_annot_count, rgb_to_rgba};
