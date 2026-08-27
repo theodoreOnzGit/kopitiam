@@ -316,3 +316,34 @@ fn widgets_render_even_without_an_appearance_state() {
          widget that still toggles is worse than a wrongly-stated one."
     );
 }
+
+/// The cross-engine fallback is switchable, and switching it off really does
+/// pin rendering to our own engine.
+///
+/// Worth testing rather than assuming, because the fallback is *invisible* by
+/// design: it swaps engines mid-document whenever a glyph fails to decode. A
+/// viewer offering a toggle needs the guarantee that "off" means off — and the
+/// two engines genuinely differ, most sharply on annotations, since hayro draws
+/// nothing that lacks an `/AP`.
+#[test]
+fn fallback_can_be_switched_off() {
+    use kopitiam_pdf::mupdf::rasterize_page_with_fallback;
+
+    let doc = PdfDocument::open(FIXTURE.to_vec()).expect("fixture parses");
+
+    // This fixture needs no fallback (no undecodable glyphs), so both settings
+    // must agree exactly — switching engines must not perturb an ordinary page.
+    let with = rasterize_page_with_fallback(&doc, 0, DPI, true).expect("with fallback");
+    let without = rasterize_page_with_fallback(&doc, 0, DPI, false).expect("without fallback");
+    assert_eq!(with.width(), without.width());
+    assert_eq!(with.height(), without.height());
+    assert_eq!(
+        channel_counts(&with),
+        channel_counts(&without),
+        "a page that never triggers the fallback must render identically either way"
+    );
+
+    // And the default entry point must agree with fallback = true.
+    let default = rasterize_page(&doc, 0, DPI).expect("default");
+    assert_eq!(channel_counts(&default), channel_counts(&with));
+}

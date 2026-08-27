@@ -78,8 +78,40 @@ use super::xref::PdfDocument;
 /// kopitiam's already-open [`PdfDocument`]), so this reaches for
 /// [`PdfDocument::raw_bytes`] to hand it the same file.
 pub fn rasterize_page_graceful(doc: &PdfDocument, page_index: usize, dpi: f32) -> Result<Pixmap> {
+    rasterize_page_with_fallback(doc, page_index, dpi, true)
+}
+
+/// [`rasterize_page_graceful`], with the cross-engine fallback switchable at
+/// runtime.
+///
+/// `fallback = true` is the normal behaviour and what plain `rasterize_page`
+/// does. `fallback = false` pins the render to kopitiam's own engine, so a page
+/// that would have been re-rendered by `hayro` instead shows this engine's real
+/// output -- advance boxes and all.
+///
+/// # Why a viewer wants this switch
+///
+/// The fallback is deliberately invisible: it swaps engines mid-document
+/// whenever a glyph fails to decode, which is exactly right for *reading* and
+/// exactly wrong for *diagnosing*. Someone looking at a suspicious page cannot
+/// otherwise tell "kopitiam rendered this correctly" from "kopitiam gave up and
+/// hayro rendered it", and the two have real behavioural differences -- most
+/// sharply, hayro draws no annotation that lacks an `/AP`
+/// (`hayro-interpret/src/interpret/mod.rs:157`), which is why
+/// [`overlay_missing_annots`] exists at all.
+///
+/// So this is a debugging and bug-reporting affordance first: flip it off, and
+/// what you see is unambiguously ours. It is also the honest answer for a user
+/// who would rather see our imperfect glyphs consistently than have the page
+/// silently change engine underneath them.
+pub fn rasterize_page_with_fallback(
+    doc: &PdfDocument,
+    page_index: usize,
+    dpi: f32,
+    fallback: bool,
+) -> Result<Pixmap> {
     let (pix, fallback_glyphs) = rasterize_page_ex(doc, page_index, dpi)?;
-    if fallback_glyphs == 0 {
+    if fallback_glyphs == 0 || !fallback {
         return Ok(pix);
     }
     match render_with_hayro(doc.raw_bytes(), page_index, dpi) {

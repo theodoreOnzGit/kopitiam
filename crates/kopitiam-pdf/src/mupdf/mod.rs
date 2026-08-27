@@ -144,6 +144,7 @@ pub use font::{Decoded, Font};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
 pub use hash::HashTable;
 pub use hayro_fallback::rasterize_page_graceful as rasterize_page;
+pub use hayro_fallback::rasterize_page_with_fallback;
 pub use interpret::Processor;
 pub use lex::{Token, lex};
 pub use object::Object;

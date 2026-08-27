@@ -18,6 +18,16 @@ mod textnorm;
 // `kopitiam_pdf::mupdf::geometry::{Point, Rect, IRect, Matrix, Quad}`.
 pub mod mupdf;
 
+// Reusable egui-based PDF-viewer building blocks (page layout, zoom,
+// hit-testing, forms UI, ...), lifted out of the `kpdf` example binary so
+// other KOPITIAM front ends can reuse them. Gated on the same `kpdf`
+// feature that turns on the optional eframe/egui/rfd dependencies -- see
+// Cargo.toml's `[features]` section. Named `gui_frontend` rather than
+// `egui` on purpose, so it never shadows the external `egui` crate inside
+// its own files.
+#[cfg(feature = "kpdf")]
+pub mod gui_frontend;
+
 pub use extractor::{ExtractError, extract, extract_from_bytes};
 pub use font::FontStyle;
 pub use geometry::Rect;
