@@ -12,6 +12,18 @@ Cargo.lock.bak
 *.db
 .beads-credential-key
 .beads/proxieddb/
+# `.beads/issues.jsonl` IS tracked -- it is the passive export other clones read.
+# Its neighbours are not. `*.bak` is recovery residue left by kopi-beans' old
+# symlink-based export (gh-68, since fixed): the current code only deletes a
+# `.bak` that is byte-identical to what it just wrote, and deliberately keeps
+# one that differs, in case somebody still needs it. That is the right call for
+# safety, but it means a stale ~240KB snapshot can sit in .beads/ indefinitely
+# where any `git add -A` would commit it as if it were the real export. Ignore
+# it so the safe behaviour cannot turn into an accidental commit.
+# `.issues.jsonl.tmp` is the atomic-rename staging file; it should never outlive
+# a write, but a crash mid-export can strand one.
+.beads/*.bak
+.beads/.issues.jsonl.tmp
 
 # KOPITIAM Semantic Runtime per-project state (local session memory)
 .kopitiam/
