@@ -108,11 +108,13 @@ fn main() {
     let mut path: Option<PathBuf> = None;
     let mut dpi = 150.0f32;
     let mut dump_dir: Option<PathBuf> = None;
+    let mut scan_fallback = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dpi" => dpi = args.next().and_then(|v| v.parse().ok()).unwrap_or(150.0),
             "--dump-dir" => dump_dir = args.next().map(PathBuf::from),
+            "--scan-fallback" => scan_fallback = true,
             "-h" | "--help" => return usage(),
             other => path = Some(PathBuf::from(other)),
         }
@@ -134,6 +136,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if scan_fallback {
+        return scan_fallback_report(&doc, dpi);
+    }
 
     println!("file : {}", path.display());
     println!("pages: {}", doc.page_count());
@@ -410,4 +416,49 @@ fn write_ppm(path: &std::path::Path, pix: &Pixmap) -> std::io::Result<()> {
         }
     }
     f.flush()
+}
+
+/// Report, per page, how many glyphs fell back to a solid advance box -- i.e.
+/// how much of a document kopitiam's own engine cannot draw, and would hand to
+/// `hayro` instead.
+///
+/// This is the measurement that decides whether an embedded-font dependency is
+/// worth taking: "the fallback exists" says nothing about how often it fires.
+/// A document that never triggers it needs no new dependency; one where most
+/// pages trigger it is a document our own engine effectively cannot render.
+fn scan_fallback_report(doc: &PdfDocument, dpi: f32) {
+    let mut pages_with_fallback = 0usize;
+    let mut total_boxes = 0usize;
+    let mut worst = (0usize, 0usize);
+
+    for page_index in 0..doc.page_count() {
+        match kopitiam_pdf::mupdf::rasterize_page_ex(doc, page_index, dpi) {
+            Ok((_, boxes)) => {
+                if boxes > 0 {
+                    pages_with_fallback += 1;
+                    total_boxes += boxes;
+                    if boxes > worst.1 {
+                        worst = (page_index + 1, boxes);
+                    }
+                }
+            }
+            Err(e) => println!("page {}: render failed: {e}", page_index + 1),
+        }
+    }
+
+    let pages = doc.page_count();
+    println!("pages                    : {pages}");
+    println!("pages hitting fallback   : {pages_with_fallback}");
+    println!("total advance-box glyphs : {total_boxes}");
+    if worst.1 > 0 {
+        println!("worst page               : {} ({} boxes)", worst.0, worst.1);
+    }
+    if pages_with_fallback == 0 {
+        println!("\nthis document renders entirely with kopitiam's own engine");
+    } else {
+        println!(
+            "\n{:.1}% of pages would be handed to hayro",
+            100.0 * pages_with_fallback as f32 / pages.max(1) as f32
+        );
+    }
 }
