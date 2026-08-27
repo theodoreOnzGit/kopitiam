@@ -143,27 +143,37 @@ translation above, and is recorded here and in **AID-0052**:
   (`pdf-image.c` / `image.c`), but the JPEG bitstream itself is decoded by the
   pure-Rust `zune-jpeg` (with `zune-core`) rather than by `load-jpeg.c`'s
   libjpeg. `MIT OR Apache-2.0 OR Zlib`; no C in the build.
-* **Embedded-font outlines / FreeType → spec re-implementation (no crate).**
-  MuPDF reads `/FontFile2` / `/FontFile3` / `/FontFile` programs through
-  FreeType. This port **avoids FreeType entirely**: `glyph.rs` keeps MuPDF's
-  outline→`Path` *callback shape* (the `move_to` / `line_to` / `conic_to` /
-  `cubic_to` decompose of `font.c`), but the actual font-program parsing is
-  written **clean-room from the format specifications** — the OpenType
-  `glyf`/`loca` tables (`glyph_truetype.rs`), the Adobe CFF / Type2 Charstring
-  format, Technical Note #5177 (`glyph_cff.rs`), and the **Adobe Type 1 Font
-  Format specification** (Adobe Systems Inc., 1990 — `glyph_type1.rs`, the
-  `/FontFile` decoder: PFA/PFB unwrapping, `eexec`/charstring decryption, the
-  Type1 charstring interpreter including `seac` and the `OtherSubrs`
-  flex/hint-replacement convention). One narrow exception is recorded at the
-  point of use: the CFF *container* parse (`INDEX` / `DICT` / charset / FDSelect
-  / `subr_bias`) is a close adaptation of MuPDF's own non-FreeType CFF reader in
-  `source/fitz/subset-cff.c` (still MuPDF, still `19f1284`), not of FreeType.
-  The CFF **Standard Strings** table (`glyph_cff.rs`, `CFF_STANDARD_STRINGS`,
-  Adobe TN#5176 Appendix A — used to resolve a predefined-Standard-encoding
-  simple CFF font's `code -> name -> gid`) is the spec's own fixed 391-entry
-  list, not creative expression to attribute; it was cross-checked against
-  fontTools' `cffLib.cffStandardStrings` (`fonttools`, BSD-3-Clause) for
-  transcription accuracy rather than typed from memory. See **AID-0055**.
+* **Embedded-font outlines / FreeType → spec re-implementation, plus a
+  skrifa second opinion.** MuPDF reads `/FontFile2` / `/FontFile3` /
+  `/FontFile` programs through FreeType. This port **avoids FreeType
+  entirely**: `glyph.rs` keeps MuPDF's outline→`Path` *callback shape* (the
+  `move_to` / `line_to` / `conic_to` / `cubic_to` decompose of `font.c`), but
+  the actual font-program parsing is written **clean-room from the format
+  specifications** — the OpenType `glyf`/`loca` tables (`glyph_truetype.rs`),
+  the Adobe CFF / Type2 Charstring format, Technical Note #5177
+  (`glyph_cff.rs`), and the **Adobe Type 1 Font Format specification** (Adobe
+  Systems Inc., 1990 — `glyph_type1.rs`, the `/FontFile` decoder: PFA/PFB
+  unwrapping, `eexec`/charstring decryption, the Type1 charstring interpreter
+  including `seac` and the `OtherSubrs` flex/hint-replacement convention). One
+  narrow exception is recorded at the point of use: the CFF *container* parse
+  (`INDEX` / `DICT` / charset / FDSelect / `subr_bias`) is a close adaptation
+  of MuPDF's own non-FreeType CFF reader in `source/fitz/subset-cff.c` (still
+  MuPDF, still `19f1284`), not of FreeType. The CFF **Standard Strings** table
+  (`glyph_cff.rs`, `CFF_STANDARD_STRINGS`, Adobe TN#5176 Appendix A — used to
+  resolve a predefined-Standard-encoding simple CFF font's `code -> name ->
+  gid`) is the spec's own fixed 391-entry list, not creative expression to
+  attribute; it was cross-checked against fontTools'
+  `cffLib.cffStandardStrings` (`fonttools`, BSD-3-Clause) for transcription
+  accuracy rather than typed from memory. See **AID-0055**.
+
+  As of the skrifa integration (`glyph_skrifa.rs`), the clean-room decoders
+  above remain the **primary** path and are tried first for every glyph;
+  [skrifa](https://crates.io/crates/skrifa) (Google `fontations`,
+  Apache-2.0/MIT) is consulted **only** as a per-glyph second opinion when a
+  primary decoder returns no outline for a specific GID (the documented
+  ceilings: predefined-Expert CFF encoding, CID-keyed CFF edge cases, `seac`).
+  This is a genuine crates.io dependency (see "Notable shipped Rust
+  dependencies" below), not a translation — it is used as published, unmodified.
 
 The consequence for provenance is that these subsystems are **not** derivative
 of FreeType or libjpeg: the glyph decoders are spec-based original Rust (plus one
@@ -315,6 +325,7 @@ enumerated here; their provenance is the Cargo lockfile.)
 | [pdf-extract](https://crates.io/crates/pdf-extract) | MIT | The pre-MuPDF-port PDF text-extraction path (wraps `lopdf`); still the `pdf-extract` engine option in `pdf2md` |
 | [lopdf](https://crates.io/crates/lopdf) | MIT | Low-level PDF object / content-stream walking for font-style recovery (`kopitiam-pdf`), `kopitiam-plot` vector paths |
 | [zune-jpeg](https://crates.io/crates/zune-jpeg) (+ `zune-core`) | MIT OR Apache-2.0 OR Zlib | Pure-Rust JPEG decoder substituting for MuPDF's libjpeg on the DCTDecode image path (see "Pure-Rust substitutions" above, AID-0052) |
+| [skrifa](https://crates.io/crates/skrifa) (Google `fontations`) | MIT OR Apache-2.0 | Per-glyph **second opinion** for embedded-font outlines (`glyph_skrifa.rs`): consulted only when the clean-room `glyph_truetype.rs`/`glyph_cff.rs` decoders return no outline for a specific GID. The primary decoders stay primary and unmodified; see "Pure-Rust substitutions" above |
 | [miniz_oxide](https://crates.io/crates/miniz_oxide) | MIT OR Zlib OR Apache-2.0 | Pure-Rust DEFLATE/zlib behind PDF FlateDecode, substituting for MuPDF's zlib |
 | [gitoxide](https://crates.io/crates/gix) (`gix`) | MIT OR Apache-2.0 | Pure-Rust Git, substituting for `git2`/libgit2 in the `kopi-beans` fork — no libgit2-sys / openssl-sys / libz-sys, so `bn` cross-compiles to Termux/Android with no NDK. `gix` 0.86 has no high-level push, so the push path is gated on a `gix-protocol`/`gix-transport` send-pack shim (see the beads-rs fork section) |
 | [nucleo](https://crates.io/crates/nucleo) / [nucleo-matcher](https://crates.io/crates/nucleo-matcher) | MPL-2.0 | Fuzzy matching/ranking by the Helix authors — kvim's telescope-replacement pickers and the CLI/TUI PDF finder. MPL-2.0 is file-level copyleft, one-way compatible with AGPLv3; used unmodified as a dependency, so its files stay under MPL-2.0 |

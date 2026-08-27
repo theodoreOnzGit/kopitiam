@@ -61,6 +61,19 @@ zune-jpeg = { workspace = true }
 # months) and we bump deliberately rather than drift with it.
 hayro = "=0.7.1"
 
+# Embedded-font glyph outlines (`mupdf/glyph_skrifa.rs`), used as a second
+# opinion when this crate's own from-spec decoders cannot produce an outline.
+# Part of googlefonts/fontations: pure Rust, no C toolchain, MIT OR Apache-2.0
+# (absorbs into AGPL-3.0 with notices), actively maintained.
+#
+# Adopted per CLAUDE.md's Pure Rust Core hard rule -- "prefer an existing,
+# actively-maintained pure-Rust crate over writing a new implementation" --
+# which deliberately reverses the older AID-0055 precedent of writing font
+# decoding from spec. It does NOT replace the hayro fallback (the maintainer
+# was explicit: do not delete it) and it does NOT cover Type1 `/FontFile`,
+# which is outside skrifa's OpenType scope and stays with `glyph_type1.rs`.
+skrifa = "0.46"
+
 # --- kpdf GUI stack (optional, behind the default `kpdf` feature) -------------
 # `src/bin/kpdf.rs` -- a lightweight native PDF reader. These were
 # `[dev-dependencies]` while kpdf was an example; promoting kpdf to a real

@@ -86,6 +86,7 @@ pub mod form;
 pub mod geometry;
 pub mod glyph;
 pub mod glyph_cff;
+pub mod glyph_skrifa;
 pub mod glyph_truetype;
 pub mod glyph_type1;
 pub mod hash;
