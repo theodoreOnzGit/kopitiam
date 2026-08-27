@@ -247,6 +247,215 @@ pub fn rect_contains(r: Rect, x: f32, y: f32) -> bool {
     x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1
 }
 
+// -- Continuous (all-pages-in-one-column) scroll layout ----------------------
+//
+// Everything below this point supports a *continuous* viewer -- every page
+// stacked in one scrollable column, rather than one page filling the whole
+// viewport at a time (the model [`PageLayout`]/[`screen_to_page`] above
+// assume). The overall shape -- learn each page's on-screen size from its
+// already-cheap thumbnail render rather than a full rasterization, only
+// full-render pages actually intersecting the viewport, track "current
+// page" by vertical viewport overlap -- is ported from a sibling project
+// (`kovan`, a different KOPITIAM-adjacent app by the same maintainer) that
+// solved continuous PDF scrolling first; see `kpdf.rs`'s module docs for
+// exactly what was taken and from where. Unlike that source, this version
+// *does* resolve pen/eraser/forms clicks to a page while scrolling (see
+// [`screen_to_page_at`]) rather than leaving continuous mode view-only --
+// kopitiam-pdf already has the single-page hit-testing this needs, so the
+// extra resolution step is a binary search plus delegation, not a
+// re-derivation.
+//
+// See [`ContinuousSlot`]'s docs for the coordinate system this introduces,
+// and [`screen_to_page_at`] for the seam every interactive feature (pen,
+// eraser, forms clicks, field highlighting) now routes through.
+
+/// One page's already-computed on-screen size and physical (PDF-point) size
+/// -- the input [`layout_continuous_pages`] stacks into a
+/// [`ContinuousSlot`] per page. Deliberately carries no dpi/zoom logic of
+/// its own: the caller (`kpdf.rs`) is the one that knows the current dpi and
+/// derives `display_w`/`display_h` from a page's cached thumbnail texture
+/// size scaled up to render dpi (see that file's module docs) -- keeping
+/// that arithmetic out of this pure-layout function is what lets
+/// [`layout_continuous_pages`] stay a plain "stack these rectangles"
+/// operation, testable with hand-picked numbers instead of a real render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageSize {
+    /// This page's on-screen size at the caller's current zoom.
+    pub display_w: f32,
+    pub display_h: f32,
+    /// The page's physical size in PDF points -- carried through so
+    /// [`screen_to_page_at`] can build a [`PageLayout`] without a second
+    /// document lookup.
+    pub page_w_pts: f32,
+    pub page_h_pts: f32,
+}
+
+/// One page's placement within a **continuous** (all-pages-stacked-
+/// vertically) scroll layout, in **content space**: content `y == 0` is the
+/// top of the very first page and increases monotonically down the whole
+/// document, entirely independent of the current scroll offset -- scrolling
+/// only changes which slice of this space the viewport currently shows, it
+/// never changes these numbers. Built by [`layout_continuous_pages`] (one
+/// per page, for the whole document) and consumed by [`screen_to_page_at`]
+/// (resolving a content-space point back to a page) and by a caller's own
+/// per-frame painting (converting each visible slot to an on-screen
+/// [`PageLayout`] by adding the content column's current screen-space
+/// origin -- see `kpdf.rs`'s `Mode::Image` rendering for the one place that
+/// addition happens).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContinuousSlot {
+    /// 0-based, matching every other page index in this crate.
+    pub page_index: usize,
+    /// Top edge of this page's image, content-space y.
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    /// The page's physical size in PDF points -- see [`PageSize`].
+    pub page_w_pts: f32,
+    pub page_h_pts: f32,
+}
+
+impl ContinuousSlot {
+    /// The bottom edge, content-space y -- `top + height`, named so a
+    /// caller doesn't have to re-derive it (and risk an off-by-`height`
+    /// mistake) at every use site.
+    pub fn bottom(&self) -> f32 {
+        self.top + self.height
+    }
+}
+
+/// Stack `sizes` top-to-bottom, `gap` screen points apart, into one
+/// [`ContinuousSlot`] per page -- pure arithmetic (no document, no dpi/zoom
+/// awareness; see [`PageSize`]'s docs for why that lives in the caller
+/// instead), which is what makes this testable with hand-picked sizes
+/// rather than a real render. `gap` is clamped to `>= 0.0` so a caller
+/// passing a negative value by mistake cannot make slots overlap.
+pub fn layout_continuous_pages(sizes: &[PageSize], gap: f32) -> Vec<ContinuousSlot> {
+    let gap = gap.max(0.0);
+    let mut slots = Vec::with_capacity(sizes.len());
+    let mut top = 0.0f32;
+    for (i, size) in sizes.iter().enumerate() {
+        let width = size.display_w.max(0.0);
+        let height = size.display_h.max(0.0);
+        slots.push(ContinuousSlot {
+            page_index: i,
+            top,
+            width,
+            height,
+            page_w_pts: size.page_w_pts,
+            page_h_pts: size.page_h_pts,
+        });
+        top += height + gap;
+    }
+    slots
+}
+
+/// The continuous-view analogue of [`screen_to_page`]: resolve a
+/// **content-space** point (see [`ContinuousSlot`]'s docs -- a caller
+/// converts a raw pointer position to content space by subtracting the
+/// content column's own on-screen origin for this frame, which already
+/// reflects the current scroll offset, since that origin comes from
+/// wherever the GUI toolkit actually placed the column widget) to
+/// `(page_index, page_x_pts, page_y_pts)`.
+///
+/// Returns `None` for a point above the first page, below the last page, or
+/// inside the gap between two pages -- there is no page there, and a caller
+/// (annotation drawing, the eraser, forms clicks) must treat that exactly
+/// like today's single-page "click missed the image" case rather than
+/// guessing at a nearby page. See the `tests` module below for exactly
+/// these boundary cases.
+///
+/// `slots` must be in top-to-bottom document order (exactly what
+/// [`layout_continuous_pages`] produces) -- this binary-searches it
+/// (`partition_point`, O(log n)) for the first slot whose bottom edge is
+/// past `content_y`, rather than scanning linearly, since a long document
+/// can carry hundreds of slots and this runs on every pointer event a tool
+/// handles.
+///
+/// Delegates the actual page-space mapping to the already-tested
+/// [`screen_to_page`], via a [`PageLayout`] built from the resolved slot
+/// (`image_x = 0.0`, `image_y = slot.top`) -- so the y-flip this module's
+/// top-of-file docs warn about is *inherited*, not re-derived a second time
+/// for the continuous case.
+pub fn screen_to_page_at(
+    content_x: f32,
+    content_y: f32,
+    slots: &[ContinuousSlot],
+) -> Option<(usize, f32, f32)> {
+    // `partition_point`'s predicate must hold for a prefix and then never
+    // again -- true here because `top` (hence `bottom()`) increases
+    // monotonically across `slots`, so "this slot ends at or before
+    // content_y" starts true and flips to false exactly once.
+    let idx = slots.partition_point(|s| s.bottom() <= content_y);
+    let slot = slots
+        .get(idx)
+        .filter(|s| content_y >= s.top && content_y < s.bottom())?;
+    let layout = PageLayout {
+        image_x: 0.0,
+        image_y: slot.top,
+        image_w: slot.width,
+        image_h: slot.height,
+        page_w_pts: slot.page_w_pts,
+        page_h_pts: slot.page_h_pts,
+    };
+    let (px, py) = screen_to_page(content_x, content_y, layout);
+    Some((slot.page_index, px, py))
+}
+
+/// Which page counts as "current" for a continuous view whose viewport
+/// (content-space) currently spans `[viewport_top, viewport_bottom)` -- the
+/// page with the **most vertical overlap** with that range, ported from
+/// `kovan`'s own continuous-scroll reader (see this module's top-of-section
+/// docs): more robust than a single centre-point test when a very tall page
+/// spans the whole viewport, or several short pages are all partly visible
+/// at once. Falls back to the nearest page (by distance to `viewport_top`)
+/// when `viewport_top`/`viewport_bottom` fall entirely outside every slot
+/// (before the first page or past the last) -- only an empty `slots`
+/// returns `None`.
+pub fn current_page_in_view(
+    slots: &[ContinuousSlot],
+    viewport_top: f32,
+    viewport_bottom: f32,
+) -> Option<usize> {
+    slots
+        .iter()
+        .map(|s| {
+            let overlap = s.bottom().min(viewport_bottom) - s.top.max(viewport_top);
+            (s, overlap.max(0.0))
+        })
+        .max_by(|(a, ov_a), (b, ov_b)| {
+            ov_a.partial_cmp(ov_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    // Tie-break (including the "no slot overlaps at all" case,
+                    // where every overlap is 0.0) by proximity to the top of
+                    // the viewport, so "past the last page" resolves to the
+                    // last page and "before the first" to the first, rather
+                    // than an arbitrary `max_by` tie winner.
+                    let da = (a.top - viewport_top).abs();
+                    let db = (b.top - viewport_top).abs();
+                    db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .map(|(s, _)| s.page_index)
+}
+
+/// Whether `slot` intersects `[viewport_top, viewport_bottom]` widened by
+/// `margin` on both edges -- the "should this page be full-resolution
+/// rendered this frame" test a continuous view's paint loop runs per page,
+/// per frame. Widening by a margin (rather than the exact viewport) means a
+/// page one screen-height below the fold is already rasterized by the time
+/// a fast scroll reaches it, instead of the reader seeing a bare placeholder
+/// flash by first.
+pub fn continuous_slot_visible(
+    slot: &ContinuousSlot,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    margin: f32,
+) -> bool {
+    slot.bottom() >= viewport_top - margin && slot.top <= viewport_bottom + margin
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,5 +814,173 @@ mod tests {
         layout.image_w = 0.0;
         let r = Rect::new(1.0, 2.0, 3.0, 4.0);
         assert_eq!(min_hit_rect(r, layout, TEST_MIN_HIT_AREA), r);
+    }
+
+    // -- layout_continuous_pages / screen_to_page_at / current_page_in_view --
+    //
+    // Three US-Letter-shaped pages (612x792pt, displayed at 300x400 screen
+    // points -- the same proportions `sample_layout` above uses), stacked
+    // with a 10pt gap: page 0 spans content y [0, 400), the gap spans
+    // [400, 410), page 1 spans [410, 810), the gap spans [810, 820), page 2
+    // spans [820, 1220).
+
+    fn three_page_sizes() -> Vec<PageSize> {
+        vec![
+            PageSize {
+                display_w: 300.0,
+                display_h: 400.0,
+                page_w_pts: 612.0,
+                page_h_pts: 792.0,
+            };
+            3
+        ]
+    }
+
+    #[test]
+    fn layout_continuous_pages_stacks_with_the_given_gap() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0].top, 0.0);
+        assert_eq!(slots[0].bottom(), 400.0);
+        assert_eq!(slots[1].top, 410.0);
+        assert_eq!(slots[1].bottom(), 810.0);
+        assert_eq!(slots[2].top, 820.0);
+        assert_eq!(slots[2].bottom(), 1220.0);
+        for (i, s) in slots.iter().enumerate() {
+            assert_eq!(s.page_index, i);
+            assert_eq!(s.width, 300.0);
+            assert_eq!(s.height, 400.0);
+        }
+    }
+
+    #[test]
+    fn layout_continuous_pages_negative_gap_is_clamped_to_zero() {
+        let slots = layout_continuous_pages(&three_page_sizes(), -50.0);
+        // A negative gap must never make slots overlap -- clamp to 0, i.e.
+        // back-to-back, not negative spacing.
+        assert_eq!(slots[1].top, slots[0].bottom());
+    }
+
+    #[test]
+    fn layout_continuous_pages_mixed_sizes_stack_independently() {
+        let sizes = vec![
+            PageSize {
+                display_w: 300.0,
+                display_h: 400.0,
+                page_w_pts: 612.0,
+                page_h_pts: 792.0,
+            },
+            PageSize {
+                display_w: 300.0,
+                display_h: 200.0,
+                page_w_pts: 612.0,
+                page_h_pts: 396.0,
+            },
+        ];
+        let slots = layout_continuous_pages(&sizes, 5.0);
+        assert_eq!(slots[0].bottom(), 400.0);
+        assert_eq!(slots[1].top, 405.0);
+        assert_eq!(slots[1].bottom(), 605.0);
+    }
+
+    #[test]
+    fn screen_to_page_at_above_the_first_page_is_none() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        assert_eq!(screen_to_page_at(150.0, -1.0, &slots), None);
+    }
+
+    #[test]
+    fn screen_to_page_at_below_the_last_page_is_none() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        let last_bottom = slots.last().unwrap().bottom();
+        assert_eq!(screen_to_page_at(150.0, last_bottom + 1.0, &slots), None);
+        assert_eq!(screen_to_page_at(150.0, last_bottom, &slots), None);
+    }
+
+    #[test]
+    fn screen_to_page_at_in_the_gap_between_pages_is_none() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        // The gap between page 0 (ends at 400) and page 1 (starts at 410).
+        assert_eq!(screen_to_page_at(150.0, 405.0, &slots), None);
+    }
+
+    #[test]
+    fn screen_to_page_at_exact_top_boundary_is_inclusive_to_that_page() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        // content_y == 410.0 is page 1's exact top edge.
+        let hit = screen_to_page_at(150.0, 410.0, &slots);
+        assert_eq!(hit.map(|(p, ..)| p), Some(1));
+    }
+
+    #[test]
+    fn screen_to_page_at_exact_bottom_boundary_is_exclusive() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        // content_y == 400.0 is page 0's exact bottom edge -- half-open, so
+        // this belongs to neither page 0 nor the gap's own page.
+        assert_eq!(screen_to_page_at(150.0, 400.0, &slots), None);
+    }
+
+    #[test]
+    fn screen_to_page_at_resolves_the_correct_page_and_maps_within_it() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        // The top-left corner of page 1's slot (content x=0, y=410) must
+        // map to that page's own top-left in default user space: x=0,
+        // y=page_h_pts (the y-flip `screen_to_page` already covers).
+        let (page, px, py) = screen_to_page_at(0.0, 410.0, &slots).expect("hits page 1");
+        assert_eq!(page, 1);
+        assert!((px - 0.0).abs() < 1e-2);
+        assert!((py - 792.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn screen_to_page_at_empty_slots_is_none() {
+        assert_eq!(screen_to_page_at(0.0, 0.0, &[]), None);
+    }
+
+    #[test]
+    fn current_page_in_view_picks_the_most_overlapping_page() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        // A viewport mostly over page 1 (410..810) with only a sliver of
+        // page 0 showing (390..400) must resolve to page 1.
+        assert_eq!(current_page_in_view(&slots, 390.0, 420.0), Some(1));
+    }
+
+    #[test]
+    fn current_page_in_view_before_the_first_page_falls_back_to_it() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        assert_eq!(current_page_in_view(&slots, -500.0, -100.0), Some(0));
+    }
+
+    #[test]
+    fn current_page_in_view_past_the_last_page_falls_back_to_it() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        assert_eq!(current_page_in_view(&slots, 5000.0, 5400.0), Some(2));
+    }
+
+    #[test]
+    fn current_page_in_view_empty_slots_is_none() {
+        assert_eq!(current_page_in_view(&[], 0.0, 100.0), None);
+    }
+
+    #[test]
+    fn continuous_slot_visible_true_when_intersecting() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        assert!(continuous_slot_visible(&slots[1], 500.0, 700.0, 0.0));
+    }
+
+    #[test]
+    fn continuous_slot_visible_false_when_far_off_screen() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        assert!(!continuous_slot_visible(&slots[0], 5000.0, 5400.0, 0.0));
+    }
+
+    #[test]
+    fn continuous_slot_visible_margin_extends_the_range() {
+        let slots = layout_continuous_pages(&three_page_sizes(), 10.0);
+        // Page 2 starts at 820 -- a viewport ending at 700 misses it with no
+        // margin, but a 200pt margin (one extra "screen or so" of lookahead)
+        // reaches it.
+        assert!(!continuous_slot_visible(&slots[2], 500.0, 700.0, 0.0));
+        assert!(continuous_slot_visible(&slots[2], 500.0, 700.0, 200.0));
     }
 }

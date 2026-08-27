@@ -1,13 +1,14 @@
 //! Reusable egui-based PDF-viewer building blocks.
 //!
-//! These are the pieces of the `kpdf` example viewer
-//! (`src/bin/kpdf.rs`) that are genuinely reusable by *any* egui-based
-//! KOPITIAM front end (kvim, kovan, a future TUI-adjacent GUI) rather than
-//! specific to that one binary's app state: page layout math, the zoom
-//! model, hit-testing, forms-mode UI helpers, the annotation-tool state
-//! machine, and the `Pixmap` -> egui texture bridge. `kpdf.rs` itself now
-//! consumes this module rather than defining these a second time -- see its
-//! imports.
+//! These are the pieces of the `kpdf` viewer (`src/bin/kpdf.rs`) that are
+//! genuinely reusable by *any* egui-based KOPITIAM front end (kvim, kovan, a
+//! future TUI-adjacent GUI) rather than specific to that one binary's app
+//! state: single-page layout math, the continuous (all-pages-in-one-column)
+//! scroll layout, the zoom model, hit-testing, forms-mode UI helpers, the
+//! annotation-tool state machine, vim-motion key handling, a generic bounded
+//! LRU eviction policy, and the `Pixmap` -> egui texture bridge. `kpdf.rs`
+//! itself now consumes this module rather than defining these a second
+//! time -- see its imports.
 //!
 //! Left behind in `kpdf.rs`, deliberately not moved here: `KpdfApp` itself
 //! (the concrete eframe app state), `main`, `pick_pdf`, `load_doc`, the
@@ -31,6 +32,8 @@
 pub mod forms;
 pub mod geometry;
 pub mod hit_test;
+pub mod keys;
+pub mod lru;
 pub mod pixmap;
 pub mod tools;
 pub mod zoom;
@@ -40,10 +43,15 @@ pub use forms::{
     should_commit_on_enter,
 };
 pub use geometry::{
-    PageLayout, field_rect_to_screen, min_hit_rect, page_display_size, page_size_pts,
-    page_to_screen, recentred_scroll_offset, rect_contains, screen_to_page,
+    ContinuousSlot, PageLayout, PageSize, continuous_slot_visible, current_page_in_view,
+    field_rect_to_screen, layout_continuous_pages, min_hit_rect, page_display_size, page_size_pts,
+    page_to_screen, recentred_scroll_offset, rect_contains, screen_to_page, screen_to_page_at,
 };
 pub use hit_test::{hit_test_annot, hit_test_field, hit_test_field_expanded};
+pub use keys::{
+    G_PENDING_TIMEOUT, GPending, VIM_STEP, g_pending_expired, half_viewport_step, keys_captured,
+};
+pub use lru::Lru;
 pub use pixmap::{drawable_annot_count, rgb_to_rgba};
 pub use tools::{Tool, select_tool, toggle_forms_mode};
 pub use zoom::{
