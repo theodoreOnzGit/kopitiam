@@ -66,6 +66,8 @@
 
 pub mod agl;
 pub mod agl_data;
+pub mod annot_appearance;
+pub mod annot_run;
 pub mod buffer;
 pub mod cmap;
 pub mod doc_stream;
@@ -84,8 +86,8 @@ pub mod glyph;
 pub mod glyph_cff;
 pub mod glyph_truetype;
 pub mod glyph_type1;
-pub mod hayro_fallback;
 pub mod hash;
+pub mod hayro_fallback;
 pub mod interpret;
 pub mod lex;
 pub mod object;
@@ -108,34 +110,40 @@ pub mod text_device;
 pub mod xref;
 
 pub use agl::{unicode_from_glyph_name, unicode_from_glyph_name_strict};
+pub use annot_appearance::{
+    SynthAp, annot_border_width, annot_color_rgb, annot_opacity, synthesize_ap,
+};
+pub use annot_run::{AnnotPass, run_page_annots, run_page_annots_with};
 pub use buffer::Buffer;
 pub use cmap::CMap;
 pub use doc_stream::decode_stream;
-pub use draw_device::{cmyk_to_rgb, gray_to_rgb, rasterize_page_ex, rasterize_page_native, DrawDevice};
+pub use draw_device::{
+    DrawDevice, cmyk_to_rgb, gray_to_rgb, rasterize_page_ex, rasterize_page_native,
+};
 // The crate's `rasterize_page` is the graceful (hayro-fallback-aware) one --
 // see hayro_fallback.rs's module docs for why the plain-kopitiam-engine
 // render (`rasterize_page_native`) isn't the default name. Every existing
 // caller across the workspace already calls `mupdf::rasterize_page`, so this
 // re-export is what makes the fallback apply everywhere with no call-site
 // changes.
-pub use hayro_fallback::rasterize_page_graceful as rasterize_page;
-pub use draw_edge::{fill_polygons, FillRule};
+pub use draw_edge::{FillRule, fill_polygons};
 pub use draw_path::Path;
 pub use encodings::BaseEncoding;
 pub use error::{Error, ErrorKind, Result};
 pub use font::{Decoded, Font};
 pub use geometry::{IRect, Matrix, Point, Quad, Rect};
 pub use hash::HashTable;
+pub use hayro_fallback::rasterize_page_graceful as rasterize_page;
 pub use interpret::Processor;
-pub use lex::{lex, Token};
+pub use lex::{Token, lex};
 pub use object::Object;
-pub use page_image::{page_full_image, page_images, DecodedImage};
+pub use page_image::{DecodedImage, page_full_image, page_images};
 pub use page_run::{run_page, run_page_dict};
-pub use parse::{parse_array, parse_dict, parse_ind_obj, IndirectObject, StreamRange};
+pub use parse::{IndirectObject, StreamRange, parse_array, parse_dict, parse_ind_obj};
 pub use pixmap::Pixmap;
 pub use pool::{Handle, Pool};
 pub use stext_boxer::{page_to_stext_segmented, segment_stext_page};
-pub use stext_device::{page_to_stext, StextDevice};
+pub use stext_device::{StextDevice, page_to_stext};
 pub use stext_iterator::{block_bbox, blocks_dfs, line_bbox};
 pub use stext_para::paragraph_break;
 pub use stream::{Stream, StreamSource, Whence};

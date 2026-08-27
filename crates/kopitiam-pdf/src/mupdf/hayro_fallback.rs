@@ -63,7 +63,7 @@
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{render, RenderCache, RenderSettings};
+use hayro::{RenderCache, RenderSettings, render};
 
 use super::draw_device::rasterize_page_ex;
 use super::error::Result;
@@ -82,7 +82,53 @@ pub fn rasterize_page_graceful(doc: &PdfDocument, page_index: usize, dpi: f32) -
     if fallback_glyphs == 0 {
         return Ok(pix);
     }
-    Ok(render_with_hayro(doc.raw_bytes(), page_index, dpi).unwrap_or(pix))
+    match render_with_hayro(doc.raw_bytes(), page_index, dpi) {
+        Some(hayro_pix) => Ok(overlay_missing_annots(doc, page_index, dpi, hayro_pix)),
+        None => Ok(pix),
+    }
+}
+
+/// Paint onto `hayro_pix` the annotations `hayro` did not draw.
+///
+/// hayro gates every annotation behind `/AP` -> `/N`
+/// (`hayro-interpret/src/interpret/mod.rs:157`), so a file that stores an
+/// annotation as pure data -- `/InkList`, `/C`, `/Border`, no appearance
+/// stream, which is exactly what Okular writes -- comes back from hayro with
+/// that annotation missing. Without this step, taking the fallback for a
+/// *glyph* problem would silently cost the page its *annotations*: the reader
+/// would watch ink disappear on precisely the pages where the fallback
+/// engaged, which is worse than either engine alone.
+///
+/// Only [`AnnotPass::SynthesizedOnly`] is painted, so annotations hayro
+/// already drew from a real `/AP` are not drawn a second time -- double
+/// compositing would darken any annot with `/CA` < 1.
+///
+/// Failure here is never fatal: annotations are decoration, and hayro's page
+/// is already a valid render. Any error leaves `hayro_pix` exactly as it came.
+fn overlay_missing_annots(
+    doc: &PdfDocument,
+    page_index: usize,
+    dpi: f32,
+    hayro_pix: Pixmap,
+) -> Pixmap {
+    let Ok(page) = doc.page(page_index).cloned() else {
+        return hayro_pix;
+    };
+    let scale = (dpi / 72.0).max(0.01);
+    let base_ctm = super::page_run::page_ctm(doc, &page);
+
+    let mut dev = super::draw_device::DrawDevice::over_pixmap(
+        hayro_pix,
+        super::geometry::Matrix::scale(scale, scale),
+    );
+    let _ = super::annot_run::run_page_annots_with(
+        doc,
+        &page,
+        base_ctm,
+        &mut dev,
+        super::annot_run::AnnotPass::SynthesizedOnly,
+    );
+    dev.into_pixmap()
 }
 
 /// Render `page_index` of `bytes` with `hayro`, or `None` if hayro itself
@@ -95,8 +141,18 @@ fn render_with_hayro(bytes: &[u8], page_index: usize, dpi: f32) -> Option<Pixmap
     let cache = RenderCache::new();
     let settings = InterpreterSettings::default();
     let scale = (dpi / 72.0).max(0.01);
-    let render_settings = RenderSettings { x_scale: scale, y_scale: scale, bg_color: WHITE, ..Default::default() };
-    Some(convert_pixmap(render(page, &cache, &settings, &render_settings)))
+    let render_settings = RenderSettings {
+        x_scale: scale,
+        y_scale: scale,
+        bg_color: WHITE,
+        ..Default::default()
+    };
+    Some(convert_pixmap(render(
+        page,
+        &cache,
+        &settings,
+        &render_settings,
+    )))
 }
 
 /// `hayro::vello_cpu::Pixmap` (premultiplied RGBA8) to kopitiam-pdf's own
@@ -109,7 +165,13 @@ fn convert_pixmap(vpix: hayro::vello_cpu::Pixmap) -> Pixmap {
     let w = vpix.width() as u32;
     let h = vpix.height() as u32;
     let mut out = Pixmap::new_rgb(w.max(1), h.max(1));
-    for (dst, src) in out.samples.as_chunks_mut::<3>().0.iter_mut().zip(vpix.take_unpremultiplied()) {
+    for (dst, src) in out
+        .samples
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(vpix.take_unpremultiplied())
+    {
         dst[0] = src.r;
         dst[1] = src.g;
         dst[2] = src.b;

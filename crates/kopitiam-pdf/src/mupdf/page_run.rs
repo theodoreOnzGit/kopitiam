@@ -99,10 +99,16 @@ fn gather_contents(doc: &PdfDocument, page: &Object) -> super::error::Result<Vec
 }
 
 // MuPDF: pdf_page_obj_transform_box (pdf-page.c:742), MediaBox path, UserUnit=1.
+/// Public because the annotation pass needs *the same* base transform the
+/// content stream was run under: `/Annots` are positioned in the same default
+/// user space as page content, so drawing them under a different CTM would put
+/// every annotation in the wrong place. See [`super::annot_run::run_page_annots`].
+///
 /// The MediaBox-derived base page transform: flip y, apply the (0/90/180/270)
 /// page rotation, and translate so the box origin lands at `(0, 0)`.
-fn page_ctm(doc: &PdfDocument, page: &Object) -> Matrix {
-    let mut mediabox = rect_from(doc, page, "MediaBox").unwrap_or(Rect::new(0.0, 0.0, 612.0, 792.0));
+pub fn page_ctm(doc: &PdfDocument, page: &Object) -> Matrix {
+    let mut mediabox =
+        rect_from(doc, page, "MediaBox").unwrap_or(Rect::new(0.0, 0.0, 612.0, 792.0));
     // Normalise (x0<=x1, y0<=y1); degenerate boxes fall back to US Letter.
     if mediabox.x1 - mediabox.x0 < 1.0 || mediabox.y1 - mediabox.y0 < 1.0 {
         mediabox = Rect::new(0.0, 0.0, 612.0, 792.0);
@@ -115,7 +121,10 @@ fn page_ctm(doc: &PdfDocument, page: &Object) -> Matrix {
     );
 
     // Snap /Rotate to a multiple of 90 in [0, 360).
-    let mut rotate = doc.resolve_get(page, "Rotate").map(|o| o.to_int()).unwrap_or(0);
+    let mut rotate = doc
+        .resolve_get(page, "Rotate")
+        .map(|o| o.to_int())
+        .unwrap_or(0);
     if rotate < 0 {
         rotate = 360 - ((-rotate) % 360);
     }
@@ -167,7 +176,10 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
 
         // Form XObjects recurse; Image XObjects are painted (Subtype2 overrides
         // Subtype for a form).
-        let subtype = self.doc.resolve_get(&xobj, "Subtype").unwrap_or(Object::Null);
+        let subtype = self
+            .doc
+            .resolve_get(&xobj, "Subtype")
+            .unwrap_or(Object::Null);
         let subtype = if xobj.dict_gets("Subtype2").is_some() {
             self.doc.resolve_get(&xobj, "Subtype2").unwrap_or(subtype)
         } else {
@@ -202,7 +214,10 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // /Matrix (default identity) and /Resources (fall back to the current
         // resources -- MuPDF uses the page resources when the form omits its own).
         let matrix = matrix_from(&xobj).unwrap_or(Matrix::IDENTITY);
-        let resources = self.doc.resolve_get(&xobj, "Resources").unwrap_or(Object::Null);
+        let resources = self
+            .doc
+            .resolve_get(&xobj, "Resources")
+            .unwrap_or(Object::Null);
 
         // gsave; ctm = matrix . ctm; push resources; run; restore.
         self.op_q();
@@ -299,7 +314,15 @@ mod tests {
     }
 
     impl TextDevice for Recorder {
-        fn show_glyph(&mut self, _font: &Font, trm: Matrix, _adv: f32, unicode: char, cid: u32, wmode: u8) {
+        fn show_glyph(
+            &mut self,
+            _font: &Font,
+            trm: Matrix,
+            _adv: f32,
+            unicode: char,
+            cid: u32,
+            wmode: u8,
+        ) {
             self.glyphs.push((unicode, trm.e, trm.f, cid, wmode));
         }
     }

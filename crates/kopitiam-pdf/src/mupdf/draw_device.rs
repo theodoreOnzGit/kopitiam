@@ -50,7 +50,7 @@
 //!   knockout / transparency groups. Image blitting is **nearest-neighbour**
 //!   (no bilinear/mip smoothing) and honours only a rectangular clip.
 
-use super::draw_edge::{fill_polygons, FillRule};
+use super::draw_edge::{FillRule, fill_polygons};
 use super::draw_path::Path;
 use super::font::Font;
 use super::geometry::{IRect, Matrix, Point, Rect};
@@ -91,7 +91,38 @@ impl DrawDevice {
         let mut pix = Pixmap::new_rgb(w.max(1), h.max(1));
         pix.clear_with_value(0xff); // white page
         let clip = pix.bbox();
-        DrawDevice { pix, base, clip, fill: [0, 0, 0], fallback_glyphs: 0 }
+        DrawDevice {
+            pix,
+            base,
+            clip,
+            fill: [0, 0, 0],
+            fallback_glyphs: 0,
+        }
+    }
+
+    /// Create a device that draws **on top of an existing pixmap** instead of a
+    /// fresh white page.
+    ///
+    /// This is what lets two engines contribute to one page. When a page hits
+    /// the glyph fallback, [`super::hayro_fallback`] renders it with `hayro`
+    /// and gets back a finished raster -- but hayro gates annotations behind
+    /// `/AP` -> `/N`, so any annotation the file stores without an appearance
+    /// stream is simply missing from it. Wrapping hayro's pixmap in a device
+    /// lets the annotation pass paint those over the top, rather than the page
+    /// silently losing its annotations whenever the fallback engages.
+    ///
+    /// `base` must be the same post-CTM device transform the pixmap was
+    /// rendered under (`Matrix::scale(dpi / 72.0, dpi / 72.0)` for the
+    /// rasterizer's own convention), or the overlay lands in the wrong place.
+    pub fn over_pixmap(pix: Pixmap, base: Matrix) -> DrawDevice {
+        let clip = pix.bbox();
+        DrawDevice {
+            pix,
+            base,
+            clip,
+            fill: [0, 0, 0],
+            fallback_glyphs: 0,
+        }
     }
 
     /// Borrow the current pixmap.
@@ -119,13 +150,28 @@ impl DrawDevice {
     /// Fill `path` (path space) with `color` (DeviceRGB 0..=1) at `alpha`,
     /// transformed by `ctm`, using the winding rule `rule`. Clipped to the whole
     /// pixmap (use the [`TextDevice`] path for content-stream `W`/`W*` clipping).
-    pub fn fill_path(&mut self, path: &Path, rule: FillRule, ctm: Matrix, color: [f32; 3], alpha: f32) {
+    pub fn fill_path(
+        &mut self,
+        path: &Path,
+        rule: FillRule,
+        ctm: Matrix,
+        color: [f32; 3],
+        alpha: f32,
+    ) {
         let clip = self.clip;
         self.fill_path_clipped(path, rule, ctm, color, alpha, clip);
     }
 
     /// [`fill_path`](DrawDevice::fill_path) with an explicit device-pixel clip.
-    fn fill_path_clipped(&mut self, path: &Path, rule: FillRule, ctm: Matrix, color: [f32; 3], alpha: f32, clip: IRect) {
+    fn fill_path_clipped(
+        &mut self,
+        path: &Path,
+        rule: FillRule,
+        ctm: Matrix,
+        color: [f32; 3],
+        alpha: f32,
+        clip: IRect,
+    ) {
         let m = ctm.concat(self.base);
         let polys = path.flatten(m);
         let c = rgb_to_bytes(color);
@@ -136,13 +182,28 @@ impl DrawDevice {
     /// Stroke `path` with `color` at `alpha`, `line_width` in *path* units,
     /// transformed by `ctm`. Uses the width-expansion approximation
     /// ([`Path::stroke_to_polygons`]).
-    pub fn stroke_path(&mut self, path: &Path, ctm: Matrix, line_width: f32, color: [f32; 3], alpha: f32) {
+    pub fn stroke_path(
+        &mut self,
+        path: &Path,
+        ctm: Matrix,
+        line_width: f32,
+        color: [f32; 3],
+        alpha: f32,
+    ) {
         let clip = self.clip;
         self.stroke_path_clipped(path, ctm, line_width, color, alpha, clip);
     }
 
     /// [`stroke_path`](DrawDevice::stroke_path) with an explicit device-pixel clip.
-    fn stroke_path_clipped(&mut self, path: &Path, ctm: Matrix, line_width: f32, color: [f32; 3], alpha: f32, clip: IRect) {
+    fn stroke_path_clipped(
+        &mut self,
+        path: &Path,
+        ctm: Matrix,
+        line_width: f32,
+        color: [f32; 3],
+        alpha: f32,
+        clip: IRect,
+    ) {
         let m = ctm.concat(self.base);
         // Convert the path-space width to device pixels via the CTM expansion.
         let dev_w = line_width * m.max_expansion();
@@ -159,7 +220,9 @@ impl DrawDevice {
             None => self.clip,
             // `base` is the device output transform (dpi scale); an axis-aligned
             // scale keeps the transformed rect axis-aligned, so its bbox is exact.
-            Some(r) => self.clip.intersect(r.transform(self.base).irect_from_rect()),
+            Some(r) => self
+                .clip
+                .intersect(r.transform(self.base).irect_from_rect()),
         }
     }
 
@@ -199,9 +262,14 @@ impl DrawDevice {
             x1 = x1.max(p.x);
             y1 = y1.max(p.y);
         }
-        let bounds = IRect::new(x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32)
-            .intersect(self.pix.bbox())
-            .intersect(clip);
+        let bounds = IRect::new(
+            x0.floor() as i32,
+            y0.floor() as i32,
+            x1.ceil() as i32,
+            y1.ceil() as i32,
+        )
+        .intersect(self.pix.bbox())
+        .intersect(clip);
         if bounds.is_empty() {
             return;
         }
@@ -238,7 +306,15 @@ impl DrawDevice {
 // with no outline source, reduced to the advance-box placeholder (see the module
 // header's fidelity-ceiling note).
 impl TextDevice for DrawDevice {
-    fn show_glyph(&mut self, font: &Font, trm: Matrix, adv: f32, unicode: char, cid: u32, _wmode: u8) {
+    fn show_glyph(
+        &mut self,
+        font: &Font,
+        trm: Matrix,
+        adv: f32,
+        unicode: char,
+        cid: u32,
+        _wmode: u8,
+    ) {
         // Whitespace and zero-width glyphs paint nothing (keeps inter-word gaps).
         if adv <= 0.0 || unicode.is_whitespace() {
             return;
@@ -258,7 +334,14 @@ impl TextDevice for DrawDevice {
             // Nonzero winding: a glyph's counter (the hole in 'o'/'A') is wound
             // opposite its outer contour, so nonzero leaves it unfilled -- the
             // interior white that distinguishes a real letterform from the box.
-            fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &self.fill, 1.0, self.clip);
+            fill_polygons(
+                &mut self.pix,
+                &polys,
+                FillRule::NonZero,
+                &self.fill,
+                1.0,
+                self.clip,
+            );
             return;
         }
 
@@ -275,18 +358,41 @@ impl TextDevice for DrawDevice {
         path.rect(x0, 0.0, x1, asc);
 
         let polys = path.flatten(m);
-        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &self.fill, 1.0, self.clip);
+        fill_polygons(
+            &mut self.pix,
+            &polys,
+            FillRule::NonZero,
+            &self.fill,
+            1.0,
+            self.clip,
+        );
     }
 
     // The interpreter's path/colour/image operators drive these (see
     // [`interpret`](super::interpret) / [`op_run`](super::op_run)); each forwards to
     // the inherent painter with the content-space clip resolved to device pixels.
-    fn fill_path(&mut self, path: &Path, rule: FillRule, ctm: Matrix, color: [f32; 3], alpha: f32, clip: Option<Rect>) {
+    fn fill_path(
+        &mut self,
+        path: &Path,
+        rule: FillRule,
+        ctm: Matrix,
+        color: [f32; 3],
+        alpha: f32,
+        clip: Option<Rect>,
+    ) {
         let ic = self.resolve_clip(clip);
         self.fill_path_clipped(path, rule, ctm, color, alpha, ic);
     }
 
-    fn stroke_path(&mut self, path: &Path, ctm: Matrix, line_width: f32, color: [f32; 3], alpha: f32, clip: Option<Rect>) {
+    fn stroke_path(
+        &mut self,
+        path: &Path,
+        ctm: Matrix,
+        line_width: f32,
+        color: [f32; 3],
+        alpha: f32,
+        clip: Option<Rect>,
+    ) {
         let ic = self.resolve_clip(clip);
         self.stroke_path_clipped(path, ctm, line_width, color, alpha, ic);
     }
@@ -315,7 +421,9 @@ fn rgb_to_bytes(c: [f32; 3]) -> [u8; 3] {
 fn blend_rgb(dst: &mut [u8], src: [u8; 3], a: f32) {
     let ia = 1.0 - a;
     for k in 0..3 {
-        dst[k] = (src[k] as f32 * a + dst[k] as f32 * ia).round().clamp(0.0, 255.0) as u8;
+        dst[k] = (src[k] as f32 * a + dst[k] as f32 * ia)
+            .round()
+            .clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -329,7 +437,11 @@ pub fn gray_to_rgb(g: f32) -> [f32; 3] {
 // ICC profile applies).
 /// Convert DeviceCMYK (each 0..=1) to DeviceRGB.
 pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
-    [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)]
+    [
+        (1.0 - c) * (1.0 - k),
+        (1.0 - m) * (1.0 - k),
+        (1.0 - y) * (1.0 - k),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +468,11 @@ pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
 /// glyph letterforms wherever an embedded font program decodes (see the
 /// fidelity-ceiling note on [`DrawDevice`] for the remaining stubs and the
 /// advance-box fallback).
-pub fn rasterize_page_native(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<Pixmap> {
+pub fn rasterize_page_native(
+    doc: &PdfDocument,
+    page_index: usize,
+    dpi: f32,
+) -> super::error::Result<Pixmap> {
     rasterize_page_ex(doc, page_index, dpi).map(|(pix, _fallback_glyphs)| pix)
 }
 
@@ -366,7 +482,11 @@ pub fn rasterize_page_native(doc: &PdfDocument, page_index: usize, dpi: f32) -> 
 /// real outlines throughout. This is the seam
 /// [`hayro_fallback`](super::hayro_fallback) uses to decide whether a
 /// second, cross-engine render is worth attempting.
-pub fn rasterize_page_ex(doc: &PdfDocument, page_index: usize, dpi: f32) -> super::error::Result<(Pixmap, usize)> {
+pub fn rasterize_page_ex(
+    doc: &PdfDocument,
+    page_index: usize,
+    dpi: f32,
+) -> super::error::Result<(Pixmap, usize)> {
     let scale = (dpi / 72.0).max(0.01);
     let page = doc.page(page_index)?.clone();
 
@@ -402,6 +522,20 @@ pub fn rasterize_page_ex(doc: &PdfDocument, page_index: usize, dpi: f32) -> supe
 
     let mut dev = DrawDevice::new(iw, ih, Matrix::scale(scale, scale));
     super::run_page(doc, page_index, &mut dev)?;
+
+    // MuPDF: fz_run_page = pdf_run_page_contents + pdf_run_page_annots
+    // (pdf-run.c:353). A page's /Annots is a *sibling* of /Contents, so the
+    // interpreter run above draws none of them -- annotations need their own
+    // pass, under the same base CTM, painted *after* the content because PDF
+    // draws them on top.
+    //
+    // Errors are swallowed deliberately: annotations are decoration, and a
+    // single malformed annot must never stop an otherwise readable page from
+    // rendering. `run_page_annots` already contains per-annot error handling;
+    // this is the outer belt-and-braces for a failure to even read /Annots.
+    let base_ctm = super::page_run::page_ctm(doc, &page);
+    let _ = super::annot_run::run_page_annots(doc, &page, base_ctm, &mut dev);
+
     let fallback_glyphs = dev.fallback_glyph_count();
     Ok((dev.into_pixmap(), fallback_glyphs))
 }
@@ -428,7 +562,10 @@ fn mediabox_size(doc: &PdfDocument, page: &Object) -> (f32, f32) {
 
 /// True if the page's `/Rotate` (snapped to a multiple of 90) is 90° or 270°.
 fn page_is_quarter_turned(doc: &PdfDocument, page: &Object) -> bool {
-    let mut r = doc.resolve_get(page, "Rotate").map(|o| o.to_int()).unwrap_or(0);
+    let mut r = doc
+        .resolve_get(page, "Rotate")
+        .map(|o| o.to_int())
+        .unwrap_or(0);
     r = ((r % 360) + 360) % 360;
     r = 90 * ((r + 45) / 90);
     r %= 360;
@@ -444,7 +581,13 @@ mod tests {
         let mut dev = DrawDevice::new(40, 40, Matrix::IDENTITY);
         let mut p = Path::new();
         p.rect(10.0, 10.0, 30.0, 30.0);
-        dev.fill_path(&p, FillRule::NonZero, Matrix::IDENTITY, [0.0, 0.0, 0.0], 1.0);
+        dev.fill_path(
+            &p,
+            FillRule::NonZero,
+            Matrix::IDENTITY,
+            [0.0, 0.0, 0.0],
+            1.0,
+        );
         let pix = dev.pixmap();
         assert!(pix.luma(20, 20).unwrap() < 5, "inside not black");
         assert_eq!(pix.luma(2, 2).unwrap(), 255, "margin not white");
@@ -456,7 +599,13 @@ mod tests {
         let mut dev = DrawDevice::new(40, 40, Matrix::scale(2.0, 2.0));
         let mut p = Path::new();
         p.rect(0.0, 0.0, 10.0, 10.0);
-        dev.fill_path(&p, FillRule::NonZero, Matrix::IDENTITY, [0.0, 0.0, 0.0], 1.0);
+        dev.fill_path(
+            &p,
+            FillRule::NonZero,
+            Matrix::IDENTITY,
+            [0.0, 0.0, 0.0],
+            1.0,
+        );
         // (10,10) path -> (20,20) device: still black inside.
         assert!(dev.pixmap().luma(15, 15).unwrap() < 5);
         assert!(dev.pixmap().luma(25, 25).unwrap() == 255);
@@ -491,7 +640,8 @@ mod tests {
             pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
         }
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_ofs}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_ofs}\n%%EOF\n")
+                .as_bytes(),
         );
         pdf
     }
@@ -519,7 +669,11 @@ mod tests {
     fn rasterize_page_dims_scale_with_dpi() {
         let doc = text_page_doc();
         let p72 = rasterize_page_native(&doc, 0, 72.0).unwrap();
-        assert_eq!((p72.w, p72.h), (200, 200), "72 dpi -> 1:1 with the 200pt MediaBox");
+        assert_eq!(
+            (p72.w, p72.h),
+            (200, 200),
+            "72 dpi -> 1:1 with the 200pt MediaBox"
+        );
         let p144 = rasterize_page_native(&doc, 0, 144.0).unwrap();
         assert_eq!((p144.w, p144.h), (400, 400), "144 dpi -> 2x");
     }
@@ -551,14 +705,19 @@ mod tests {
         let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // The page is not blank: some pixel is darkened by the text.
-        let any_dark = (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 200));
+        let any_dark =
+            (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 200));
         assert!(any_dark, "rasterized text page should not be all white");
 
         // The text sits near the top-left (device y ~ 78..100, x ~ 20..90). The
         // bottom-right quadrant is margin: it must stay white.
         for y in 150..200 {
             for x in 150..200 {
-                assert_eq!(pix.luma(x, y).unwrap(), 255, "margin pixel ({x},{y}) not white");
+                assert_eq!(
+                    pix.luma(x, y).unwrap(),
+                    255,
+                    "margin pixel ({x},{y}) not white"
+                );
             }
         }
     }
@@ -567,7 +726,12 @@ mod tests {
     fn draw_image_fills_unit_square() {
         let mut dev = DrawDevice::new(20, 20, Matrix::IDENTITY);
         // A 2x2 solid red image mapped onto a 10x10 device square at (5,5).
-        let img = DecodedImage { width: 2, height: 2, components: 3, pixels: vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0] };
+        let img = DecodedImage {
+            width: 2,
+            height: 2,
+            components: 3,
+            pixels: vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0],
+        };
         let ctm = Matrix::new(10.0, 0.0, 0.0, 10.0, 5.0, 5.0);
         dev.draw_image(&img, ctm, 1.0);
         let px = dev.pixmap().pixel(10, 10).unwrap();
@@ -612,9 +776,16 @@ mod tests {
 
         // Inside the rectangle: red (high R, low G/B) -- not the old default black.
         let c = pix.pixel(50, 50).unwrap();
-        assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "centre should be red, got {c:?}");
+        assert!(
+            c[0] > 200 && c[1] < 60 && c[2] < 60,
+            "centre should be red, got {c:?}"
+        );
         // Outside the rectangle: still white.
-        assert_eq!(pix.pixel(5, 5).unwrap(), &[255, 255, 255], "margin not white");
+        assert_eq!(
+            pix.pixel(5, 5).unwrap(),
+            &[255, 255, 255],
+            "margin not white"
+        );
     }
 
     #[test]
@@ -627,8 +798,14 @@ mod tests {
 
         let cb = pb.pixel(50, 50).unwrap();
         let cg = pg.pixel(50, 50).unwrap();
-        assert!(cb.iter().all(|&v| v < 40), "default fill should be black, got {cb:?}");
-        assert!(cg[1] > 200 && cg[0] < 60 && cg[2] < 60, "rg fill should be green, got {cg:?}");
+        assert!(
+            cb.iter().all(|&v| v < 40),
+            "default fill should be black, got {cb:?}"
+        );
+        assert!(
+            cg[1] > 200 && cg[0] < 60 && cg[2] < 60,
+            "rg fill should be green, got {cg:?}"
+        );
         assert_ne!(cb, cg, "colour operator must change the output colour");
     }
 
@@ -639,10 +816,20 @@ mod tests {
         let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
 
         // On the line: dark pixels.
-        assert!(pix.luma(50, 50).unwrap() < 150, "stroke should darken the line");
-        assert!(pix.luma(30, 50).unwrap() < 150, "stroke should darken along the line");
+        assert!(
+            pix.luma(50, 50).unwrap() < 150,
+            "stroke should darken the line"
+        );
+        assert!(
+            pix.luma(30, 50).unwrap() < 150,
+            "stroke should darken along the line"
+        );
         // Well away from the line: white.
-        assert_eq!(pix.luma(50, 10).unwrap(), 255, "off-line pixel should be white");
+        assert_eq!(
+            pix.luma(50, 10).unwrap(),
+            255,
+            "off-line pixel should be white"
+        );
     }
 
     #[test]
@@ -660,8 +847,14 @@ mod tests {
         let eo = rasterize_page_native(&op_doc(&eo_ops, "<< >>", &[]), 0, 72.0).unwrap();
 
         // Centre pentagon: filled under nonzero, a hole under even-odd.
-        assert!(nz.luma(50, 50).unwrap() < 100, "nonzero centre should be filled");
-        assert!(eo.luma(50, 50).unwrap() > 200, "even-odd centre should be a hole");
+        assert!(
+            nz.luma(50, 50).unwrap() < 100,
+            "nonzero centre should be filled"
+        );
+        assert!(
+            eo.luma(50, 50).unwrap() > 200,
+            "even-odd centre should be a hole"
+        );
         // Even-odd still paints the five spikes -- it is not blank.
         let eo_has_dark = (0..100).any(|y| (0..100).any(|x| eo.luma(x, y).unwrap() < 100));
         assert!(eo_has_dark, "even-odd star should still paint its spikes");
@@ -693,9 +886,16 @@ mod tests {
 
         // The image covers device (20,20)..(80,80): its centre is red.
         let c = pix.pixel(50, 50).unwrap();
-        assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "image centre should be red, got {c:?}");
+        assert!(
+            c[0] > 200 && c[1] < 60 && c[2] < 60,
+            "image centre should be red, got {c:?}"
+        );
         // Outside the placement: white.
-        assert_eq!(pix.pixel(5, 5).unwrap(), &[255, 255, 255], "outside image not white");
+        assert_eq!(
+            pix.pixel(5, 5).unwrap(),
+            &[255, 255, 255],
+            "outside image not white"
+        );
     }
 
     #[test]
@@ -711,9 +911,16 @@ mod tests {
 
         // Inside the clip window: red.
         let c = pix.pixel(50, 50).unwrap();
-        assert!(c[0] > 200 && c[1] < 60 && c[2] < 60, "clip window should be red, got {c:?}");
+        assert!(
+            c[0] > 200 && c[1] < 60 && c[2] < 60,
+            "clip window should be red, got {c:?}"
+        );
         // Outside the clip window (but inside the fill rect): unpainted white.
-        assert_eq!(pix.pixel(20, 20).unwrap(), &[255, 255, 255], "clip should mask the fill");
+        assert_eq!(
+            pix.pixel(20, 20).unwrap(),
+            &[255, 255, 255],
+            "clip should mask the fill"
+        );
     }
 
     // -- end-to-end: embedded-font glyph OUTLINES (not the advance box) --------
@@ -721,7 +928,14 @@ mod tests {
     /// Wrap raw font-program bytes as a `/FontFile2` stream object.
     fn fontfile2_body(ttf: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
-        v.extend_from_slice(format!("<< /Length {} /Length1 {} >>\nstream\n", ttf.len(), ttf.len()).as_bytes());
+        v.extend_from_slice(
+            format!(
+                "<< /Length {} /Length1 {} >>\nstream\n",
+                ttf.len(),
+                ttf.len()
+            )
+            .as_bytes(),
+        );
         v.extend_from_slice(ttf);
         v.extend_from_slice(b"\nendstream");
         v
@@ -756,9 +970,17 @@ mod tests {
         // The glyph outer ring spans device ~(35,35)-(155,155); its counter (hole)
         // spans device ~(65,65)-(125,125). Centre of the hole must stay WHITE --
         // the real letterform's interior, impossible under the solid advance box.
-        assert!(pix.luma(95, 95).unwrap() > 200, "glyph counter should be white (interior), got {}", pix.luma(95, 95).unwrap());
+        assert!(
+            pix.luma(95, 95).unwrap() > 200,
+            "glyph counter should be white (interior), got {}",
+            pix.luma(95, 95).unwrap()
+        );
         // The ring wall (left of the hole) must be painted dark.
-        assert!(pix.luma(40, 95).unwrap() < 120, "ring wall should be dark, got {}", pix.luma(40, 95).unwrap());
+        assert!(
+            pix.luma(40, 95).unwrap() < 120,
+            "ring wall should be dark, got {}",
+            pix.luma(40, 95).unwrap()
+        );
         // Sanity: the page is not blank.
         let any_dark = (0..200).any(|y| (0..200).any(|x| pix.luma(x, y).unwrap() < 100));
         assert!(any_dark, "glyph should paint some dark pixels");
@@ -805,8 +1027,16 @@ mod tests {
 
         // Same device geometry as the TrueType ring test (identical Tf/Td and
         // em-space square coordinates).
-        assert!(pix.luma(95, 95).unwrap() > 200, "glyph counter should be white (interior), got {}", pix.luma(95, 95).unwrap());
-        assert!(pix.luma(40, 95).unwrap() < 120, "ring wall should be dark, got {}", pix.luma(40, 95).unwrap());
+        assert!(
+            pix.luma(95, 95).unwrap() > 200,
+            "glyph counter should be white (interior), got {}",
+            pix.luma(95, 95).unwrap()
+        );
+        assert!(
+            pix.luma(40, 95).unwrap() < 120,
+            "ring wall should be dark, got {}",
+            pix.luma(40, 95).unwrap()
+        );
         let any_dark = (0..200).any(|y| (0..200).any(|x| pix.luma(x, y).unwrap() < 100));
         assert!(any_dark, "glyph should paint some dark pixels");
     }
@@ -818,7 +1048,8 @@ mod tests {
         let doc = text_page_doc(); // Helvetica, no FontFile
         let pix = rasterize_page_native(&doc, 0, 72.0).unwrap();
         // "HELLO" at size 24 near the top-left paints solid blocks (no outlines).
-        let any_dark = (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 100));
+        let any_dark =
+            (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 100));
         assert!(any_dark, "advance-box fallback should still paint text");
     }
 }

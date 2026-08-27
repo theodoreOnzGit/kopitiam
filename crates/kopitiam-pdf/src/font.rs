@@ -111,8 +111,18 @@ const ITALIC_MARKERS: &[&str] = &["italic", "ital", "oblique", "obli"];
 /// [`FontStyle::family`], even though it does not itself imply bold or
 /// italic (e.g. `"Regular"`, `"Medium"`, `"Condensed"`).
 const NON_BOLD_STYLE_SUFFIX_MARKERS: &[&str] = &[
-    "regular", "regu", "medium", "medi", "light", "thin", "condensed", "cond", "narrow", "plain",
-    "roman", "mt",
+    "regular",
+    "regu",
+    "medium",
+    "medi",
+    "light",
+    "thin",
+    "condensed",
+    "cond",
+    "narrow",
+    "plain",
+    "roman",
+    "mt",
 ];
 
 /// A PDF font-subsetting embedder is required (ISO 32000-1 §9.6.4.3) to
@@ -227,7 +237,9 @@ pub(crate) fn style_from_descriptor_and_name(
         .font_weight
         .map(|weight| weight >= BOLD_FONT_WEIGHT_THRESHOLD)
         .or(descriptor.force_bold_flag)
-        .or(descriptor.stem_v.map(|stem_v| stem_v >= BOLD_STEM_V_THRESHOLD))
+        .or(descriptor
+            .stem_v
+            .map(|stem_v| stem_v >= BOLD_STEM_V_THRESHOLD))
         .or(name_style.bold);
 
     let italic = descriptor.italic_flag.or(name_style.italic);

@@ -1,0 +1,44 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents 4 0 R /Annots [5 0 R 6 0 R] >>
+endobj
+4 0 obj
+<< /Length 34 >>
+stream
+0 0 0 RG 1 w 10 190 m 190 190 l S
+endstream
+endobj
+5 0 obj
+<< /Type /Annot /Subtype /Ink /Rect [20 150 120 170] /InkList [[20 150 120 170]] /C [1 0 1] /CA 1 /Border [0 0 2] /F 4 /AP << /N 7 0 R >> >>
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Ink /Rect [20 40 120 60] /InkList [[20 40 60 60 100 45 120 55]] /C [0 1 1] /CA 1 /Border [0 0 3] /F 4 >>
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 50 10] /Resources << >> /Length 28 >>
+stream
+1 0 1 RG 2 w 1 1 m 49 9 l S
+endstream
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000330 00000 n 
+0000000486 00000 n 
+0000000632 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+774
+%%EOF
