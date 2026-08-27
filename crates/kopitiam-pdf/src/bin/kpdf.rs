@@ -2446,6 +2446,7 @@ mod tests {
             rect,
             read_only: false,
             on_state: None,
+            multiline: false,
         }
     }
 
@@ -2467,5 +2468,217 @@ mod tests {
             Rect::new(0.0, 0.0, 20.0, 20.0),
         )];
         assert_eq!(hit_test_field(500.0, 500.0, &fields), None);
+    }
+
+    // -- field_rect_to_screen ------------------------------------------------
+
+    #[test]
+    fn field_rect_to_screen_full_page_matches_image_bounds() {
+        let layout = sample_layout();
+        // The whole page's rect must map back to exactly the image's
+        // on-screen bounds -- this is the same y-flip `page_to_screen`
+        // already covers, exercised here through the field-rect wrapper.
+        let (x0, y0, x1, y1) =
+            field_rect_to_screen(Rect::new(0.0, 0.0, layout.page_w_pts, layout.page_h_pts), layout);
+        assert!((x0 - layout.image_x).abs() < 1e-3);
+        assert!((y0 - layout.image_y).abs() < 1e-3);
+        assert!((x1 - (layout.image_x + layout.image_w)).abs() < 1e-3);
+        assert!((y1 - (layout.image_y + layout.image_h)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn field_rect_to_screen_normalises_the_y_flip() {
+        let layout = sample_layout();
+        // A rect near the *bottom* of the page (small y0/y1, PDF y-up) must
+        // still come out with `y0 < y1` on screen (y-down) -- i.e. this
+        // must not silently hand back an inverted rect just because the
+        // corner mapping flips which corner is which.
+        let (_, y0, _, y1) = field_rect_to_screen(Rect::new(0.0, 0.0, 50.0, 20.0), layout);
+        assert!(y0 < y1);
+    }
+
+    // -- min_hit_rect ---------------------------------------------------------
+
+    #[test]
+    fn min_hit_rect_widens_a_field_smaller_than_the_minimum() {
+        let layout = sample_layout();
+        // scale_x = image_w / page_w_pts = 300/612, scale_y = 400/792 --
+        // a 10x10pt field is well under 16 screen px on both axes here.
+        let tiny = Rect::new(100.0, 100.0, 110.0, 110.0);
+        let widened = min_hit_rect(tiny, layout, MIN_HIT_AREA_SCREEN);
+        let (sx0, sy0, sx1, sy1) = field_rect_to_screen(widened, layout);
+        assert!(
+            sx1 - sx0 >= MIN_HIT_AREA_SCREEN - 1e-3,
+            "widened width {} px, wanted >= {}",
+            sx1 - sx0,
+            MIN_HIT_AREA_SCREEN
+        );
+        assert!(
+            sy1 - sy0 >= MIN_HIT_AREA_SCREEN - 1e-3,
+            "widened height {} px, wanted >= {}",
+            sy1 - sy0,
+            MIN_HIT_AREA_SCREEN
+        );
+        // Widening must not move the field's centre.
+        let cx = (tiny.x0 + tiny.x1) / 2.0;
+        let cy = (tiny.y0 + tiny.y1) / 2.0;
+        assert!(((widened.x0 + widened.x1) / 2.0 - cx).abs() < 1e-3);
+        assert!(((widened.y0 + widened.y1) / 2.0 - cy).abs() < 1e-3);
+    }
+
+    #[test]
+    fn min_hit_rect_leaves_an_already_comfortable_field_alone() {
+        let layout = sample_layout();
+        // 200x200pt is already far larger than any sane minimum -- no
+        // reason to touch its bounds.
+        let big = Rect::new(0.0, 0.0, 200.0, 200.0);
+        assert_eq!(min_hit_rect(big, layout, MIN_HIT_AREA_SCREEN), big);
+    }
+
+    #[test]
+    fn min_hit_rect_degenerate_layout_returns_rect_unchanged() {
+        let mut layout = sample_layout();
+        layout.image_w = 0.0;
+        let r = Rect::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(min_hit_rect(r, layout, MIN_HIT_AREA_SCREEN), r);
+    }
+
+    // -- hit_test_field_expanded ------------------------------------------------
+
+    #[test]
+    fn hit_test_field_expanded_catches_a_hairline_field_the_exact_test_misses() {
+        let layout = sample_layout();
+        // A field rendered as a hairline: 40pt wide but 0.1pt tall. The
+        // exact test (`hit_test_field`) must miss a click a few points off
+        // the hairline; the expanded test must still catch it.
+        let fields = vec![field(1, FieldKind::Text, Rect::new(0.0, 100.0, 40.0, 100.1))];
+        assert_eq!(hit_test_field(20.0, 105.0, &fields), None);
+        assert_eq!(
+            hit_test_field_expanded(20.0, 105.0, &fields, layout, MIN_HIT_AREA_SCREEN),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn hit_test_field_expanded_still_misses_far_away_clicks() {
+        let layout = sample_layout();
+        let fields = vec![field(1, FieldKind::Text, Rect::new(0.0, 100.0, 40.0, 100.1))];
+        assert_eq!(
+            hit_test_field_expanded(500.0, 500.0, &fields, layout, MIN_HIT_AREA_SCREEN),
+            None
+        );
+    }
+
+    // -- field_highlight_kind ---------------------------------------------------
+
+    #[test]
+    fn field_highlight_kind_matches_handle_forms_click_dispatch() {
+        // Every kind kpdf actually acts on while not read-only.
+        assert_eq!(
+            field_highlight_kind(FieldKind::Text, false),
+            FieldHighlight::Editable
+        );
+        assert_eq!(
+            field_highlight_kind(FieldKind::Checkbox, false),
+            FieldHighlight::Toggleable
+        );
+        assert_eq!(
+            field_highlight_kind(FieldKind::Radio, false),
+            FieldHighlight::Toggleable
+        );
+        // Combobox/Listbox: `set_field_value` refuses them, so they get a
+        // distinct "can't edit this here" style rather than `Editable`.
+        assert_eq!(
+            field_highlight_kind(FieldKind::Combobox, false),
+            FieldHighlight::Unsupported
+        );
+        assert_eq!(
+            field_highlight_kind(FieldKind::Listbox, false),
+            FieldHighlight::Unsupported
+        );
+        // Nothing kpdf can act on -- no highlight at all.
+        assert_eq!(
+            field_highlight_kind(FieldKind::Button, false),
+            FieldHighlight::None
+        );
+        assert_eq!(
+            field_highlight_kind(FieldKind::Signature, false),
+            FieldHighlight::None
+        );
+        assert_eq!(
+            field_highlight_kind(FieldKind::Unknown, false),
+            FieldHighlight::None
+        );
+    }
+
+    #[test]
+    fn field_highlight_kind_read_only_overrides_every_actionable_kind() {
+        for kind in [
+            FieldKind::Text,
+            FieldKind::Checkbox,
+            FieldKind::Radio,
+            FieldKind::Combobox,
+            FieldKind::Listbox,
+        ] {
+            assert_eq!(
+                field_highlight_kind(kind, true),
+                FieldHighlight::ReadOnly,
+                "{kind:?} read-only should highlight as ReadOnly"
+            );
+        }
+    }
+
+    #[test]
+    fn field_highlight_kind_read_only_button_like_kinds_stay_hidden() {
+        // A read-only pushbutton/signature/unknown still has nothing kpdf
+        // can do with it -- read-only doesn't turn "no highlight" into
+        // "muted highlight" for these.
+        for kind in [FieldKind::Button, FieldKind::Signature, FieldKind::Unknown] {
+            assert_eq!(field_highlight_kind(kind, true), FieldHighlight::None);
+        }
+    }
+
+    // -- should_commit_on_enter --------------------------------------------
+
+    #[test]
+    fn should_commit_on_enter_plain_enter_commits() {
+        assert!(should_commit_on_enter(
+            egui::Key::Enter,
+            egui::Modifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn should_commit_on_enter_shift_enter_does_not_commit() {
+        assert!(!should_commit_on_enter(
+            egui::Key::Enter,
+            egui::Modifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn should_commit_on_enter_shift_plus_other_modifiers_still_does_not_commit() {
+        assert!(!should_commit_on_enter(
+            egui::Key::Enter,
+            egui::Modifiers::SHIFT | egui::Modifiers::CTRL
+        ));
+    }
+
+    #[test]
+    fn should_commit_on_enter_other_modifiers_without_shift_still_commit() {
+        // The maintainer's instruction only distinguished Shift; Ctrl/Alt/
+        // Cmd alongside a shiftless Enter are not diverted to a newline.
+        assert!(should_commit_on_enter(
+            egui::Key::Enter,
+            egui::Modifiers::CTRL
+        ));
+    }
+
+    #[test]
+    fn should_commit_on_enter_a_different_key_never_commits() {
+        assert!(!should_commit_on_enter(
+            egui::Key::A,
+            egui::Modifiers::NONE
+        ));
     }
 }
