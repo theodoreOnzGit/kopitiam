@@ -1325,6 +1325,188 @@ fn page_to_screen(page_x: f32, page_y: f32, layout: PageLayout) -> (f32, f32) {
     )
 }
 
+/// Map a form field's `/Rect` (default user space) to an on-screen rect --
+/// for painting the fillable-area highlight or positioning the in-place
+/// text editor over the field's own box. Delegates both corners to the
+/// already-tested [`page_to_screen`] and only then normalises min/max: the
+/// y-flip means a PDF rect's "bottom" corner (`y0`, the smaller value in
+/// PDF's y-up space) becomes the on-screen *top*, so a naive corner-to-
+/// corner copy without normalising would swap top and bottom on screen (the
+/// same trap [`screen_to_page`]/[`page_to_screen`]'s own docs call out).
+/// Returns `(min_x, min_y, max_x, max_y)` rather than an `egui::Rect` so it
+/// stays composable with the other pure functions in this file and testable
+/// without constructing egui geometry.
+fn field_rect_to_screen(rect: Rect, layout: PageLayout) -> (f32, f32, f32, f32) {
+    let (sx0, sy0) = page_to_screen(rect.x0, rect.y0, layout);
+    let (sx1, sy1) = page_to_screen(rect.x1, rect.y1, layout);
+    (sx0.min(sx1), sy0.min(sy1), sx0.max(sx1), sy0.max(sy1))
+}
+
+/// Widen `rect` (default user space) about its own centre so that, once
+/// mapped to screen space via `layout`, neither side is smaller than
+/// `min_screen_size` -- see [`MIN_HIT_AREA_SCREEN`] for why this exists.
+/// Used both before hit-testing ([`hit_test_field_expanded`]) and before
+/// painting ([`KpdfApp::paint_and_edit_form_fields`]), deliberately: the
+/// highlighted area and the clickable area must always agree, or a field
+/// would visibly highlight smaller than where a click actually registers.
+///
+/// Computed per-axis from `layout`'s own page-points-to-screen-pixels ratio
+/// -- `page_display_size` currently keeps zoom uniform across both axes, so
+/// in practice `scale_x == scale_y`, but this function does not assume
+/// that.
+fn min_hit_rect(rect: Rect, layout: PageLayout, min_screen_size: f32) -> Rect {
+    if layout.page_w_pts <= 0.0
+        || layout.page_h_pts <= 0.0
+        || layout.image_w <= 0.0
+        || layout.image_h <= 0.0
+    {
+        return rect;
+    }
+    let scale_x = layout.image_w / layout.page_w_pts;
+    let scale_y = layout.image_h / layout.page_h_pts;
+    let min_w = min_screen_size / scale_x;
+    let min_h = min_screen_size / scale_y;
+    let cx = (rect.x0 + rect.x1) / 2.0;
+    let cy = (rect.y0 + rect.y1) / 2.0;
+    let w = (rect.x1 - rect.x0).abs().max(min_w);
+    let h = (rect.y1 - rect.y0).abs().max(min_h);
+    Rect {
+        x0: cx - w / 2.0,
+        y0: cy - h / 2.0,
+        x1: cx + w / 2.0,
+        y1: cy + h / 2.0,
+    }
+}
+
+/// Which visual treatment (if any) a field gets while forms mode is on --
+/// and, implicitly, whether a click on it does anything at all. Mirrors
+/// [`KpdfApp::handle_forms_click`]'s own dispatch exactly, so the highlight
+/// never promises an interaction the click handler doesn't deliver:
+///
+/// * `Text`, not read-only -- [`FieldHighlight::Editable`]: click opens the
+///   in-place editor.
+/// * `Checkbox`/`Radio`, not read-only -- [`FieldHighlight::Toggleable`]:
+///   click flips it, unchanged from before this pass.
+/// * any kind, read-only -- [`FieldHighlight::ReadOnly`]: still shown (so
+///   the user can see a value is there) but visually muted, since a click
+///   just reports "read-only" rather than doing anything.
+/// * `Combobox`/`Listbox`, not read-only -- [`FieldHighlight::Unsupported`]:
+///   [`kopitiam_pdf::mupdf::form::set_field_value`] refuses these
+///   unconditionally in this release, so the highlight says "there is a
+///   field here" without promising an editor a click will never produce.
+/// * `Button`/`Signature`/`Unknown` -- [`FieldHighlight::None`]: no text
+///   value, no toggle, nothing kpdf can do with a click here, so no
+///   highlight at all rather than one that does nothing when clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldHighlight {
+    Editable,
+    Toggleable,
+    ReadOnly,
+    Unsupported,
+    None,
+}
+
+fn field_highlight_kind(kind: FieldKind, read_only: bool) -> FieldHighlight {
+    if read_only {
+        return match kind {
+            FieldKind::Button | FieldKind::Signature | FieldKind::Unknown => FieldHighlight::None,
+            _ => FieldHighlight::ReadOnly,
+        };
+    }
+    match kind {
+        FieldKind::Text => FieldHighlight::Editable,
+        FieldKind::Checkbox | FieldKind::Radio => FieldHighlight::Toggleable,
+        FieldKind::Combobox | FieldKind::Listbox => FieldHighlight::Unsupported,
+        FieldKind::Button | FieldKind::Signature | FieldKind::Unknown => FieldHighlight::None,
+    }
+}
+
+/// Fill + border colour for each [`FieldHighlight`] style. Not unit tested --
+/// this is pure styling with no logic to get wrong, and the actual "does
+/// this read well on screen" question is exactly what this file's module
+/// docs flag as needing a human at a display, not a gate.
+fn highlight_colors(style: FieldHighlight) -> (egui::Color32, egui::Stroke) {
+    match style {
+        FieldHighlight::Editable => (
+            egui::Color32::from_rgba_unmultiplied(90, 160, 255, 55),
+            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(40, 110, 230, 200)),
+        ),
+        FieldHighlight::Toggleable => (
+            egui::Color32::from_rgba_unmultiplied(90, 200, 140, 55),
+            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(40, 150, 90, 200)),
+        ),
+        FieldHighlight::ReadOnly => (
+            egui::Color32::from_rgba_unmultiplied(150, 150, 150, 35),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 120, 120, 160)),
+        ),
+        FieldHighlight::Unsupported => (
+            egui::Color32::from_rgba_unmultiplied(230, 170, 60, 45),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(200, 130, 30, 180)),
+        ),
+        FieldHighlight::None => (egui::Color32::TRANSPARENT, egui::Stroke::NONE),
+    }
+}
+
+/// Whether an `Enter` keypress (`key`) held with `modifiers` should commit
+/// the in-place field editor rather than (for a multiline field) insert a
+/// newline. Per the maintainer's explicit call: "enter saves the thing.
+/// Shift-Enter gets a new line" -- so plain `Enter` commits, and only
+/// `Shift+Enter` is diverted to a newline. Ctrl/Alt/Cmd held alongside
+/// `Enter` are not treated specially either way -- the maintainer's
+/// instruction only distinguished `Shift`, so this predicate does too.
+///
+/// This is only ever consulted for a *multiline* field
+/// ([`KpdfApp::paint_and_edit_form_fields`]) -- a single-line `TextEdit` has
+/// no newline to insert in the first place, so it keeps using its own
+/// built-in "Enter surrenders focus" behaviour unmodified.
+///
+/// Deliberately not implemented via `egui::InputState::consume_key`: that
+/// method matches modifiers via `Modifiers::matches_logically`, which is
+/// documented to ignore an *extra* `Shift`/`Alt` on the pressed
+/// combination -- exactly the distinction this predicate needs to make.
+/// Pure over plain `egui::Key`/`egui::Modifiers` (both plain data
+/// structures, no display needed to construct), so this exact predicate --
+/// the one keyboard-gesture decision made without being able to press the
+/// key on a real display -- is covered by a unit test rather than an
+/// assumption.
+fn should_commit_on_enter(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    key == egui::Key::Enter && !modifiers.shift
+}
+
+/// Remove a shiftless `Enter` keypress from this frame's input queue, if
+/// there is one, and report whether it found one. Called before a
+/// multiline field's `TextEdit` widget runs, so the widget's own default
+/// "Enter inserts a newline" handling never sees the key: without this, a
+/// plain Enter would both commit (via the caller's check) and still land in
+/// the buffer as a newline in the same frame. See
+/// [`should_commit_on_enter`] for the actual predicate this wraps -- that
+/// is the part covered by a unit test; this thin `egui::Ui` wrapper is not,
+/// same as the rest of this file's egui-touching (as opposed to pure)
+/// helpers.
+fn consume_commit_enter(ui: &mut egui::Ui) -> bool {
+    ui.input_mut(|i| {
+        let mut found = false;
+        i.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if should_commit_on_enter(*key, *modifiers) {
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        found
+    })
+}
+
 // -- Tool / forms-mode state machine ---------------------------------------
 
 /// Switch to `requested` and turn forms mode off. Forms mode and a drawing
@@ -1389,6 +1571,28 @@ fn hit_test_field(page_x: f32, page_y: f32, fields: &[FormField]) -> Option<usiz
         .enumerate()
         .rev()
         .find(|(_, f)| rect_contains(f.rect, page_x, page_y))
+        .map(|(i, _)| i)
+}
+
+/// Same idea as [`hit_test_field`], but first widens each field's rect via
+/// [`min_hit_rect`] so a hairline-thin or near-zero-size widget is still a
+/// comfortable click target at low zoom. Kept as a fallback rather than
+/// folded into [`hit_test_field`] itself -- see
+/// [`KpdfApp::handle_forms_click`], which always tries the exact rect
+/// first, so a click that already lands inside a field's *real* rect is
+/// never second-guessed by another, nearby field's widened area.
+fn hit_test_field_expanded(
+    page_x: f32,
+    page_y: f32,
+    fields: &[FormField],
+    layout: PageLayout,
+    min_screen_size: f32,
+) -> Option<usize> {
+    fields
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, f)| rect_contains(min_hit_rect(f.rect, layout, min_screen_size), page_x, page_y))
         .map(|(i, _)| i)
 }
 
