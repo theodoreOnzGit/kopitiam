@@ -103,7 +103,10 @@ pub enum Token {
 // MuPDF: iswhite (pdf-lex.c:72) -- the PDF whitespace set.
 #[inline]
 fn iswhite(ch: u8) -> bool {
-    matches!(ch, b'\x00' | b'\x09' | b'\x0a' | b'\x0c' | b'\x0d' | b'\x20')
+    matches!(
+        ch,
+        b'\x00' | b'\x09' | b'\x0a' | b'\x0c' | b'\x0d' | b'\x20'
+    )
 }
 
 // MuPDF: IS_DELIM (pdf-lex.c:40) -- the PDF delimiter set.
@@ -194,11 +197,7 @@ fn acrobat_compatible_atof(s: &[u8]) -> f64 {
             idx += 1;
         }
         v += frac / d;
-        if neg {
-            -v
-        } else {
-            v
-        }
+        if neg { -v } else { v }
     } else if neg {
         -(i as f64)
     } else {
@@ -447,10 +446,14 @@ fn lex_string(f: &mut Stream) -> Result<Token> {
                     b'0'..=b'7' => {
                         let mut oct = (e - b'0') as i32;
                         // Up to two more octal digits.
-                        if let Some(d2) = f.peek_byte()? && (b'0'..=b'7').contains(&d2) {
+                        if let Some(d2) = f.peek_byte()?
+                            && (b'0'..=b'7').contains(&d2)
+                        {
                             f.read_byte()?;
                             oct = oct * 8 + (d2 - b'0') as i32;
-                            if let Some(d3) = f.peek_byte()? && (b'0'..=b'7').contains(&d3) {
+                            if let Some(d3) = f.peek_byte()?
+                                && (b'0'..=b'7').contains(&d3)
+                            {
                                 f.read_byte()?;
                                 oct = oct * 8 + (d3 - b'0') as i32;
                             }
@@ -460,7 +463,9 @@ fn lex_string(f: &mut Stream) -> Result<Token> {
                     b'\n' => { /* line continuation: swallow */ }
                     b'\r' => {
                         // Swallow \r and an optional following \n.
-                        if let Some(nl) = f.peek_byte()? && nl == b'\n' {
+                        if let Some(nl) = f.peek_byte()?
+                            && nl == b'\n'
+                        {
                             f.read_byte()?;
                         }
                     }
@@ -471,7 +476,9 @@ fn lex_string(f: &mut Stream) -> Result<Token> {
             b'\n' => s.push(0x0a),
             b'\r' => {
                 s.push(0x0a);
-                if let Some(nl) = f.peek_byte()? && nl == b'\n' {
+                if let Some(nl) = f.peek_byte()?
+                    && nl == b'\n'
+                {
                     f.read_byte()?;
                 }
             }

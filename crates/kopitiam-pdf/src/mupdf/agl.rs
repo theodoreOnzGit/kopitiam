@@ -154,7 +154,10 @@ mod tests {
         // Trailing ".sc" style suffix is stripped.
         assert_eq!(unicode_from_glyph_name("A.sc"), 0x0041);
         // f-ligature underscore alias.
-        assert_eq!(unicode_from_glyph_name("f_i"), unicode_from_glyph_name("fi"));
+        assert_eq!(
+            unicode_from_glyph_name("f_i"),
+            unicode_from_glyph_name("fi")
+        );
     }
 
     #[test]

@@ -44,8 +44,8 @@
 //! on the object-model read path and are left for later modules.
 
 use super::error::{Error, Result};
-use super::lex::{lex, Token};
-use super::object::{Object, MAX_OBJECT_NUMBER};
+use super::lex::{Token, lex};
+use super::object::{MAX_OBJECT_NUMBER, Object};
 use super::stream::Stream;
 
 /// Where a stream object's raw body begins, recorded by [`parse_ind_obj`] and
@@ -257,17 +257,27 @@ pub fn parse_ind_obj(f: &mut Stream) -> Result<IndirectObject> {
     // Generation number.
     let generation = match lex(f)? {
         Token::Int(i) => i,
-        _ => return Err(Error::syntax(format!("expected generation number ({num} ? obj)"))),
+        _ => {
+            return Err(Error::syntax(format!(
+                "expected generation number ({num} ? obj)"
+            )));
+        }
     };
     if !(0..65536).contains(&generation) {
-        return Err(Error::syntax(format!("invalid generation number ({generation})")));
+        return Err(Error::syntax(format!(
+            "invalid generation number ({generation})"
+        )));
     }
     let generation = generation as i32;
 
     // 'obj' keyword.
     match lex(f)? {
         Token::Obj => {}
-        _ => return Err(Error::syntax(format!("expected 'obj' keyword ({num} {generation} ?)"))),
+        _ => {
+            return Err(Error::syntax(format!(
+                "expected 'obj' keyword ({num} {generation} ?)"
+            )));
+        }
     }
 
     // The object body. `read_next_token` mirrors MuPDF: some branches have
@@ -295,10 +305,14 @@ pub fn parse_ind_obj(f: &mut Stream) -> Result<IndirectObject> {
                 if lex(f)? == Token::R {
                     Object::new_indirect(a, b as i32)
                 } else {
-                    return Err(Error::syntax(format!("expected 'R' keyword ({num} {generation} R)")));
+                    return Err(Error::syntax(format!(
+                        "expected 'R' keyword ({num} {generation} R)"
+                    )));
                 }
             } else {
-                return Err(Error::syntax(format!("expected 'R' keyword ({num} {generation} R)")));
+                return Err(Error::syntax(format!(
+                    "expected 'R' keyword ({num} {generation} R)"
+                )));
             }
         }
         Token::EndObj => {
@@ -306,7 +320,11 @@ pub fn parse_ind_obj(f: &mut Stream) -> Result<IndirectObject> {
             post_tok = Token::EndObj;
             Object::Null
         }
-        _ => return Err(Error::syntax(format!("syntax error in object ({num} {generation} R)"))),
+        _ => {
+            return Err(Error::syntax(format!(
+                "syntax error in object ({num} {generation} R)"
+            )));
+        }
     };
 
     // Post-object phase: locate `stream`/`endobj` and, for a stream, the body.

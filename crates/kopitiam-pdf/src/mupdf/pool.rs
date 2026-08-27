@@ -351,7 +351,11 @@ mod tests {
         }
         // Read every region back; any overlap would have corrupted a neighbour.
         for (i, &h) in handles.iter().enumerate() {
-            assert_eq!(pool.bytes(h), &[(i & 0xff) as u8; SZ][..], "region {i} clobbered");
+            assert_eq!(
+                pool.bytes(h),
+                &[(i & 0xff) as u8; SZ][..],
+                "region {i} clobbered"
+            );
         }
         // Two blocks were chained beyond the (uncounted) initial one.
         assert_eq!(pool.size(), 2 * (NODE_OVERHEAD + POOL_SIZE));

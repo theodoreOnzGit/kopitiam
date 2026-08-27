@@ -202,7 +202,14 @@ pub struct Matrix {
 impl Matrix {
     // MuPDF: fz_identity (geometry.c:52)
     /// The identity transform, `[ 1 0 0 1 0 0 ]`.
-    pub const IDENTITY: Matrix = Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+    pub const IDENTITY: Matrix = Matrix {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
 
     // MuPDF: fz_make_matrix (geometry.h)
     #[inline]
@@ -220,7 +227,12 @@ impl Matrix {
     // MuPDF: fz_is_identity (geometry.h)
     #[inline]
     pub fn is_identity(self) -> bool {
-        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0 && self.e == 0.0 && self.f == 0.0
+        self.a == 1.0
+            && self.b == 0.0
+            && self.c == 0.0
+            && self.d == 1.0
+            && self.e == 0.0
+            && self.f == 0.0
     }
 
     // MuPDF: fz_concat (geometry.c:54)
@@ -244,7 +256,14 @@ impl Matrix {
     // MuPDF: fz_scale (geometry.c:67)
     #[inline]
     pub fn scale(sx: f32, sy: f32) -> Matrix {
-        Matrix { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+        Matrix {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: 0.0,
+            f: 0.0,
+        }
     }
 
     // MuPDF: fz_pre_scale (geometry.c:77)
@@ -277,7 +296,14 @@ impl Matrix {
     /// Shearing matrix `[ 1 sy sx 1 0 0 ]`.
     #[inline]
     pub fn shear(sx: f32, sy: f32) -> Matrix {
-        Matrix { a: 1.0, b: sy, c: sx, d: 1.0, e: 0.0, f: 0.0 }
+        Matrix {
+            a: 1.0,
+            b: sy,
+            c: sx,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
     }
 
     // MuPDF: fz_pre_shear (geometry.c:109)
@@ -325,7 +351,14 @@ impl Matrix {
             c = (theta * FZ_PI / 180.0).cos();
         }
 
-        Matrix { a: c, b: s, c: -s, d: c, e: 0.0, f: 0.0 }
+        Matrix {
+            a: c,
+            b: s,
+            c: -s,
+            d: c,
+            e: 0.0,
+            f: 0.0,
+        }
     }
 
     // MuPDF: fz_pre_rotate (geometry.c:164)
@@ -377,7 +410,14 @@ impl Matrix {
     // MuPDF: fz_translate (geometry.c:215)
     #[inline]
     pub fn translate(tx: f32, ty: f32) -> Matrix {
-        Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+        Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: tx,
+            f: ty,
+        }
     }
 
     // MuPDF: fz_pre_translate (geometry.c:225)
@@ -434,7 +474,9 @@ impl Matrix {
         let dd = sa * det;
         let de = -(src.e as f64) * da - (src.f as f64) * dc;
         let df = -(src.e as f64) * db - (src.f as f64) * dd;
-        Matrix::new(da as f32, db as f32, dc as f32, dd as f32, de as f32, df as f32)
+        Matrix::new(
+            da as f32, db as f32, dc as f32, dd as f32, de as f32, df as f32,
+        )
     }
 
     // MuPDF: fz_try_invert_matrix (geometry.c:279)
@@ -462,7 +504,9 @@ impl Matrix {
         let dd = sa * det;
         let de = -(src.e as f64) * da - (src.f as f64) * dc;
         let df = -(src.e as f64) * db - (src.f as f64) * dd;
-        Some(Matrix::new(da as f32, db as f32, dc as f32, dd as f32, de as f32, df as f32))
+        Some(Matrix::new(
+            da as f32, db as f32, dc as f32, dd as f32, de as f32, df as f32,
+        ))
     }
 
     // MuPDF: fz_is_rectilinear (geometry.c:305)
@@ -553,9 +597,19 @@ impl Rect {
         y1: FZ_MIN_INF_RECT as f32,
     };
     // MuPDF: fz_invalid_rect (geometry.c:382)
-    pub const INVALID: Rect = Rect { x0: 0.0, y0: 0.0, x1: -1.0, y1: -1.0 };
+    pub const INVALID: Rect = Rect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: -1.0,
+        y1: -1.0,
+    };
     // MuPDF: fz_unit_rect (geometry.c:383)
-    pub const UNIT: Rect = Rect { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 };
+    pub const UNIT: Rect = Rect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 1.0,
+        y1: 1.0,
+    };
 
     // MuPDF: fz_make_rect (geometry.h)
     #[inline]
@@ -626,7 +680,12 @@ impl Rect {
         if a.is_infinite() {
             return Rect::INFINITE;
         }
-        Rect { x0: a.x0 as f32, y0: a.y0 as f32, x1: a.x1 as f32, y1: a.y1 as f32 }
+        Rect {
+            x0: a.x0 as f32,
+            y0: a.y0 as f32,
+            x1: a.x1 as f32,
+            y1: a.y1 as f32,
+        }
     }
 
     // MuPDF: fz_intersect_rect (geometry.c:443)
@@ -911,13 +970,26 @@ pub struct IRect {
 
 impl IRect {
     // MuPDF: fz_infinite_irect (geometry.c:385)
-    pub const INFINITE: IRect =
-        IRect { x0: FZ_MIN_INF_RECT, y0: FZ_MIN_INF_RECT, x1: FZ_MAX_INF_RECT, y1: FZ_MAX_INF_RECT };
+    pub const INFINITE: IRect = IRect {
+        x0: FZ_MIN_INF_RECT,
+        y0: FZ_MIN_INF_RECT,
+        x1: FZ_MAX_INF_RECT,
+        y1: FZ_MAX_INF_RECT,
+    };
     // MuPDF: fz_empty_irect (geometry.c:386)
-    pub const EMPTY: IRect =
-        IRect { x0: FZ_MAX_INF_RECT, y0: FZ_MAX_INF_RECT, x1: FZ_MIN_INF_RECT, y1: FZ_MIN_INF_RECT };
+    pub const EMPTY: IRect = IRect {
+        x0: FZ_MAX_INF_RECT,
+        y0: FZ_MAX_INF_RECT,
+        x1: FZ_MIN_INF_RECT,
+        y1: FZ_MIN_INF_RECT,
+    };
     // MuPDF: fz_invalid_irect (geometry.c:387)
-    pub const INVALID: IRect = IRect { x0: 0, y0: 0, x1: -1, y1: -1 };
+    pub const INVALID: IRect = IRect {
+        x0: 0,
+        y0: 0,
+        x1: -1,
+        y1: -1,
+    };
 
     // MuPDF: fz_make_irect (geometry.h)
     #[inline]
@@ -1075,17 +1147,41 @@ pub struct Quad {
 impl Quad {
     // MuPDF: fz_infinite_quad (geometry.c:390)
     pub const INFINITE: Quad = Quad {
-        ul: Point { x: f32::NEG_INFINITY, y: f32::INFINITY },
-        ur: Point { x: f32::INFINITY, y: f32::INFINITY },
-        ll: Point { x: f32::NEG_INFINITY, y: f32::NEG_INFINITY },
-        lr: Point { x: f32::INFINITY, y: f32::NEG_INFINITY },
+        ul: Point {
+            x: f32::NEG_INFINITY,
+            y: f32::INFINITY,
+        },
+        ur: Point {
+            x: f32::INFINITY,
+            y: f32::INFINITY,
+        },
+        ll: Point {
+            x: f32::NEG_INFINITY,
+            y: f32::NEG_INFINITY,
+        },
+        lr: Point {
+            x: f32::INFINITY,
+            y: f32::NEG_INFINITY,
+        },
     };
     // MuPDF: fz_invalid_quad (geometry.c:391) -- every ordinate NaN.
     pub const INVALID: Quad = Quad {
-        ul: Point { x: f32::NAN, y: f32::NAN },
-        ur: Point { x: f32::NAN, y: f32::NAN },
-        ll: Point { x: f32::NAN, y: f32::NAN },
-        lr: Point { x: f32::NAN, y: f32::NAN },
+        ul: Point {
+            x: f32::NAN,
+            y: f32::NAN,
+        },
+        ur: Point {
+            x: f32::NAN,
+            y: f32::NAN,
+        },
+        ll: Point {
+            x: f32::NAN,
+            y: f32::NAN,
+        },
+        lr: Point {
+            x: f32::NAN,
+            y: f32::NAN,
+        },
     };
 
     // MuPDF: fz_make_quad (geometry.h)
@@ -1175,10 +1271,7 @@ impl Quad {
         if !q.is_valid() {
             return true; // All invalid quads are empty.
         }
-        let area = q.ll.x * q.lr.y
-            + q.lr.x * q.ur.y
-            + q.ur.x * q.ul.y
-            + q.ul.x * q.ll.y
+        let area = q.ll.x * q.lr.y + q.lr.x * q.ur.y + q.ur.x * q.ul.y + q.ul.x * q.ll.y
             - q.lr.x * q.ll.y
             - q.ur.x * q.lr.y
             - q.ul.x * q.ur.y
@@ -1241,7 +1334,8 @@ impl Quad {
         if q.is_infinite() {
             return true;
         }
-        is_point_inside_triangle(p, q.ul, q.ur, q.lr) || is_point_inside_triangle(p, q.ul, q.lr, q.ll)
+        is_point_inside_triangle(p, q.ul, q.ur, q.lr)
+            || is_point_inside_triangle(p, q.ul, q.lr, q.ll)
     }
 
     // MuPDF: fz_is_quad_inside_quad (geometry.c:884)
@@ -1387,7 +1481,10 @@ mod tests {
     #[test]
     fn pre_translate_composition() {
         let m = Matrix::scale(2.0, 4.0);
-        assert_eq!(m.pre_translate(3.0, 5.0), Matrix::translate(3.0, 5.0).concat(m));
+        assert_eq!(
+            m.pre_translate(3.0, 5.0),
+            Matrix::translate(3.0, 5.0).concat(m)
+        );
     }
 
     #[test]
@@ -1418,7 +1515,10 @@ mod tests {
     #[test]
     fn rotate_negative_and_wraparound() {
         // -90 wraps to 270; 450 wraps to 90.
-        assert_eq!(Matrix::rotate(-90.0), Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 0.0));
+        assert_eq!(
+            Matrix::rotate(-90.0),
+            Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 0.0)
+        );
         assert_eq!(Matrix::rotate(450.0), Matrix::rotate(90.0));
     }
 
@@ -1463,7 +1563,11 @@ mod tests {
         // sqrt(|a*d - b*c|) for scale(2,8) = sqrt(16) = 4.
         assert!(approx(Matrix::scale(2.0, 8.0).expansion(), 4.0, 1e-5));
         // max(|a|,|b|,|c|,|d|).
-        assert!(approx(Matrix::new(-3.0, 1.0, 2.0, -5.0, 0.0, 0.0).max_expansion(), 5.0, 1e-5));
+        assert!(approx(
+            Matrix::new(-3.0, 1.0, 2.0, -5.0, 0.0, 0.0).max_expansion(),
+            5.0,
+            1e-5
+        ));
     }
 
     #[test]
@@ -1565,7 +1669,11 @@ mod tests {
     fn include_point_builds_bbox() {
         // Start from an empty rect and fold in points -> tight bbox.
         let mut r = Rect::EMPTY;
-        for p in [Point::new(3.0, 4.0), Point::new(-1.0, 8.0), Point::new(5.0, -2.0)] {
+        for p in [
+            Point::new(3.0, 4.0),
+            Point::new(-1.0, 8.0),
+            Point::new(5.0, -2.0),
+        ] {
             r = r.include_point(p);
         }
         assert_eq!(r, Rect::new(-1.0, -2.0, 5.0, 8.0));

@@ -53,10 +53,7 @@ const BURST: usize = 256;
 // MuPDF: iswhite (filter-basic.c:415) -- the filter whitespace set (note it
 // includes NUL, backspace, and 0177/DEL, which differs from PDF's usual set).
 fn iswhite(a: i32) -> bool {
-    matches!(
-        a,
-        0x0a | 0x0d | 0x09 | 0x20 | 0x00 | 0x0c | 0x08 | 0o177
-    )
+    matches!(a, 0x0a | 0x0d | 0x09 | 0x20 | 0x00 | 0x0c | 0x08 | 0o177)
 }
 
 // ---------------------------------------------------------------------------
@@ -198,9 +195,7 @@ impl<'a> StreamSource for A85d<'a> {
                         // Illegal per spec but tolerated (Adobe/gs cope).
                     }
                     2 => {
-                        word = word
-                            .wrapping_mul(85 * 85 * 85)
-                            .wrapping_add(0x00ff_ffff);
+                        word = word.wrapping_mul(85 * 85 * 85).wrapping_add(0x00ff_ffff);
                         self.buffer.push((word >> 24) as u8);
                     }
                     3 => {
@@ -278,9 +273,7 @@ impl<'a> StreamSource for Rld<'a> {
                     self.n = 257 - self.run;
                     self.c = self.chain.read_byte()?.map_or(-1, |b| b as i32);
                     if self.c < 0 {
-                        return Err(Error::format(
-                            "premature end of data in run length decode",
-                        ));
+                        return Err(Error::format("premature end of data in run length decode"));
                     }
                 }
             }
@@ -289,9 +282,7 @@ impl<'a> StreamSource for Rld<'a> {
                 while self.buffer.len() < max && self.n != 0 {
                     let c = self.chain.read_byte()?.map_or(-1, |b| b as i32);
                     if c < 0 {
-                        return Err(Error::format(
-                            "premature end of data in run length decode",
-                        ));
+                        return Err(Error::format("premature end of data in run length decode"));
                     }
                     self.buffer.push(c as u8);
                     self.n -= 1;
@@ -459,7 +450,9 @@ mod tests {
     #[test]
     fn rld_mixed_and_eod() {
         // literal "ab" (len 1), repeat 'C' x3 (len 254), EOD.
-        let input = [1u8, b'a', b'b', 254, b'C', 128, /* trailing ignored */ 9];
+        let input = [
+            1u8, b'a', b'b', 254, b'C', 128, /* trailing ignored */ 9,
+        ];
         assert_eq!(decode_rld(&input).unwrap(), b"abCCC");
     }
 

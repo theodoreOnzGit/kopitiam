@@ -126,7 +126,10 @@ mod tests {
             bbox: Rect::new(x0, y0, x0 + 20.0, y0 + 10.0),
             chars: vec![ch],
         };
-        StextBlock::Text(StextTextBlock { bbox: line.bbox, lines: vec![line] })
+        StextBlock::Text(StextTextBlock {
+            bbox: line.bbox,
+            lines: vec![line],
+        })
     }
 
     fn tags(page: &StextPage) -> String {
@@ -152,7 +155,10 @@ mod tests {
             ],
             fonts: Vec::new(),
         };
-        let regions = vec![Rect::new(0.0, 0.0, 100.0, 200.0), Rect::new(100.0, 0.0, 200.0, 200.0)];
+        let regions = vec![
+            Rect::new(0.0, 0.0, 100.0, 200.0),
+            Rect::new(100.0, 0.0, 200.0, 200.0),
+        ];
         order_blocks_by_regions(&mut page, &regions);
         // Left region top-to-bottom: '1','2'; right region: 'b','a' -> but 'a'
         // is lower so should come after 'b'. Result: 1 2 b a.

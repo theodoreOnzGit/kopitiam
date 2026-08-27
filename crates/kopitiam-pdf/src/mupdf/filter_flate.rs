@@ -44,7 +44,7 @@
 
 use super::error::{Error, Result};
 use super::stream::{Stream, StreamSource};
-use miniz_oxide::inflate::stream::{inflate, InflateState};
+use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
 /// Output burst size, matching `fz_inflate_state.buffer` (filter-flate.c:33).

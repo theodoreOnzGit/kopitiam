@@ -48,7 +48,7 @@
 //! -> `vmtx`; horizontal `hmtx` is always built), the named Adobe CJK CMap
 //! resource set (see `cmap.rs`), and embedded-font glyph reading (FreeType).
 
-use super::agl::{unicode_from_glyph_name, REPLACEMENT_CHARACTER};
+use super::agl::{REPLACEMENT_CHARACTER, unicode_from_glyph_name};
 use super::cmap::{self, CMap};
 use super::draw_path::Path;
 use super::encodings::BaseEncoding;
@@ -341,7 +341,11 @@ impl Font {
 
         // Horizontal metrics: /DW (default 1000) + /W.
         let dw = doc.resolve_get(&dfont, "DW")?;
-        font.dhmtx_w = if dw.is_null() { 1000 } else { dw.to_int() as i32 };
+        font.dhmtx_w = if dw.is_null() {
+            1000
+        } else {
+            dw.to_int() as i32
+        };
 
         let w = doc.resolve_get(&dfont, "W")?;
         if w.is_array() {
@@ -666,8 +670,12 @@ enum LoadedFontProgram {
 /// advance-box fallback). Never fails the font load.
 fn load_font_program(doc: &PdfDocument, descriptor: &Object) -> Option<LoadedFontProgram> {
     for key in ["FontFile2", "FontFile3"] {
-        let Some(obj) = descriptor.dict_gets(key) else { continue };
-        let Ok(bytes) = doc.open_stream(obj) else { continue };
+        let Some(obj) = descriptor.dict_gets(key) else {
+            continue;
+        };
+        let Ok(bytes) = doc.open_stream(obj) else {
+            continue;
+        };
         if let Some(prog) = FontProgram::parse(&bytes) {
             return Some(LoadedFontProgram::Gid(prog));
         }
@@ -684,7 +692,9 @@ fn load_font_program(doc: &PdfDocument, descriptor: &Object) -> Option<LoadedFon
 /// The PDF stream dict's `/Length1`/`/Length2` (a Type1 `/FontFile`'s
 /// cleartext / encrypted byte counts), when present and non-null.
 fn stream_lengths(doc: &PdfDocument, obj: &Object) -> (Option<usize>, Option<usize>) {
-    let Ok(dict) = doc.resolve(obj) else { return (None, None) };
+    let Ok(dict) = doc.resolve(obj) else {
+        return (None, None);
+    };
     let len = |key: &str| -> Option<usize> {
         let v = doc.resolve_get(&dict, key).ok()?;
         if v.is_null() {

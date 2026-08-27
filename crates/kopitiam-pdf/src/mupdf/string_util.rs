@@ -463,11 +463,7 @@ pub fn tolower(c: u32) -> u32 {
 /// of the slice (mirroring the NUL that terminates MuPDF's loops).
 #[inline]
 fn next_rune(s: &[u8]) -> (u32, usize) {
-    if s.is_empty() {
-        (0, 0)
-    } else {
-        chartorune(s)
-    }
+    if s.is_empty() { (0, 0) } else { chartorune(s) }
 }
 
 /// Case-insensitive comparison of two UTF-8 strings, terminating at the end of
@@ -619,17 +615,17 @@ mod tests {
     fn invalid_sequences_yield_replacement_one_byte() {
         // Every malformed input: rune 0xFFFD, exactly one byte consumed.
         let cases: &[&[u8]] = &[
-            &[],             // empty
-            &[0x80],         // lone continuation byte (n < 2)
-            &[0x80, 0x80],   // continuation byte as lead
-            &[0xC0, 0xAF],   // overlong '/' (2-byte)
-            &[0xC1, 0x81],   // overlong (2-byte)
-            &[0xE2, 0x82],   // truncated 3-byte (n < 3)
-            &[0xE0, 0x80, 0x80], // overlong 3-byte
-            &[0xF0, 0x9F, 0x98], // truncated 4-byte (n < 4)
+            &[],                       // empty
+            &[0x80],                   // lone continuation byte (n < 2)
+            &[0x80, 0x80],             // continuation byte as lead
+            &[0xC0, 0xAF],             // overlong '/' (2-byte)
+            &[0xC1, 0x81],             // overlong (2-byte)
+            &[0xE2, 0x82],             // truncated 3-byte (n < 3)
+            &[0xE0, 0x80, 0x80],       // overlong 3-byte
+            &[0xF0, 0x9F, 0x98],       // truncated 4-byte (n < 4)
             &[0xF0, 0x80, 0x80, 0x80], // overlong 4-byte
-            &[0xFF],         // invalid lead >= T5
-            &[0xE2, 0xFF, 0xAC], // bad continuation in 3-byte
+            &[0xFF],                   // invalid lead >= T5
+            &[0xE2, 0xFF, 0xAC],       // bad continuation in 3-byte
         ];
         for &c in cases {
             assert_eq!(

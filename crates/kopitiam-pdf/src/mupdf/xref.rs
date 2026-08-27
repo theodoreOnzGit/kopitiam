@@ -50,8 +50,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::doc_stream::decode_stream;
 use super::error::{Error, Result};
-use super::lex::{lex, Token};
-use super::object::{Object, MAX_OBJECT_NUMBER};
+use super::lex::{Token, lex};
+use super::object::{MAX_OBJECT_NUMBER, Object};
 use super::parse::{parse_ind_obj, parse_stm_obj};
 use super::stream::{Stream, Whence};
 
@@ -149,7 +149,11 @@ impl PdfDocument {
 
     /// The document catalog (`/Root`, resolved).
     pub fn catalog(&self) -> Result<Object> {
-        let root = self.trailer.dict_gets("Root").cloned().unwrap_or(Object::Null);
+        let root = self
+            .trailer
+            .dict_gets("Root")
+            .cloned()
+            .unwrap_or(Object::Null);
         self.resolve(&root)
     }
 
@@ -282,7 +286,7 @@ impl PdfDocument {
                 _ => {
                     return Err(Error::format(format!(
                         "corrupt object stream ({stm_num} 0 R)"
-                    )))
+                    )));
                 }
             };
             let ooff = match lex(&mut hdr)? {
@@ -290,7 +294,7 @@ impl PdfDocument {
                 _ => {
                     return Err(Error::format(format!(
                         "corrupt object stream ({stm_num} 0 R)"
-                    )))
+                    )));
                 }
             };
             nums.push(onum as i32);
@@ -312,17 +316,11 @@ impl PdfDocument {
             let mut s = Stream::from_slice(&raw);
             s.seek(first + offs[i], Whence::Set)?;
             let obj = parse_stm_obj(&mut s)?;
-            let cached = Cached {
-                obj,
-                stm_ofs: None,
-            };
+            let cached = Cached { obj, stm_ofs: None };
             if onum == target {
                 target_cached = Some(cached.clone());
             }
-            self.cache
-                .borrow_mut()
-                .entry(onum)
-                .or_insert(cached);
+            self.cache.borrow_mut().entry(onum).or_insert(cached);
         }
 
         Ok(target_cached.unwrap_or(Cached {
@@ -467,9 +465,9 @@ impl PdfDocument {
 
     /// The `i`-th page dict (0-based), with inherited attributes flattened in.
     pub fn page(&self, i: usize) -> Result<&Object> {
-        self.pages
-            .get(i)
-            .ok_or_else(|| Error::argument(format!("page {i} out of range 0..{}", self.pages.len())))
+        self.pages.get(i).ok_or_else(|| {
+            Error::argument(format!("page {i} out of range 0..{}", self.pages.len()))
+        })
     }
 
     // MuPDF: pdf_lookup_page_loc + pdf_load_page_tree_imp (pdf-page.c:265, 72).
@@ -730,7 +728,9 @@ fn read_old_xref(f: &mut Stream, entries: &mut Vec<Option<XrefEntry>>) -> Result
                 continue; // newest section already populated this object
             }
             let text = &rec[..got];
-            let mut fields = text.split(|b| b.is_ascii_whitespace()).filter(|s| !s.is_empty());
+            let mut fields = text
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|s| !s.is_empty());
             let offset = parse_ascii_int(fields.next())?;
             let generation = parse_ascii_int(fields.next())?;
             let kind = fields
@@ -741,11 +741,7 @@ fn read_old_xref(f: &mut Stream, entries: &mut Vec<Option<XrefEntry>>) -> Result
             entries[num] = Some(match kind {
                 b'n' => XrefEntry::Uncompressed { offset },
                 b'f' => XrefEntry::Free,
-                other => {
-                    return Err(Error::format(format!(
-                        "unexpected xref type: 0x{other:x}"
-                    )))
-                }
+                other => return Err(Error::format(format!("unexpected xref type: 0x{other:x}"))),
             });
         }
     }
@@ -965,7 +961,7 @@ fn parse_ascii_int(field: Option<&[u8]>) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{dictionary, Document, Object as LObject, Stream as LStream};
+    use lopdf::{Document, Object as LObject, Stream as LStream, dictionary};
 
     /// Build a minimal one-page PDF with a classic xref table via lopdf.
     fn minimal_classic_pdf() -> Vec<u8> {
@@ -1077,7 +1073,9 @@ mod tests {
         let doc = PdfDocument::open(pdf).unwrap();
         assert_eq!(doc.page_count(), 1);
         let page = doc.page(0).unwrap().clone();
-        let out = doc.open_stream(page.dict_gets("Contents").unwrap()).unwrap();
+        let out = doc
+            .open_stream(page.dict_gets("Contents").unwrap())
+            .unwrap();
         assert_eq!(out, body);
     }
 
@@ -1155,7 +1153,11 @@ mod tests {
         assert_eq!(page.dict_gets("Type").unwrap().to_name(), b"Page");
         // Inherited nothing here; the page defines its own MediaBox.
         assert_eq!(
-            page.dict_gets("MediaBox").unwrap().array_get(2).unwrap().to_int(),
+            page.dict_gets("MediaBox")
+                .unwrap()
+                .array_get(2)
+                .unwrap()
+                .to_int(),
             200
         );
     }
@@ -1237,7 +1239,11 @@ mod tests {
         // decompressed first while walking the page tree.
         let page = doc.page(0).unwrap();
         assert_eq!(
-            page.dict_gets("MediaBox").unwrap().array_get(2).unwrap().to_int(),
+            page.dict_gets("MediaBox")
+                .unwrap()
+                .array_get(2)
+                .unwrap()
+                .to_int(),
             400,
             "page resolved to its pre-update (object-stream) copy"
         );
@@ -1252,7 +1258,11 @@ mod tests {
         // whichever object of stream 4 is touched first.
         let obj3 = doc.get_object(3).unwrap();
         assert_eq!(
-            obj3.dict_gets("MediaBox").unwrap().array_get(2).unwrap().to_int(),
+            obj3.dict_gets("MediaBox")
+                .unwrap()
+                .array_get(2)
+                .unwrap()
+                .to_int(),
             400
         );
 

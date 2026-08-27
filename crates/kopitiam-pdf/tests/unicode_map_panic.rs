@@ -127,9 +127,7 @@ fn unmapped_font_returns_error_instead_of_aborting() {
                 "expected the recovered pdf-extract panic message, got: {msg:?}"
             );
         }
-        other => panic!(
-            "expected Err(ExtractError::UnsupportedFont(..)), got {other:?}"
-        ),
+        other => panic!("expected Err(ExtractError::UnsupportedFont(..)), got {other:?}"),
     }
 }
 
@@ -183,8 +181,7 @@ fn build_two_page_pdf_with_one_bad_page() -> Vec<u8> {
             Operation::new("ET", vec![]),
         ],
     };
-    let bad_content_id =
-        doc.add_object(Stream::new(dictionary! {}, bad_content.encode().unwrap()));
+    let bad_content_id = doc.add_object(Stream::new(dictionary! {}, bad_content.encode().unwrap()));
 
     // --- Page 2: a clean core font. ---
     let good_font = doc.add_object(dictionary! {

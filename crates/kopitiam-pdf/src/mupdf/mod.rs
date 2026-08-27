@@ -67,6 +67,7 @@
 pub mod agl;
 pub mod agl_data;
 pub mod annot_appearance;
+pub mod annot_edit;
 pub mod annot_run;
 pub mod buffer;
 pub mod cmap;
@@ -81,6 +82,7 @@ pub mod filter_flate;
 pub mod filter_lzw;
 pub mod filter_predict;
 pub mod font;
+pub mod form;
 pub mod geometry;
 pub mod glyph;
 pub mod glyph_cff;
@@ -107,11 +109,15 @@ pub mod stream;
 pub mod string_util;
 pub mod structured_text;
 pub mod text_device;
+pub mod write;
 pub mod xref;
 
 pub use agl::{unicode_from_glyph_name, unicode_from_glyph_name_strict};
 pub use annot_appearance::{
     SynthAp, annot_border_width, annot_color_rgb, annot_opacity, synthesize_ap,
+};
+pub use annot_edit::{
+    AnnotRef, EditHistory, InkAnnotSpec, InkStroke, add_ink_annot, delete_annot, page_annot_refs,
 };
 pub use annot_run::{AnnotPass, run_page_annots, run_page_annots_with};
 pub use buffer::Buffer;
@@ -120,6 +126,10 @@ pub use doc_stream::decode_stream;
 pub use draw_device::{
     DrawDevice, cmyk_to_rgb, gray_to_rgb, rasterize_page_ex, rasterize_page_native,
 };
+pub use form::{
+    FieldKind, FormField, has_acroform, page_form_fields, set_field_value, toggle_checkbox,
+};
+pub use write::{NewObject, incremental_update, next_object_number, write_object};
 // The crate's `rasterize_page` is the graceful (hayro-fallback-aware) one --
 // see hayro_fallback.rs's module docs for why the plain-kopitiam-engine
 // render (`rasterize_page_native`) isn't the default name. Every existing

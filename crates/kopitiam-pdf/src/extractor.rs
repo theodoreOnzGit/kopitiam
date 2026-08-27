@@ -94,8 +94,9 @@ fn run(doc: &PdfDocument) -> Result<Vec<Page>, ExtractError> {
     let mut last_failure: Option<String> = None;
 
     for page_num in page_nums {
-        let result =
-            std::panic::catch_unwind(AssertUnwindSafe(|| output_doc_page(doc, &mut collector, page_num)));
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            output_doc_page(doc, &mut collector, page_num)
+        }));
         match result {
             // Page decoded cleanly; its `Page` is already in `collector.pages`
             // (pushed by `PageCollector::end_page`).

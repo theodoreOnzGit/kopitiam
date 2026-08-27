@@ -60,13 +60,13 @@
 /// Mirrors `textnorm.py::LIGATURES` (lines 13-21).
 fn ligature(c: char) -> Option<&'static str> {
     Some(match c {
-        '\u{FB00}' => "ff", // ﬀ
-        '\u{FB01}' => "fi", // ﬁ
-        '\u{FB02}' => "fl", // ﬂ
+        '\u{FB00}' => "ff",  // ﬀ
+        '\u{FB01}' => "fi",  // ﬁ
+        '\u{FB02}' => "fl",  // ﬂ
         '\u{FB03}' => "ffi", // ﬃ
         '\u{FB04}' => "ffl", // ﬄ
-        '\u{FB05}' => "st", // ﬅ (long-s t)
-        '\u{FB06}' => "st", // ﬆ
+        '\u{FB05}' => "st",  // ﬅ (long-s t)
+        '\u{FB06}' => "st",  // ﬆ
         _ => return None,
     })
 }
@@ -81,7 +81,8 @@ fn is_exotic_space(c: char) -> bool {
         c,
         '\u{00A0}'                 // NO-BREAK SPACE (NBSP)
         | '\u{1680}'               // OGHAM SPACE MARK
-        | '\u{2000}'..='\u{200A}'  // EN QUAD .. HAIR SPACE (thin, figure, en, em, …)
+        | '\u{2000}'
+            ..='\u{200A}'  // EN QUAD .. HAIR SPACE (thin, figure, en, em, …)
         | '\u{202F}'               // NARROW NO-BREAK SPACE
         | '\u{205F}'               // MEDIUM MATHEMATICAL SPACE
         | '\u{3000}' // IDEOGRAPHIC SPACE

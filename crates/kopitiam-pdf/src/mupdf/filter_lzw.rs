@@ -157,9 +157,7 @@ impl<'a> StreamSource for Lzwd<'a> {
                 // Tolerate a single out-of-range code (Ghostscript-like).
                 next_code += 1;
             } else if code > next_code || (!self.old_tiff && next_code >= NUM_CODES as i32) {
-                return Err(Error::format(
-                    "out of range code encountered in lzw decode",
-                ));
+                return Err(Error::format("out of range code encountered in lzw decode"));
             } else if next_code < NUM_CODES as i32 {
                 // Add a new entry to the code table.
                 let nc = next_code as usize;
@@ -172,9 +170,7 @@ impl<'a> StreamSource for Lzwd<'a> {
                 } else if code == next_code {
                     self.table[nc].value = self.table[nc].first_char;
                 } else {
-                    return Err(Error::format(
-                        "out of range code encountered in lzw decode",
-                    ));
+                    return Err(Error::format("out of range code encountered in lzw decode"));
                 }
 
                 next_code += 1;
@@ -319,7 +315,10 @@ mod tests {
     fn lzw_encode_pdf(data: &[u8]) -> Vec<u8> {
         const CLEAR: u32 = 256;
         const EOD: u32 = 257;
-        assert!(data.len() < 4096, "test encoder does not emit table-full CLEAR");
+        assert!(
+            data.len() < 4096,
+            "test encoder does not emit table-full CLEAR"
+        );
 
         let mut out: Vec<u8> = Vec::new();
         let mut acc: u32 = 0;

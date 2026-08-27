@@ -306,7 +306,7 @@ impl<'a> Stream<'a> {
                 Whence::End => {
                     return Err(Error::unsupported(
                         "cannot seek relative to end on a non-seekable stream",
-                    ))
+                    ));
                 }
             };
             let delta = target - self.tell();

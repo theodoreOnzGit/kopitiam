@@ -891,6 +891,36 @@ frozen API contracts they are coding against, the standing constraints, and the
 open questions. Keep it accurate. A resumed session should need only `bd list`
 plus that file.
 
+## HARD RULE: agents never format. Only the main session formats.
+
+**No subagent may run a formatter** — not `cargo fmt`, not `cargo fmt -p <crate>`,
+not `rustfmt` on a file it does not own, not "just tidying up the imports."
+Formatting is **exclusively the main session's job**, and it is done across the
+crate in one deliberate pass, never piecemeal by whoever happens to be editing.
+
+Why this is a hard rule and not a style preference: `cargo fmt -p <crate>`
+reformats the **whole crate**, not the file the agent is working on. During a
+parallel run that means an agent silently rewrites files owned by other agents
+who are editing them *at that moment*. It already happened here — an agent ran
+`cargo fmt -p kopitiam-pdf` while checking its own file, reformatted every `.rs`
+in the crate, and put cosmetic churn on top of seven files carrying other
+agents' in-progress edits. It recovered honestly (rustfmt is semantics-preserving
+and nothing was lost), but the damage that *could* have happened — clobbering a
+concurrent writer, or a diff so noisy the real change hides in it — is exactly
+what one-owner-per-file exists to prevent.
+
+Concretely:
+
+* **Agent prompts must say so explicitly.** Every parallel-agent prompt states
+  that formatting is forbidden, in the same breath as file ownership.
+* **An agent that wants formatting changed reports it**, and the main session
+  decides. "The file looks untidy" is a report, not a licence.
+* **The main session formats once**, after the agents have landed and their work
+  is integrated — so a formatting pass can never race a writer.
+* This crate has **no settled formatting policy** (`HEAD` does not
+  `cargo fmt --check` clean), so a stray `cargo fmt` also silently *changes the
+  project's style*, which is a decision no agent gets to make unilaterally.
+
 ## Parallel agents: one directory, one owner
 
 When fanning work out to subagents, give each **exactly one directory** and say

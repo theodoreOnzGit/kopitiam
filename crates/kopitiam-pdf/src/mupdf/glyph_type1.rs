@@ -50,7 +50,7 @@
 
 use super::draw_path::Path;
 use super::encodings::BaseEncoding;
-use super::glyph::{path_is_empty, Affine};
+use super::glyph::{Affine, path_is_empty};
 use std::collections::HashMap;
 
 /// Recursion / call-depth guard for `callsubr` (mirrors [`super::glyph_cff`]'s
@@ -86,7 +86,11 @@ impl Type1Program {
     /// which needs no length hint to be right. Two independent ways to find
     /// the same boundary is cheap insurance against a single wrong number
     /// turning an otherwise-decodable font into a page of advance-box glyphs.
-    pub fn parse(bytes: &[u8], length1: Option<usize>, length2: Option<usize>) -> Option<Type1Program> {
+    pub fn parse(
+        bytes: &[u8],
+        length1: Option<usize>,
+        length2: Option<usize>,
+    ) -> Option<Type1Program> {
         if bytes.first() == Some(&0x80) {
             return Type1Program::parse_pfb(bytes);
         }
@@ -596,7 +600,10 @@ fn parse_num(data: &[u8], pos: usize) -> (f32, usize) {
     match b0 {
         32..=246 => (b0 as f32 - 139.0, pos + 1),
         247..=250 => (((b0 as i32 - 247) * 256 + g(pos + 1) + 108) as f32, pos + 2),
-        251..=254 => ((-(b0 as i32 - 251) * 256 - g(pos + 1) - 108) as f32, pos + 2),
+        251..=254 => (
+            (-(b0 as i32 - 251) * 256 - g(pos + 1) - 108) as f32,
+            pos + 2,
+        ),
         255 => {
             let v = (g(pos + 1) << 24) | (g(pos + 2) << 16) | (g(pos + 3) << 8) | g(pos + 4);
             (v as f32, pos + 5)
@@ -688,7 +695,10 @@ impl<'a> Cursor<'a> {
         if self.pos == start {
             return None;
         }
-        std::str::from_utf8(&self.data[start..self.pos]).ok()?.parse().ok()
+        std::str::from_utf8(&self.data[start..self.pos])
+            .ok()?
+            .parse()
+            .ok()
     }
 
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -706,7 +716,9 @@ impl<'a> Cursor<'a> {
 /// truncated block degrades to a partial (or empty) table rather than hanging.
 fn parse_subrs(data: &[u8], len_iv: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let Some(start) = find(data, b"/Subrs") else { return out };
+    let Some(start) = find(data, b"/Subrs") else {
+        return out;
+    };
     let mut cur = Cursor::new(data);
     cur.pos = start + "/Subrs".len();
     let Some(n) = cur.read_int() else { return out };
@@ -725,7 +737,9 @@ fn parse_subrs(data: &[u8], len_iv: usize) -> Vec<Vec<u8>> {
         if cur.peek() == Some(b' ') {
             cur.pos += 1;
         }
-        let Some(len) = usize::try_from(len).ok() else { break };
+        let Some(len) = usize::try_from(len).ok() else {
+            break;
+        };
         let Some(raw) = cur.take(len) else { break };
         if idx >= 0 && (idx as usize) < out.len() {
             out[idx as usize] = decrypt_charstring(raw, len_iv);
@@ -764,7 +778,9 @@ fn parse_charstrings(data: &[u8], len_iv: usize) -> Option<HashMap<String, Vec<u
         if cur.peek() == Some(b' ') {
             cur.pos += 1;
         }
-        let Some(len) = usize::try_from(len).ok() else { break };
+        let Some(len) = usize::try_from(len).ok() else {
+            break;
+        };
         let Some(raw) = cur.take(len) else { break };
         map.insert(name, decrypt_charstring(raw, len_iv));
     }
@@ -807,7 +823,9 @@ fn find_font_matrix(cleartext: &[u8]) -> Option<Affine> {
 fn find_encoding(cleartext: &[u8]) -> [Option<String>; 256] {
     const NONE: Option<String> = None;
     let mut table = [NONE; 256];
-    let Some(pos) = find(cleartext, b"/Encoding") else { return table };
+    let Some(pos) = find(cleartext, b"/Encoding") else {
+        return table;
+    };
     let mut cur = Cursor::new(cleartext);
     cur.pos = pos + "/Encoding".len();
     cur.skip_ws();
@@ -815,7 +833,9 @@ fn find_encoding(cleartext: &[u8]) -> [Option<String>; 256] {
     let word = cur.read_word();
     if word == b"StandardEncoding" {
         for (i, slot) in table.iter_mut().enumerate() {
-            *slot = BaseEncoding::Standard.glyph_name(i as u8).map(str::to_owned);
+            *slot = BaseEncoding::Standard
+                .glyph_name(i as u8)
+                .map(str::to_owned);
         }
         return table;
     }
@@ -1006,7 +1026,9 @@ mod tests {
         let priv_enc = encrypt(&priv_plain, 55665, &[0, 0, 0, 0]);
 
         let mut pfa = Vec::new();
-        pfa.extend_from_slice(b"%!PS-AdobeFont-1.0\n/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n");
+        pfa.extend_from_slice(
+            b"%!PS-AdobeFont-1.0\n/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n",
+        );
         pfa.extend_from_slice(b"/Encoding StandardEncoding def\n");
         pfa.extend_from_slice(b"currentfile eexec\n");
         for byte in &priv_enc {
@@ -1100,9 +1122,12 @@ mod tests {
         let correct_length1 = eexec_kw + 5;
         for bad_offset in [-3i64, -1, 1, 3] {
             let wrong_length1 = (correct_length1 as i64 + bad_offset) as usize;
-            let prog = Type1Program::parse(&pfa, Some(wrong_length1), None)
-                .unwrap_or_else(|| panic!("parse failed to recover from a Length1 off by {bad_offset}"));
-            let path = prog.outline("A").unwrap_or_else(|| panic!("no outline recovered for Length1 off by {bad_offset}"));
+            let prog = Type1Program::parse(&pfa, Some(wrong_length1), None).unwrap_or_else(|| {
+                panic!("parse failed to recover from a Length1 off by {bad_offset}")
+            });
+            let path = prog
+                .outline("A")
+                .unwrap_or_else(|| panic!("no outline recovered for Length1 off by {bad_offset}"));
             assert!(!path_is_empty(&path));
         }
     }

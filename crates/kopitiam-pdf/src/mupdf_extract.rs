@@ -30,8 +30,7 @@
 use std::path::Path as FsPath;
 
 use crate::mupdf::{
-    self, StextBlock, StextLine, StextPage,
-    structured_text::StextOptions,
+    self, StextBlock, StextLine, StextPage, structured_text::StextOptions,
     xref::PdfDocument as MupdfDocument,
 };
 use crate::page::{Page, TextSpan};

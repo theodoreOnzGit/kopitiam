@@ -23,7 +23,7 @@
 //!   glyphs through `CIDToGIDMap` instead and do not consult this.
 
 use super::draw_path::Path;
-use super::glyph::{quad_to, Affine, Reader};
+use super::glyph::{Affine, Reader, quad_to};
 use std::collections::HashMap;
 
 /// Recursion cap on composite-glyph component nesting.
@@ -69,9 +69,18 @@ impl TrueTypeProgram {
         let num_glyphs = r.u16() as usize;
 
         let loca = parse_loca(bytes, loca_tbl, loc_format, num_glyphs)?;
-        let cmap = dir.find(b"cmap").map(|(off, _)| parse_cmap(bytes, off)).unwrap_or_default();
+        let cmap = dir
+            .find(b"cmap")
+            .map(|(off, _)| parse_cmap(bytes, off))
+            .unwrap_or_default();
 
-        Some(TrueTypeProgram { data: bytes.to_vec(), glyf: (glyf.0, glyf.1), loca, units_per_em, cmap })
+        Some(TrueTypeProgram {
+            data: bytes.to_vec(),
+            glyf: (glyf.0, glyf.1),
+            loca,
+            units_per_em,
+            cmap,
+        })
     }
 
     /// Extract the raw `CFF ` table bytes from an OpenType (`OTTO` / sfnt) image,
@@ -242,11 +251,19 @@ impl TrueTypeProgram {
             if flags & ARG_WORDS != 0 {
                 let a1 = r.i16() as f32;
                 let a2 = r.i16() as f32;
-                (dx, dy) = if flags & ARGS_XY != 0 { (a1, a2) } else { (0.0, 0.0) };
+                (dx, dy) = if flags & ARGS_XY != 0 {
+                    (a1, a2)
+                } else {
+                    (0.0, 0.0)
+                };
             } else {
                 let a1 = r.u8() as i8 as f32;
                 let a2 = r.u8() as i8 as f32;
-                (dx, dy) = if flags & ARGS_XY != 0 { (a1, a2) } else { (0.0, 0.0) };
+                (dx, dy) = if flags & ARGS_XY != 0 {
+                    (a1, a2)
+                } else {
+                    (0.0, 0.0)
+                };
             }
 
             // 2x2 component transform (F2Dot14).
@@ -266,7 +283,14 @@ impl TrueTypeProgram {
             }
 
             // Component space -> parent space -> (parent's) em space.
-            let comp = Affine { a, b, c, d, e: dx, f: dy };
+            let comp = Affine {
+                a,
+                b,
+                c,
+                d,
+                e: dx,
+                f: dy,
+            };
             let child = comp.concat(xform);
             self.decode_into(path, comp_gid, child, depth + 1);
 
@@ -386,9 +410,10 @@ fn maxp_table(num_glyphs: u16) -> Vec<u8> {
 pub(crate) fn simple_glyf(contours: &[Vec<(i16, i16, bool)>]) -> Vec<u8> {
     let mut g = Vec::new();
     let all: Vec<(i16, i16, bool)> = contours.iter().flatten().copied().collect();
-    let (xmin, ymin, xmax, ymax) = all.iter().fold((i16::MAX, i16::MAX, i16::MIN, i16::MIN), |(a, b, c, d), p| {
-        (a.min(p.0), b.min(p.1), c.max(p.0), d.max(p.1))
-    });
+    let (xmin, ymin, xmax, ymax) = all.iter().fold(
+        (i16::MAX, i16::MAX, i16::MIN, i16::MIN),
+        |(a, b, c, d), p| (a.min(p.0), b.min(p.1), c.max(p.0), d.max(p.1)),
+    );
     g.extend_from_slice(&(contours.len() as i16).to_be_bytes());
     g.extend_from_slice(&xmin.to_be_bytes());
     g.extend_from_slice(&ymin.to_be_bytes());
@@ -435,7 +460,11 @@ fn cmap_format0(map: &[u8; 256]) -> Vec<u8> {
 /// Build a complete TrueType font (`glyphs[0]` is `.notdef`) with an optional
 /// `code -> gid` cmap. `glyphs` are pre-encoded `glyf` entries.
 #[cfg(test)]
-pub(crate) fn build_ttf(units_per_em: u16, glyphs: &[Vec<u8>], cmap_map: Option<[u8; 256]>) -> Vec<u8> {
+pub(crate) fn build_ttf(
+    units_per_em: u16,
+    glyphs: &[Vec<u8>],
+    cmap_map: Option<[u8; 256]>,
+) -> Vec<u8> {
     // loca (long): running offsets into the concatenated glyf table.
     let mut glyf = Vec::new();
     let mut loca = Vec::new();
@@ -460,7 +489,12 @@ pub(crate) fn build_ttf(units_per_em: u16, glyphs: &[Vec<u8>], cmap_map: Option<
 #[cfg(test)]
 pub(crate) fn box_font() -> Vec<u8> {
     let notdef = simple_glyf(&[]);
-    let boxg = simple_glyf(&[vec![(0, 0, true), (500, 0, true), (500, 700, true), (0, 700, true)]]);
+    let boxg = simple_glyf(&[vec![
+        (0, 0, true),
+        (500, 0, true),
+        (500, 700, true),
+        (0, 700, true),
+    ]]);
     build_ttf(1000, &[notdef, boxg], None)
 }
 
@@ -472,9 +506,19 @@ pub(crate) fn ring_font() -> Vec<u8> {
     let notdef = simple_glyf(&[]);
     let ring = simple_glyf(&[
         // Outer square, clockwise (in y-up).
-        vec![(100, 100, true), (100, 900, true), (900, 900, true), (900, 100, true)],
+        vec![
+            (100, 100, true),
+            (100, 900, true),
+            (900, 900, true),
+            (900, 100, true),
+        ],
         // Inner square, counter-clockwise -> a hole under nonzero winding.
-        vec![(300, 300, true), (700, 300, true), (700, 700, true), (300, 700, true)],
+        vec![
+            (300, 300, true),
+            (700, 300, true),
+            (700, 700, true),
+            (300, 700, true),
+        ],
     ]);
     let mut map = [0u8; 256];
     map[0x41] = 1;
@@ -531,7 +575,12 @@ impl TableDir {
 }
 
 /// Parse the `loca` table into `numGlyphs + 1` byte offsets into `glyf`.
-fn parse_loca(bytes: &[u8], loca: (usize, usize), format: i16, num_glyphs: usize) -> Option<Vec<u32>> {
+fn parse_loca(
+    bytes: &[u8],
+    loca: (usize, usize),
+    format: i16,
+    num_glyphs: usize,
+) -> Option<Vec<u32>> {
     let (off, len) = loca;
     let count = num_glyphs + 1;
     let mut r = Reader::at(bytes, off);
@@ -717,7 +766,10 @@ mod tests {
         let path = prog.outline(1).expect("box outline");
         // 1000 units/em: box (0,0)-(500,700) -> em (0,0)-(0.5,0.7).
         let (x0, y0, x1, y1) = bbox(&path);
-        assert!(x0.abs() < 1e-4 && y0.abs() < 1e-4, "origin corner {x0},{y0}");
+        assert!(
+            x0.abs() < 1e-4 && y0.abs() < 1e-4,
+            "origin corner {x0},{y0}"
+        );
         assert!((x1 - 0.5).abs() < 1e-4, "max x {x1}");
         assert!((y1 - 0.7).abs() < 1e-4, "max y {y1}");
     }
@@ -760,7 +812,12 @@ mod tests {
     fn composite_glyph_translates_component() {
         // gid1 = a box; gid2 = a composite placing gid1 translated by (500,0).
         let notdef = simple_glyf(&[]);
-        let boxg = simple_glyf(&[vec![(0, 0, true), (400, 0, true), (400, 400, true), (0, 400, true)]]);
+        let boxg = simple_glyf(&[vec![
+            (0, 0, true),
+            (400, 0, true),
+            (400, 400, true),
+            (0, 400, true),
+        ]]);
         // Composite: flags = ARG_WORDS|ARGS_XY|MORE_off, component gid 1, dx=500 dy=0.
         let mut comp = Vec::new();
         comp.extend_from_slice(&(-1i16).to_be_bytes()); // numberOfContours < 0 -> composite

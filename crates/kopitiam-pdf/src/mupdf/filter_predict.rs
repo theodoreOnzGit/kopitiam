@@ -94,7 +94,14 @@ fn paeth(a: i32, b: i32, c: i32) -> i32 {
 }
 
 // MuPDF: fz_predict_tiff (filter-predict.c:84)
-fn predict_tiff(out: &mut [u8], input: &[u8], colors: usize, columns: usize, bpc: i32, stride: usize) {
+fn predict_tiff(
+    out: &mut [u8],
+    input: &[u8],
+    colors: usize,
+    columns: usize,
+    bpc: i32,
+    stride: usize,
+) {
     let mut left = [0i32; FZ_MAX_COLORS];
     let mask = (1i32 << bpc) - 1;
 
@@ -132,7 +139,14 @@ fn predict_tiff(out: &mut [u8], input: &[u8], colors: usize, columns: usize, bpc
 }
 
 // MuPDF: fz_predict_png (filter-predict.c:120)
-fn predict_png(out: &mut [u8], input: &[u8], ref_row: &[u8], bpp: usize, len: usize, predictor: i32) {
+fn predict_png(
+    out: &mut [u8],
+    input: &[u8],
+    ref_row: &[u8],
+    bpp: usize,
+    len: usize,
+    predictor: i32,
+) {
     let bpp = if bpp > len { len } else { bpp };
 
     match predictor {

@@ -37,7 +37,7 @@ use super::draw_edge::FillRule;
 use super::draw_path::Path;
 use super::font::Font;
 use super::geometry::{Matrix, Point, Rect};
-use super::interpret::{make_trm, GState, Processor};
+use super::interpret::{GState, Processor, make_trm};
 use super::object::Object;
 use super::resources::ColorSpace;
 use super::text_device::TextDevice;
@@ -80,7 +80,9 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             return; // "cannot draw text since font and size not set"
         }
         for i in 0..arr.array_len() {
-            let Some(item) = arr.array_get(i) else { continue };
+            let Some(item) = arr.array_get(i) else {
+                continue;
+            };
             match item {
                 Object::String(bytes) => {
                     let bytes = bytes.clone();
@@ -155,14 +157,7 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // `dev` is a disjoint field, so the borrow checker permits both (going
         // through the `gstate()` method would borrow all of `self`).
         {
-            let font: &Font = self
-                .gstack
-                .last()
-                .unwrap()
-                .text
-                .font
-                .as_ref()
-                .unwrap();
+            let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
             self.dev
                 .show_glyph(font, trm_dev, adv_em, unicode, cid, wmode as u8);
         }
@@ -177,7 +172,13 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     /// Advance the text matrix by `tadj` (word spacing, or a `TJ` position
     /// adjustment). Horizontal writing scales by `Tz`; vertical does not.
     fn show_space(&mut self, tadj: f32) {
-        let wmode = self.gstate().text.font.as_ref().map(Font::wmode).unwrap_or(0);
+        let wmode = self
+            .gstate()
+            .text
+            .font
+            .as_ref()
+            .map(Font::wmode)
+            .unwrap_or(0);
         let scale = self.gstate().text.scale;
         if wmode == 0 {
             self.tos.tm = self.tos.tm.pre_translate(tadj * scale, 0.0);

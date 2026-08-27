@@ -9,7 +9,9 @@ name = "kopitiam-pdf"
 # cache-poisoning fix (gh-70, `claimed_by_objstm` in xref.rs) takes it to
 # 0.2.8. That last one landed AFTER 0.2.7 was already on crates.io -- verified
 # by diffing the published .crate, which has no such guard -- so it needs its
-# own version rather than riding along on one already spent.
+# own version rather than riding along on one already spent. 0.2.9 adds
+# annotation rendering + authoring (gh-79/gh-80), the stroker cap/join port
+# (gh-82), and promotes kpdf from an example to a real binary.
 #
 # The wrinkle worth remembering (it has already caught us once, on develop's
 # 6facc3b "bumping kopitiam pdf to version 0.2.6"): bumping the
@@ -17,7 +19,7 @@ name = "kopitiam-pdf"
 # changes what *other* crates resolve against -- it does NOT change what
 # `cargo publish` uploads. The crate's own `[package] version` here is the
 # other half, and both have to move together.
-version = "0.2.8"
+version = "0.2.9"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -59,15 +61,47 @@ zune-jpeg = { workspace = true }
 # months) and we bump deliberately rather than drift with it.
 hayro = "=0.7.1"
 
+# --- kpdf GUI stack (optional, behind the default `kpdf` feature) -------------
+# `src/bin/kpdf.rs` -- a lightweight native PDF reader. These were
+# `[dev-dependencies]` while kpdf was an example; promoting kpdf to a real
+# binary means they must be real dependencies, and `optional = true` keeps them
+# out of a library-only build (see `[features]` below).
+# MIT OR Apache-2.0, pure Rust.
+eframe = { version = "0.36", optional = true }
+egui = { version = "0.36", optional = true }
+# Native file picker ("Open a PDF"). MIT. Default features (xdg-portal +
+# wayland on Linux) are pure Rust to build -- no GTK/C toolchain needed, per the
+# Pure Rust Core hard rule's "prefer an existing pure-Rust crate" and "avoid a C
+# dependency's own complex build system" guidance.
+rfd = { version = "0.17", optional = true }
+
 [dev-dependencies]
-# `examples/kpdf.rs` -- a lightweight native GUI viewer, dev-dependency only so
-# egui/eframe never enter the published library's own dependency graph (a
-# `cargo publish` consumer never needs a GUI toolkit to use kopitiam-pdf as a
-# library). MIT OR Apache-2.0, pure Rust.
-eframe = "0.36"
-egui = "0.36"
-# Native "Open a PDF" file picker for kpdf. MIT. Default features
-# (xdg-portal + wayland on Linux) are pure Rust to build -- no GTK/C toolchain
-# needed, per the Pure Rust Core hard rule's "prefer an existing pure-Rust
-# crate" and "avoid a C dependency's own complex build system" guidance.
-rfd = "0.17"
+# Nothing here today: the GUI stack that used to live in this section is now an
+# optional *real* dependency (see `[features] kpdf` above), because kpdf is a
+# shipped binary rather than an example.
+
+[features]
+# `kpdf` -- the native GUI viewer binary. ON by default so `cargo install
+# kopitiam-pdf` just works and produces a usable reader with no flags.
+#
+# The deps below are `optional = true` rather than plain dependencies, which is
+# the whole point of this feature: a consumer using kopitiam-pdf as a *library*
+# (apps/cli, kovan, anything downstream) can take `default-features = false` and
+# never compile a GUI toolkit it does not render with. That preserves the
+# property the old `[dev-dependencies]` comment was protecting -- "a `cargo
+# publish` consumer never needs a GUI toolkit to use kopitiam-pdf as a library"
+# -- while still shipping the binary the maintainer asked for.
+#
+# Turning this from a default feature into a non-default one later is NOT a
+# breaking change for library users; going the other way (hard dependency ->
+# optional) would be. Hence optional-from-the-start.
+default = ["kpdf"]
+kpdf = ["dep:eframe", "dep:egui", "dep:rfd"]
+
+[[bin]]
+name = "kpdf"
+path = "src/bin/kpdf.rs"
+# Without this, `cargo build --no-default-features` would try to build the
+# binary with its GUI deps switched off and fail to compile. `required-features`
+# makes cargo skip the target instead, so a library-only build is clean.
+required-features = ["kpdf"]

@@ -115,7 +115,8 @@ fn build_fixture_pdf() -> Vec<u8> {
     doc.trailer.set("Root", catalog_id);
 
     let mut bytes = Vec::new();
-    doc.save_to(&mut bytes).expect("saving the fixture PDF must succeed");
+    doc.save_to(&mut bytes)
+        .expect("saving the fixture PDF must succeed");
     bytes
 }
 

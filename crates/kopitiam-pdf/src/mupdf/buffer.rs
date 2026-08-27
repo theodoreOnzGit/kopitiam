@@ -130,11 +130,7 @@ impl Buffer {
             256
         } else {
             let ns = cap + (cap >> 1);
-            if ns < cap {
-                usize::MAX
-            } else {
-                ns
-            }
+            if ns < cap { usize::MAX } else { ns }
         };
         let len = self.data.len();
         if newsize > len {
@@ -313,7 +309,9 @@ mod tests {
         b.append_uint32_le(0x0A0B0C0D);
         assert_eq!(
             b.as_slice(),
-            &[0x01, 0x02, 0x04, 0x03, 0x0A, 0x0B, 0x0C, 0x0D, 0x0D, 0x0C, 0x0B, 0x0A]
+            &[
+                0x01, 0x02, 0x04, 0x03, 0x0A, 0x0B, 0x0C, 0x0D, 0x0D, 0x0C, 0x0B, 0x0A
+            ]
         );
     }
 

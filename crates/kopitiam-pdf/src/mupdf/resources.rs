@@ -196,7 +196,11 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                 // count; fall back to its /Alternate colourspace, else guess gray.
                 let stream = obj.array_get(1).cloned().unwrap_or(Object::Null);
                 let dict = self.doc.resolve(&stream).unwrap_or(Object::Null);
-                let n = self.doc.resolve_get(&dict, "N").map(|o| o.to_int()).unwrap_or(0);
+                let n = self
+                    .doc
+                    .resolve_get(&dict, "N")
+                    .map(|o| o.to_int())
+                    .unwrap_or(0);
                 match n {
                     1 => ColorSpace::Gray,
                     3 => ColorSpace::Rgb,

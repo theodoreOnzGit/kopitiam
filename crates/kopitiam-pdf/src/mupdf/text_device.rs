@@ -66,7 +66,15 @@ pub trait TextDevice {
     /// * `unicode` -- the code's Unicode value (U+FFFD on a total miss).
     /// * `cid` -- the code's CID (the glyph identifier within the font).
     /// * `wmode` -- writing mode: 0 = horizontal, 1 = vertical.
-    fn show_glyph(&mut self, font: &Font, trm: Matrix, adv: f32, unicode: char, cid: u32, wmode: u8);
+    fn show_glyph(
+        &mut self,
+        font: &Font,
+        trm: Matrix,
+        adv: f32,
+        unicode: char,
+        cid: u32,
+        wmode: u8,
+    );
 
     // MuPDF: the fz_device fill_path callback (fz_fill_path -> dev->fill_path,
     // device.h). Wired by the content interpreter's path-painting operators.

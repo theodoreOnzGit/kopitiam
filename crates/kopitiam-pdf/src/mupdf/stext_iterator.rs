@@ -85,5 +85,7 @@ impl<'a> Iterator for BlockDfsIter<'a> {
 // MuPDF: fz_stext_page_block_iterator_begin_dfs (stext-iterator.c:73).
 /// Begin a depth-first walk over `page`'s blocks in reading order.
 pub fn blocks_dfs(page: &StextPage) -> BlockDfsIter<'_> {
-    BlockDfsIter { inner: page.blocks.iter() }
+    BlockDfsIter {
+        inner: page.blocks.iter(),
+    }
 }

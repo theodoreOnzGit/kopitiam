@@ -82,7 +82,11 @@ fn split_block_by_line_gap(tb: StextTextBlock, out: &mut Vec<StextBlock>) {
 
         if let Some(pb) = prev_bottom {
             let gap = lb.y0 - pb; // device space: next line sits below (larger y).
-            let pitch = if prev_height > 0.0 { prev_height } else { height };
+            let pitch = if prev_height > 0.0 {
+                prev_height
+            } else {
+                height
+            };
             if gap > PARAGRAPH_LEADING_FACTOR * pitch && !group.is_empty() {
                 out.push(flush(std::mem::take(&mut group)));
             }
@@ -154,9 +158,9 @@ mod tests {
             bbox: Rect::EMPTY,
             lines: vec![
                 line("first", 40.0, 10.0),
-                line("line", 52.0, 10.0),  // gap 2 -> same paragraph
+                line("line", 52.0, 10.0),   // gap 2 -> same paragraph
                 line("second", 77.0, 10.0), // gap 15 -> new paragraph
-                line("para", 89.0, 10.0),  // gap 2 -> same paragraph
+                line("para", 89.0, 10.0),   // gap 2 -> same paragraph
             ],
         };
         let mut page = StextPage {
@@ -165,7 +169,11 @@ mod tests {
             fonts: Vec::new(),
         };
         paragraph_break(&mut page);
-        assert_eq!(page.blocks.len(), 2, "the large gap splits the block in two");
+        assert_eq!(
+            page.blocks.len(),
+            2,
+            "the large gap splits the block in two"
+        );
         if let (StextBlock::Text(a), StextBlock::Text(b)) = (&page.blocks[0], &page.blocks[1]) {
             assert_eq!(a.lines.len(), 2);
             assert_eq!(b.lines.len(), 2);
@@ -180,7 +188,11 @@ mod tests {
     fn tight_lines_stay_one_paragraph() {
         let tb = StextTextBlock {
             bbox: Rect::EMPTY,
-            lines: vec![line("a", 40.0, 10.0), line("b", 52.0, 10.0), line("c", 64.0, 10.0)],
+            lines: vec![
+                line("a", 40.0, 10.0),
+                line("b", 52.0, 10.0),
+                line("c", 64.0, 10.0),
+            ],
         };
         let mut page = StextPage {
             mediabox: Rect::new(0.0, 0.0, 300.0, 300.0),
@@ -188,6 +200,10 @@ mod tests {
             fonts: Vec::new(),
         };
         paragraph_break(&mut page);
-        assert_eq!(page.blocks.len(), 1, "evenly-spaced lines stay one paragraph");
+        assert_eq!(
+            page.blocks.len(),
+            1,
+            "evenly-spaced lines stay one paragraph"
+        );
     }
 }

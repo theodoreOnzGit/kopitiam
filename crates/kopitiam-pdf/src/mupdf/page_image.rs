@@ -48,9 +48,9 @@ use super::error::{Error, Result};
 use super::object::Object;
 use super::xref::PdfDocument;
 
+use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
-use zune_jpeg::JpegDecoder;
 
 /// A decoded raster image: 8-bit samples, row-major, either 1 component
 /// (grayscale) or 3 (RGB). This is the normalized form the OCR pipeline
@@ -80,7 +80,10 @@ enum ColorKind {
     Cmyk,
     /// `[/Indexed base hival lookup]` -- one index component into `palette`
     /// (row of `base` samples, 8-bit each), resolved to `base`'s colour.
-    Indexed { base: Box<ColorKind>, palette: Vec<u8> },
+    Indexed {
+        base: Box<ColorKind>,
+        palette: Vec<u8>,
+    },
 }
 
 impl ColorKind {
@@ -108,7 +111,10 @@ impl ColorKind {
 
 /// The image-only compression filters this module does not (yet) decode.
 fn is_deferred_codec(name: &[u8]) -> bool {
-    matches!(name, b"JPXDecode" | b"JBIG2Decode" | b"CCITTFaxDecode" | b"CCF")
+    matches!(
+        name,
+        b"JPXDecode" | b"JBIG2Decode" | b"CCITTFaxDecode" | b"CCF"
+    )
 }
 
 /// The JPEG filter names (`DCTDecode` / its inline abbreviation `DCT`).
@@ -214,7 +220,11 @@ fn image_xobjects(doc: &PdfDocument, page: &Object) -> Result<Vec<(Object, Objec
 /// content interpreter ([`Processor::op_do`](super::interpret::Processor)) uses to
 /// paint image XObjects; a deferred codec / colorspace returns an error the caller
 /// treats as a safe skip.
-pub(crate) fn decode_image_xobject(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result<DecodedImage> {
+pub(crate) fn decode_image_xobject(
+    doc: &PdfDocument,
+    dict: &Object,
+    stream_ref: &Object,
+) -> Result<DecodedImage> {
     decode_image(doc, dict, stream_ref)
 }
 
@@ -256,7 +266,9 @@ fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result
         bpc = 1;
     }
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
-        return Err(Error::syntax(format!("unsupported bits-per-component: {bpc}")));
+        return Err(Error::syntax(format!(
+            "unsupported bits-per-component: {bpc}"
+        )));
     }
     let bpc = bpc as u32;
 
@@ -270,7 +282,14 @@ fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result
 
     let samples = doc.open_stream(stream_ref)?;
     let decode = read_decode(doc, dict);
-    Ok(decode_samples(width, height, bpc, &cs, decode.as_deref(), &samples))
+    Ok(decode_samples(
+        width,
+        height,
+        bpc,
+        &cs,
+        decode.as_deref(),
+        &samples,
+    ))
 }
 
 /// Apply the filters *before* index `image_pos` in the chain (usually none), so
@@ -341,10 +360,18 @@ fn decode_jpeg(
         ColorSpace::CMYK | ColorSpace::YCCK => {
             // Adobe CMYK JPEGs commonly store inverted samples, flagged by a
             // /Decode of [1 0 1 0 1 0 1 0]; honour it when present.
-            let invert = decode.map(|d| d.first().copied().unwrap_or(0.0) > 0.5).unwrap_or(false);
+            let invert = decode
+                .map(|d| d.first().copied().unwrap_or(0.0) > 0.5)
+                .unwrap_or(false);
             let mut out = Vec::with_capacity(w * h * 3);
             for px in pixels.chunks_exact(4) {
-                let f = |b: u8| if invert { 1.0 - b as f32 / 255.0 } else { b as f32 / 255.0 };
+                let f = |b: u8| {
+                    if invert {
+                        1.0 - b as f32 / 255.0
+                    } else {
+                        b as f32 / 255.0
+                    }
+                };
                 let (r, g, b) = cmyk_to_rgb(f(px[0]), f(px[1]), f(px[2]), f(px[3]));
                 out.extend_from_slice(&[r, g, b]);
             }
@@ -419,7 +446,13 @@ fn read_bits(row: &[u8], bit: &mut usize, bpc: u32) -> u32 {
 
 /// Resolve one pixel's `src_n` raw samples through `cs` and push its output
 /// bytes.
-fn emit_pixel(cs: &ColorKind, comps: &[u32], maxval: f32, decode: Option<&[f32]>, out: &mut Vec<u8>) {
+fn emit_pixel(
+    cs: &ColorKind,
+    comps: &[u32],
+    maxval: f32,
+    decode: Option<&[f32]>,
+    out: &mut Vec<u8>,
+) {
     match cs {
         ColorKind::Gray | ColorKind::Rgb | ColorKind::Cmyk => {
             let mut c01 = [0f32; 4];
@@ -431,9 +464,9 @@ fn emit_pixel(cs: &ColorKind, comps: &[u32], maxval: f32, decode: Option<&[f32]>
         ColorKind::Indexed { base, palette } => {
             // The single sample is a palette index (optionally /Decode-remapped).
             let index = match decode {
-                Some(d) if d.len() >= 2 => {
-                    (d[0] + comps[0] as f32 * (d[1] - d[0]) / maxval).round().max(0.0) as usize
-                }
+                Some(d) if d.len() >= 2 => (d[0] + comps[0] as f32 * (d[1] - d[0]) / maxval)
+                    .round()
+                    .max(0.0) as usize,
                 _ => comps[0] as usize,
             };
             let base_n = base.source_components();
@@ -535,7 +568,9 @@ fn parse_colorspace(doc: &PdfDocument, obj: &Object) -> Result<ColorKind> {
                         Object::String(bytes) => bytes,
                         d if d.is_dict() => doc.open_stream(&lookup_obj)?,
                         _ => {
-                            return Err(Error::syntax("Indexed colorspace lookup is not a string or stream"))
+                            return Err(Error::syntax(
+                                "Indexed colorspace lookup is not a string or stream",
+                            ));
                         }
                     };
                     Ok(ColorKind::Indexed {
@@ -751,7 +786,9 @@ mod tests {
         assert_eq!((im.width, im.height, im.components), (2, 2, 3));
         assert_eq!(
             im.pixels,
-            vec![255, 0, 0, /**/ 0, 255, 0, /**/ 0, 0, 255, /**/ 255, 0, 0]
+            vec![
+                255, 0, 0, /**/ 0, 255, 0, /**/ 0, 0, 255, /**/ 255, 0, 0
+            ]
         );
     }
 

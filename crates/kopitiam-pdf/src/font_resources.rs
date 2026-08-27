@@ -257,7 +257,11 @@ fn resolve_xobject<'a>(
 
 /// Resolve a `Tf` resource name (e.g. `b"F1"`) against a `/Resources`
 /// dictionary's `/Font` sub-dictionary into a [`ResolvedFont`].
-fn resolve_font_by_name(doc: &Document, resources: &Dictionary, name: &[u8]) -> Option<ResolvedFont> {
+fn resolve_font_by_name(
+    doc: &Document,
+    resources: &Dictionary,
+    name: &[u8],
+) -> Option<ResolvedFont> {
     let fonts = doc.get_dict_in_dict(resources, b"Font").ok()?;
     let font_dict = doc.get_dict_in_dict(fonts, name).ok()?;
     resolve_font_dict(doc, font_dict)
@@ -299,7 +303,8 @@ fn descriptor_for<'a>(doc: &'a Document, font_dict: &'a Dictionary) -> Option<&'
     let descendant = descendants.first()?;
     let (_, descendant) = doc.dereference(descendant).ok()?;
     let descendant_dict = descendant.as_dict().ok()?;
-    doc.get_dict_in_dict(descendant_dict, b"FontDescriptor").ok()
+    doc.get_dict_in_dict(descendant_dict, b"FontDescriptor")
+        .ok()
 }
 
 /// Extract the bold/italic-relevant fields from a `FontDescriptor`

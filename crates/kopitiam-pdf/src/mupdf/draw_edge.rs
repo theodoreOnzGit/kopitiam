@@ -85,7 +85,13 @@ fn build_edges(subpaths: &[Vec<Point>]) -> Vec<EdgeSeg> {
             }
             let (top, bot, dir) = if a.y < b.y { (a, b, 1) } else { (b, a, -1) };
             let dxdy = (bot.x - top.x) / (bot.y - top.y);
-            edges.push(EdgeSeg { ytop: top.y, ybot: bot.y, x_top: top.x, dxdy, dir });
+            edges.push(EdgeSeg {
+                ytop: top.y,
+                ybot: bot.y,
+                x_top: top.x,
+                dxdy,
+                dir,
+            });
         }
     }
     edges
@@ -111,7 +117,12 @@ fn fill_bounds(subpaths: &[Vec<Point>], pix: &Pixmap, clip: IRect) -> IRect {
         return IRect::EMPTY;
     }
     // Floor the low edge, ceil the high edge, then clamp to pixmap ∩ clip.
-    let b = IRect::new(x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32);
+    let b = IRect::new(
+        x0.floor() as i32,
+        y0.floor() as i32,
+        x1.ceil() as i32,
+        y1.ceil() as i32,
+    );
     b.intersect(pix.bbox()).intersect(clip)
 }
 
@@ -169,7 +180,14 @@ fn composite(pix: &mut Pixmap, o: usize, color: &[u8], a: f32) {
 ///
 /// This is the rasterizer entry the [`DrawDevice`](super::draw_device) drives for
 /// every filled path and every glyph box.
-pub fn fill_polygons(pix: &mut Pixmap, subpaths: &[Vec<Point>], rule: FillRule, color: &[u8], alpha: f32, clip: IRect) {
+pub fn fill_polygons(
+    pix: &mut Pixmap,
+    subpaths: &[Vec<Point>],
+    rule: FillRule,
+    color: &[u8],
+    alpha: f32,
+    clip: IRect,
+) {
     if alpha <= 0.0 {
         return;
     }
@@ -261,9 +279,20 @@ mod tests {
         pix.clear_with_value(0xff);
         let bb = pix.bbox();
         // Fill an axis-aligned rectangle black.
-        fill_polygons(&mut pix, &[rect(5.0, 5.0, 15.0, 15.0)], FillRule::NonZero, &[0, 0, 0], 1.0, bb);
+        fill_polygons(
+            &mut pix,
+            &[rect(5.0, 5.0, 15.0, 15.0)],
+            FillRule::NonZero,
+            &[0, 0, 0],
+            1.0,
+            bb,
+        );
         // Deep inside -> near 0.
-        assert!(pix.luma(10, 10).unwrap() < 5, "inside luma {}", pix.luma(10, 10).unwrap());
+        assert!(
+            pix.luma(10, 10).unwrap() < 5,
+            "inside luma {}",
+            pix.luma(10, 10).unwrap()
+        );
         // Well outside -> still white.
         assert_eq!(pix.luma(1, 1).unwrap(), 255);
         assert_eq!(pix.luma(18, 18).unwrap(), 255);
@@ -276,9 +305,19 @@ mod tests {
         let mut pix = Pixmap::new_rgb(20, 20);
         pix.clear_with_value(0xff);
         let bb = pix.bbox();
-        fill_polygons(&mut pix, &[rect(5.5, 5.0, 15.0, 15.0)], FillRule::NonZero, &[0, 0, 0], 1.0, bb);
+        fill_polygons(
+            &mut pix,
+            &[rect(5.5, 5.0, 15.0, 15.0)],
+            FillRule::NonZero,
+            &[0, 0, 0],
+            1.0,
+            bb,
+        );
         let edge = pix.luma(5, 10).unwrap();
-        assert!(edge > 5 && edge < 250, "AA edge luma should be gray, got {edge}");
+        assert!(
+            edge > 5 && edge < 250,
+            "AA edge luma should be gray, got {edge}"
+        );
     }
 
     #[test]
@@ -291,16 +330,37 @@ mod tests {
         let mut nz = Pixmap::new_rgb(20, 20);
         nz.clear_with_value(0xff);
         let bb = nz.bbox();
-        fill_polygons(&mut nz, &[outer.clone(), inner.clone()], FillRule::NonZero, &[0, 0, 0], 1.0, bb);
+        fill_polygons(
+            &mut nz,
+            &[outer.clone(), inner.clone()],
+            FillRule::NonZero,
+            &[0, 0, 0],
+            1.0,
+            bb,
+        );
 
         let mut eo = Pixmap::new_rgb(20, 20);
         eo.clear_with_value(0xff);
         let bb = eo.bbox();
-        fill_polygons(&mut eo, &[outer, inner], FillRule::EvenOdd, &[0, 0, 0], 1.0, bb);
+        fill_polygons(
+            &mut eo,
+            &[outer, inner],
+            FillRule::EvenOdd,
+            &[0, 0, 0],
+            1.0,
+            bb,
+        );
 
         // Centre pixel: nonzero -> filled (black), even-odd -> hole (white).
-        assert!(nz.luma(10, 10).unwrap() < 5, "nonzero centre should be black");
-        assert_eq!(eo.luma(10, 10).unwrap(), 255, "even-odd centre should be a hole");
+        assert!(
+            nz.luma(10, 10).unwrap() < 5,
+            "nonzero centre should be black"
+        );
+        assert_eq!(
+            eo.luma(10, 10).unwrap(),
+            255,
+            "even-odd centre should be a hole"
+        );
         // A pixel in the outer ring is filled under both rules.
         assert!(nz.luma(4, 10).unwrap() < 5);
         assert!(eo.luma(4, 10).unwrap() < 5);
@@ -311,7 +371,14 @@ mod tests {
         let mut pix = Pixmap::new_rgb(10, 10);
         pix.clear_with_value(0xff);
         let bb = pix.bbox();
-        fill_polygons(&mut pix, &[rect(2.0, 2.0, 8.0, 8.0)], FillRule::NonZero, &[0, 0, 0], 0.5, bb);
+        fill_polygons(
+            &mut pix,
+            &[rect(2.0, 2.0, 8.0, 8.0)],
+            FillRule::NonZero,
+            &[0, 0, 0],
+            0.5,
+            bb,
+        );
         // Half-alpha black over white -> ~128.
         let v = pix.luma(5, 5).unwrap();
         assert!((v as i32 - 128).abs() <= 2, "half-alpha luma {v}");

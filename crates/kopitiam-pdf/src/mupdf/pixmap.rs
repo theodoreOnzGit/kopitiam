@@ -94,7 +94,12 @@ impl Pixmap {
     // MuPDF: fz_pixmap_bbox (pixmap.c:238).
     /// The pixmap's bounding box in device space.
     pub fn bbox(&self) -> IRect {
-        IRect::new(self.x, self.y, self.x + self.w as i32, self.y + self.h as i32)
+        IRect::new(
+            self.x,
+            self.y,
+            self.x + self.w as i32,
+            self.y + self.h as i32,
+        )
     }
 
     /// Width in pixels (`fz_pixmap_width`).
@@ -111,7 +116,11 @@ impl Pixmap {
     /// `None` if it lies outside the pixmap.
     #[inline]
     pub fn offset(&self, px: i32, py: i32) -> Option<usize> {
-        if px < self.x || py < self.y || px >= self.x + self.w as i32 || py >= self.y + self.h as i32 {
+        if px < self.x
+            || py < self.y
+            || px >= self.x + self.w as i32
+            || py >= self.y + self.h as i32
+        {
             return None;
         }
         let col = (px - self.x) as usize;

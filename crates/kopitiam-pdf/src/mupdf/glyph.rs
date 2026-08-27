@@ -219,11 +219,21 @@ pub(crate) struct Affine {
 
 impl Affine {
     pub(crate) fn scale(s: f32) -> Affine {
-        Affine { a: s, b: 0.0, c: 0.0, d: s, e: 0.0, f: 0.0 }
+        Affine {
+            a: s,
+            b: 0.0,
+            c: 0.0,
+            d: s,
+            e: 0.0,
+            f: 0.0,
+        }
     }
 
     pub(crate) fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
 
     /// `self` applied first, then `other` (matching [`Matrix::concat`] order).

@@ -63,8 +63,8 @@ use super::font::Font;
 use super::geometry::{Matrix, Point, Quad, Rect};
 use super::page_run::run_page;
 use super::structured_text::{
-    StextBlock, StextChar, StextLine, StextOptions, StextPage, StextTextBlock,
-    FZ_STEXT_LINE_FLAGS_JOINED, FZ_STEXT_SYNTHETIC, FZ_STEXT_SYNTHETIC_LARGE,
+    FZ_STEXT_LINE_FLAGS_JOINED, FZ_STEXT_SYNTHETIC, FZ_STEXT_SYNTHETIC_LARGE, StextBlock,
+    StextChar, StextLine, StextOptions, StextPage, StextTextBlock,
 };
 use super::text_device::TextDevice;
 use super::xref::PdfDocument;
@@ -126,7 +126,11 @@ impl StextDevice {
     /// Create a device that will accumulate into a fresh page over `mediabox`.
     pub fn new(mediabox: Rect, opts: StextOptions) -> StextDevice {
         StextDevice {
-            page: StextPage { mediabox, blocks: Vec::new(), fonts: Vec::new() },
+            page: StextPage {
+                mediabox,
+                blocks: Vec::new(),
+                fonts: Vec::new(),
+            },
             flags: opts.flags,
             pen: Point::new(0.0, 0.0),
             start: Point::new(0.0, 0.0),
@@ -161,7 +165,15 @@ impl StextDevice {
     // normalisation, then dispatch to the assembly core.
     /// Fold one glyph into the page, applying (unless the matching option is
     /// set) ligature expansion and whitespace normalisation first.
-    fn add_char(&mut self, font_idx: usize, mut c: char, trm: Matrix, adv: f32, wmode: u8, force_new_line: bool) {
+    fn add_char(
+        &mut self,
+        font_idx: usize,
+        mut c: char,
+        trm: Matrix,
+        adv: f32,
+        wmode: u8,
+        force_new_line: bool,
+    ) {
         let opts = StextOptions { flags: self.flags };
 
         // MuPDF expands ligatures unless FZ_STEXT_PRESERVE_LIGATURES.
@@ -180,7 +192,15 @@ impl StextDevice {
             if !parts.is_empty() {
                 // First part carries the real advance/force_new_line; the rest
                 // ride along at the same origin with zero advance.
-                self.add_char_imp(font_idx, parts[0], NON_ACCURATE_GLYPH, trm, adv, wmode, force_new_line);
+                self.add_char_imp(
+                    font_idx,
+                    parts[0],
+                    NON_ACCURATE_GLYPH,
+                    trm,
+                    adv,
+                    wmode,
+                    force_new_line,
+                );
                 for &p in &parts[1..] {
                     self.add_char_imp(font_idx, p, NON_ACCURATE_GLYPH, trm, 0.0, wmode, false);
                 }
@@ -194,17 +214,38 @@ impl StextDevice {
             c = normalize_whitespace(c);
         }
 
-        self.add_char_imp(font_idx, c, NON_ACCURATE_GLYPH, trm, adv, wmode, force_new_line);
+        self.add_char_imp(
+            font_idx,
+            c,
+            NON_ACCURATE_GLYPH,
+            trm,
+            adv,
+            wmode,
+            force_new_line,
+        );
     }
 
     // MuPDF: fz_add_stext_char_imp (stext-device.c:758). THE line/block/space
     // decision. `glyph` is always NON_ACCURATE_GLYPH (>= 0 real gids and the
     // combining-mark/actualtext sentinels are out of scope for this port).
     #[allow(clippy::too_many_arguments)]
-    fn add_char_imp(&mut self, font_idx: usize, c: char, glyph: i32, trm: Matrix, adv: f32, wmode: u8, force_new_line: bool) {
+    fn add_char_imp(
+        &mut self,
+        font_idx: usize,
+        c: char,
+        glyph: i32,
+        trm: Matrix,
+        adv: f32,
+        wmode: u8,
+        force_new_line: bool,
+    ) {
         // dir = motion direction; ndir = normalised(dir). (bidi is always 0 in
         // this port, so we only ever take the LTR/neutral branch.)
-        let dir = if wmode == 0 { Point::new(1.0, 0.0) } else { Point::new(0.0, -1.0) };
+        let dir = if wmode == 0 {
+            Point::new(1.0, 0.0)
+        } else {
+            Point::new(0.0, -1.0)
+        };
         let dir = dir.transform_vector(trm);
         let ndir = dir.normalize();
 
@@ -242,7 +283,9 @@ impl StextDevice {
             None => {
                 new_para = true;
             }
-            Some((line_wmode, line_dir)) if line_wmode != wmode || vec_dot(ndir, line_dir) < 0.999 => {
+            Some((line_wmode, line_dir))
+                if line_wmode != wmode || vec_dot(ndir, line_dir) < 0.999 =>
+            {
                 new_para = true;
             }
             Some(_) => {
@@ -292,7 +335,10 @@ impl StextDevice {
         // Start a new block if needed.
         let mut cur_block = cur_block;
         if new_para || cur_block.is_none() {
-            self.page.blocks.push(StextBlock::Text(StextTextBlock { bbox: Rect::EMPTY, lines: Vec::new() }));
+            self.page.blocks.push(StextBlock::Text(StextTextBlock {
+                bbox: Rect::EMPTY,
+                lines: Vec::new(),
+            }));
             cur_block = Some(self.page.blocks.len() - 1);
         }
         let bi = cur_block.expect("a text block exists after the new-block step");
@@ -309,7 +355,8 @@ impl StextDevice {
         }
 
         // Start a new line if needed.
-        let line_exists = matches!(&self.page.blocks[bi], StextBlock::Text(tb) if !tb.lines.is_empty());
+        let line_exists =
+            matches!(&self.page.blocks[bi], StextBlock::Text(tb) if !tb.lines.is_empty());
         if new_line || !line_exists || force_new_line {
             if let StextBlock::Text(tb) = &mut self.page.blocks[bi] {
                 tb.lines.push(StextLine {
@@ -321,7 +368,11 @@ impl StextDevice {
                 });
             }
             self.start = p;
-            self.maybe_bullet = if glyph == NON_ACCURATE_GLYPH_ADDED_SPACE { true } else { plausible_bullet(c) };
+            self.maybe_bullet = if glyph == NON_ACCURATE_GLYPH_ADDED_SPACE {
+                true
+            } else {
+                plausible_bullet(c)
+            };
         }
 
         let li = match &self.page.blocks[bi] {
@@ -335,7 +386,12 @@ impl StextDevice {
         // Synthesised space (from `dev->pen` to `p`), unless it's redundant or
         // inhibited.
         if c != ' ' && add_space != 0 && (self.flags & StextOptions::INHIBIT_SPACES == 0) {
-            let flags = FZ_STEXT_SYNTHETIC | if add_space > 1 { FZ_STEXT_SYNTHETIC_LARGE } else { 0 };
+            let flags = FZ_STEXT_SYNTHETIC
+                | if add_space > 1 {
+                    FZ_STEXT_SYNTHETIC_LARGE
+                } else {
+                    0
+                };
             let ch = make_char(
                 ' ', trm, size, font_idx, wmode, self.pen, p, font_asc, font_desc, flags, 0,
             );
@@ -345,7 +401,10 @@ impl StextDevice {
         }
 
         // The glyph itself (from p to q).
-        let ch = make_char(c, trm, size, font_idx, wmode, p, q, font_asc, font_desc, 0, /*cid set by caller path*/ 0);
+        let ch = make_char(
+            c, trm, size, font_idx, wmode, p, q, font_asc, font_desc, 0,
+            /*cid set by caller path*/ 0,
+        );
         if let StextBlock::Text(tb) = &mut self.page.blocks[bi] {
             tb.lines[li].chars.push(ch);
         }
@@ -375,7 +434,11 @@ impl StextDevice {
                     let mut line_box = Rect::EMPTY;
                     for (i, ch) in line.chars.iter().enumerate() {
                         let ch_box = Rect::from_quad(ch.quad);
-                        line_box = if i == 0 { ch_box } else { line_box.union(ch_box) };
+                        line_box = if i == 0 {
+                            ch_box
+                        } else {
+                            line_box.union(ch_box)
+                        };
                     }
                     line.bbox = line_box;
                     block_box = block_box.union(line_box);
@@ -391,7 +454,15 @@ impl TextDevice for StextDevice {
     // (stext-device.c:1163-1220). Here the interpreter has already composed the
     // device-space trm, so we intern the font, apply PRESERVE_SPANS as the
     // force-new-line signal, and hand straight to the assembly core.
-    fn show_glyph(&mut self, font: &Font, trm: Matrix, adv: f32, unicode: char, cid: u32, wmode: u8) {
+    fn show_glyph(
+        &mut self,
+        font: &Font,
+        trm: Matrix,
+        adv: f32,
+        unicode: char,
+        cid: u32,
+        wmode: u8,
+    ) {
         let font_idx = self.intern_font(font);
         // MuPDF forces a new line at each span start under PRESERVE_SPANS. The
         // interpreter emits per string; treat every glyph as mid-span (false),
@@ -436,7 +507,9 @@ fn is_unicode_hyphen(c: i32) -> bool {
 /// Map every horizontal whitespace code MuPDF recognises to `U+0020`.
 fn normalize_whitespace(c: char) -> char {
     match c as u32 {
-        0x0009 | 0x0020 | 0x00A0 | 0x1680 | 0x180E | 0x2000..=0x200A | 0x202F | 0x205F | 0x3000 => ' ',
+        0x0009 | 0x0020 | 0x00A0 | 0x1680 | 0x180E | 0x2000..=0x200A | 0x202F | 0x205F | 0x3000 => {
+            ' '
+        }
         _ => c,
     }
 }
@@ -495,7 +568,16 @@ fn make_char(
         ur: Point::new(q.x + a.x, q.y + a.y),
     };
 
-    StextChar { c, origin: p, quad, size, font: font_idx, flags, cid, wmode }
+    StextChar {
+        c,
+        origin: p,
+        quad,
+        size,
+        font: font_idx,
+        flags,
+        cid,
+        wmode,
+    }
 }
 
 // MuPDF: fz_new_stext_device + fz_run_page (the caller side that wires the
@@ -505,7 +587,11 @@ fn make_char(
 /// Constructs a [`StextDevice`] over the page mediabox, drives it with
 /// [`run_page`], and returns the finalised page (blocks -> lines -> chars with
 /// bboxes, inter-word spaces synthesised per MuPDF's gap rule).
-pub fn page_to_stext(doc: &PdfDocument, page_index: usize, opts: StextOptions) -> super::error::Result<StextPage> {
+pub fn page_to_stext(
+    doc: &PdfDocument,
+    page_index: usize,
+    opts: StextOptions,
+) -> super::error::Result<StextPage> {
     let mediabox = page_mediabox(doc, page_index);
     let mut dev = StextDevice::new(mediabox, opts);
     run_page(doc, page_index, &mut dev)?;
@@ -626,7 +712,8 @@ mod tests {
             pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
         }
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_ofs}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_ofs}\n%%EOF\n")
+                .as_bytes(),
         );
         pdf
     }
@@ -660,7 +747,12 @@ mod tests {
         if let StextBlock::Text(tb) = &page.blocks[0] {
             assert_eq!(tb.lines.len(), 1);
             assert_eq!(tb.lines[0].chars.len(), 5);
-            assert!(tb.lines[0].chars.iter().all(|c| c.flags & FZ_STEXT_SYNTHETIC == 0));
+            assert!(
+                tb.lines[0]
+                    .chars
+                    .iter()
+                    .all(|c| c.flags & FZ_STEXT_SYNTHETIC == 0)
+            );
         } else {
             panic!("expected a text block");
         }
@@ -681,7 +773,11 @@ mod tests {
                     if ch.flags & FZ_STEXT_SYNTHETIC != 0 {
                         synth += 1;
                         assert_eq!(ch.c, ' ');
-                        assert_eq!(ch.flags & FZ_STEXT_SYNTHETIC_LARGE, 0, "gap 0.3 is not 'large'");
+                        assert_eq!(
+                            ch.flags & FZ_STEXT_SYNTHETIC_LARGE,
+                            0,
+                            "gap 0.3 is not 'large'"
+                        );
                     }
                 }
             }
@@ -767,11 +863,18 @@ mod tests {
         let page = run(b"BT /F1 12 Tf 20 100 Td (Hi Wo) Tj ET");
         assert_eq!(page.text().trim_end(), "Hi Wo");
         let synth: usize = if let StextBlock::Text(tb) = &page.blocks[0] {
-            tb.lines.iter().flat_map(|l| &l.chars).filter(|c| c.flags & FZ_STEXT_SYNTHETIC != 0).count()
+            tb.lines
+                .iter()
+                .flat_map(|l| &l.chars)
+                .filter(|c| c.flags & FZ_STEXT_SYNTHETIC != 0)
+                .count()
         } else {
             0
         };
-        assert_eq!(synth, 0, "the real space is not augmented by a synthetic one");
+        assert_eq!(
+            synth, 0,
+            "the real space is not augmented by a synthetic one"
+        );
     }
 
     // -- End-to-end via a real (lopdf-independent) PDF -------------------------
@@ -812,11 +915,14 @@ mod tests {
     fn inhibit_spaces_suppresses_synthesis() {
         // Same wide-gap content, but with INHIBIT_SPACES set: no synthetic space.
         let doc = minimal_doc();
-        let opts = StextOptions { flags: StextOptions::INHIBIT_SPACES };
+        let opts = StextOptions {
+            flags: StextOptions::INHIBIT_SPACES,
+        };
         let mut dev = StextDevice::new(Rect::new(0.0, 0.0, 200.0, 200.0), opts);
         {
             let mut proc = Processor::new(&doc, &mut dev, Matrix::IDENTITY, resources());
-            proc.run_stream(b"BT /F1 12 Tf 20 100 Td [(Hello) -300 (World)] TJ ET").unwrap();
+            proc.run_stream(b"BT /F1 12 Tf 20 100 Td [(Hello) -300 (World)] TJ ET")
+                .unwrap();
         }
         let page = dev.into_page();
         assert_eq!(page.text().trim_end(), "HelloWorld", "no synthesized space");

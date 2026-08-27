@@ -82,7 +82,12 @@ struct Boxer {
 impl Boxer {
     // MuPDF: boxer_create_length (stext-boxer.c:102) -- an empty boxer.
     fn create_length(mediabox: Rect, tight: bool) -> Boxer {
-        Boxer { mediabox, list: Vec::new(), fudge: if tight { 0.0 } else { 4.0 }, tight }
+        Boxer {
+            mediabox,
+            list: Vec::new(),
+            fudge: if tight { 0.0 } else { 4.0 },
+            tight,
+        }
     }
 
     // MuPDF: boxer_create (stext-boxer.c:126) -- seeds the list with the whole
@@ -125,7 +130,12 @@ impl Boxer {
     // each of the four mediabox bands lying outside `bbox`.
     fn feed(&mut self, bbox: Rect) {
         let mb = self.mediabox;
-        let mut newlist = Boxer { mediabox: mb, list: Vec::new(), fudge: self.fudge, tight: self.tight };
+        let mut newlist = Boxer {
+            mediabox: mb,
+            list: Vec::new(),
+            fudge: self.fudge,
+            tight: self.tight,
+        };
 
         // Left (mb.x0, mb.y0) -> (bbox.x0, mb.y1)
         self.feed_intersect(&mut newlist, Rect::new(mb.x0, mb.y0, bbox.x0, mb.y1));
@@ -192,7 +202,9 @@ impl Boxer {
 
 // MuPDF: line_isnt_all_spaces (stext-boxer.c:781).
 fn line_isnt_all_spaces(line: &StextLine) -> bool {
-    line.chars.iter().any(|ch| ch.c != ' ' && ch.c != '\u{00A0}')
+    line.chars
+        .iter()
+        .any(|ch| ch.c != ' ' && ch.c != '\u{00A0}')
 }
 
 // MuPDF: feed_line (stext-boxer.c:791). Feed each whitespace-delimited word run
@@ -427,7 +439,10 @@ mod tests {
             bbox: Rect::new(x0, y_top, x, y_top + size),
             chars,
         };
-        StextBlock::Text(StextTextBlock { bbox: line.bbox, lines: vec![line] })
+        StextBlock::Text(StextTextBlock {
+            bbox: line.bbox,
+            lines: vec![line],
+        })
     }
 
     fn text_of(page: &StextPage) -> String {
@@ -435,7 +450,11 @@ mod tests {
             .iter()
             .filter_map(|b| match b {
                 StextBlock::Text(tb) => Some(
-                    tb.lines.iter().map(|l| l.text()).collect::<Vec<_>>().join(" "),
+                    tb.lines
+                        .iter()
+                        .map(|l| l.text())
+                        .collect::<Vec<_>>()
+                        .join(" "),
                 ),
                 _ => None,
             })
@@ -463,7 +482,11 @@ mod tests {
             fonts: Vec::new(),
         };
         segment_stext_page(&mut page);
-        assert_eq!(text_of(&page), "L1 L2 L3 R1 R2 R3", "must read column-by-column, not interleaved");
+        assert_eq!(
+            text_of(&page),
+            "L1 L2 L3 R1 R2 R3",
+            "must read column-by-column, not interleaved"
+        );
     }
 
     // -- Single column is not falsely split ------------------------------------
@@ -484,7 +507,11 @@ mod tests {
         };
         let before = text_of(&page);
         segment_stext_page(&mut page);
-        assert_eq!(text_of(&page), before, "single column order must be preserved top-to-bottom");
+        assert_eq!(
+            text_of(&page),
+            before,
+            "single column order must be preserved top-to-bottom"
+        );
     }
 
     // -- Full-width heading interrupts two columns into bands -------------------
@@ -508,8 +535,14 @@ mod tests {
         segment_stext_page(&mut page);
         // Heading first, then left column, then right column.
         let t = text_of(&page);
-        assert!(t.starts_with("HEADING"), "heading must come first, got {t:?}");
-        assert_eq!(t, "HEADING SPANS THE WHOLE WIDTH HERE OK L1 L2 R1 R2", "bands in order");
+        assert!(
+            t.starts_with("HEADING"),
+            "heading must come first, got {t:?}"
+        );
+        assert_eq!(
+            t, "HEADING SPANS THE WHOLE WIDTH HERE OK L1 L2 R1 R2",
+            "bands in order"
+        );
     }
 
     // -- Gutter detection: genuine gutter splits, narrow gap does not -----------
@@ -528,7 +561,11 @@ mod tests {
             fonts: Vec::new(),
         };
         segment_stext_page(&mut page);
-        assert_eq!(text_of(&page), "aa cc bb dd", "aligned gutter triggers a column split");
+        assert_eq!(
+            text_of(&page),
+            "aa cc bb dd",
+            "aligned gutter triggers a column split"
+        );
     }
 
     #[test]
@@ -547,7 +584,11 @@ mod tests {
         };
         let before = text_of(&page);
         segment_stext_page(&mut page);
-        assert_eq!(text_of(&page), before, "loose inter-word spacing is not a column boundary");
+        assert_eq!(
+            text_of(&page),
+            before,
+            "loose inter-word spacing is not a column boundary"
+        );
     }
 
     // -- Boxer unit: a fed box carves the whitespace ----------------------------
@@ -560,8 +601,14 @@ mod tests {
         boxer.feed(Rect::new(40.0, 40.0, 60.0, 60.0));
         // Full-height left band [0,40]x[0,100] and right band [60,100]x[0,100]
         // must both be present (they are the vertical corridors either side).
-        let has_left = boxer.list.iter().any(|r| r.x0 <= 0.0 && r.x1 >= 40.0 && r.y0 <= 0.0 && r.y1 >= 100.0);
-        let has_right = boxer.list.iter().any(|r| r.x0 <= 60.0 && r.x1 >= 100.0 && r.y0 <= 0.0 && r.y1 >= 100.0);
+        let has_left = boxer
+            .list
+            .iter()
+            .any(|r| r.x0 <= 0.0 && r.x1 >= 40.0 && r.y0 <= 0.0 && r.y1 >= 100.0);
+        let has_right = boxer
+            .list
+            .iter()
+            .any(|r| r.x0 <= 60.0 && r.x1 >= 100.0 && r.y0 <= 0.0 && r.y1 >= 100.0);
         assert!(has_left, "left full-height corridor present");
         assert!(has_right, "right full-height corridor present");
     }

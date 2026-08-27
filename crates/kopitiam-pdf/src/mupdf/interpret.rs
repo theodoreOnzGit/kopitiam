@@ -56,7 +56,7 @@ use super::draw_path::Path;
 use super::error::Result;
 use super::font::Font;
 use super::geometry::{Matrix, Point, Rect};
-use super::lex::{lex, Token};
+use super::lex::{Token, lex};
 use super::object::Object;
 use super::parse::{parse_array, parse_dict};
 use super::resources::ColorSpace;
@@ -171,7 +171,12 @@ pub(crate) struct Tos {
 
 impl Tos {
     fn new() -> Tos {
-        Tos { tm: Matrix::IDENTITY, tlm: Matrix::IDENTITY, char_tx: 0.0, char_ty: 0.0 }
+        Tos {
+            tm: Matrix::IDENTITY,
+            tlm: Matrix::IDENTITY,
+            char_tx: 0.0,
+            char_ty: 0.0,
+        }
     }
 
     // MuPDF: pdf_tos_translate (pdf-interpret.c:2071) -- `Td` / `TD`.
@@ -205,7 +210,12 @@ impl Tos {
 /// * `(char_tx, char_ty)` -- how far to advance `Tm` after this glyph.
 ///
 /// `width` is the glyph's advance in 1/1000 em (from `Font::decode`).
-pub(crate) fn make_trm(text: &TextState, wmode: i32, width: f32, tm: Matrix) -> (Matrix, f32, f32, f32) {
+pub(crate) fn make_trm(
+    text: &TextState,
+    wmode: i32,
+    width: f32,
+    tm: Matrix,
+) -> (Matrix, f32, f32, f32) {
     // tsm = [ size*scale, 0, 0, size, 0, rise ].
     let mut tsm = Matrix::new(text.size * text.scale, 0.0, 0.0, text.size, 0.0, text.rise);
 
@@ -268,7 +278,12 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
     // MuPDF: pdf_new_run_processor + pdf_init_gstate (pdf-op-run.c).
     /// Create an interpreter over `doc`, emitting to `dev`, with the base CTM
     /// `ctm` (the page transform) and the given root resource dict.
-    pub(crate) fn new(doc: &'a PdfDocument, dev: &'a mut D, ctm: Matrix, resources: Object) -> Processor<'a, D> {
+    pub(crate) fn new(
+        doc: &'a PdfDocument,
+        dev: &'a mut D,
+        ctm: Matrix,
+        resources: Object,
+    ) -> Processor<'a, D> {
         Processor {
             doc,
             dev,

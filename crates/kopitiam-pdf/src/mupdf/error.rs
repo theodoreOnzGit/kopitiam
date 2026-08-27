@@ -312,7 +312,12 @@ mod tests {
             (Error::library("l"), ErrorKind::Library, "library", 3),
             (Error::argument("a"), ErrorKind::Argument, "argument", 4),
             (Error::limit("li"), ErrorKind::Limit, "limit", 5),
-            (Error::unsupported("u"), ErrorKind::Unsupported, "unsupported", 6),
+            (
+                Error::unsupported("u"),
+                ErrorKind::Unsupported,
+                "unsupported",
+                6,
+            ),
             (Error::format("f"), ErrorKind::Format, "format", 7),
             (Error::syntax("sy"), ErrorKind::Syntax, "syntax", 8),
             (Error::try_later("t"), ErrorKind::TryLater, "trylater", 9),

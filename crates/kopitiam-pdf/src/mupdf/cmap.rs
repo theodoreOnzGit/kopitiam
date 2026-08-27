@@ -42,7 +42,7 @@
 //! stored but the vertical-metrics path is handled in `font.rs`.
 
 use super::error::Result;
-use super::lex::{lex, Token};
+use super::lex::{Token, lex};
 use super::stream::Stream;
 
 /// The maximum 1-to-many mapping length (`PDF_MRANGE_CAP`). The PDF reference
@@ -288,7 +288,12 @@ impl CMap {
     pub fn new_identity(wmode: i32, bytes: usize) -> CMap {
         let mut cmap = CMap::new();
         let high = (1u64 << (bytes * 8)) as u32 - 1;
-        cmap.cmap_name = if wmode != 0 { "Identity-V" } else { "Identity-H" }.to_string();
+        cmap.cmap_name = if wmode != 0 {
+            "Identity-V"
+        } else {
+            "Identity-H"
+        }
+        .to_string();
         cmap.add_codespace(0, high, bytes);
         cmap.map_range_to_range(0, high, 0);
         cmap.sort();
