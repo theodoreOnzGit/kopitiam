@@ -87,9 +87,23 @@
 //!   via [`kopitiam_pdf::mupdf::annot_edit::delete_annot`].
 //! * **Forms** -- offered only when the open document actually has an
 //!   `/AcroForm` ([`kopitiam_pdf::mupdf::form::has_acroform`]). While on,
-//!   clicking a checkbox/radio widget toggles it and clicking a text field
-//!   opens a small popup to type a new value, mirroring Okular's forms
-//!   toggle.
+//!   every fillable field on the page is painted with a translucent
+//!   highlight ([`KpdfApp::paint_and_edit_form_fields`]) -- Okular-style, so
+//!   the fields are visible before anything is clicked, not discovered by
+//!   hunting. Read-only fields and combobox/listbox (unsupported by
+//!   [`kopitiam_pdf::mupdf::form::set_field_value`] in this release) get a
+//!   visually distinct, non-actionable tint rather than being invited to
+//!   click ([`field_highlight_kind`]). Clicking a checkbox/radio toggles it
+//!   in place; clicking a text field opens an `egui::TextEdit` **in place**,
+//!   positioned over the field's own rect on the page, rather than a
+//!   separate popup window -- so editing happens where the text actually
+//!   goes, matching what the highlight promised. A multiline field
+//!   ([`kopitiam_pdf::mupdf::form::FormField::multiline`]) gets
+//!   `egui::TextEdit::multiline`; `Enter` commits either kind (single- or
+//!   multiline alike, per the maintainer's explicit call -- "enter saves the
+//!   thing"), and only `Shift+Enter` inserts a newline in a multiline field
+//!   ([`should_commit_on_enter`]). `Esc` cancels without writing anything
+//!   (see [`KpdfApp::handle_key`]'s `form_edit` guard).
 //!
 //! All of this is **additive**: page nav, `goto`, reflow mode, the zoom
 //! controls and the annotation counter behave exactly as before when none of
@@ -114,7 +128,11 @@
 //! coordinate-math/state-machine/hit-testing unit tests are all that has
 //! actually been checked. Whether the pen visually tracks the cursor, whether
 //! button layout/spacing reads well, whether click-to-erase "feels" precise,
-//! and whether the forms popup is positioned sensibly are all **unverified
+//! whether the form-field highlights read clearly against the rendered page,
+//! whether the in-place text editor sits exactly over the field it edits at
+//! every zoom level, whether a tiny checkbox is comfortably clickable at the
+//! chosen minimum hit area ([`MIN_HIT_AREA_SCREEN`]), and whether `Enter`
+//! vs. `Shift+Enter` in a multiline field feels right are all **unverified
 //! and need a human at a real display** -- per this project's GUI-surfaces
 //! rule, that dogfooding is not something an agent can fake.
 
@@ -136,6 +154,20 @@ const INK_WIDTH: f32 = 2.0;
 /// Constant opacity (`/CA`); 1.0 means fully opaque and writes no `/CA` at
 /// all (see [`InkAnnotSpec::opacity`](kopitiam_pdf::mupdf::annot_edit::InkAnnotSpec::opacity)).
 const INK_OPACITY: f32 = 1.0;
+
+/// Minimum on-screen size (egui ui points, one per pixel at 100% OS scaling)
+/// a form field's clickable area is widened to before hit-testing (and,
+/// for consistency -- the highlighted area and the clickable area should
+/// always agree -- before painting too). Without this, a field whose
+/// `/Rect` renders as a hairline or a near-zero box at low zoom (not
+/// unheard of; some form authors size the widget to a printed underline
+/// rather than the real input box) would be a pixel hunt to click.
+///
+/// 16.0 is a judgment call, not a measured value -- there is no display in
+/// this environment to test "does a 16px target feel comfortable to
+/// click", so this is exactly the kind of choice a human dogfooder should
+/// eyeball. See [`min_hit_rect`].
+const MIN_HIT_AREA_SCREEN: f32 = 16.0;
 
 /// Which page-editing tool on-drag/on-click input is currently routed to.
 /// Mutually exclusive with forms mode -- see [`select_tool`] and
@@ -256,11 +288,56 @@ struct KpdfApp {
     /// every drag frame) -- committed as a real annotation on drag-release
     /// (see [`KpdfApp::handle_draw`]) and cleared either way.
     draw_stroke: Vec<(f32, f32)>,
-    /// `Some((obj_num, buf))` while the small "edit this text field" popup is
-    /// open: `obj_num` identifies which [`FormField`] (re-looked-up by
-    /// [`kopitiam_pdf::mupdf::form::page_form_fields`] each frame, since a
-    /// `FormField` itself is not [`Clone`]), `buf` is the text being typed.
+    /// `Some((obj_num, buf))` while the in-place text-field editor (see
+    /// [`KpdfApp::paint_and_edit_form_fields`]) is open over a field on the
+    /// page: `obj_num` identifies which [`FormField`] (re-looked-up by
+    /// obj_num each frame, from `form_fields_cache` for position/kind and
+    /// from a fresh [`kopitiam_pdf::mupdf::form::page_form_fields`] call at
+    /// commit time, since a `FormField` itself is not [`Clone`]), `buf` is
+    /// the text being typed. Cleared on commit, on `Esc`
+    /// ([`KpdfApp::handle_key`]), and whenever the active tool or forms mode
+    /// changes ([`KpdfApp::select_tool`]/[`KpdfApp::toggle_forms_mode`]) --
+    /// an in-progress, uncommitted edit should not survive leaving forms
+    /// mode with no way left to interact with it.
     form_edit: Option<(i32, String)>,
+    /// `true` for exactly the one frame after a click opens `form_edit` --
+    /// tells [`KpdfApp::paint_and_edit_form_fields`] to call
+    /// `Response::request_focus()` once, so typing can start immediately
+    /// without an extra click into the box. Must never stay `true` across
+    /// frames: re-requesting focus every frame would mean the box could
+    /// never lose focus, and therefore never commit-on-focus-loss.
+    form_edit_focus_pending: bool,
+    /// Cache of the current page's form fields for painting the highlight
+    /// overlay, keyed by page index -- see
+    /// [`KpdfApp::refresh_form_fields_cache`]. `None` until forms mode first
+    /// needs it. Cleared to `None` (see [`KpdfApp::open_path`] and
+    /// [`KpdfApp::reload_from_bytes`]) whenever `self.doc` is replaced,
+    /// since a new `PdfDocument` can carry different field values/rects even
+    /// at the same page index -- keyed on page alone would silently show a
+    /// stale highlight otherwise.
+    form_fields_cache: Option<(usize, Vec<CachedField>)>,
+}
+
+/// A page's form fields, captured as plain owned data for
+/// [`KpdfApp::form_fields_cache`]. Unlike [`FormField`] (borrows nothing
+/// itself, but carries no [`Clone`] -- it is meant to be built and consumed
+/// within a single call), this is cheap to hold across frames, which is the
+/// whole point: [`kopitiam_pdf::mupdf::form::page_form_fields`] walks the
+/// page's `/Annots` (resolving every widget, its `/Parent` chain, its
+/// appearance stream for `on_state`, ...) on every call, and painting the
+/// highlight overlay runs every frame forms mode is on -- roughly 20/sec,
+/// since [`eframe::App::ui`] ends with a `request_repaint_after`. Without
+/// this cache, that would re-parse the PDF continuously.
+#[derive(Clone)]
+struct CachedField {
+    obj_num: i32,
+    kind: FieldKind,
+    rect: Rect,
+    read_only: bool,
+    /// [`FormField::multiline`] -- which `egui::TextEdit` constructor
+    /// [`KpdfApp::paint_and_edit_form_fields`] must use if this field is the
+    /// one being edited.
+    multiline: bool,
 }
 
 impl KpdfApp {
@@ -295,6 +372,8 @@ impl KpdfApp {
             edit_history: None,
             draw_stroke: Vec::new(),
             form_edit: None,
+            form_edit_focus_pending: false,
+            form_fields_cache: None,
         })
     }
 
@@ -333,6 +412,8 @@ impl KpdfApp {
                 self.edit_history = None;
                 self.draw_stroke.clear();
                 self.form_edit = None;
+                self.form_edit_focus_pending = false;
+                self.form_fields_cache = None;
                 self.forms_mode = false;
             }
             Err(e) => self.status = Some(e),
@@ -455,13 +536,27 @@ impl KpdfApp {
     }
 
     /// Switch tools, via the pure [`select_tool`] transition.
+    ///
+    /// Also drops any in-progress form-field edit: leaving forms mode (which
+    /// this always does -- see [`select_tool`]) means there is no longer any
+    /// path for the in-place editor to be interacted with (it is only drawn
+    /// while forms mode is on, see
+    /// [`KpdfApp::paint_and_edit_form_fields`]), so an edit left open would
+    /// be stuck showing forever with no way to commit or cancel it short of
+    /// `Esc`.
     fn select_tool(&mut self, requested: Tool) {
         select_tool(&mut self.tool, &mut self.forms_mode, requested);
+        self.form_edit = None;
+        self.form_edit_focus_pending = false;
     }
 
-    /// Flip forms mode, via the pure [`toggle_forms_mode`] transition.
+    /// Flip forms mode, via the pure [`toggle_forms_mode`] transition. Also
+    /// drops any in-progress form-field edit when forms mode turns off --
+    /// same reasoning as [`KpdfApp::select_tool`].
     fn toggle_forms_mode(&mut self) {
         toggle_forms_mode(&mut self.tool, &mut self.forms_mode);
+        self.form_edit = None;
+        self.form_edit_focus_pending = false;
     }
 
     /// Get (creating on first use) the edit history backing Undo/Redo/Save.
@@ -516,6 +611,13 @@ impl KpdfApp {
                 self.texture_key = None;
                 self.annot_count = drawable_annot_count(&self.doc, self.page);
                 self.status = None;
+                // A fresh `PdfDocument` invalidates `form_fields_cache`
+                // exactly like it invalidates `texture` above -- form field
+                // values/rects belong to the document that was just
+                // replaced, not necessarily the new one (this is also how a
+                // just-committed edit's new value shows up in the highlight
+                // overlay/editor rather than the pre-edit one).
+                self.form_fields_cache = None;
             }
             Err(e) => self.status = Some(format!("reload after edit: {e}")),
         }
@@ -575,9 +677,17 @@ impl KpdfApp {
 
     /// Forms-mode click handling: hit-test against the current page's form
     /// fields and either toggle a checkbox/radio in place or open the
-    /// text-field editor popup. All PDF-structure knowledge (what `/AS`,
-    /// `/V`, an on-state name are) stays in `kopitiam_pdf::mupdf::form` --
-    /// this only converts a click to page coordinates and dispatches.
+    /// in-place text-field editor (see
+    /// [`KpdfApp::paint_and_edit_form_fields`]). All PDF-structure knowledge
+    /// (what `/AS`, `/V`, an on-state name are) stays in
+    /// `kopitiam_pdf::mupdf::form` -- this only converts a click to page
+    /// coordinates and dispatches.
+    ///
+    /// Fetches a fresh `page_form_fields` rather than reusing
+    /// `form_fields_cache`: a click is rare (unlike the highlight overlay's
+    /// once-a-frame repaint, which is exactly what the cache exists to
+    /// avoid re-parsing for), so there is no performance reason to risk
+    /// acting on a stale cache here.
     fn handle_forms_click(&mut self, response: &egui::Response, layout: PageLayout) {
         if !response.clicked() {
             return;
@@ -585,9 +695,27 @@ impl KpdfApp {
         let Some(pos) = response.interact_pointer_pos() else {
             return;
         };
+        if self.form_edit.is_some() {
+            // A click on the page that the in-place editor itself didn't
+            // consume (it sits in front of the page image, so a click *on*
+            // it never reaches here) is exactly the "clicked away" case --
+            // commit whatever is currently typed rather than silently
+            // discarding it, whether the click lands on a different field
+            // or on empty page space. `commit_form_edit` is idempotent
+            // (`Option::take`), so if the editor's own `lost_focus` check
+            // already committed it this same frame, this is a harmless
+            // no-op.
+            self.commit_form_edit();
+        }
         let (px, py) = screen_to_page(pos.x, pos.y, layout);
         let fields = kopitiam_pdf::mupdf::form::page_form_fields(&self.doc, self.page);
-        let Some(idx) = hit_test_field(px, py, &fields) else {
+        // Exact rect first; only fall back to the widened hit area
+        // (`MIN_HIT_AREA_SCREEN`) if nothing was hit outright, so a click
+        // genuinely inside one field's real box is never second-guessed by
+        // another field's widened area.
+        let idx = hit_test_field(px, py, &fields)
+            .or_else(|| hit_test_field_expanded(px, py, &fields, layout, MIN_HIT_AREA_SCREEN));
+        let Some(idx) = idx else {
             return;
         };
         let field = &fields[idx];
@@ -602,6 +730,7 @@ impl KpdfApp {
             }
             FieldKind::Text => {
                 self.form_edit = Some((field.obj_num, field.value.clone()));
+                self.form_edit_focus_pending = true;
             }
             _ => self.status = Some(format!("{}: unsupported field kind for kpdf", field.name)),
         }
@@ -672,52 +801,169 @@ impl KpdfApp {
         self.apply_edit(result);
     }
 
-    /// Draw the small "edit this text field" popup while
-    /// [`KpdfApp::form_edit`] is `Some`, and handle its Set/Cancel/Enter.
+    /// Populate (or reuse) `form_fields_cache` for the current page. Mirrors
+    /// [`KpdfApp::ensure_texture`]'s `(page, dpi)`-keyed caching for the
+    /// rasterised texture: see [`CachedField`]'s docs for why this exists at
+    /// all. Keyed on page index only (no "doc version" component the way
+    /// `texture_key` carries `dpi`) because every call site that can change
+    /// `self.doc` out from under this cache -- [`KpdfApp::open_path`],
+    /// [`KpdfApp::reload_from_bytes`] -- already clears it to `None`
+    /// unconditionally there; see those methods.
+    fn refresh_form_fields_cache(&mut self) {
+        if self
+            .form_fields_cache
+            .as_ref()
+            .is_some_and(|(page, _)| *page == self.page)
+        {
+            return;
+        }
+        let fields = kopitiam_pdf::mupdf::form::page_form_fields(&self.doc, self.page)
+            .iter()
+            .map(|f| CachedField {
+                obj_num: f.obj_num,
+                kind: f.kind,
+                rect: f.rect,
+                read_only: f.read_only,
+                multiline: f.multiline,
+            })
+            .collect();
+        self.form_fields_cache = Some((self.page, fields));
+    }
+
+    /// Commit the in-place text editor's current buffer (see
+    /// [`KpdfApp::paint_and_edit_form_fields`]) via
+    /// [`kopitiam_pdf::mupdf::form::set_field_value`], then follow the same
+    /// push-to-history/reopen/invalidate tail every edit in this file goes
+    /// through ([`KpdfApp::apply_edit`]).
     ///
-    /// Re-fetches the page's form fields every frame it's open (rather than
-    /// caching a `FormField`, which is not `Clone`) and matches by
-    /// `obj_num` -- cheap for a form-sized field list, and always
-    /// consistent with whatever the document currently is.
-    fn show_form_edit_popup(&mut self, ctx: &egui::Context) {
+    /// A no-op if there is nothing to commit -- `Option::take` makes this
+    /// safe to call from more than one place in the same frame. Both
+    /// [`KpdfApp::paint_and_edit_form_fields`]'s own `lost_focus` check and
+    /// [`KpdfApp::handle_forms_click`]'s "clicked away" guard can reach this
+    /// for the very same click; only the first one to run does anything.
+    ///
+    /// Re-fetches the page's form fields fresh (rather than reading
+    /// `form_fields_cache`) because the actual write needs a real
+    /// [`FormField`] borrow, which the cache -- deliberately plain, `Clone`
+    /// data, see [`CachedField`] -- does not carry.
+    fn commit_form_edit(&mut self) {
+        let Some((obj_num, value)) = self.form_edit.take() else {
+            return;
+        };
+        let fields = kopitiam_pdf::mupdf::form::page_form_fields(&self.doc, self.page);
+        if let Some(field) = fields.iter().find(|f| f.obj_num == obj_num) {
+            let result = kopitiam_pdf::mupdf::form::set_field_value(&self.doc, field, &value);
+            self.apply_edit(result);
+        } else {
+            self.status = Some("field no longer present on this page".to_string());
+        }
+    }
+
+    /// Paint the Okular-style "fillable area" overlay for every field on the
+    /// current page that [`field_highlight_kind`] says gets one, and -- if a
+    /// text field is currently being edited ([`KpdfApp::form_edit`]) -- draw
+    /// the in-place `egui::TextEdit` over that field's own rect instead of a
+    /// highlight for it (the editor box stands in for its own highlight, so
+    /// the two are never drawn on top of each other).
+    ///
+    /// Called every frame forms mode is on, in image mode, right after the
+    /// page's `ScrollArea` has laid out for this frame -- every screen rect
+    /// is recomputed from `layout` here, never cached (only the *field
+    /// data* -- kind/rect/read-only/multiline -- is cached, in
+    /// `form_fields_cache`), so panning or zooming moves the overlay and the
+    /// editor with the page underneath them on the very next frame. `clip`
+    /// bounds both the painted rectangles and the editor to the
+    /// `ScrollArea`'s visible viewport, so a field scrolled out of view
+    /// doesn't bleed over the toolbar above the page.
+    fn paint_and_edit_form_fields(&mut self, ui: &mut egui::Ui, layout: PageLayout, clip: egui::Rect) {
+        let editing_obj = self.form_edit.as_ref().map(|(n, _)| *n);
+
+        if let Some((_, fields)) = &self.form_fields_cache {
+            let painter = ui.painter_at(clip);
+            for field in fields {
+                if Some(field.obj_num) == editing_obj {
+                    continue;
+                }
+                let style = field_highlight_kind(field.kind, field.read_only);
+                if style == FieldHighlight::None {
+                    continue;
+                }
+                let hit_rect = min_hit_rect(field.rect, layout, MIN_HIT_AREA_SCREEN);
+                let (x0, y0, x1, y1) = field_rect_to_screen(hit_rect, layout);
+                let screen_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+                let (fill, stroke) = highlight_colors(style);
+                painter.rect_filled(screen_rect, 2.0, fill);
+                painter.rect_stroke(screen_rect, 2.0, stroke, egui::StrokeKind::Inside);
+            }
+        }
+
         let Some((obj_num, _)) = self.form_edit else {
             return;
         };
+        // `Rect`/`bool` are both `Copy`, so this extracts exactly the two
+        // fields needed and releases the `form_fields_cache` borrow
+        // immediately -- no cloning of the whole cached list needed just to
+        // read one entry's geometry.
+        let field_meta = self.form_fields_cache.as_ref().and_then(|(_, fields)| {
+            fields
+                .iter()
+                .find(|f| f.obj_num == obj_num)
+                .map(|f| (f.rect, f.multiline))
+        });
+        let Some((field_rect, multiline)) = field_meta else {
+            // The field the editor was open for isn't in this page's cache
+            // anymore (the page changed under it, or the doc was reloaded
+            // and the cache hasn't been refreshed with it yet) -- there is
+            // nothing sane left to draw the box over.
+            self.form_edit = None;
+            self.form_edit_focus_pending = false;
+            return;
+        };
+        let hit_rect = min_hit_rect(field_rect, layout, MIN_HIT_AREA_SCREEN);
+        let (x0, y0, x1, y1) = field_rect_to_screen(hit_rect, layout);
+        let screen_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
 
+        // Enter alone must commit rather than insert a newline in a
+        // multiline field -- the maintainer's explicit call: "enter saves
+        // the thing. Shift-Enter gets a new line". `TextEdit::multiline`'s
+        // own default is "any Enter is a newline" with no notion of shift,
+        // so the shiftless-Enter event has to be pulled out of the input
+        // queue *before* the widget runs below, or it would both commit
+        // (via this flag) and still land in `buf` as a newline this same
+        // frame. An unconsumed `Shift+Enter` reaches the widget untouched
+        // and inserts a newline via its ordinary default handling -- so
+        // this only ever needs to intervene for the plain-Enter case.
+        let enter_commit = multiline && consume_commit_enter(ui);
+
+        let prev_clip = ui.clip_rect();
+        ui.set_clip_rect(clip);
         let mut commit = false;
-        let mut cancel = false;
         if let Some((_, buf)) = self.form_edit.as_mut() {
-            egui::Window::new("Edit field")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    let resp = ui.text_edit_singleline(buf);
-                    let enter_pressed =
-                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.horizontal(|ui| {
-                        if ui.button("Set").clicked() || enter_pressed {
-                            commit = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
+            ui.painter()
+                .rect_filled(screen_rect, 0.0, egui::Color32::WHITE);
+            let resp = if multiline {
+                ui.put(screen_rect, egui::TextEdit::multiline(buf))
+            } else {
+                ui.put(screen_rect, egui::TextEdit::singleline(buf))
+            };
+            if self.form_edit_focus_pending {
+                resp.request_focus();
+                self.form_edit_focus_pending = false;
+            }
+            // For a single-line field, `TextEdit::singleline`'s own default
+            // handling already surrenders focus on Enter (so `lost_focus()`
+            // covers "Enter commits" for free there); `enter_commit` is
+            // always `false` in that branch since it's gated on
+            // `multiline`. For a multiline field, `lost_focus()` remains a
+            // safety net for "clicked/tabbed away without pressing Enter".
+            if enter_commit || resp.lost_focus() {
+                commit = true;
+            }
         }
+        ui.set_clip_rect(prev_clip);
 
         if commit {
-            if let Some((_, value)) = self.form_edit.take() {
-                let fields = kopitiam_pdf::mupdf::form::page_form_fields(&self.doc, self.page);
-                if let Some(field) = fields.iter().find(|f| f.obj_num == obj_num) {
-                    let result =
-                        kopitiam_pdf::mupdf::form::set_field_value(&self.doc, field, &value);
-                    self.apply_edit(result);
-                } else {
-                    self.status = Some("field no longer present on this page".to_string());
-                }
-            }
-        } else if cancel {
-            self.form_edit = None;
+            self.commit_form_edit();
         }
     }
 
@@ -1198,7 +1444,6 @@ impl eframe::App for KpdfApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_key(ui.ctx());
         self.handle_scroll_zoom(ui.ctx());
-        self.show_form_edit_popup(ui.ctx());
 
         egui::Panel::top("kpdf-status").show(ui, |ui| {
             ui.vertical(|ui| {
@@ -1405,12 +1650,30 @@ impl eframe::App for KpdfApp {
                     // nothing by default (`Sense::hover()`); without this,
                     // none of the tool below (draw/erase/forms click) would
                     // ever see a `Response::clicked()`/`dragged()`.
+                    //
+                    // The layout is computed here, inside the closure, from
+                    // the image response's own rect (rather than a second
+                    // time afterwards from `output.inner`) so there is only
+                    // ever one place per frame that turns "where the image
+                    // landed" into a `PageLayout` -- both halves of the
+                    // closure's return value come from the same computation.
                     let output = scroll_area.show(ui, |ui| {
-                        ui.add(
+                        let img_resp = ui.add(
                             egui::Image::new(tex)
                                 .fit_to_exact_size(new_size)
                                 .sense(egui::Sense::click_and_drag()),
-                        )
+                        );
+                        let (page_w_pts, page_h_pts) =
+                            page_size_pts(tw as f32, th as f32, self.dpi);
+                        let layout = PageLayout {
+                            image_x: img_resp.rect.min.x,
+                            image_y: img_resp.rect.min.y,
+                            image_w: img_resp.rect.width(),
+                            image_h: img_resp.rect.height(),
+                            page_w_pts,
+                            page_h_pts,
+                        };
+                        (img_resp, layout)
                     });
 
                     self.page_scroll_offset = output.state.offset;
@@ -1424,18 +1687,14 @@ impl eframe::App for KpdfApp {
                     // docs' "coordinate trap" section -- and all business
                     // logic (what a hit means, how to edit the PDF) lives in
                     // `kopitiam_pdf::mupdf::{annot_edit,form}`, not here.
-                    let image_response = output.inner;
-                    let img_rect = image_response.rect;
-                    let (page_w_pts, page_h_pts) = page_size_pts(tw as f32, th as f32, self.dpi);
-                    let layout = PageLayout {
-                        image_x: img_rect.min.x,
-                        image_y: img_rect.min.y,
-                        image_w: img_rect.width(),
-                        image_h: img_rect.height(),
-                        page_w_pts,
-                        page_h_pts,
-                    };
+                    let (image_response, layout) = output.inner;
                     if self.forms_mode {
+                        // Highlight overlay + in-place editor first (so a
+                        // click that opens/commits/cancels an edit this same
+                        // frame still sees a freshly-painted, freshly-cached
+                        // field list), then the click itself.
+                        self.refresh_form_fields_cache();
+                        self.paint_and_edit_form_fields(ui, layout, output.inner_rect);
                         self.handle_forms_click(&image_response, layout);
                     } else {
                         match self.tool {

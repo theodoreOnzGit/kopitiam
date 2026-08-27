@@ -55,7 +55,7 @@
 //! * **No rotation, no `/MK` background/border colour, no rich text (`/RC`),
 //!   no comb-field cells.** The regenerated text-field appearance is
 //!   deliberately the plain case: clip to `/BBox`, `/DA` font+size+colour,
-//!   `/Q` quadding, optional naive `\n`-split multiline. `pdf-appearance.c`'s
+//!   `/Q` quadding, optional `\n`-split + word-wrapped multiline. `pdf-appearance.c`'s
 //!   `write_variable_text` does considerably more (word-wrap, shrink-to-fit
 //!   measurement, the `FZ_ENABLE_HTML_ENGINE` rich-text branch); none of that
 //!   is ported here.
@@ -126,6 +126,14 @@ pub struct FormField {
     /// For checkbox/radio: the "on" state name from `/AP` `/N` (often `Yes`),
     /// i.e. what `/AS` must become to tick it. `Off` is always the other one.
     pub on_state: Option<String>,
+    /// `/Ff` bit 13 (`PDF_TX_FIELD_IS_MULTILINE`, `form.h:135`): this text
+    /// field accepts more than one line.
+    ///
+    /// Exposed because a *viewer* cannot infer it — `/Ff` is inheritable
+    /// through `/Parent`, so a widget commonly does not carry the flag itself,
+    /// and without this a UI has no way to know it should offer a multi-line
+    /// editor rather than a single-line one. Always `false` for non-text kinds.
+    pub multiline: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +264,12 @@ pub fn page_form_fields(doc: &PdfDocument, page_index: usize) -> Vec<FormField> 
             None
         };
 
+        // Read from the *inheritable* /Ff, same as `kind` above: a widget
+        // frequently carries no /Ff of its own and inherits the flag from its
+        // field parent, so reading it non-inheritably would report every
+        // multiline field as single-line.
+        let multiline = matches!(kind, FieldKind::Text) && ff & FF_TX_MULTILINE != 0;
+
         out.push(FormField {
             obj_num: num,
             page_index,
@@ -265,6 +279,7 @@ pub fn page_form_fields(doc: &PdfDocument, page_index: usize) -> Vec<FormField> 
             rect,
             read_only,
             on_state,
+            multiline,
         });
     }
     out
@@ -1002,10 +1017,75 @@ fn encode_content_string(text: &str) -> Vec<u8> {
     out
 }
 
+/// Break `value` into the lines a multiline text field should actually draw.
+///
+/// Splits on explicit `\n` first (an author-entered newline is a hard break and
+/// must be honoured), then **word-wraps** each resulting paragraph to `max_w`
+/// text-space units using the same width estimate the auto-sizer uses.
+///
+/// Word wrap matters more than it looks. A multiline field exists precisely
+/// because its content is longer than one line, so without wrapping the very
+/// first sentence typed runs straight out of the widget's box and is clipped
+/// away by the `re W n` above -- the text is stored correctly in `/V` but
+/// invisible in the appearance, which is the most confusing failure mode
+/// available (the value is *there*, the field looks empty or truncated).
+///
+/// A word longer than the whole line is broken mid-word rather than dropped or
+/// allowed to overflow: losing characters would be worse than an ugly break,
+/// and `char_indices` keeps the split on a character boundary so multi-byte
+/// text cannot panic here.
+fn wrap_lines<'a>(value: &'a str, abbrev: &str, size: f32, max_w: f32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // A non-positive width (a degenerate widget) has no meaningful wrap point;
+    // fall back to hard breaks only rather than looping forever.
+    let usable = max_w;
+    for para in value.split('\n') {
+        if usable <= 0.0 || para.is_empty() {
+            out.push(para.to_string());
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split(' ') {
+            let candidate = if line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{line} {word}")
+            };
+            if estimate_string_width_em(&candidate, abbrev) * size <= usable || line.is_empty() {
+                // Still fits, or nothing to fall back to yet.
+                line = candidate;
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+            // A single word wider than the whole line: break it mid-word so no
+            // characters are silently lost.
+            while estimate_string_width_em(&line, abbrev) * size > usable && line.chars().count() > 1
+            {
+                let mut cut = line.len();
+                for (i, _) in line.char_indices() {
+                    if i > 0 && estimate_string_width_em(&line[..i], abbrev) * size > usable {
+                        cut = i;
+                        break;
+                    }
+                }
+                let rest = line.split_off(cut.max(1).min(line.len()));
+                if rest.is_empty() {
+                    break;
+                }
+                out.push(std::mem::take(&mut line));
+                line = rest;
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
 /// Build the `/Tx BMC … EMC` appearance content stream: clip to the widget's
 /// own box (inset by the border width), then draw `value` in `abbrev`/`size`/
 /// `color`, honouring `/Q` quadding (0 left, 1 centre, 2 right) and, when
-/// `multiline`, naive `\n`-splitting with no word-wrap.
+/// `multiline`, `\n`-splitting plus word wrap (see [`wrap_lines`]).
 ///
 /// Simplified re-expression of `pdf_write_tx_widget_appearance` +
 /// `write_variable_text` (`pdf-appearance.c:2687`, `:2101`) -- see the module
@@ -1044,8 +1124,13 @@ fn build_tx_content(
     out.push(b'\n');
     out.extend_from_slice(format!("/{abbrev} {} Tf\n", fmt_num(size)).as_bytes());
 
+    // Multiline fields wrap to the widget's usable width; single-line fields
+    // are drawn as one run (PDF single-line text fields do not wrap, and an
+    // embedded newline in one is not a line break).
+    let wrapped: Vec<String>;
     let lines: Vec<&str> = if multiline {
-        value.split('\n').collect()
+        wrapped = wrap_lines(value, abbrev, size, cw);
+        wrapped.iter().map(|s| s.as_str()).collect()
     } else {
         vec![value]
     };
@@ -1190,6 +1275,72 @@ mod tests {
         ])
     }
 
+    // -----------------------------------------------------------------------
+    // Multiline word wrap
+    // -----------------------------------------------------------------------
+
+    /// A paragraph longer than the field is broken into several lines rather
+    /// than running off the side and being clipped away by the appearance's
+    /// `re W n`. Without this the value is stored correctly in `/V` but looks
+    /// missing on screen -- the most confusing failure mode available.
+    #[test]
+    fn wrap_lines_breaks_a_long_paragraph() {
+        let text = "the quick brown fox jumps over the lazy dog again and again";
+        let lines = wrap_lines(text, "Helv", 10.0, 100.0);
+        assert!(lines.len() > 1, "long text was not wrapped: {lines:?}");
+        for line in &lines {
+            assert!(
+                estimate_string_width_em(line, "Helv") * 10.0 <= 100.0 + 1e-3,
+                "wrapped line still overflows the field: {line:?}"
+            );
+        }
+        // Wrapping must not lose or invent words.
+        let rejoined = lines.join(" ");
+        assert_eq!(rejoined.split_whitespace().collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>());
+    }
+
+    /// An author-typed newline is a hard break and survives wrapping.
+    #[test]
+    fn wrap_lines_honours_explicit_newlines() {
+        let lines = wrap_lines("alpha\nbeta", "Helv", 10.0, 1000.0);
+        assert_eq!(lines, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// A single word wider than the whole line is broken mid-word. Losing
+    /// characters would be worse than an ugly break, and the split must stay on
+    /// a character boundary so multi-byte text cannot panic.
+    #[test]
+    fn wrap_lines_breaks_an_overlong_word_without_losing_characters() {
+        let word = "supercalifragilisticexpialidocious";
+        let lines = wrap_lines(word, "Helv", 10.0, 40.0);
+        assert!(lines.len() > 1, "overlong word was not broken: {lines:?}");
+        assert_eq!(lines.concat(), word, "characters were lost while breaking");
+    }
+
+    /// Degenerate widths must not hang or panic — a zero-width widget has no
+    /// meaningful wrap point.
+    #[test]
+    fn wrap_lines_survives_degenerate_width() {
+        assert_eq!(wrap_lines("hello world", "Helv", 10.0, 0.0), vec!["hello world".to_string()]);
+        assert_eq!(wrap_lines("", "Helv", 10.0, 100.0), vec!["".to_string()]);
+        let _ = wrap_lines("日本語のテキストです", "Helv", 10.0, 5.0);
+    }
+
+    /// The generated appearance actually contains multiple positioned runs for
+    /// a wrapped multiline field — i.e. the wrap reaches the content stream,
+    /// not just the helper.
+    #[test]
+    fn multiline_appearance_emits_several_positioned_lines() {
+        let long = "the quick brown fox jumps over the lazy dog again and again and again";
+        let content = build_tx_content(long, "Helv", 10.0, &[0.0], 0, true, 1.0, 120.0, 60.0);
+        let text = String::from_utf8_lossy(&content);
+        let tm_count = text.matches(" Tm\n").count();
+        assert!(tm_count > 1, "multiline appearance drew only {tm_count} line(s)");
+        // Single-line fields must NOT wrap: PDF single-line text does not.
+        let single = build_tx_content(long, "Helv", 10.0, &[0.0], 0, false, 1.0, 120.0, 60.0);
+        assert_eq!(String::from_utf8_lossy(&single).matches(" Tm\n").count(), 1);
+    }
+
     fn field_named<'a>(fields: &'a [FormField], name: &str) -> &'a FormField {
         fields.iter().find(|f| f.name == name).unwrap_or_else(|| {
             panic!(
@@ -1275,6 +1426,7 @@ mod tests {
             rect: locked.rect,
             read_only: true,
             on_state: Some("Yes".to_string()),
+            multiline: false,
         };
         assert!(toggle_checkbox(&doc, &ro_checkbox).is_err());
         ro_checkbox.read_only = false;
