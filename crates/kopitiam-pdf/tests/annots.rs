@@ -205,8 +205,8 @@ fn real_ap_and_synthesized_both_render() {
     );
 }
 
-/// `AnnotPass::SynthesizedOnly` must paint the AP-less annot and **skip** the
-/// one with a real `/AP`.
+/// `AnnotPass::HayroSkipped` must paint what hayro cannot draw and **skip**
+/// what it already drew.
 ///
 /// This is the guarantee the `hayro` fallback path depends on. When a page hits
 /// the glyph fallback, hayro renders it and draws the real-`/AP` annots itself
@@ -233,18 +233,18 @@ fn synthesized_only_pass_skips_real_ap() {
         &page,
         page_run::page_ctm(&doc, &page),
         &mut dev,
-        AnnotPass::SynthesizedOnly,
+        AnnotPass::HayroSkipped,
     )
     .expect("annot pass must not fail");
 
     let (magenta, cyan) = mixed_counts(dev.pixmap());
     assert!(
         cyan > 200,
-        "SynthesizedOnly dropped the AP-less annot (cyan px = {cyan})"
+        "HayroSkipped dropped the AP-less annot (cyan px = {cyan})"
     );
     assert_eq!(
         magenta, 0,
-        "SynthesizedOnly painted a real-/AP annot ({magenta} magenta px); on the hayro \
+        "HayroSkipped painted a stream-/AP annot ({magenta} magenta px); on the hayro \
          fallback path this double-draws what hayro already drew"
     );
 }
@@ -346,4 +346,55 @@ fn fallback_can_be_switched_off() {
     // And the default entry point must agree with fallback = true.
     let default = rasterize_page(&doc, 0, DPI).expect("default");
     assert_eq!(channel_counts(&default), channel_counts(&with));
+}
+
+/// Checkbox and radio widgets survive the `hayro` fallback.
+///
+/// Found by dogfooding: radios rendered fine normally and **vanished the
+/// moment the fallback was switched on**. Cause is precise — hayro asks for
+/// `ap.get::<Stream>(N)` (`hayro-interpret/src/interpret/mod.rs:157`), but a
+/// checkbox or radio stores `/N` as a **dictionary of appearance states**
+/// keyed by `/AS`, never a bare stream. So hayro draws none of them (measured:
+/// 0/3 on this fixture), and the overlay used to skip them too, because they
+/// *do* have an `/AP` and the old filter only rescued annots with none.
+///
+/// The overlay pass therefore has to be "what did hayro miss?", not "what had
+/// to be synthesised" — those are different questions, and only the first one
+/// keeps radio buttons on screen.
+#[test]
+fn state_dict_widgets_are_painted_for_the_hayro_overlay() {
+    use kopitiam_pdf::mupdf::{AnnotPass, DrawDevice, Matrix, page_run, run_page_annots_with};
+
+    let doc = PdfDocument::open(RADIO.to_vec()).expect("radio fixture parses");
+    let page = doc.page(0).expect("page 0").clone();
+    let scale = DPI / 72.0;
+
+    // Blank device, so anything drawn came from this pass alone.
+    let mut dev = DrawDevice::new(
+        (200.0 * scale) as u32,
+        (200.0 * scale) as u32,
+        Matrix::scale(scale, scale),
+    );
+    run_page_annots_with(
+        &doc,
+        &page,
+        page_run::page_ctm(&doc, &page),
+        &mut dev,
+        AnnotPass::HayroSkipped,
+    )
+    .expect("overlay pass must not fail");
+
+    let pix = dev.pixmap();
+    let dark = (0..pix.height() as i32)
+        .flat_map(|y| (0..pix.width() as i32).map(move |x| (x, y)))
+        .filter(|&(x, y)| pix.luma(x, y).map(|l| l < 128).unwrap_or(false))
+        .count();
+
+    assert!(
+        dark > 150,
+        "HayroSkipped drew nothing for state-dict widgets ({dark} dark px). All three \
+         widgets in this fixture keep /N as a dictionary of appearance states, so hayro \
+         renders none of them -- if this pass skips them too, every checkbox and radio \
+         disappears whenever the fallback engages."
+    );
 }

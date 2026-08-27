@@ -82,7 +82,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Exercises the *other* half of annotation rendering -- consuming a real /AP
 # form XObject (PDF 32000-1 s12.5.5's BBox->Rect mapping) -- and the
-# AnnotPass::SynthesizedOnly filter that stops the hayro fallback path from
+# AnnotPass::HayroSkipped filter that stops the hayro fallback path from
 # double-drawing.
 #
 #   magenta: HAS /AP  -> drawn by any /AP-capable engine, including hayro

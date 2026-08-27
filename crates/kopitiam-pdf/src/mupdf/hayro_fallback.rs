@@ -131,7 +131,7 @@ pub fn rasterize_page_with_fallback(
 /// would watch ink disappear on precisely the pages where the fallback
 /// engaged, which is worse than either engine alone.
 ///
-/// Only [`AnnotPass::SynthesizedOnly`] is painted, so annotations hayro
+/// Only [`AnnotPass::HayroSkipped`] is painted, so annotations hayro
 /// already drew from a real `/AP` are not drawn a second time -- double
 /// compositing would darken any annot with `/CA` < 1.
 ///
@@ -158,7 +158,7 @@ fn overlay_missing_annots(
         &page,
         base_ctm,
         &mut dev,
-        super::annot_run::AnnotPass::SynthesizedOnly,
+        super::annot_run::AnnotPass::HayroSkipped,
     );
     dev.into_pixmap()
 }

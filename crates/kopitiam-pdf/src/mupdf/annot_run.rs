@@ -128,7 +128,7 @@ pub fn run_page_annots<D: TextDevice + ?Sized>(
 /// would double-draw: harmless for an opaque stroke, but visibly wrong for one
 /// with `/CA` < 1, where two translucent passes composite darker than one.
 ///
-/// [`AnnotPass::SynthesizedOnly`] paints exactly the complement -- the annots
+/// [`AnnotPass::HayroSkipped`] paints exactly the complement -- the annots
 /// hayro skipped because they have no `/AP` at all -- so the two engines add up
 /// to one complete page with nothing drawn twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,10 +136,21 @@ pub enum AnnotPass {
     /// Every visible annotation: real `/AP` streams and synthesised
     /// appearances alike. What a from-scratch render wants.
     All,
-    /// Only annotations whose appearance had to be **synthesised** because the
-    /// file carries no `/AP` for them. Use after an engine that is `/AP`-only
-    /// has already had its turn.
-    SynthesizedOnly,
+    /// Only the annotations `hayro` does **not** draw, so the two engines add
+    /// up to one complete page with nothing drawn twice. Two kinds qualify:
+    ///
+    /// 1. **No `/AP` at all** -- the appearance had to be synthesised (the
+    ///    AP-less ink annotations Okular writes).
+    /// 2. **`/AP` `/N` is a dictionary of appearance states**, not a stream.
+    ///    hayro asks for `ap.get::<Stream>(N)`
+    ///    (`hayro-interpret/src/interpret/mod.rs:157`) and gets nothing, so
+    ///    **every checkbox and radio button is invisible to it** -- their `/N`
+    ///    is always a state dict keyed by `/AS`. Found by dogfooding: radios
+    ///    rendered fine normally and vanished the moment the fallback engaged.
+    ///
+    /// Named for the question it answers -- "what did hayro miss?" -- rather
+    /// than for one of the two answers.
+    HayroSkipped,
 }
 
 /// [`run_page_annots`], restricted to a subset of the page's annotations.
@@ -243,8 +254,11 @@ fn paint_one_annot<D: TextDevice + ?Sized>(
         // appearances -- an `/AP`-only engine (hayro) has already drawn this
         // one, and drawing it again would composite a `/CA` < 1 annot twice.
         // See [`AnnotPass`].
-        PaintSource::RealAp(_) if pass == AnnotPass::SynthesizedOnly => return Ok(()),
-        PaintSource::RealAp(ap) => {
+        // Skip only what the /AP-only engine has ALREADY drawn: an /N that was
+        // a real stream. An /N state dictionary (every checkbox and radio) is
+        // invisible to hayro, so it still needs painting here.
+        PaintSource::RealAp(_, true) if pass == AnnotPass::HayroSkipped => return Ok(()),
+        PaintSource::RealAp(ap, _) => {
             let resources = if ap.resources.is_dict() {
                 ap.resources.clone()
             } else {
@@ -287,7 +301,7 @@ fn paint_one_annot<D: TextDevice + ?Sized>(
 /// fall back to the page's.
 fn resolve_appearance(doc: &PdfDocument, annot: &Object) -> Option<PaintSource> {
     match lookup_ap(doc, annot) {
-        ApLookup::Found(ap) => Some(PaintSource::RealAp(ap)),
+        ApLookup::Found(ap, from_stream) => Some(PaintSource::RealAp(ap, from_stream)),
         ApLookup::AmbiguousOrBroken => None,
         ApLookup::Absent => synthesize_ap(doc, annot).map(PaintSource::Synthesized),
     }
@@ -300,7 +314,11 @@ fn resolve_appearance(doc: &PdfDocument, annot: &Object) -> Option<PaintSource> 
 enum PaintSource {
     /// Read directly from the annotation's own `/AP` (or its `/N` dictionary
     /// of states). May legitimately omit `/Resources` and rely on the page's.
-    RealAp(SynthAp),
+    ///
+    /// The `bool` is `true` when `/N` was itself a stream, `false` when it was
+    /// a dictionary of appearance states -- see [`ApLookup::Found`] for why
+    /// that matters to the `hayro` overlay.
+    RealAp(SynthAp, bool),
     /// Built in memory by [`synthesize_ap`] because the annotation had no
     /// `/AP` at all. Self-contained by construction: an absent `/Resources`
     /// here means none are needed, never "check the page".
@@ -309,10 +327,16 @@ enum PaintSource {
 
 /// The three outcomes of looking up `/AP`/`/N` on an annotation.
 enum ApLookup {
-    /// A usable appearance was found (either `/N` was itself a stream, or a
-    /// dictionary-of-states entry was unambiguously selected and *that* was a
-    /// stream).
-    Found(SynthAp),
+    /// A usable appearance was found. The `bool` records whether `/N` was
+    /// **itself a stream** (`true`) or a **dictionary of appearance states**
+    /// from which one was selected (`false`).
+    ///
+    /// That distinction is not academic: `hayro` only accepts `/N` as a
+    /// stream (`ap.get::<Stream>(N)`,
+    /// `hayro-interpret/src/interpret/mod.rs:157`), so every checkbox and
+    /// radio -- whose `/N` is always a state dictionary -- is invisible to it.
+    /// [`AnnotPass::HayroSkipped`] uses this to paint them back.
+    Found(SynthAp, bool),
     /// `/AP` is present but no usable stream could be selected from it.
     AmbiguousOrBroken,
     /// No `/AP` (or no `/N` under it) at all: the caller should try the
@@ -342,7 +366,8 @@ fn lookup_ap(doc: &PdfDocument, annot: &Object) -> ApLookup {
         && let Ok(bytes) = doc.open_stream(n_raw)
     {
         return match form_ap(doc, n_raw, bytes, annot) {
-            Some(found) => ApLookup::Found(found),
+            // /N was itself a stream -- hayro draws this one.
+            Some(found) => ApLookup::Found(found, true),
             None => ApLookup::AmbiguousOrBroken,
         };
     }
@@ -377,7 +402,8 @@ fn lookup_ap(doc: &PdfDocument, annot: &Object) -> ApLookup {
     }
     match doc.open_stream(selected) {
         Ok(bytes) => match form_ap(doc, selected, bytes, annot) {
-            Some(found) => ApLookup::Found(found),
+            // Selected out of a /N state dictionary -- hayro skips these.
+            Some(found) => ApLookup::Found(found, false),
             None => ApLookup::AmbiguousOrBroken,
         },
         Err(_) => ApLookup::AmbiguousOrBroken,
