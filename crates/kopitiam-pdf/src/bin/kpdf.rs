@@ -19,6 +19,23 @@
 //! before the viewer window does, so there is nothing to specify up front.
 //! Cancelling it exits quietly (not an error).
 //!
+//! # Live lecturing: blank pages on demand
+//!
+//! `a` inserts a blank page **after the page you are on** and jumps to it, at
+//! that page's size and rotation, so a derivation that overruns its slide
+//! continues onto fresh paper without leaving the flow. `Ctrl+Delete` removes
+//! the current page. Both are ordinary entries in the edit history, so Undo
+//! and `Ctrl+S` treat them exactly like ink. The page-tree mechanics, and why
+//! a deleted page's bytes remain in the saved file, are in
+//! [`kopitiam_pdf::mupdf::page_edit`].
+//!
+//! # Hot reload
+//!
+//! The open file's mtime is polled (throttled, not filesystem-watched) and an
+//! external change re-opens it, keeping your page and zoom -- so a TeX/Typst
+//! recompile refreshes in place. A document with unsaved annotations is never
+//! auto-reloaded; see [`KpdfApp::check_hot_reload`].
+//!
 //! # Continuous scroll (gh-89)
 //!
 //! Image mode shows every page of the document stacked in one scrollable
@@ -127,6 +144,11 @@
 //!
 //! * **Open** -- the same native file picker `o` already opened, now also a
 //!   button, so a mouse-only session can reach it.
+//! * **+ Page** / **- Page** -- add a blank page after the current one
+//!   (**`a`**), or delete the current one (**`Ctrl+Delete`**). Both are in
+//!   the toolbar as well as on keys because the use case they exist for --
+//!   lecturing with a graphics tablet -- often leaves no hand free for the
+//!   keyboard. See [`KpdfApp::add_blank_page`].
 //! * **Undo** / **Redo** -- step through [`EditHistory`], disabled when there
 //!   is nothing to step to.
 //! * **Save** -- write the current (possibly edited) bytes to a file chosen
@@ -927,10 +949,20 @@ impl KpdfApp {
         match PdfDocument::open(bytes) {
             Ok(doc) => {
                 self.doc = doc;
+                // The page count can MOVE across an edit. It never did while
+                // the only edits were annotations, but adding or deleting a
+                // page changes it -- and a stale count leaves the new page
+                // unreachable (navigation clamps to the old maximum) or lets
+                // the viewer address a page that no longer exists.
+                self.page_count = self.doc.page_count();
+                self.page = self.page.min(self.page_count.saturating_sub(1));
                 self.page_textures.clear();
                 self.page_textures_lru = Lru::new(PAGE_TEXTURE_CACHE_CAPACITY);
                 self.thumbnails.clear();
                 self.slots_cache = None;
+                // Extracted reflow text is indexed by page, so inserting or
+                // removing a page shifts every entry after it out of step.
+                self.reflow_pages = None;
                 self.annot_count = drawable_annot_count(&self.doc, self.page);
                 self.status = None;
                 self.form_fields_cache.clear();
@@ -1066,6 +1098,61 @@ impl KpdfApp {
                 let _ = std::fs::remove_file(&tmp_path);
                 self.status = Some(format!("save {}: {e}", self.path.display()));
             }
+        }
+    }
+
+    /// Insert a blank page directly after the page being viewed, and go to it.
+    ///
+    /// The lecturing move (the maintainer's ask): you are mid-derivation on
+    /// slide 12, you run out of room, you add a page and keep writing on it
+    /// with the tablet. So it lands *after the current page*, not at the end
+    /// of the deck -- appending would put the new page 60 slides away from
+    /// where the thought is -- and the view jumps to it so the pen can start
+    /// immediately.
+    ///
+    /// Size and `/Rotate` are copied from the page you were on
+    /// ([`kopitiam_pdf::mupdf::page_edit::insert_blank_page`]), so the new
+    /// page appears at the same size and zoom and the stroke you were about
+    /// to draw lands where you expect.
+    ///
+    /// Goes through [`KpdfApp::apply_edit`] like every other edit, so it is
+    /// undoable and saved by the same Ctrl+S.
+    fn add_blank_page(&mut self) {
+        let at = self.page + 1;
+        let result = kopitiam_pdf::mupdf::page_edit::insert_blank_page(&self.doc, at, None);
+        let ok = result.is_ok();
+        self.apply_edit(result);
+        if ok {
+            // `apply_edit` -> `reload_from_bytes` keeps the page index, but the
+            // new page is the point of the exercise, so move to it.
+            self.page = at.min(self.page_count.saturating_sub(1));
+            self.scroll_to_page = Some(self.page);
+            self.status = Some(format!("added blank page {}", self.page + 1));
+        }
+    }
+
+    /// Delete the page being viewed.
+    ///
+    /// Undoable (it is an ordinary entry in the edit history) and refused on
+    /// the last remaining page, since a zero-page PDF will not reopen.
+    ///
+    /// Note this removes the page from the page *tree*; the page's content
+    /// stays in the saved file as an orphaned object. That is inherent to
+    /// append-only editing -- see
+    /// [`kopitiam_pdf::mupdf::page_edit`]'s module docs. It is deletion, not
+    /// redaction.
+    fn delete_current_page(&mut self) {
+        let target = self.page;
+        let result = kopitiam_pdf::mupdf::page_edit::delete_page(&self.doc, target);
+        let ok = result.is_ok();
+        self.apply_edit(result);
+        if ok {
+            // Deleting the last page leaves the index past the end; step back
+            // so the viewer lands on the page that took its place (or the new
+            // final page).
+            self.page = target.min(self.page_count.saturating_sub(1));
+            self.scroll_to_page = Some(self.page);
+            self.status = Some(format!("deleted page {}", target + 1));
         }
     }
 
@@ -1600,6 +1687,14 @@ impl KpdfApp {
             egui::Key::L => self.pending_scroll_delta.x -= VIM_STEP,
             egui::Key::J => self.pending_scroll_delta.y -= VIM_STEP,
             egui::Key::K => self.pending_scroll_delta.y += VIM_STEP,
+            // `a` -- add a blank page after this one and jump to it. Chosen
+            // as a bare letter on purpose: mid-lecture it is pressed
+            // one-handed while the other hand holds the stylus.
+            egui::Key::A => self.add_blank_page(),
+            // Ctrl+Delete -- destructive, so deliberately NOT a bare letter
+            // and deliberately nowhere near the scroll keys, where a fumble
+            // would cost a page. Undoable regardless.
+            egui::Key::Delete if modifiers.ctrl => self.delete_current_page(),
             // Ctrl+d / Ctrl+u -- half a viewport, vim's own contract.
             egui::Key::D if modifiers.ctrl => {
                 self.pending_scroll_delta.y -= half_viewport_step(self.last_viewport_h);
@@ -1781,6 +1876,26 @@ impl eframe::App for KpdfApp {
                         .edit_history
                         .as_ref()
                         .is_some_and(EditHistory::can_redo);
+                    // Page add/delete sit in the toolbar as well as on keys:
+                    // lecturing with a tablet often means no hand free for the
+                    // keyboard at all.
+                    if ui
+                        .button("+ Page")
+                        .on_hover_text("Add a blank page after this one (a)")
+                        .clicked()
+                    {
+                        self.add_blank_page();
+                    }
+                    if ui
+                        .add_enabled(self.page_count > 1, egui::Button::new("- Page"))
+                        .on_hover_text(
+                            "Delete this page (Ctrl+Delete) -- undoable; the last page cannot be deleted",
+                        )
+                        .clicked()
+                    {
+                        self.delete_current_page();
+                    }
+                    ui.separator();
                     if ui
                         .add_enabled(can_undo, egui::Button::new("Undo"))
                         .clicked()

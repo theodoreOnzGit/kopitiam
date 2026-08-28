@@ -96,6 +96,7 @@ pub mod interpret;
 pub mod lex;
 pub mod object;
 pub mod op_run;
+pub mod page_edit;
 pub mod page_image;
 pub mod page_run;
 pub mod parse;
