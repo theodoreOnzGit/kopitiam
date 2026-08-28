@@ -227,7 +227,8 @@ use eframe::egui;
 // re-implementing this file.
 use kopitiam_pdf::gui_frontend::{
     Command, ContinuousSlot, DPI_DEFAULT, DPI_MAX, DPI_MIN, DPI_STEP, FieldHighlight, GPending,
-    Lru, PageLayout, PageSize, Tool, VIM_STEP, consume_commit_enter, continuous_slot_visible,
+    HotReload, Lru, PageLayout, PageSize, RELOAD_CHECK_INTERVAL, ReloadDecision, Tool, VIM_STEP,
+    consume_commit_enter, continuous_slot_visible,
     current_page_in_view, drawable_annot_count, field_highlight_kind, field_rect_to_screen,
     g_pending_expired, half_viewport_step, highlight_colors, hit_test_annot, hit_test_field,
     hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect, page_size_pts,
@@ -427,6 +428,17 @@ struct KpdfApp {
     /// is only ever viewed, never annotated, never pays for one (see
     /// [`KpdfApp::ensure_edit_history`]).
     edit_history: Option<EditHistory>,
+    /// Reload the document when it changes on disk -- the live-preview loop
+    /// for a TeX/Typst recompile. Ported from `kovan`'s reader; see
+    /// [`kopitiam_pdf::gui_frontend::hot_reload`] for the mechanism and for
+    /// why it polls rather than watches. Default **on**, matching kovan.
+    hot_reload: HotReload,
+    /// Whether [`KpdfApp::edit_history`] holds annotation/form edits that are
+    /// not yet on disk. Gates hot reload: re-opening the file would discard
+    /// them, so a document with unsaved work is never auto-reloaded (the
+    /// status bar says so instead). Set by [`KpdfApp::apply_edit`], cleared
+    /// by a successful save and by opening a document.
+    unsaved_edits: bool,
     /// The in-progress ink stroke while [`Tool::Draw`] is being dragged, in
     /// **default user space** on the page it belongs to (see
     /// [`KpdfApp::draw_page`]) -- committed as a real annotation on
@@ -495,6 +507,10 @@ struct CachedField {
 impl KpdfApp {
     fn open(path: PathBuf) -> Result<KpdfApp, String> {
         let (doc, page_count) = load_doc(&path)?;
+        let mut hot_reload = HotReload::new(true);
+        // Claim the file we just read, so the first poll does not see our own
+        // open as an external change.
+        hot_reload.mark_current(&path);
         // See the module docs' "Forms" bullet: computed once per document
         // load, not per frame -- it is a property of the document's
         // `/AcroForm`, which ink/eraser edits never touch.
@@ -525,6 +541,8 @@ impl KpdfApp {
             forms_mode: false,
             has_acroform,
             edit_history: None,
+            hot_reload,
+            unsaved_edits: false,
             draw_stroke: Vec::new(),
             draw_page: None,
             form_edit: None,
@@ -547,6 +565,10 @@ impl KpdfApp {
                 self.has_acroform = kopitiam_pdf::mupdf::form::has_acroform(&doc);
                 self.doc = doc;
                 self.path = path;
+                // A different document: claim its mtime and drop the old
+                // document's unsaved-edit state (its history goes too, below).
+                self.hot_reload.mark_current(&self.path);
+                self.unsaved_edits = false;
                 self.page_count = page_count;
                 self.page = 0;
                 self.scroll_to_page = None;
@@ -880,6 +902,7 @@ impl KpdfApp {
                     .current()
                     .to_vec();
                 self.reload_from_bytes(current);
+                self.unsaved_edits = true;
             }
             Err(e) => self.status = Some(e.to_string()),
         }
@@ -966,7 +989,19 @@ impl KpdfApp {
             return;
         };
         match std::fs::write(&target, hist.current()) {
-            Ok(()) => self.status = Some(format!("saved {}", target.display())),
+            Ok(()) => {
+                // Save-As can legitimately target the document we already
+                // have open. When it does, claim the mtime we just wrote and
+                // count the edits as saved -- otherwise hot reload sees our
+                // own write as external. Saving elsewhere leaves the open
+                // document's unsaved state exactly as it was, which is
+                // correct: those edits are still not in *this* file.
+                if target == self.path {
+                    self.hot_reload.mark_current(&self.path);
+                    self.unsaved_edits = false;
+                }
+                self.status = Some(format!("saved {}", target.display()));
+            }
             Err(e) => self.status = Some(format!("save {}: {e}", target.display())),
         }
     }
@@ -1018,12 +1053,63 @@ impl KpdfApp {
             return;
         }
         match std::fs::rename(&tmp_path, &self.path) {
-            Ok(()) => self.status = Some(format!("saved {}", self.path.display())),
+            Ok(()) => {
+                // Claim the mtime our own rename just set. Without this the
+                // watcher reads this save as an external change and reloads
+                // the document out from under the user on every Ctrl+S --
+                // see hot_reload.rs's module docs.
+                self.hot_reload.mark_current(&self.path);
+                self.unsaved_edits = false;
+                self.status = Some(format!("saved {}", self.path.display()));
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 self.status = Some(format!("save {}: {e}", self.path.display()));
             }
         }
+    }
+
+    /// Poll the open file and reload it if it changed on disk (hot reload).
+    ///
+    /// Ported from `kovan`'s `check_hot_reload`, with one addition kovan does
+    /// not need: kpdf holds **unsaved annotation edits** in memory, and
+    /// re-opening would discard them. So a document with unsaved work is
+    /// never auto-reloaded -- the status bar reports the change and waits for
+    /// the user to save (or discard by reopening with `o`). Silently throwing
+    /// away someone's ink because LaTeX recompiled underneath is exactly the
+    /// kind of data loss this reader must not do.
+    ///
+    /// The page position is preserved across the reload (clamped, in case the
+    /// recompile changed the page count), which is the whole point of a
+    /// live-preview loop -- kovan does the same.
+    fn check_hot_reload(&mut self, ctx: &egui::Context) {
+        if !self.hot_reload.is_enabled() {
+            return;
+        }
+        // Keep waking up even when idle, or an unattended window would never
+        // poll (egui only repaints on input otherwise).
+        ctx.request_repaint_after(RELOAD_CHECK_INTERVAL);
+        if self.hot_reload.poll(&self.path, std::time::Instant::now()) != ReloadDecision::Changed {
+            return;
+        }
+        if self.unsaved_edits {
+            self.status = Some(format!(
+                "{} changed on disk -- not reloaded, you have unsaved edits (Ctrl+S to keep them)",
+                self.path.display()
+            ));
+            // Claim it anyway: otherwise this repeats every 500ms and buries
+            // every other status message the user might need to read.
+            self.hot_reload.mark_current(&self.path);
+            return;
+        }
+        let keep_page = self.page;
+        let keep_dpi = self.dpi;
+        let path = self.path.clone();
+        self.open_path(path);
+        self.dpi = keep_dpi;
+        self.page = keep_page.min(self.page_count.saturating_sub(1));
+        self.scroll_to_page = Some(self.page);
+        self.status = Some(format!("{} changed on disk -- reloaded", self.path.display()));
     }
 
     /// Forms-mode click handling: resolve the click to a page (via
@@ -1666,6 +1752,10 @@ fn cmdline_char(key: egui::Key) -> Option<char> {
 
 impl eframe::App for KpdfApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Before anything paints: pick up an external recompile of the open
+        // file (hot reload). Cheap -- throttled to one `stat` per
+        // RELOAD_CHECK_INTERVAL inside `HotReload::poll`.
+        self.check_hot_reload(ui.ctx());
         self.handle_key(ui.ctx());
         self.handle_scroll_zoom(ui.ctx());
 

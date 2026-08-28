@@ -200,6 +200,30 @@ vendored or committed.
 
 ---
 
+## kovan (sibling project — reader features ported across)
+
+`kovan` is the maintainer's own literature/digitiser workbench, living in
+[`theodoreOnzGit/outram-park-backend`](https://github.com/theodoreOnzGit/outram-park-backend)
+(`crates/kovan`, branch `develop`). It is not a third-party dependency and
+nothing is vendored from it: KOPITIAM and kovan share an author, and `kpdf`
+carries features **ported** from kovan's egui PDF reader
+(`src/digitiser/gui/desktop/pdf_reader.rs`) so that PDF work consolidates in
+`kopitiam-pdf` rather than being maintained twice.
+
+| Ported into | From kovan | Notes |
+| --- | --- | --- |
+| `gui_frontend/hot_reload.rs`, `kpdf`'s `check_hot_reload` | `PdfReaderState::check_hot_reload` / `read_mtime`, `RELOAD_CHECK_INTERVAL` (kovan issue #30, op-eehc) | Same mechanism (throttled mtime poll, not a filesystem watcher), same 500 ms interval, same default-on stance. Diverges deliberately: the clock is injected so the throttle is unit-testable, and kpdf additionally refuses to auto-reload over **unsaved annotation edits** — a case kovan's reader does not have to handle, and silently discarding a user's ink would be data loss. |
+| continuous scroll, thumbnail sidebar, page-LRU (earlier work) | kovan's reader | See `kpdf`'s module docs for what was and was not carried over. |
+
+Deliberately **not** ported: kovan's box-annotation / graph-digitiser /
+table-reading tooling and its 3-pane bibliography panels — a different
+workflow from kpdf's ink/eraser/forms tools. Where the two overlapped,
+whichever implementation was more advanced won: kovan's text extraction and
+image extraction go through `pdf-extract`/`lopdf`, which `kopitiam-pdf`'s own
+MuPDF port already supersedes, so those were **not** taken.
+
+---
+
 ## Forks (direct code reuse — notices retained)
 
 Unlike everything above, these are **forks**. Their code is reused directly,

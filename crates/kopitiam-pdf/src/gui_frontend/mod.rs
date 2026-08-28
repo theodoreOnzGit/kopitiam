@@ -32,6 +32,7 @@
 pub mod forms;
 pub mod geometry;
 pub mod hit_test;
+pub mod hot_reload;
 pub mod keys;
 pub mod lru;
 pub mod pixmap;
@@ -48,6 +49,7 @@ pub use geometry::{
     page_to_screen, recentred_scroll_offset, rect_contains, screen_to_page, screen_to_page_at,
 };
 pub use hit_test::{hit_test_annot, hit_test_field, hit_test_field_expanded};
+pub use hot_reload::{HotReload, RELOAD_CHECK_INTERVAL, ReloadDecision, read_mtime};
 pub use keys::{
     Command, G_PENDING_TIMEOUT, GPending, VIM_STEP, g_pending_expired, half_viewport_step,
     keys_captured, parse_command,
