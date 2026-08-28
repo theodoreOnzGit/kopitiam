@@ -287,7 +287,7 @@ use kopitiam_pdf::gui_frontend::{
     consume_commit_enter, continuous_slot_visible,
     current_page_in_view, drawable_annot_count, field_highlight_kind, field_rect_to_screen,
     g_pending_expired, half_viewport_step, highlight_colors, hit_test_annot, hit_test_field,
-    hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect, page_size_pts,
+    hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect,
     page_to_screen, parse_command, rgb_to_rgba, screen_to_page_at, select_tool, toggle_forms_mode,
     zoom_percent, zoom_steps_from_zoom_delta,
 };
@@ -386,11 +386,15 @@ enum Mode {
 type PageTextureKey = (usize, u32, bool);
 
 /// Cache key for the continuous-layout slot list ([`KpdfApp::slots_cache`]):
-/// rebuild only when dpi, the page count (a new document), how many
-/// thumbnails have been rasterized so far (more thumbnails means more
-/// accurate page sizes have become available), or the fallback toggle
-/// actually change -- not on every frame.
-type SlotsCacheKey = (u32, usize, usize, bool);
+/// rebuild only when dpi, the page count (a new document) or the fallback
+/// toggle actually change -- not on every frame.
+///
+/// It used to carry the thumbnail count too, because page sizes were
+/// measured from rendered thumbnails and so improved as more arrived. Sizes
+/// now come from `/MediaBox` ([`KpdfApp::page_size_for_layout`]), which is
+/// exact on the first frame, so there is nothing to refine and the layout is
+/// built exactly once per (dpi, document, fallback) combination.
+type SlotsCacheKey = (u32, usize, bool);
 
 struct KpdfApp {
     doc: PdfDocument,
@@ -798,43 +802,39 @@ impl KpdfApp {
     }
 
     /// This page's on-screen size (and physical point size) for the
-    /// continuous layout, derived from its cached thumbnail texture (see
-    /// [`KpdfApp::thumbnail_texture`]) rather than a full-resolution render
-    /// -- ported from `kovan`'s continuous-scroll sizing trick (see the
-    /// module docs): this is what makes opening a long document cheap.
+    /// continuous layout, read from `/MediaBox` (with `/Rotate` applied) via
+    /// [`kopitiam_pdf::mupdf::page_geom::page_size_points`].
     ///
-    /// The physical point size comes from [`page_size_pts`] applied to the
-    /// thumbnail's own pixel size at [`THUMBNAIL_DPI`] -- that function is
-    /// dpi-invariant by construction (see its own docs), so this recovers
-    /// the *exact* page size in PDF points without any separate `/MediaBox`
-    /// lookup.
+    /// # Why not the thumbnail any more
     ///
-    /// Falls back to a US-Letter-shaped size (at the current `dpi`, 612x792
-    /// points) if the thumbnail itself failed to render, so the layout still
-    /// gets a plausible slot instead of a zero-size one.
-    fn page_size_for_layout(&mut self, ctx: &egui::Context, page: usize) -> PageSize {
-        match self.thumbnail_texture(ctx, page) {
-            Some(t) => {
-                let [tw, th] = t.size();
-                let (tw, th) = (tw as f32, th as f32);
-                let scale = self.dpi / THUMBNAIL_DPI;
-                let (page_w_pts, page_h_pts) = page_size_pts(tw, th, THUMBNAIL_DPI);
-                PageSize {
-                    display_w: tw * scale,
-                    display_h: th * scale,
-                    page_w_pts,
-                    page_h_pts,
-                }
-            }
-            None => {
-                let scale = self.dpi / 72.0;
-                PageSize {
-                    display_w: 612.0 * scale,
-                    display_h: 792.0 * scale,
-                    page_w_pts: 612.0,
-                    page_h_pts: 792.0,
-                }
-            }
+    /// This was ported from `kovan`, which measures the page's *rendered
+    /// thumbnail* -- cheap for a short document, and it needs no `/MediaBox`
+    /// lookup. On a long one it is ruinous: [`KpdfApp::continuous_slots`]
+    /// asks for every page's size on the first frame, so measuring by
+    /// rendering meant rasterizing the whole document before anything could
+    /// be laid out. The Irodori Japanese-course workbook (506 pages, 106 MB)
+    /// parsed in 133 ms and then hung the window for **36.6 seconds** doing
+    /// exactly that.
+    ///
+    /// The file states the size outright, so read it: microseconds for the
+    /// whole document, and `/Rotate` is handled properly into the bargain
+    /// (the thumbnail route got that for free by rendering; a naive
+    /// `/MediaBox` read would not, which is why `page_size_points` applies
+    /// it).
+    ///
+    /// Thumbnails are still rendered for the sidebar, but only for the rows
+    /// actually on screen (`show_rows` in
+    /// [`KpdfApp::thumbnail_sidebar`]), which is bounded no matter how long
+    /// the document is.
+    fn page_size_for_layout(&mut self, _ctx: &egui::Context, page: usize) -> PageSize {
+        let (page_w_pts, page_h_pts) =
+            kopitiam_pdf::mupdf::page_geom::page_size_points(&self.doc, page);
+        let scale = self.dpi / 72.0;
+        PageSize {
+            display_w: page_w_pts * scale,
+            display_h: page_h_pts * scale,
+            page_w_pts,
+            page_h_pts,
         }
     }
 
@@ -844,12 +844,7 @@ impl KpdfApp {
     /// not on every frame, since a long document's slot list is otherwise
     /// non-trivial `Vec` churn to rebuild 20 times a second for nothing.
     fn continuous_slots(&mut self, ctx: &egui::Context) -> Vec<ContinuousSlot> {
-        let key: SlotsCacheKey = (
-            self.dpi.to_bits(),
-            self.page_count,
-            self.thumbnails.len(),
-            self.fallback_enabled,
-        );
+        let key: SlotsCacheKey = (self.dpi.to_bits(), self.page_count, self.fallback_enabled);
         if let Some((cached_key, slots)) = &self.slots_cache
             && *cached_key == key
         {
