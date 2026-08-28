@@ -43,7 +43,7 @@ pub use forms::{
     FieldHighlight, consume_commit_enter, field_highlight_kind, highlight_colors,
     should_commit_on_enter,
 };
-pub use geometry::{
+pub use geometry::{stext_to_screen, 
     ContinuousSlot, PageLayout, PageSize, continuous_slot_visible, current_page_in_view,
     field_rect_to_screen, layout_continuous_pages, min_hit_rect, page_display_size, page_size_pts,
     page_to_screen, recentred_scroll_offset, rect_contains, screen_to_page, screen_to_page_at,

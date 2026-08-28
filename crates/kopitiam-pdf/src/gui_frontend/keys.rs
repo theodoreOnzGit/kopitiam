@@ -108,6 +108,29 @@ pub fn g_pending_expired(elapsed: Duration) -> bool {
 mod tests {
     use super::*;
 
+    /// Quitting must be reachable from the command line, since `Escape` no
+    /// longer closes the window.
+    #[test]
+    fn quit_commands_parse() {
+        assert!(matches!(parse_command("q"), Command::Quit));
+        assert!(matches!(parse_command("q!"), Command::Quit));
+        assert!(matches!(parse_command("wq"), Command::WriteQuit));
+        assert!(matches!(parse_command("wq!"), Command::WriteQuit));
+        assert!(matches!(parse_command("x"), Command::WriteQuit));
+        // Surrounding whitespace is trimmed like every other command.
+        assert!(matches!(parse_command("  q  "), Command::Quit));
+    }
+
+    /// The existing commands must keep working, and a near-miss must still
+    /// report itself rather than quitting by accident.
+    #[test]
+    fn quit_parsing_does_not_swallow_other_commands() {
+        assert!(matches!(parse_command("w"), Command::Write));
+        assert!(matches!(parse_command("12"), Command::GotoPage(12)));
+        assert!(matches!(parse_command("quit"), Command::Unknown(_)));
+        assert!(matches!(parse_command("qq"), Command::Unknown(_)));
+    }
+
     // -- keys_captured ------------------------------------------------------
 
     #[test]
@@ -219,6 +242,16 @@ pub enum Command {
     GotoPage(usize),
     /// `:w` — write the file in place, same as `Ctrl+S`.
     Write,
+    /// `:q` — quit.
+    ///
+    /// Quitting is deliberately reachable **only** through the command line.
+    /// `Escape` used to close the window, which meant the key every other
+    /// dialog uses for "cancel" threw away the session — press it once too
+    /// often after a find and the document is gone. Vim's contract is the one
+    /// the maintainer asked for: `Esc` cancels, `:q` quits.
+    Quit,
+    /// `:wq` — write the file in place, then quit. Vim's own spelling.
+    WriteQuit,
     /// Typed something we do not implement. The caller should say so rather
     /// than silently doing nothing: a command line that ignores input leaves
     /// the user unable to tell "not a command" from "command failed".
@@ -241,8 +274,14 @@ pub fn parse_command(input: &str) -> Command {
     if text.is_empty() {
         return Command::Empty;
     }
-    if text == "w" {
-        return Command::Write;
+    match text {
+        "w" => return Command::Write,
+        // `:q!` is accepted as `:q` rather than rejected: kpdf never blocks a
+        // quit on unsaved edits, so the forcing form means the same thing, and
+        // refusing a command vim users type reflexively would only confuse.
+        "q" | "q!" => return Command::Quit,
+        "wq" | "x" | "wq!" => return Command::WriteQuit,
+        _ => {}
     }
     match text.parse::<usize>() {
         Ok(n) if n >= 1 => Command::GotoPage(n),
@@ -283,8 +322,12 @@ mod command_tests {
     /// the user cannot tell "not a command" from "command silently failed".
     #[test]
     fn unknown_commands_are_reported() {
-        assert_eq!(parse_command("q"), Command::Unknown("q".to_string()));
-        assert_eq!(parse_command("wq"), Command::Unknown("wq".to_string()));
+        // `q` and `wq` used to be Unknown, because quitting was reachable only
+        // by `Escape`/`Q`. They are real commands now -- `Escape` no longer
+        // closes the window -- so they are asserted in `quit_commands_parse`
+        // instead. Commands are case-sensitive, so `W` is still unknown.
         assert_eq!(parse_command("W"), Command::Unknown("W".to_string()));
+        assert_eq!(parse_command("Q"), Command::Unknown("Q".to_string()));
+        assert_eq!(parse_command("zz"), Command::Unknown("zz".to_string()));
     }
 }

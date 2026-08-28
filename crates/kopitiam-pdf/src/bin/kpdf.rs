@@ -82,10 +82,22 @@
 //! could not help either, since that cost is paid inside one indivisible
 //! extraction. See [`SearchWorker`].
 //!
-//! Still on the UI thread, honestly: pressing `n` when the next hit is on a
-//! page nothing has searched yet must search it there and then, because it
-//! has to answer *where* the next hit is. The prefetch makes that rare rather
-//! than impossible.
+//! Searching never blocks the window, including the first `/`. A scan for the
+//! next hit examines only pages already searched; the moment it reaches an
+//! unsearched one it parks and resumes as the worker delivers. That matters
+//! more than it sounds: searching the 506-page Irodori book for a word it
+//! does not contain scans **every page** and took **16.3 seconds** of frozen
+//! UI when the scan ran inline.
+//!
+//! # Quitting is `:q` / `:wq` only
+//!
+//! `Escape` does **not** close the window. It is the key every panel uses for
+//! "cancel" — the find bar, the command line, a form edit — so having it also
+//! quit meant one press too many threw the session away. At top level it now
+//! clears the search and its highlights, or says there is nothing to cancel.
+//! `:q` quits, `:wq` (or `:x`) saves in place and quits, and the forcing
+//! spellings `:q!`/`:wq!` are accepted as the same thing since kpdf never
+//! blocks a quit on unsaved edits.
 //!
 //! # Live lecturing: blank pages on demand
 //!
@@ -321,7 +333,7 @@ use kopitiam_pdf::gui_frontend::{
     consume_commit_enter, continuous_slot_visible,
     current_page_in_view, drawable_annot_count, field_highlight_kind, field_rect_to_screen,
     g_pending_expired, half_viewport_step, highlight_colors, hit_test_annot, hit_test_field,
-    hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect,
+    hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect, stext_to_screen,
     page_to_screen, parse_command, rgb_to_rgba, screen_to_page_at, select_tool, toggle_forms_mode,
     zoom_percent, zoom_steps_from_zoom_delta,
 };
@@ -375,6 +387,14 @@ const THUMBNAIL_DPI: f32 = 24.0;
 /// that jumping elsewhere is served promptly, while covering everything
 /// visible in continuous scroll at normal zoom.
 const SEARCH_PREFETCH_RADIUS: usize = 2;
+
+/// How many pages ahead of a parked scan to queue at once.
+///
+/// The scan needs its frontier page before it can move, so queuing only that
+/// one page would make the search advance a page per round trip. Queuing a
+/// short run ahead keeps the worker busy without committing the whole
+/// document to the queue, so a jump elsewhere is still served promptly.
+const SEARCH_SCAN_LOOKAHEAD: usize = 8;
 
 /// Vertical gap (screen points) between consecutive pages in the continuous
 /// layout -- large enough that the boundary between two pages is visually
@@ -507,6 +527,16 @@ impl SearchWorker {
     }
 }
 
+/// Where a hit-scan got to, so it can resume when more pages are searched.
+struct FindScan {
+    forward: bool,
+    /// The next page to examine, in scan order.
+    next: usize,
+    /// How many more pages to examine before concluding there is no match.
+    /// Counts down so the scan wraps the document exactly once.
+    remaining: usize,
+}
+
 /// The find bar's transient state while it is open.
 ///
 /// `backward` records which key opened it — `/` searches forward, `?`
@@ -561,6 +591,16 @@ struct KpdfApp {
     /// `/MediaBox` sizing was introduced to remove, and a reader only ever
     /// needs the next hit.
     find_hits: HashMap<usize, Vec<SearchHit>>,
+    /// An in-progress scan for the next hit, when the answer is not yet
+    /// known from cached pages alone.
+    ///
+    /// `/` and `n` must answer *where* the next hit is, which in the worst
+    /// case means examining every page. Doing that synchronously is what hung
+    /// the window for minutes on a 506-page book: pages cost a median 5.4 ms
+    /// but up to 349 ms each. So the scan stops at the first page nothing has
+    /// searched yet, records where it got to here, and resumes as the
+    /// background worker delivers.
+    find_scan: Option<FindScan>,
     /// The background searcher for the current query, if one is running.
     find_worker: Option<SearchWorker>,
     /// The hit the view is currently on: `(page, index within that page)`.
@@ -733,6 +773,7 @@ impl KpdfApp {
             find: None,
             find_query: String::new(),
             find_hits: HashMap::new(),
+            find_scan: None,
             find_worker: None,
             find_current: None,
             outline: Vec::new(),
@@ -1430,12 +1471,16 @@ impl KpdfApp {
         self.find_hits.get(&page).map_or(&[][..], Vec::as_slice)
     }
 
-    /// Move to the next (or previous) hit, scanning pages until one is found.
+    /// Move to the next (or previous) hit.
     ///
-    /// `from_current_page` restarts the scan at the page in view (what a fresh
-    /// `/` does); otherwise it continues from the hit already selected (what
-    /// `n` does). The scan wraps once around the document and gives up, so a
-    /// query with no matches anywhere reports that instead of looping.
+    /// `from_current_page` restarts at the page in view (a fresh `/`);
+    /// otherwise it continues from the hit already selected (`n`).
+    ///
+    /// Only pages **already searched** are examined here. The moment the scan
+    /// reaches an unsearched page it stops and hands off to the background
+    /// worker ([`KpdfApp::resume_scan`]), because searching a page can cost
+    /// up to 349 ms and a scan may cross the whole document — which is what
+    /// hung the window for minutes on the 506-page Irodori book.
     fn find_step(&mut self, forward: bool, from_current_page: bool) {
         if self.find_query.is_empty() {
             self.status = Some("no search — press / to find".into());
@@ -1445,53 +1490,84 @@ impl KpdfApp {
         if n == 0 {
             return;
         }
-
-        // Where to resume from.
-        let (mut page, mut idx): (usize, Option<usize>) = match (from_current_page, self.find_current) {
+        let (page, idx) = match (from_current_page, self.find_current) {
             (false, Some((p, i))) => (p, Some(i)),
             _ => (self.page, None),
         };
+        self.scan_from(forward, page, idx, n);
+    }
 
-        for step in 0..=n {
-            let hits_len = self.hits_on(page).len();
+    /// Walk pages in scan order looking for the next hit, using cached pages
+    /// only. Parks the scan at the first unsearched page.
+    fn scan_from(&mut self, forward: bool, start: usize, start_idx: Option<usize>, budget: usize) {
+        let n = self.page_count;
+        let mut page = start;
+        let mut idx = start_idx;
+        for step in 0..=budget {
+            let Some(hits) = self.find_hits.get(&page) else {
+                // Unsearched: park here and let the worker catch up.
+                self.find_scan = Some(FindScan {
+                    forward,
+                    next: page,
+                    remaining: budget.saturating_sub(step),
+                });
+                self.status = Some(format!("searching for {:?}…", self.find_query));
+                // With no worker (spawn failed) there is nothing to wait for,
+                // so fall back to searching here: slow beats never answering.
+                if self.find_worker.is_none() {
+                    let _ = self.hits_on(page);
+                    let scan = self.find_scan.take();
+                    if let Some(scan) = scan {
+                        self.scan_from(scan.forward, scan.next, None, scan.remaining);
+                    }
+                }
+                return;
+            };
+            let len = hits.len();
             let next = match (idx, forward) {
-                // Continuing on the page we are already on.
-                (Some(i), true) if i + 1 < hits_len => Some(i + 1),
+                (Some(i), true) if i + 1 < len => Some(i + 1),
                 (Some(i), false) if i > 0 => Some(i - 1),
                 (Some(_), _) => None,
-                // Arriving on a fresh page: take its first or last hit.
-                (None, true) if hits_len > 0 => Some(0),
-                (None, false) if hits_len > 0 => Some(hits_len - 1),
+                (None, true) if len > 0 => Some(0),
+                (None, false) if len > 0 => Some(len - 1),
                 (None, _) => None,
             };
             if let Some(i) = next {
+                self.find_scan = None;
                 self.find_current = Some((page, i));
                 self.page = page;
                 self.scroll_to_page = Some(page);
-                let total: usize = hits_len;
                 self.status = Some(format!(
                     "/{} — hit {} of {} on page {}",
                     self.find_query,
                     i + 1,
-                    total,
+                    len,
                     page + 1
                 ));
                 return;
             }
-            // Nothing usable on this page: step to the next one and take its
-            // first/last hit rather than continuing an index into it.
-            if step == n {
+            if step == budget {
                 break;
             }
-            page = if forward {
-                (page + 1) % n
-            } else {
-                (page + n - 1) % n
-            };
+            page = if forward { (page + 1) % n } else { (page + n - 1) % n };
             idx = None;
         }
+        self.find_scan = None;
         self.find_current = None;
         self.status = Some(format!("no match for {:?}", self.find_query));
+    }
+
+    /// Continue a parked scan now that more pages have been searched.
+    fn resume_scan(&mut self) {
+        let Some(scan) = self.find_scan.take() else {
+            return;
+        };
+        if !self.find_hits.contains_key(&scan.next) {
+            // Still waiting on that page; put the scan back untouched.
+            self.find_scan = Some(scan);
+            return;
+        }
+        self.scan_from(scan.forward, scan.next, None, scan.remaining);
     }
 
     /// Jump to an outline destination.
@@ -1955,6 +2031,15 @@ impl KpdfApp {
                             match parse_command(&buf) {
                                 Command::GotoPage(n) => self.goto_page_1based(n),
                                 Command::Write => self.save_in_place(),
+                                Command::Quit => {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    return;
+                                }
+                                Command::WriteQuit => {
+                                    self.save_in_place();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    return;
+                                }
                                 Command::Empty => {}
                                 Command::Unknown(what) => {
                                     // Say so rather than doing nothing: a
@@ -1986,9 +2071,25 @@ impl KpdfApp {
             }
 
             match key {
-                egui::Key::Q | egui::Key::Escape => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    return;
+                // NOTHING here closes the window. `Escape` is the key every
+                // panel uses for "cancel" -- the find bar, the command line,
+                // a form edit -- and having it also quit meant one press too
+                // many threw the session away. Quitting is `:q` / `:wq`
+                // only, which is the vim contract the maintainer asked for.
+                egui::Key::Escape => {
+                    // Nothing to cancel at top level; say so rather than
+                    // appear dead.
+                    if self.find_query.is_empty() {
+                        self.status = Some("nothing to cancel — :q to quit".into());
+                    } else {
+                        // A second Escape clears the search and its
+                        // highlights, which is what "cancel" should mean here.
+                        self.find_query.clear();
+                        self.find_hits.clear();
+                        self.find_current = None;
+                        self.find_worker = None;
+                        self.status = Some("search cleared".into());
+                    }
                 }
                 egui::Key::Tab => self.toggle_mode(),
                 egui::Key::O => self.open_via_dialog(),
@@ -2114,10 +2215,31 @@ impl KpdfApp {
             return;
         };
         // Everything finished since the last frame.
+        let mut arrived = false;
         while let Ok((page, hits)) = worker.res.try_recv() {
             self.find_hits.insert(page, hits);
+            arrived = true;
         }
-        for page in visible {
+
+        // A parked scan takes priority over the visible-page prefetch: the
+        // user is waiting on it, and the pages it needs may be nowhere near
+        // the ones on screen.
+        let scan_pages: Vec<usize> = match &self.find_scan {
+            Some(scan) => {
+                let n = self.page_count.max(1);
+                (0..SEARCH_SCAN_LOOKAHEAD.min(scan.remaining.max(1)))
+                    .map(|k| {
+                        if scan.forward {
+                            (scan.next + k) % n
+                        } else {
+                            (scan.next + n - (k % n)) % n
+                        }
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        for page in scan_pages.iter().chain(visible.iter()) {
             if self.find_hits.contains_key(page) || worker.requested.contains(page) {
                 continue;
             }
@@ -2127,6 +2249,12 @@ impl KpdfApp {
                 return;
             }
             worker.requested.insert(*page);
+        }
+
+        // Results changed the picture: see whether the parked scan can now
+        // reach a hit (possibly parking again further along).
+        if arrived {
+            self.resume_scan();
         }
     }
 
@@ -2163,8 +2291,12 @@ impl KpdfApp {
                 // The quad's own corners, mapped through the same page->screen
                 // transform the annotations use, so highlights track zoom and
                 // scroll exactly like everything else on the page.
-                let a = page_to_screen(q.ul.x, q.ul.y, layout);
-                let b = page_to_screen(q.lr.x, q.lr.y, layout);
+                // stext quads are in fitz page space (y-DOWN), not the
+                // y-up user space `page_to_screen` takes -- see
+                // `stext_to_screen`. Using the wrong one mirrors every
+                // highlight vertically, which is exactly what it did.
+                let a = stext_to_screen(q.ul.x, q.ul.y, layout);
+                let b = stext_to_screen(q.lr.x, q.lr.y, layout);
                 let rect = egui::Rect::from_two_pos(
                     egui::pos2(a.0, a.1),
                     egui::pos2(b.0, b.1),

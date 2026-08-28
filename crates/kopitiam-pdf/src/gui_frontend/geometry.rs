@@ -172,6 +172,35 @@ pub fn screen_to_page(screen_x: f32, screen_y: f32, layout: PageLayout) -> (f32,
 /// space, e.g. to paint an in-progress ink preview or to position something
 /// over a `/Rect`. See [`screen_to_page`]'s docs for the parameters and the
 /// y-flip this undoes.
+/// Map a point in **fitz page space** to the screen.
+///
+/// Not the same space as [`page_to_screen`], and mixing them up is a real bug
+/// rather than a theoretical one — it shipped in the first cut of search
+/// highlighting and put every highlight in the wrong place.
+///
+/// * [`page_to_screen`] takes **PDF user space**: y-up, origin bottom-left.
+///   That is what annotation `/Rect`s and destination coordinates use, so it
+///   flips y.
+/// * This takes **fitz page space**: y-down, origin top-left, box already
+///   translated to `(0, 0)` — what `page_ctm` produces and therefore what
+///   every `StextChar::quad` from the structured-text device is in
+///   (`page_run::page_ctm`: "left-handed (flip y), then rotate", then
+///   translate the box origin to the origin).
+///
+/// Because that space already matches the rendered image's own orientation,
+/// this is a plain scale with **no flip**. Passing stext coordinates through
+/// `page_to_screen` flips them a second time and mirrors the result
+/// vertically.
+pub fn stext_to_screen(x: f32, y: f32, layout: PageLayout) -> (f32, f32) {
+    if layout.page_w_pts <= 0.0 || layout.page_h_pts <= 0.0 {
+        return (layout.image_x, layout.image_y);
+    }
+    (
+        layout.image_x + (x / layout.page_w_pts) * layout.image_w,
+        layout.image_y + (y / layout.page_h_pts) * layout.image_h,
+    )
+}
+
 pub fn page_to_screen(page_x: f32, page_y: f32, layout: PageLayout) -> (f32, f32) {
     if layout.page_w_pts <= 0.0 || layout.page_h_pts <= 0.0 {
         return (layout.image_x, layout.image_y);
@@ -579,6 +608,64 @@ mod tests {
     }
 
     // -- page_size_pts ---------------------------------------------------
+
+    #[test]
+    /// The regression that shipped: stext coordinates are y-DOWN, so putting
+    /// them through `page_to_screen` (which flips for y-up user space) mirrors
+    /// every highlight vertically. A point near the top of the page must map
+    /// near the top of the image.
+    #[test]
+    fn stext_to_screen_does_not_flip_y() {
+        let layout = PageLayout {
+            image_x: 0.0,
+            image_y: 0.0,
+            image_w: 100.0,
+            image_h: 200.0,
+            page_w_pts: 50.0,
+            page_h_pts: 100.0,
+        };
+        // Top of the page in fitz space (y small) -> top of the image.
+        let (_, top) = stext_to_screen(0.0, 10.0, layout);
+        assert!(top < 40.0, "y=10/100 should land near the top, got {top}");
+        // Bottom of the page -> bottom of the image.
+        let (_, bottom) = stext_to_screen(0.0, 90.0, layout);
+        assert!(bottom > 160.0, "y=90/100 should land near the bottom, got {bottom}");
+        // And it is the OPPOSITE of what page_to_screen would have produced,
+        // which is precisely why the two must not be interchanged.
+        let (_, flipped) = page_to_screen(0.0, 10.0, layout);
+        assert!(
+            (flipped - bottom).abs() < 1.0,
+            "page_to_screen flips: {flipped} vs stext {bottom}"
+        );
+    }
+
+    #[test]
+    fn stext_to_screen_scales_x_and_respects_the_image_origin() {
+        let layout = PageLayout {
+            image_x: 7.0,
+            image_y: 11.0,
+            image_w: 100.0,
+            image_h: 200.0,
+            page_w_pts: 50.0,
+            page_h_pts: 100.0,
+        };
+        assert_eq!(stext_to_screen(0.0, 0.0, layout), (7.0, 11.0));
+        assert_eq!(stext_to_screen(50.0, 100.0, layout), (107.0, 211.0));
+        assert_eq!(stext_to_screen(25.0, 50.0, layout), (57.0, 111.0));
+    }
+
+    #[test]
+    fn stext_to_screen_survives_a_degenerate_page() {
+        let layout = PageLayout {
+            image_x: 3.0,
+            image_y: 4.0,
+            image_w: 10.0,
+            image_h: 10.0,
+            page_w_pts: 0.0,
+            page_h_pts: 0.0,
+        };
+        assert_eq!(stext_to_screen(5.0, 5.0, layout), (3.0, 4.0));
+    }
 
     #[test]
     fn page_size_pts_at_72_dpi_is_pixels_unchanged() {
