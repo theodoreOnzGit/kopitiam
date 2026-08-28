@@ -19,6 +19,16 @@
 //! before the viewer window does, so there is nothing to specify up front.
 //! Cancelling it exits quietly (not an error).
 //!
+//! # Forms open ready to fill in
+//!
+//! A document carrying an `/AcroForm` opens with **Forms mode already on**,
+//! so clicking a checkbox ticks it straight away. This used to default off,
+//! which made a form-heavy workbook look broken -- every click went to the
+//! pan tool and nothing happened, with nothing on screen saying a toolbar
+//! toggle stood in the way. Documents with no `/AcroForm` are unaffected.
+//!
+//! To annotate a form with the pen instead, turn Forms off in the toolbar.
+//!
 //! # Wacom / stylus users on Wayland: run under XWayland (bd-wdh)
 //!
 //! **If your tablet does nothing in kpdf, this is why.** On a Wayland
@@ -581,10 +591,19 @@ impl KpdfApp {
             fallback_enabled: true,
             reflow_pages: None,
             reflow_scroll: 0.0,
-            status: None,
+            status: has_acroform
+                .then(|| "form document -- Forms mode on, click a field to fill it".to_string()),
             annot_count: 0,
             tool: Tool::Pan,
-            forms_mode: false,
+            // Forms mode ON for a document that actually has an /AcroForm.
+            // It used to default off, which made a form-heavy workbook look
+            // broken: every click on a checkbox went to the pan tool and
+            // nothing happened, with no hint that a toolbar toggle was
+            // standing between the user and the field. A form is for filling
+            // in, so a form opens ready to fill in. Documents with no
+            // /AcroForm are unaffected -- the mode stays off and the toolbar
+            // button is not even shown.
+            forms_mode: has_acroform,
             has_acroform,
             edit_history: None,
             hot_reload,
@@ -629,16 +648,24 @@ impl KpdfApp {
                 self.status = None;
                 // A different document is a different byte history -- the
                 // old one's undo/redo stack describes edits to a file that
-                // is no longer open. Forms mode is reset to off rather than
-                // carried over stale, since the new document might not even
-                // have a forms button to have turned it back on with.
+                // is no longer open. Forms mode is not carried over stale
+                // either; it is re-decided from the NEW document, since the
+                // old one's answer says nothing about this one.
                 self.edit_history = None;
                 self.draw_stroke.clear();
                 self.draw_page = None;
                 self.form_edit = None;
                 self.form_edit_focus_pending = false;
                 self.form_fields_cache.clear();
-                self.forms_mode = false;
+                self.forms_mode = self.has_acroform;
+                if self.forms_mode {
+                    // `toggle_forms_mode`'s invariant: forms mode implies the
+                    // Pan tool. Without this a Pen left selected on the
+                    // previous document would swallow every field click here.
+                    self.tool = Tool::Pan;
+                    self.status =
+                        Some("form document -- Forms mode on, click a field to fill it".into());
+                }
                 self.g_pending.cancel();
                 self.g_armed_at = None;
             }
