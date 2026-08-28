@@ -718,6 +718,25 @@ Two things this change does **not** touch:
   "Attribution is mandatory" below. Becoming institute work does not open a path
   to relicensing.
 
+## Always speak to the maintainer in Singapore time (SGT, UTC+8)
+
+Whenever a time or date is stated **to the maintainer** — a chat reply, an issue
+comment, a bead note, a commit message — put it in **SGT**, not UTC. They read
+these in their own day; making them add eight hours in their head is friction
+for no reason, and an unlabelled UTC timestamp reads as a *wrong* local time
+rather than an ambiguous one.
+
+Practical notes:
+
+* Git, GitHub's API, `crates.io` and container filesystems all hand you **UTC**.
+  Convert before quoting, and say "SGT" explicitly so nobody has to guess which
+  it is.
+* Watch the date, not just the clock: 22:00 UTC is **06:00 SGT the next day**.
+  A UTC-dated "this happened Tuesday" can be Wednesday to them.
+* This is also what the sleep-hours rule below is denominated in, so getting the
+  zone wrong there gets the *rule* wrong — 23:30 UTC is 07:30 SGT, well outside
+  the window it is meant to protect.
+
 ## HARD RULE: the maintainer stays out of the loop during sleep hours (23:30–06:00 SGT)
 
 This is a **hard safety rule, not a preference**. It protects the maintainer's
