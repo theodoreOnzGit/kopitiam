@@ -18,7 +18,17 @@
 # keeps the rmux fork's own pins).
 [package]
 name = "kopi-beans"
-version = "0.1.7"
+# 0.1.8, not 0.1.7: 0.1.7 is already on crates.io, and this tree is now AHEAD
+# of it by exactly the gh-68 fix (84d3f6b -- the daemon used to point each
+# clone's .beads/issues.jsonl at a symlink into its own data dir, which is
+# unusable in any other clone). Verified by unpacking the published
+# kopi-beans-0.1.7.crate and diffing its src/ against this one: 3 files differ,
+# all three of them that fix, everything else byte-identical.
+#
+# The 53-file gap bd-s06 recorded (published tree three weeks ahead of git) is
+# CLOSED -- it was never lost work, it was sitting on the `develop` branch and
+# came across in the 2026-08-26 develop->main merge.
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.91"
 publish = true

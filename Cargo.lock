@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "kopi-beans"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bytes",
  "chrono",
