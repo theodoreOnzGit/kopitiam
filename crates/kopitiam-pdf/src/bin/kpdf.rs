@@ -53,6 +53,32 @@
 //! exist to serve: lecturing with a tablet. Worth putting in a shell alias
 //! before a lecture rather than discovering it in front of a room.
 //!
+//! # Find and contents (`/` `?` `n` `N` `t`)
+//!
+//! MuPDF's and vim's own bindings, as asked for:
+//!
+//! * **`/`** opens the find bar searching forward, **`?`** backward.
+//! * **`n`** goes to the next hit, **`N`** (Shift+n) the previous. Both wrap
+//!   once around the document and then report no match, rather than looping.
+//! * **`t`** toggles the contents sidebar (mupdf-gl's key), which lists the
+//!   outline and jumps on click.
+//!
+//! **This took `n`/`p` away from page navigation**, which they were bound to
+//! before. Page keys are now **`,`** and **`.`** (mupdf's own), and the arrows
+//! and PageUp/PageDown are unchanged — those were always bound.
+//!
+//! Searching is **incremental**: only the pages actually needed are extracted
+//! and searched, resuming from the page in view. Searching all 506 pages of a
+//! long document up front is precisely the all-pages-on-the-UI-thread stall
+//! that `/MediaBox` page sizing was introduced to remove, and a reader only
+//! ever needs the next hit.
+//!
+//! A consequence worth knowing: highlights are painted only for pages that
+//! have already been searched, so scrolling onto a page of hits shows nothing
+//! until `n` reaches it. Painting would otherwise have to extract text mid-
+//! frame, which is the cost being avoided. A background prefetch would close
+//! that gap without reintroducing the stall.
+//!
 //! # Live lecturing: blank pages on demand
 //!
 //! `a` inserts a blank page **after the page you are on** and jumps to it, at
@@ -293,7 +319,10 @@ use kopitiam_pdf::gui_frontend::{
 };
 use kopitiam_pdf::mupdf::annot_edit::{EditHistory, InkAnnotSpec, InkStroke};
 use kopitiam_pdf::mupdf::form::FieldKind;
-use kopitiam_pdf::mupdf::{PdfDocument, Rect, rasterize_page_with_fallback};
+use kopitiam_pdf::mupdf::outline::{OutlineItem, load_outline};
+use kopitiam_pdf::mupdf::stext_search::{SearchHit, search_page};
+use kopitiam_pdf::mupdf::structured_text::StextOptions;
+use kopitiam_pdf::mupdf::{PdfDocument, Rect, page_to_stext, rasterize_page_with_fallback};
 use kopitiam_pdf::{Page as TextPage, extract_mupdf_from_bytes};
 
 /// Ink color for a newly-drawn stroke (DeviceRGB, 0..=1) -- plain black, the
@@ -396,6 +425,19 @@ type PageTextureKey = (usize, u32, bool);
 /// built exactly once per (dpi, document, fallback) combination.
 type SlotsCacheKey = (u32, usize, bool);
 
+/// The find bar's transient state while it is open.
+///
+/// `backward` records which key opened it — `/` searches forward, `?`
+/// backward, exactly as vim and `mupdf-gl` do — so `Enter` knows which way to
+/// go without a second keystroke.
+struct FindBar {
+    query: String,
+    backward: bool,
+    /// `true` for exactly the frame after the bar opens, so the text field can
+    /// take focus once rather than stealing it back every frame.
+    focus_pending: bool,
+}
+
 struct KpdfApp {
     doc: PdfDocument,
     path: PathBuf,
@@ -424,6 +466,25 @@ struct KpdfApp {
     /// `Some(buf)` while a "go to page" number is being typed (image mode,
     /// triggered by `:`).
     cmdline: Option<String>,
+    /// The find bar, when open: the query being typed and which way `Enter`
+    /// will search. `None` means the bar is closed.
+    find: Option<FindBar>,
+    /// The committed query the hit cache belongs to. Cleared with the cache
+    /// whenever a new search is committed.
+    find_query: String,
+    /// Per-page hits for [`KpdfApp::find_query`], filled lazily.
+    ///
+    /// Lazily on purpose: searching every page of a 500-page document up
+    /// front is exactly the all-pages-on-the-UI-thread stall that
+    /// `/MediaBox` sizing was introduced to remove, and a reader only ever
+    /// needs the next hit.
+    find_hits: HashMap<usize, Vec<SearchHit>>,
+    /// The hit the view is currently on: `(page, index within that page)`.
+    find_current: Option<(usize, usize)>,
+    /// The document outline, loaded once per document.
+    outline: Vec<OutlineItem>,
+    /// Whether the contents sidebar is shown (`t`).
+    show_outline: bool,
     /// Leftover Ctrl+scroll signal not yet large enough to make a whole
     /// [`DPI_STEP`] move -- see `zoom.rs`'s `ZOOM_DELTA_PER_STEP` and
     /// `zoom_steps_from_zoom_delta`. Persists across frames so a slow or
@@ -585,6 +646,12 @@ impl KpdfApp {
             scroll_to_page: None,
             pending_scroll_delta: egui::Vec2::ZERO,
             cmdline: None,
+            find: None,
+            find_query: String::new(),
+            find_hits: HashMap::new(),
+            find_current: None,
+            outline: Vec::new(),
+            show_outline: false,
             scroll_zoom_accum: 0.0,
             last_viewport_h: 800.0,
             page_textures: HashMap::new(),
@@ -638,6 +705,10 @@ impl KpdfApp {
                 // document's unsaved-edit state (its history goes too, below).
                 self.hot_reload.mark_current(&self.path);
                 self.unsaved_edits = false;
+                // Search hits and the outline belong to the OLD document.
+                self.find_hits.clear();
+                self.find_current = None;
+                self.outline.clear();
                 self.page_count = page_count;
                 self.page = 0;
                 self.scroll_to_page = None;
@@ -1202,6 +1273,153 @@ impl KpdfApp {
         }
     }
 
+    /// Show or hide the contents sidebar, loading the outline the first time
+    /// it is asked for.
+    ///
+    /// Loaded lazily rather than on open: most documents are read without ever
+    /// opening the sidebar, and walking the outline tree resolves a
+    /// destination per item.
+    fn toggle_outline(&mut self) {
+        self.show_outline = !self.show_outline;
+        if self.show_outline && self.outline.is_empty() {
+            self.outline = load_outline(&self.doc);
+            if self.outline.is_empty() {
+                self.status = Some("this document has no outline".into());
+                self.show_outline = false;
+            }
+        }
+    }
+
+    /// Open the find bar. `/` searches forward, `?` backward — vim's and
+    /// `mupdf-gl`'s own convention, which is what the maintainer asked for.
+    fn open_find(&mut self, backward: bool) {
+        self.find = Some(FindBar {
+            query: self.find_query.clone(),
+            backward,
+            focus_pending: true,
+        });
+    }
+
+    /// Commit the typed query and jump to the first hit.
+    ///
+    /// A new query throws away the hit cache: it belongs to the old query and
+    /// keeping it would show stale highlights.
+    fn commit_find(&mut self) {
+        let Some(bar) = self.find.take() else { return };
+        let query = bar.query.trim().to_string();
+        if query.is_empty() {
+            self.find_query.clear();
+            self.find_hits.clear();
+            self.find_current = None;
+            return;
+        }
+        if query != self.find_query {
+            self.find_query = query;
+            self.find_hits.clear();
+            self.find_current = None;
+        }
+        // Search starts from the page in view, not from page 1 — the reader is
+        // looking for the next occurrence from where they are.
+        self.find_step(!bar.backward, true);
+    }
+
+    /// The hits on `page` for the current query, extracting and searching that
+    /// page the first time it is asked for.
+    ///
+    /// One page at a time is the whole point: a 500-page document is never
+    /// searched up front, so opening the find bar cannot stall the UI.
+    fn hits_on(&mut self, page: usize) -> &[SearchHit] {
+        if !self.find_hits.contains_key(&page) {
+            let hits = page_to_stext(&self.doc, page, StextOptions::default())
+                .map(|sp| search_page(&sp, &self.find_query))
+                .unwrap_or_default();
+            self.find_hits.insert(page, hits);
+        }
+        self.find_hits.get(&page).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Move to the next (or previous) hit, scanning pages until one is found.
+    ///
+    /// `from_current_page` restarts the scan at the page in view (what a fresh
+    /// `/` does); otherwise it continues from the hit already selected (what
+    /// `n` does). The scan wraps once around the document and gives up, so a
+    /// query with no matches anywhere reports that instead of looping.
+    fn find_step(&mut self, forward: bool, from_current_page: bool) {
+        if self.find_query.is_empty() {
+            self.status = Some("no search — press / to find".into());
+            return;
+        }
+        let n = self.page_count;
+        if n == 0 {
+            return;
+        }
+
+        // Where to resume from.
+        let (mut page, mut idx): (usize, Option<usize>) = match (from_current_page, self.find_current) {
+            (false, Some((p, i))) => (p, Some(i)),
+            _ => (self.page, None),
+        };
+
+        for step in 0..=n {
+            let hits_len = self.hits_on(page).len();
+            let next = match (idx, forward) {
+                // Continuing on the page we are already on.
+                (Some(i), true) if i + 1 < hits_len => Some(i + 1),
+                (Some(i), false) if i > 0 => Some(i - 1),
+                (Some(_), _) => None,
+                // Arriving on a fresh page: take its first or last hit.
+                (None, true) if hits_len > 0 => Some(0),
+                (None, false) if hits_len > 0 => Some(hits_len - 1),
+                (None, _) => None,
+            };
+            if let Some(i) = next {
+                self.find_current = Some((page, i));
+                self.page = page;
+                self.scroll_to_page = Some(page);
+                let total: usize = hits_len;
+                self.status = Some(format!(
+                    "/{} — hit {} of {} on page {}",
+                    self.find_query,
+                    i + 1,
+                    total,
+                    page + 1
+                ));
+                return;
+            }
+            // Nothing usable on this page: step to the next one and take its
+            // first/last hit rather than continuing an index into it.
+            if step == n {
+                break;
+            }
+            page = if forward {
+                (page + 1) % n
+            } else {
+                (page + n - 1) % n
+            };
+            idx = None;
+        }
+        self.find_current = None;
+        self.status = Some(format!("no match for {:?}", self.find_query));
+    }
+
+    /// Jump to an outline destination.
+    fn goto_destination(&mut self, dest: &kopitiam_pdf::mupdf::destination::Destination) {
+        use kopitiam_pdf::mupdf::destination::Destination;
+        match dest {
+            Destination::Page { page, .. } => {
+                let p = (*page).min(self.page_count.saturating_sub(1));
+                self.page = p;
+                self.scroll_to_page = Some(p);
+            }
+            // Opening a browser is the application's call, not the viewer's:
+            // say where it points and let the operator decide.
+            Destination::Uri(u) => self.status = Some(format!("link: {u}")),
+            Destination::Unsupported(kind) => {
+                self.status = Some(format!("{kind} destinations are not followed"));
+            }
+        }
+    }
+
     /// Poll the open file and reload it if it changed on disk (hot reload).
     ///
     /// Ported from `kovan`'s `check_hot_reload`, with one addition kovan does
@@ -1621,10 +1839,21 @@ impl KpdfApp {
             // handling (digit entry vs. just Escape-to-cancel) still
             // differs beneath it. See `keys_captured`'s docs: a `j` typed
             // into a form field must insert `j`, never scroll.
-            if keys_captured(self.cmdline.is_some(), self.form_edit.is_some()) {
+            if keys_captured(
+                self.cmdline.is_some() || self.find.is_some(),
+                self.form_edit.is_some(),
+            ) {
                 if self.form_edit.is_some() {
                     if key == egui::Key::Escape {
                         self.form_edit = None;
+                    }
+                } else if self.find.is_some() {
+                    // The text field itself handles typing; only the two
+                    // control keys are ours.
+                    match key {
+                        egui::Key::Escape => self.find = None,
+                        egui::Key::Enter => self.commit_find(),
+                        _ => {}
                     }
                 } else if self.cmdline.is_some() {
                     match key {
@@ -1697,8 +1926,18 @@ impl KpdfApp {
 
         match key {
             egui::Key::R => self.mode = Mode::Reflow,
-            egui::Key::N | egui::Key::ArrowRight | egui::Key::PageDown => self.next_page(),
-            egui::Key::P | egui::Key::ArrowLeft | egui::Key::PageUp => self.prev_page(),
+            // `/` and `?` open the find bar; `n`/`N` step through hits.
+            // vim's and mupdf-gl's convention, which is what was asked for.
+            // This TOOK `n`/`p` away from page navigation: page keys are now
+            // `,`/`.` (mupdf's own), plus the arrows and PageUp/PageDown,
+            // which were always bound and are unchanged.
+            egui::Key::Slash => self.open_find(false),
+            egui::Key::Questionmark => self.open_find(true),
+            egui::Key::N if modifiers.shift => self.find_step(false, false),
+            egui::Key::N => self.find_step(true, false),
+            egui::Key::T => self.toggle_outline(),
+            egui::Key::Period | egui::Key::ArrowRight | egui::Key::PageDown => self.next_page(),
+            egui::Key::Comma | egui::Key::ArrowLeft | egui::Key::PageUp => self.prev_page(),
             egui::Key::Plus | egui::Key::Equals => self.zoom_in(),
             egui::Key::Minus => self.zoom_out(),
             // `:N<Enter>` -- vim's own line-number-jump idiom, reused here
@@ -1773,6 +2012,142 @@ impl KpdfApp {
     /// scrolled into view are rasterized/uploaded, rather than every page in
     /// the document up front (the sidebar's own scroll position is
     /// independent of the main continuous view's).
+    /// Paint this page's search hits.
+    ///
+    /// Every hit on the page is shaded; the one the view is *on* is drawn
+    /// stronger, so `n` visibly moves rather than just scrolling. A hit's
+    /// quads are drawn individually, never as one union box — a phrase broken
+    /// across a line break would otherwise be highlighted along with all the
+    /// text between its two fragments.
+    fn paint_search_highlights(&mut self, ui: &mut egui::Ui, page: usize, layout: PageLayout) {
+        if self.find_query.is_empty() {
+            return;
+        }
+        // Only ever paints what is already cached: a page scrolling into view
+        // must not trigger a text extraction mid-frame, which would make
+        // scrolling cost exactly what lazy searching exists to avoid.
+        let Some(hits) = self.find_hits.get(&page) else {
+            return;
+        };
+        if hits.is_empty() {
+            return;
+        }
+        let current = self.find_current;
+        let painter = ui.painter();
+        for (i, hit) in hits.iter().enumerate() {
+            let is_current = current == Some((page, i));
+            let fill = if is_current {
+                egui::Color32::from_rgba_unmultiplied(255, 165, 0, 110)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 235, 59, 70)
+            };
+            for q in &hit.quads {
+                // The quad's own corners, mapped through the same page->screen
+                // transform the annotations use, so highlights track zoom and
+                // scroll exactly like everything else on the page.
+                let a = page_to_screen(q.ul.x, q.ul.y, layout);
+                let b = page_to_screen(q.lr.x, q.lr.y, layout);
+                let rect = egui::Rect::from_two_pos(
+                    egui::pos2(a.0, a.1),
+                    egui::pos2(b.0, b.1),
+                );
+                painter.rect_filled(rect, 1.0, fill);
+                if is_current {
+                    painter.rect_stroke(
+                        rect,
+                        1.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 90, 0)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The find bar: a text field plus the hit counter.
+    ///
+    /// A real `egui::TextEdit` rather than the key-by-key buffer `:` uses,
+    /// because a search query is arbitrary text — it needs paste, selection
+    /// and IME, none of which a hand-rolled keystroke loop gets right.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        let mut commit = false;
+        let mut close = false;
+        if let Some(bar) = self.find.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label(if bar.backward { "?" } else { "/" });
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut bar.query)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("find in document"),
+                );
+                if bar.focus_pending {
+                    field.request_focus();
+                    bar.focus_pending = false;
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                if ui.button("Find").clicked() {
+                    commit = true;
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        }
+        if commit {
+            self.commit_find();
+        } else if close {
+            self.find = None;
+        }
+    }
+
+    /// The contents sidebar: the outline, indented, each item jumping to its
+    /// destination.
+    fn outline_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Contents").strong());
+            if ui.small_button("x").clicked() {
+                self.show_outline = false;
+            }
+        });
+        ui.separator();
+        // The tree is flattened for display so the whole sidebar is one
+        // scroll area; `depth` carries the indent that shows the nesting.
+        let flat = flatten_outline(&self.outline, 0);
+        let mut jump = None;
+        egui::ScrollArea::vertical()
+            .id_salt("kpdf_outline_scroll")
+            .show(ui, |ui| {
+                for (depth, item) in &flat {
+                    ui.horizontal(|ui| {
+                        ui.add_space(*depth as f32 * 12.0);
+                        let label = if item.title.is_empty() {
+                            "(untitled)"
+                        } else {
+                            item.title.as_str()
+                        };
+                        // An item with no resolvable destination is shown but
+                        // not clickable: it is still structure worth seeing,
+                        // and a button that does nothing is worse than none.
+                        match &item.dest {
+                            Some(d) => {
+                                if ui.link(label).clicked() {
+                                    jump = Some(d.clone());
+                                }
+                            }
+                            None => {
+                                ui.weak(label);
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some(d) = jump {
+            self.goto_destination(&d);
+        }
+    }
+
     fn thumbnail_sidebar(&mut self, ui: &mut egui::Ui) {
         let page_count = self.page_count;
         let row_height = 96.0;
@@ -1848,6 +2223,20 @@ fn pick_pdf() -> Option<PathBuf> {
 /// not the shifted character -- and vim's commands are lowercase anyway, so
 /// folding here means `:w` works whether or not Caps Lock is on, while
 /// [`parse_command`] can still reject a genuinely different command.
+/// Flatten an outline tree into `(depth, item)` pairs in reading order, so
+/// the sidebar can render it as one list with indentation.
+fn flatten_outline(items: &[OutlineItem], depth: usize) -> Vec<(usize, &OutlineItem)> {
+    let mut out = Vec::new();
+    for it in items {
+        out.push((depth, it));
+        // Children of a collapsed item are still listed: kpdf's sidebar has no
+        // expand/collapse control yet, and hiding them would make parts of the
+        // document unreachable from it.
+        out.extend(flatten_outline(&it.children, depth + 1));
+    }
+    out
+}
+
 fn cmdline_char(key: egui::Key) -> Option<char> {
     use egui::Key::*;
     Some(match key {
@@ -2101,11 +2490,22 @@ impl eframe::App for KpdfApp {
             });
         });
 
+        if self.show_outline && !self.outline.is_empty() {
+            egui::Panel::left("kpdf_outline")
+                .resizable(true)
+                .default_size(240.0)
+                .show(ui, |ui| self.outline_sidebar(ui));
+        }
+
         if self.mode == Mode::Image && self.page_count > 1 && !self.hide_thumbnails {
             egui::Panel::left("kpdf_thumbnails")
                 .resizable(true)
                 .default_size(110.0)
                 .show(ui, |ui| self.thumbnail_sidebar(ui));
+        }
+
+        if self.find.is_some() {
+            egui::Panel::bottom("kpdf_find").show(ui, |ui| self.find_bar(ui));
         }
 
         egui::CentralPanel::default().show(ui, |ui| match self.mode {
@@ -2182,6 +2582,8 @@ impl eframe::App for KpdfApp {
                                 page_w_pts: slot.page_w_pts,
                                 page_h_pts: slot.page_h_pts,
                             };
+
+                            self.paint_search_highlights(ui, slot.page_index, layout);
 
                             if self.forms_mode {
                                 self.refresh_form_fields_cache(slot.page_index);
