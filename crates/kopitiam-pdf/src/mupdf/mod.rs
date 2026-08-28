@@ -107,6 +107,7 @@ pub mod resources;
 pub mod standard_encodings;
 pub mod standard_font;
 pub mod stext_boxer;
+pub mod stext_search;
 pub mod stext_classify;
 pub mod stext_device;
 pub mod stext_iterator;
