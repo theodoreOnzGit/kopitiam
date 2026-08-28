@@ -64,6 +64,8 @@
 //! own. Integrating with `kopitiam-core` / `kopitiam-tensor` (their `Device` and
 //! dtype types) is a follow-up, not part of this cut.
 
+pub mod lazy;
+pub use lazy::LazyExecutor;
 mod context;
 mod executor;
 pub mod ops;
