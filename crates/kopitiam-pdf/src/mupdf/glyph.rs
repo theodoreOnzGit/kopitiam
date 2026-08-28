@@ -44,19 +44,35 @@
 //!   the draw device keeps its advance-box fallback. Never a panic, never a
 //!   corrupted pixmap.
 //!
-//! ## Second opinion: skrifa, per glyph
+//! ## Rescue order: skrifa first, our decoders second, hayro last (gh-91)
 //!
-//! The two decoders above have documented ceilings (gh-67: predefined-Expert
-//! CFF encoding, CID-keyed CFF edge cases, the `seac` operator) where the font
-//! parses fine but *one particular glyph*'s charstring/outline decode fails.
 //! [`FontProgram`] additionally carries an optional
-//! [`SkrifaProgram`](super::glyph_skrifa::SkrifaProgram) -- parsed from the
-//! same bytes -- and [`FontProgram::outline`] tries the primary decoder
-//! **first**, only asking skrifa when that returns `None`. This is strictly
-//! additive: every glyph the primary decoders already handle is unaffected;
-//! skrifa only ever fills a gap. See [`glyph_skrifa`](super::glyph_skrifa) for
-//! why skrifa is scoped to `/FontFile2` / `/FontFile3` (OpenType `glyf` /
-//! `CFF`), never `/FontFile` (Type1).
+//! [`SkrifaProgram`](super::glyph_skrifa::SkrifaProgram), parsed from the same
+//! bytes, and [`FontProgram::outline`] asks **skrifa first**, falling to the
+//! from-spec decoder above only when skrifa has nothing, and to the advance box
+//! (which is what hands the page to hayro) only when neither does:
+//!
+//! ```text
+//!   skrifa  ->  ours  ->  advance box (=> hayro)
+//! ```
+//!
+//! **This order was deliberately inverted** — gh-90 shipped ours-first, gh-91
+//! flipped it on the maintainer's instruction — so the reasoning is worth
+//! keeping, not just the outcome. Ours-first was the conservative call: it
+//! cannot change any glyph that already renders, so skrifa could only ever
+//! *fill a gap* (the documented gh-67 ceilings: predefined-Expert CFF encoding,
+//! CID-keyed CFF edge cases, the `seac` operator). Skrifa-first is the
+//! *most-correct-engine-first* call instead: skrifa (Google's `fontations`) is
+//! a far more battle-tested OpenType implementation than decoders we wrote from
+//! the spec, so where the two disagree about a real glyph, skrifa is the better
+//! bet. The cost is that it changes the rendering of glyphs that already
+//! worked, which is why gh-91 carried a pixel-diff verification bar rather than
+//! just a green test suite.
+//!
+//! What is *not* negotiable in that chain: hayro stays last, and Type1
+//! (`/FontFile`) never enters it at all. See
+//! [`glyph_skrifa`](super::glyph_skrifa) for why skrifa is scoped to
+//! `/FontFile2` / `/FontFile3` (OpenType `glyf` / `CFF`), never `/FontFile`.
 //!
 //! A note on why [`FontProgram`] still looks like a plain two-variant enum
 //! rather than the more obvious `{ primary, skrifa }` struct: `font.rs`'s
@@ -128,6 +144,19 @@ pub enum FontProgram {
     /// size every `FontProgram` -- including the common TrueType case -- to
     /// the larger one.
     Cff(Box<CffWithSkrifa>),
+    /// **skrifa alone**: a program neither from-spec decoder could parse at
+    /// all, that skrifa nevertheless reads. There is no primary decoder behind
+    /// this variant, so both the outline *and* the GID resolution come from
+    /// skrifa (see [`select_gid`](super::font::Font) and
+    /// [`SkrifaProgram::gid_for_code`](super::glyph_skrifa::SkrifaProgram::gid_for_code)).
+    ///
+    /// Reaching this variant is **strictly better than the alternative**, and
+    /// that is the whole argument for it: before gh-91 a font our decoders
+    /// rejected produced no [`FontProgram`] at all, so every one of its glyphs
+    /// painted an advance box and the page went to hayro. Nothing that renders
+    /// today can regress into this variant — it is only ever constructed where
+    /// [`FontProgram::parse`] used to return `None`.
+    Skrifa(SkrifaProgram),
 }
 
 impl FontProgram {
@@ -152,17 +181,15 @@ impl FontProgram {
     /// * `OTTO` -> OpenType with a `CFF ` table.
     /// * otherwise -> a bare CFF (`/FontFile3` `Type1C` / `CIDFontType0C`).
     ///
-    /// Whether `parse` succeeds is decided by the **primary** decoder alone,
-    /// exactly as before this module gained a skrifa second opinion: skrifa is
-    /// attached when it *also* parses the same bytes, but a font our own
-    /// decoders reject outright still yields `None` here, with no skrifa
-    /// rescue. This is a real scope limit, not an oversight -- see this
-    /// crate's `glyph_skrifa.rs` module docs and the implementation report for
-    /// why (in short: GID resolution for a wholly-skrifa font would need
-    /// `select_gid` in `font.rs` to know about skrifa too, which is out of
-    /// this change's owned files). What skrifa *does* rescue is the documented
-    /// per-glyph ceiling (gh-67): a font that parses fine here but fails to
-    /// decode one particular glyph's outline.
+    /// **A primary decoder is no longer required** (gh-91). When the from-spec
+    /// decoder rejects the program outright but skrifa reads it, this returns
+    /// [`FontProgram::Skrifa`] instead of `None`, and GID resolution for that
+    /// font comes from skrifa's own `cmap` / CFF `Encoding` / CFF charset (see
+    /// [`Font::select_gid`](super::font::Font)). Before gh-91 that case yielded
+    /// `None`, which meant an advance box per glyph and the whole page handed
+    /// to hayro — so this widening cannot regress a font that already rendered,
+    /// it can only rescue one that didn't. `None` now means *neither* engine
+    /// could make sense of the bytes.
     pub fn parse(bytes: &[u8]) -> Option<FontProgram> {
         if bytes.len() < 4 {
             return None;
@@ -172,19 +199,25 @@ impl FontProgram {
         if tag[0] == b'%' || tag[0] == 0x80 {
             return None;
         }
+        let skrifa = SkrifaProgram::parse(bytes);
+        // `skrifa_only` is the last resort: it is reached only where every
+        // branch below would have returned `None` before gh-91.
+        let skrifa_only = || skrifa.clone().map(FontProgram::Skrifa);
         match tag {
             // sfnt wrappers: could carry either `glyf` or a `CFF ` table.
             b"\x00\x01\x00\x00" | b"true" | b"ttcf" | b"OTTO" => {
                 if let Some(cff) = TrueTypeProgram::cff_table(bytes) {
-                    let primary = CffProgram::parse(&cff)?;
-                    let skrifa = SkrifaProgram::parse(bytes);
+                    let Some(primary) = CffProgram::parse(&cff) else {
+                        return skrifa_only();
+                    };
                     return Some(FontProgram::Cff(Box::new(CffWithSkrifa {
                         primary,
                         skrifa,
                     })));
                 }
-                let primary = TrueTypeProgram::parse(bytes)?;
-                let skrifa = SkrifaProgram::parse(bytes);
+                let Some(primary) = TrueTypeProgram::parse(bytes) else {
+                    return skrifa_only();
+                };
                 Some(FontProgram::TrueType(TrueTypeWithSkrifa {
                     primary,
                     skrifa,
@@ -192,8 +225,9 @@ impl FontProgram {
             }
             // A bare CFF font program (typ. version 1.0 -> first byte 0x01).
             _ => {
-                let primary = CffProgram::parse(bytes)?;
-                let skrifa = SkrifaProgram::parse(bytes);
+                let Some(primary) = CffProgram::parse(bytes) else {
+                    return skrifa_only();
+                };
                 Some(FontProgram::Cff(Box::new(CffWithSkrifa {
                     primary,
                     skrifa,
@@ -207,21 +241,28 @@ impl FontProgram {
     /// primary decoder or (when present) the skrifa second opinion. The caller
     /// applies the text-rendering matrix + CTM.
     ///
-    /// Tries the primary decoder first; skrifa is only consulted when the
-    /// primary decoder returns `None` for this specific glyph. This ordering
-    /// is the crux of the design: it means every glyph the primary decoders
-    /// already handle renders exactly as before, and skrifa only ever fills a
-    /// gap (see this crate's `glyph_skrifa.rs` module docs).
+    /// **skrifa first, the from-spec decoder second** (gh-91): skrifa is asked
+    /// for every glyph, and the primary decoder only answers the ones skrifa
+    /// has nothing for. `None` from both is the advance-box signal, which is
+    /// what puts the page on hayro — so the full chain is
+    /// `skrifa -> ours -> hayro`, hayro always last.
+    ///
+    /// The order matters and was flipped on purpose; see this module's
+    /// "Rescue order" section for why ours-first came first and why
+    /// most-correct-engine-first replaced it.
     pub fn outline(&self, gid: u16) -> Option<Path> {
         match self {
             FontProgram::TrueType(t) => t
-                .primary
-                .outline(gid)
-                .or_else(|| t.skrifa.as_ref().and_then(|s| s.outline(gid))),
+                .skrifa
+                .as_ref()
+                .and_then(|s| s.outline(gid))
+                .or_else(|| t.primary.outline(gid)),
             FontProgram::Cff(c) => c
-                .primary
-                .outline(gid)
-                .or_else(|| c.skrifa.as_ref().and_then(|s| s.outline(gid))),
+                .skrifa
+                .as_ref()
+                .and_then(|s| s.outline(gid))
+                .or_else(|| c.primary.outline(gid)),
+            FontProgram::Skrifa(s) => s.outline(gid),
         }
     }
 }
@@ -413,12 +454,18 @@ mod tests {
     }
 
     /// Proves the ordering that is the whole point of this design: when BOTH
-    /// the primary decoder and skrifa can produce an outline for the same GID,
-    /// the primary's result wins. Deliberately mismatched inputs (box_font as
+    /// skrifa and the primary decoder can produce an outline for the same GID,
+    /// **skrifa's** result wins. Deliberately mismatched inputs (box_font as
     /// primary, a ring as the skrifa side) so a wrong ordering would be caught
     /// by a bounding-box mismatch, not just silently identical output.
+    ///
+    /// This test is the **record that the order changed on purpose** (gh-91).
+    /// It was `outline_prefers_primary_over_skrifa` and asserted the opposite
+    /// bounding box; it was inverted and renamed rather than deleted, so a
+    /// `git log -S` on either name lands on the decision instead of on a
+    /// vanished test.
     #[test]
-    fn outline_prefers_primary_over_skrifa() {
+    fn outline_prefers_skrifa_over_primary() {
         let primary = TrueTypeProgram::parse(&box_font()).expect("parse box font");
         let skrifa =
             SkrifaProgram::parse(&ring_font_with_metrics()).expect("parse ring font via skrifa");
@@ -433,12 +480,42 @@ mod tests {
         // These bounding boxes are disjoint enough that using the wrong source
         // cannot pass this assertion by accident.
         assert!(
-            (x0 - 0.0).abs() < 1e-3 && (y0 - 0.0).abs() < 1e-3,
-            "expected primary's box origin, got {x0},{y0}"
+            (x0 - 0.1).abs() < 1e-3 && (y0 - 0.1).abs() < 1e-3,
+            "expected skrifa's ring origin, got {x0},{y0} (looks like the primary's box instead)"
         );
         assert!(
-            (x1 - 0.5).abs() < 1e-3 && (y1 - 0.7).abs() < 1e-3,
-            "expected primary's box extent, got {x1},{y1} (looks like skrifa's ring instead)"
+            (x1 - 0.9).abs() < 1e-3 && (y1 - 0.9).abs() < 1e-3,
+            "expected skrifa's ring extent, got {x1},{y1} (looks like the primary's box instead)"
+        );
+    }
+
+    /// The mirror of the test above, and the reason skrifa-first is not simply
+    /// "skrifa-only": a glyph **skrifa** has nothing for still falls through to
+    /// the from-spec decoder. Same fixtures, roles swapped -- skrifa gets the
+    /// notdef-only font (gid 1 out of range for it), the primary gets the ring.
+    #[test]
+    fn outline_falls_back_to_primary_for_a_glyph_skrifa_lacks() {
+        let notdef_only = build_ttf_with_metrics(1000, &[simple_glyf(&[])]);
+        let skrifa = SkrifaProgram::parse(&notdef_only).expect("parse notdef-only via skrifa");
+        assert!(
+            skrifa.outline(1).is_none(),
+            "skrifa should have nothing for gid 1"
+        );
+        let primary =
+            TrueTypeProgram::parse(&ring_font_with_metrics()).expect("parse ring font as primary");
+        let program = FontProgram::TrueType(TrueTypeWithSkrifa {
+            primary,
+            skrifa: Some(skrifa),
+        });
+        let path = program.outline(1).expect("primary should fill the gap");
+        let (x0, y0, x1, y1) = bbox(&path);
+        assert!(
+            (x0 - 0.1).abs() < 1e-3 && (y0 - 0.1).abs() < 1e-3,
+            "{x0},{y0}"
+        );
+        assert!(
+            (x1 - 0.9).abs() < 1e-3 && (y1 - 0.9).abs() < 1e-3,
+            "{x1},{y1}"
         );
     }
 

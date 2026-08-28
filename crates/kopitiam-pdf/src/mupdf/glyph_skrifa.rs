@@ -126,6 +126,8 @@
 
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::raw::ps::cff::CffFontRef;
+use skrifa::raw::ps::string::Sid;
 use skrifa::raw::TableProvider;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 
@@ -256,6 +258,13 @@ pub struct SkrifaProgram {
     /// input, [`SYNTHETIC_UNITS_PER_EM`] for a wrapped bare CFF program) so
     /// [`outline`](SkrifaProgram::outline) doesn't need to re-read it per glyph.
     units_per_em: u16,
+    /// True when this program carries a **CID-keyed** `CFF ` table (its Top
+    /// DICT has `ROS`). Read once at parse time because
+    /// [`super::font::Font::select_gid`] needs it on *every* glyph to choose
+    /// between the charset (`cid -> gid`) and `/CIDToGIDMap`, and re-deriving
+    /// it per glyph would re-walk the Top DICT for nothing. `false` for a
+    /// `glyf` program, and for anything whose CFF table won't parse.
+    cff_is_cid_keyed: bool,
 }
 
 impl SkrifaProgram {
@@ -290,10 +299,87 @@ impl SkrifaProgram {
         // is also exactly what happens if `hmtx`/`hhea` are missing or
         // malformed. Catching that here means `outline()` never has to.
         font.outline_glyphs().format()?;
+        let cff_is_cid_keyed = cff_font_ref(&wrapped).is_some_and(|c| c.is_cid());
         Some(SkrifaProgram {
             bytes: wrapped,
             units_per_em,
+            cff_is_cid_keyed,
         })
+    }
+
+    /// Whether this program's `CFF ` table is **CID-keyed** (Top DICT `ROS`).
+    ///
+    /// [`super::font::Font`] uses this exactly the way it uses
+    /// [`CffProgram::is_cid_keyed`](super::glyph_cff::CffProgram::is_cid_keyed):
+    /// a `CIDFontType0` whose CFF is CID-keyed selects glyphs through the CFF
+    /// **charset** ([`gid_for_cid`](SkrifaProgram::gid_for_cid)), and one whose
+    /// CFF is *not* CID-keyed goes through the PDF's own `/CIDToGIDMap`
+    /// instead. Always `false` for a `glyf` (TrueType) program.
+    pub fn is_cid_keyed_cff(&self) -> bool {
+        self.cff_is_cid_keyed
+    }
+
+    /// `code -> gid` for a **simple** (non-CID) font, or `None` when the code
+    /// resolves to nothing (caller then falls back to `code == gid` identity,
+    /// same as the primary decoders' callers do).
+    ///
+    /// Two sources, tried in that order, because a font program is one shape or
+    /// the other and never both:
+    ///
+    /// 1. the sfnt **`cmap`**, via skrifa's [`Charmap`](skrifa::charmap::Charmap)
+    ///    — which already implements the `(3,0)` symbol-font convention of
+    ///    duplicating `U+F000..F0FF` at `U+0000..U+00FF`
+    ///    (`skrifa` `src/charmap.rs`, `CodepointSubtable::map`, following
+    ///    HarfBuzz), i.e. exactly what
+    ///    [`TrueTypeProgram::gid_for_code`](super::glyph_truetype::TrueTypeProgram::gid_for_code)
+    ///    hand-rolls;
+    /// 2. the **CFF `Encoding`**, via read-fonts' [`CffFontRef::encoding`] —
+    ///    which covers the font's custom Encoding *and* the predefined
+    ///    Standard/Expert ones. The Expert case is one of our own CFF decoder's
+    ///    documented ceilings (gh-67), so this path is strictly wider than
+    ///    [`CffProgram::gid_for_code`](super::glyph_cff::CffProgram::gid_for_code),
+    ///    not merely a duplicate of it.
+    ///
+    /// **Codes, not Unicode.** `code` is the raw PDF character code, handed to
+    /// the `cmap` as-is. That is deliberate and matches what the primary
+    /// TrueType decoder does: for the symbolic embedded fonts this path
+    /// actually serves, the `cmap` *is* keyed by the code. A font whose glyphs
+    /// are reachable only by going code -> glyph name -> Unicode -> `cmap`
+    /// is out of scope here, same as it is for the primary decoder.
+    pub fn gid_for_code(&self, code: u32) -> Option<u16> {
+        if let Ok(font) = FontRef::new(&self.bytes)
+            && let Some(gid) = font.charmap().map(code)
+        {
+            return u16::try_from(gid.to_u32()).ok();
+        }
+        let code = u8::try_from(code).ok()?;
+        let cff = cff_font_ref(&self.bytes)?;
+        let gid = cff.encoding()?.map(code)?;
+        u16::try_from(gid.to_u32()).ok()
+    }
+
+    /// `cid -> gid` through a **CID-keyed** CFF's charset, falling back to the
+    /// identity `cid == gid` when the charset doesn't list the CID — the same
+    /// identity-ordering fallback
+    /// [`CffProgram::gid_for_cid`](super::glyph_cff::CffProgram::gid_for_cid)
+    /// makes, so both decoders answer alike for a font neither has an entry
+    /// for.
+    ///
+    /// In a CID-keyed CFF the charset's SIDs *are* CIDs (CFF spec, `ROS`
+    /// operator), which is why the CID goes straight in as a [`Sid`]. Calling
+    /// this on a program that is **not** CID-keyed
+    /// ([`is_cid_keyed_cff`](SkrifaProgram::is_cid_keyed_cff) is `false`) is a
+    /// caller bug rather than a panic: it just returns the identity.
+    pub fn gid_for_cid(&self, cid: u32) -> u16 {
+        let identity = cid as u16;
+        let Ok(sid) = u16::try_from(cid) else {
+            return identity;
+        };
+        cff_font_ref(&self.bytes)
+            .and_then(|c| c.charset())
+            .and_then(|cs| cs.glyph_id(Sid::new(sid)).ok())
+            .and_then(|g| u16::try_from(g.to_u32()).ok())
+            .unwrap_or(identity)
     }
 
     /// The outline of glyph `gid`, in **em space** (y-up, 1 em = 1.0), or
@@ -314,6 +400,29 @@ impl SkrifaProgram {
             Some(pen.path)
         }
     }
+}
+
+/// The `CFF ` table of an sfnt-wrapped program, re-read as a read-fonts
+/// [`CffFontRef`] so the CFF's own **charset** and **Encoding** tables are
+/// reachable for GID resolution (they are not exposed on skrifa's higher-level
+/// outline API, which only ever wants a GID it already has).
+///
+/// `bytes` must be the *wrapped* form [`SkrifaProgram`] stores — the original
+/// sfnt for a `/FontFile2` / OpenType `/FontFile3`, or [`wrap_bare_cff`]'s
+/// synthetic `OTTO` for a bare CFF. Returns `None` for a `glyf`-only program
+/// (no `CFF ` table at all) or a CFF whose header/Top DICT won't read.
+///
+/// Top DICT index `0`: "The Name INDEX in the CFF data must contain only one
+/// entry; that is, there must be only one font in the CFF FontSet" for a CFF
+/// inside an OpenType wrapper (OpenType spec, `CFF ` table), which is the shape
+/// everything reaching here has — skrifa's own `cff::Outlines::from_cff`
+/// (`src/outline/cff/mod.rs`) passes `0` for the same reason. `upem = None`
+/// makes read-fonts assume the CFF-spec default 1000, which is irrelevant to
+/// charset/Encoding lookups (they are pure table reads, no scaling).
+fn cff_font_ref(bytes: &[u8]) -> Option<CffFontRef<'_>> {
+    let font = FontRef::new(bytes).ok()?;
+    let cff = font.cff().ok()?;
+    CffFontRef::new(cff.offset_data().as_bytes(), 0, None).ok()
 }
 
 /// An [`OutlinePen`] that scales skrifa's raw font-unit coordinates into em

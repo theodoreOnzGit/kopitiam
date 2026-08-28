@@ -521,6 +521,30 @@ impl Font {
                     cff.gid_for_code(cid).unwrap_or(cid as u16)
                 }
             }
+            // gh-91: no primary decoder behind this one -- skrifa parsed a
+            // program both from-spec decoders rejected, so skrifa's own tables
+            // answer the same four questions the arms above ask of ours. Same
+            // shape, same fallbacks, so a font that lands here selects glyphs
+            // by the same rules as one that doesn't.
+            FontProgram::Skrifa(sk) => {
+                if self.is_cid {
+                    if sk.is_cid_keyed_cff() {
+                        // CIDFontType0 CID-keyed CFF: the CFF charset maps
+                        // CID -> GID (its SIDs *are* CIDs).
+                        sk.gid_for_cid(cid)
+                    } else {
+                        // CIDFontType2, or a non-CID CFF wrapped as
+                        // CIDFontType0: /CIDToGIDMap, which is the PDF's own
+                        // table and needs no font-program help at all.
+                        self.map_cid_to_gid(cid)
+                    }
+                } else {
+                    // Simple font: the sfnt cmap, else the CFF Encoding;
+                    // identity when neither resolves the code, matching what
+                    // both arms above do.
+                    sk.gid_for_code(cid).unwrap_or(cid as u16)
+                }
+            }
         }
     }
 
