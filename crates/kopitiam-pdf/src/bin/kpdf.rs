@@ -19,6 +19,30 @@
 //! before the viewer window does, so there is nothing to specify up front.
 //! Cancelling it exits quietly (not an error).
 //!
+//! # Wacom / stylus users on Wayland: run under XWayland (bd-wdh)
+//!
+//! **If your tablet does nothing in kpdf, this is why.** On a Wayland
+//! session the stylus never draws: `winit` does not implement
+//! `zwp_tablet_v2`, so tablet events never reach `egui` at all. Nothing in
+//! kpdf is at fault and there is nothing to configure -- the protocol
+//! support is simply absent upstream.
+//!
+//! The workaround, confirmed by the maintainer on the hardware:
+//!
+//! ```text
+//! WAYLAND_DISPLAY= ./target/release/kpdf lecture.pdf
+//! ```
+//!
+//! Emptying `WAYLAND_DISPLAY` forces the app onto XWayland, where the tablet
+//! arrives via XInput2 -- which `winit` *does* support -- and the stylus
+//! works. As a bonus it is also markedly less laggy than the Wayland path on
+//! the same build and document (a separate, unmeasured performance gap;
+//! bd-75k).
+//!
+//! This matters most for exactly the workflow the page-editing keys below
+//! exist to serve: lecturing with a tablet. Worth putting in a shell alias
+//! before a lecture rather than discovering it in front of a room.
+//!
 //! # Live lecturing: blank pages on demand
 //!
 //! `a` inserts a blank page **after the page you are on** and jumps to it, at
