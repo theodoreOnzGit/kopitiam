@@ -149,6 +149,14 @@ pub struct Font {
     /// font program we do not have, so using them would draw arbitrary wrong
     /// glyphs. See [`Font::glyph_outline`].
     substitute: Option<Arc<CffProgram>>,
+    /// Which standard-14 face [`Font::substitute`] is, when there is one.
+    ///
+    /// Kept because Symbol and ZapfDingbats resolve a character code through
+    /// their own built-in encodings, not StandardEncoding (see
+    /// [`super::standard_encodings`]) -- a checkbox tick is ZapfDingbats
+    /// `4` = `a20`, a check mark, and asking for `four` instead draws
+    /// nothing at all.
+    substitute_face: Option<hayro::hayro_interpret::font::StandardFont>,
 }
 
 /// Where a loaded font's glyph outlines come from — the single fact that
@@ -288,6 +296,7 @@ impl Font {
             is_cid: false,
             cid_to_gid: CidToGid::Identity,
             substitute: None,
+            substitute_face: None,
         };
 
         // cid_to_ucs from the glyph names (pdf_load_to_unicode's `strings` path).
@@ -312,8 +321,9 @@ impl Font {
                 .dict_gets("BaseFont")
                 .map(|o| String::from_utf8_lossy(o.to_name()).into_owned())
                 .unwrap_or_default();
-            font.substitute = super::standard_font::select_standard_font(&base, &descriptor, doc)
-                .and_then(super::standard_font::program_for);
+            let face = super::standard_font::select_standard_font(&base, &descriptor, doc);
+            font.substitute = face.and_then(super::standard_font::program_for);
+            font.substitute_face = face;
         }
 
         // /ToUnicode stream (remapped through the identity encoding).
@@ -399,6 +409,7 @@ impl Font {
             is_cid: true,
             cid_to_gid,
             substitute: None,
+            substitute_face: None,
         };
 
         // /ToUnicode, remapped from code->Unicode to CID->Unicode.
@@ -560,14 +571,7 @@ impl Font {
             // does not, fall back to the substitute's own built-in encoding,
             // which for these faces is Adobe StandardEncoding and so still
             // resolves plain ASCII correctly.
-            let named = self
-                .glyph_names
-                .as_ref()
-                .and_then(|gn| gn.get(cid as usize))
-                .and_then(|o| o.as_deref())
-                .and_then(|n| sub.gid_for_name(n));
-            let gid = named.or_else(|| sub.gid_for_code(cid))?;
-            return sub.outline(gid);
+            return sub.outline(self.substitute_gid(cid)?);
         }
         let program = self.program.as_ref()?;
         let gid = self.select_gid(cid, program);
@@ -657,14 +661,43 @@ impl Font {
     /// document's GIDs mean nothing in a font it never embedded.
     fn substitute_advance(&self, cid: u32) -> Option<f32> {
         let sub = self.substitute.as_ref()?;
-        let named = self
+        sub.advance_width(self.substitute_gid(cid)?)
+    }
+
+    /// The substituted face's GID for `cid`, by glyph **name**.
+    ///
+    /// Name order, most specific first:
+    /// 1. the PDF's own `/Encoding` (+ `/Differences`), when it names this code;
+    /// 2. the face's built-in symbolic encoding, for Symbol and ZapfDingbats —
+    ///    those two do not follow StandardEncoding, and a symbolic font asked
+    ///    for a StandardEncoding name simply has no such glyph;
+    /// 3. the substitute's own built-in encoding (StandardEncoding for the
+    ///    text faces), which covers plain ASCII.
+    fn substitute_gid(&self, cid: u32) -> Option<u16> {
+        use hayro::hayro_interpret::font::StandardFont;
+        let sub = self.substitute.as_ref()?;
+        if let Some(gid) = self
             .glyph_names
             .as_ref()
             .and_then(|gn| gn.get(cid as usize))
             .and_then(|o| o.as_deref())
-            .and_then(|n| sub.gid_for_name(n));
-        let gid = named.or_else(|| sub.gid_for_code(cid))?;
-        sub.advance_width(gid)
+            .and_then(|n| sub.gid_for_name(n))
+        {
+            return Some(gid);
+        }
+        if let Ok(code) = u8::try_from(cid) {
+            let symbolic = match self.substitute_face {
+                Some(StandardFont::ZapfDingBats) => {
+                    super::standard_encodings::zapf_dingbats_name(code)
+                }
+                Some(StandardFont::Symbol) => super::standard_encodings::symbol_name(code),
+                _ => None,
+            };
+            if let Some(gid) = symbolic.and_then(|n| sub.gid_for_name(n)) {
+                return Some(gid);
+            }
+        }
+        sub.gid_for_code(cid)
     }
 
     pub fn decode_string(&self, buf: &[u8]) -> Vec<Decoded> {
@@ -1034,6 +1067,7 @@ endcmap\nend\nend";
             is_cid: false,
             cid_to_gid: CidToGid::Identity,
             substitute: None,
+            substitute_face: None,
         };
         let d = font.decode(0x41);
         assert_eq!(d.unicode, '\u{FFFD}');

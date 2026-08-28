@@ -229,6 +229,14 @@ copy would add megabytes and a second licence obligation for nothing.
 Both licences are permissive and absorb into AGPLv3 with their notices carried,
 per the licence-compatibility rules below.
 
+**Also ported: the symbolic encodings.** `mupdf/standard_encodings.rs`
+transcribes hayro's generated `zapf_dings.rs` and `symbol.rs` code→glyph-name
+tables (themselves the encodings PDF 32000-1:2008 lists in Annex D.5/D.6),
+again because they are `pub(crate)` upstream. Symbol and ZapfDingbats do not
+follow StandardEncoding: ZapfDingbats `0x34` is `a20`, a check mark, not
+`four`. Without them a Word checkbox's tick — drawn as `/ZaDb … (4) Tj` —
+silently never appeared.
+
 Worth recording for whoever meets these files next: despite the `.pfb`
 extension the payloads are **bare CFF** (they begin `01 00 04 02`, a CFF header,
 not a PFB `80 01` segment marker), which is why `mupdf/glyph_cff.rs` parses them
