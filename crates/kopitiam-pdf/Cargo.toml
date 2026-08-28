@@ -72,7 +72,37 @@ hayro = "=0.7.1"
 # decoding from spec. It does NOT replace the hayro fallback (the maintainer
 # was explicit: do not delete it) and it does NOT cover Type1 `/FontFile`,
 # which is outside skrifa's OpenType scope and stays with `glyph_type1.rs`.
-skrifa = "0.46"
+#
+# ## Why 0.42 and not the newest -- KEEP IT IN STEP WITH hayro
+#
+# `hayro-interpret 0.7.0` (under our pinned `hayro =0.7.1`) requires
+# `skrifa ^0.42.0`. Asking for `"0.46"` here does NOT conflict -- cargo simply
+# builds BOTH, because for `0.x` a caret pins the minor, so 0.42 and 0.46 are
+# separate incompatible majors as far as resolution is concerned. It compiles
+# and it passes; it just silently carries a second full copy of the font stack.
+#
+# Matching hayro's requirement makes the two share one copy instead
+# (measured: skrifa copies in this crate's tree went 3 -> 2).
+#
+# We cannot get to ONE copy: hayro wants `^0.42`, `epaint`/egui wants `0.44`,
+# and those two disagree with each other. So the only real choice is which of
+# them we share with, and BOTH were tested -- 0.42 and 0.44 each compile and
+# each leave exactly two copies. The maintainer okayed either.
+#
+# 0.42 (hayro's) wins on one concrete point: hayro is the FALLBACK RENDERER FOR
+# THE SAME FONTS. When `hayro_fallback.rs` re-renders a page, the glyph
+# decoding underneath should be the same skrifa our own path used -- otherwise
+# two engines can disagree about one font in one document, which is a rendering
+# divergence rather than a build-time cost. egui's copy only lays out UI text
+# and never meets a PDF font at all, so sharing with it buys nothing.
+#
+# So: **when bumping this, check what `hayro-interpret` asks for first** and
+# move both together. Bumping skrifa alone re-forks the dependency without any
+# error to warn you. Nothing today passes a skrifa type across the hayro
+# boundary (`hayro_fallback.rs` trades only `&[u8]` and a `Pixmap`), so the
+# cost of drifting is duplicate build time rather than a type mismatch -- but
+# that stops being true the moment either side exposes skrifa types in its API.
+skrifa = "0.42"
 
 # --- kpdf GUI stack (optional, behind the default `kpdf` feature) -------------
 # `src/bin/kpdf.rs` -- a lightweight native PDF reader. These were
