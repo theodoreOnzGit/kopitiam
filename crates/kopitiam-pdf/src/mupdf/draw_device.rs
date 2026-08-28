@@ -293,9 +293,27 @@ impl DrawDevice {
                     }
                     _ => [img.pixels[si], img.pixels[si + 1], img.pixels[si + 2]],
                 };
+                // Per-pixel alpha from the /SMask, sampled in the SAME
+                // normalized image space rather than at the base image's
+                // resolution -- the mask may be a different size (§11.6.5.3),
+                // and this way neither is resampled.
+                let a = match &img.smask {
+                    Some(m) if m.width > 0 && m.height > 0 => {
+                        let mx = ((ip.x * m.width as f32) as usize).min(m.width - 1);
+                        let my = ((ip.y * m.height as f32) as usize).min(m.height - 1);
+                        let cover = m.alpha[my * m.width + mx] as f32 / 255.0;
+                        // Fully transparent: skip entirely rather than blend by
+                        // zero, so a masked-out region costs nothing.
+                        if cover <= 0.0 {
+                            continue;
+                        }
+                        alpha * cover
+                    }
+                    _ => alpha,
+                };
                 if let Some(o) = self.pix.offset(px, py) {
-                    // Straight source-over at the image's alpha.
-                    blend_rgb(&mut self.pix.samples[o..o + 3], rgb, alpha);
+                    // Straight source-over at the combined alpha.
+                    blend_rgb(&mut self.pix.samples[o..o + 3], rgb, a);
                 }
             }
         }
@@ -727,6 +745,7 @@ mod tests {
         let mut dev = DrawDevice::new(20, 20, Matrix::IDENTITY);
         // A 2x2 solid red image mapped onto a 10x10 device square at (5,5).
         let img = DecodedImage {
+            smask: None,
             width: 2,
             height: 2,
             components: 3,

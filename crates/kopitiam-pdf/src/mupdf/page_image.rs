@@ -57,6 +57,21 @@ use zune_jpeg::zune_core::colorspace::ColorSpace;
 /// (`kopitiam-ocr`: `to_gray` -> `binarize` -> `find_text_lines` -> `recognize`)
 /// and the viewer's image mode consume.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoftMask {
+    /// Mask width in pixels — **independent of the base image's**. PDF
+    /// 32000-1:2008 §11.6.5.3 lets an `/SMask` carry its own resolution and
+    /// requires it to be scaled onto the image, so it is kept at its own size
+    /// and sampled in normalized image space rather than resampled up front:
+    /// no interpolation pass, and no precision lost when the mask is the
+    /// coarser of the two.
+    pub width: usize,
+    pub height: usize,
+    /// One alpha byte per mask pixel, row-major. 0 = fully transparent,
+    /// 255 = fully opaque.
+    pub alpha: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedImage {
     /// Image width in pixels.
     pub width: usize,
@@ -66,6 +81,15 @@ pub struct DecodedImage {
     pub components: u8,
     /// Row-major, 8-bit-per-component samples (`width * height * components`).
     pub pixels: Vec<u8>,
+    /// The image's `/SMask` soft mask (§11.6.5.3), if it has one — per-pixel
+    /// alpha to composite this image with.
+    ///
+    /// Ignoring this is not a cosmetic shortcut: a chart or logo exported by
+    /// Word stores its background as *opaque black* in the base image and
+    /// relies entirely on the mask to make it disappear. Drawn without the
+    /// mask, such an image is a solid black rectangle over the page — which is
+    /// exactly how the maintainer's workbook rendered before this existed.
+    pub smask: Option<SoftMask>,
 }
 
 /// The interpreted `/ColorSpace` of an image, reduced to what the sample decoder
@@ -231,6 +255,51 @@ pub(crate) fn decode_image_xobject(
 // MuPDF: pdf_load_image_imp (pdf-image.c:33).
 /// Decode one Image XObject to a [`DecodedImage`].
 fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result<DecodedImage> {
+    let mut img = decode_image_base(doc, dict, stream_ref)?;
+    img.smask = decode_smask(doc, dict);
+    Ok(img)
+}
+
+/// Decode an image's `/SMask` (§11.6.5.3) to per-pixel alpha.
+///
+/// The mask is itself an image XObject in `DeviceGray`, whose samples *are*
+/// the alpha. Returns `None` when there is no mask, or when the mask cannot be
+/// decoded — a failed mask must never fail the base image, since dropping the
+/// picture entirely is worse than drawing it opaque.
+///
+/// `/Matte` (pre-multiplied alpha, §11.6.5.3) is not handled: it is rare, and
+/// treating a matted mask as ordinary alpha merely mis-tints edge pixels
+/// rather than producing the solid-black rectangle this function exists to
+/// prevent.
+fn decode_smask(doc: &PdfDocument, dict: &Object) -> Option<SoftMask> {
+    let smask_ref = dict.dict_gets("SMask")?;
+    let smask_dict = doc.resolve(smask_ref).ok()?;
+    if !smask_dict.is_dict() {
+        return None;
+    }
+    let decoded = decode_image_base(doc, &smask_dict, smask_ref).ok()?;
+    if decoded.width == 0 || decoded.height == 0 {
+        return None;
+    }
+    // The mask is DeviceGray by spec, but be defensive: if it decoded to RGB
+    // (a malformed producer), take the first component rather than bailing.
+    let n = decoded.components.max(1) as usize;
+    let alpha: Vec<u8> = decoded.pixels.iter().step_by(n).copied().collect();
+    if alpha.len() < decoded.width * decoded.height {
+        return None;
+    }
+    Some(SoftMask {
+        width: decoded.width,
+        height: decoded.height,
+        alpha,
+    })
+}
+
+fn decode_image_base(
+    doc: &PdfDocument,
+    dict: &Object,
+    stream_ref: &Object,
+) -> Result<DecodedImage> {
     let width = geta(doc, dict, "Width", "W").to_int();
     let height = geta(doc, dict, "Height", "H").to_int();
     if width <= 0 || height <= 0 {
@@ -346,12 +415,14 @@ fn decode_jpeg(
 
     match cs {
         ColorSpace::Luma => Ok(DecodedImage {
+            smask: None,
             width: w,
             height: h,
             components: 1,
             pixels,
         }),
         ColorSpace::RGB => Ok(DecodedImage {
+            smask: None,
             width: w,
             height: h,
             components: 3,
@@ -376,6 +447,7 @@ fn decode_jpeg(
                 out.extend_from_slice(&[r, g, b]);
             }
             Ok(DecodedImage {
+                smask: None,
                 width: w,
                 height: h,
                 components: 3,
@@ -428,6 +500,7 @@ fn decode_samples(
         height,
         components: out_n as u8,
         pixels,
+        smask: None,
     }
 }
 
