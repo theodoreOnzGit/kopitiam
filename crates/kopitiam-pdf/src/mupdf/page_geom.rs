@@ -145,9 +145,8 @@ mod tests {
     /// shape, and the one a page-dict-only lookup misses.
     #[test]
     fn inherits_the_media_box_from_the_page_tree() {
-        let mut d = build(&["<< /Type /Page /Parent 2 0 R >>"], &[]);
-        // Rebuild with MediaBox on the Pages node instead.
-        d = {
+        // MediaBox on the /Pages node, not on the page itself.
+        let d = {
             let bodies = [
                 "<< /Type /Catalog /Pages 2 0 R >>",
                 "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>",
