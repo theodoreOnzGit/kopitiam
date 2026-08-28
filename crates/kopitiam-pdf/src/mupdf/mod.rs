@@ -103,6 +103,7 @@ pub mod parse;
 pub mod pixmap;
 pub mod pool;
 pub mod resources;
+pub mod standard_font;
 pub mod stext_boxer;
 pub mod stext_classify;
 pub mod stext_device;

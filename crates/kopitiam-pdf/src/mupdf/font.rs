@@ -48,6 +48,7 @@
 //! -> `vmtx`; horizontal `hmtx` is always built), the named Adobe CJK CMap
 //! resource set (see `cmap.rs`), and embedded-font glyph reading (FreeType).
 
+use super::glyph_cff::CffProgram;
 use super::agl::{REPLACEMENT_CHARACTER, unicode_from_glyph_name};
 use super::cmap::{self, CMap};
 use super::draw_path::Path;
@@ -139,6 +140,15 @@ pub struct Font {
     is_cid: bool,
     /// The CIDFontType2 `/CIDToGIDMap` (CID fonts only; `Identity` otherwise).
     cid_to_gid: CidToGid,
+    /// A bundled standard-14 face standing in for a font the PDF does **not**
+    /// embed (see [`super::standard_font`]). Only ever set when both
+    /// `program` and `type1` are `None` -- an embedded program is always
+    /// preferred, since it is what the document actually specifies.
+    ///
+    /// Selected by glyph **name**, never by the document's GIDs: those index a
+    /// font program we do not have, so using them would draw arbitrary wrong
+    /// glyphs. See [`Font::glyph_outline`].
+    substitute: Option<Arc<CffProgram>>,
 }
 
 /// Where a loaded font's glyph outlines come from — the single fact that
@@ -154,6 +164,9 @@ pub enum OutlineSource {
     Program,
     /// A decoded `/FontFile` Type1 program, selected by glyph name.
     Type1,
+    /// No embedded program, but a bundled standard-14 face was substituted
+    /// for it ([`super::standard_font`]) — the font renders as real text.
+    Substitute,
     /// Nothing decodable. **This is the advance-box fallback condition**: the
     /// draw device has no outlines to draw, so it emits a filled box of the
     /// glyph's advance width. Either the font embeds no program at all (a
@@ -170,6 +183,8 @@ impl Font {
             OutlineSource::Program
         } else if self.type1.is_some() {
             OutlineSource::Type1
+        } else if self.substitute.is_some() {
+            OutlineSource::Substitute
         } else {
             OutlineSource::None
         }
@@ -272,6 +287,7 @@ impl Font {
             glyph_names: None,
             is_cid: false,
             cid_to_gid: CidToGid::Identity,
+            substitute: None,
         };
 
         // cid_to_ucs from the glyph names (pdf_load_to_unicode's `strings` path).
@@ -286,6 +302,19 @@ impl Font {
         // Retain the per-code glyph names too: a Type1 program is selected by
         // name, not GID (see `glyph_outline`).
         font.glyph_names = Some(estrings);
+
+        // Nothing embedded: stand a bundled standard-14 face in for it, or
+        // every glyph would be drawn as a filled advance box. This is the
+        // Word/LibreOffice case (`/BaseFont /ArialMT` with no `/FontFile*`);
+        // see `super::standard_font` for the selection rules and provenance.
+        if font.program.is_none() && font.type1.is_none() {
+            let base = dict
+                .dict_gets("BaseFont")
+                .map(|o| String::from_utf8_lossy(o.to_name()).into_owned())
+                .unwrap_or_default();
+            font.substitute = super::standard_font::select_standard_font(&base, &descriptor, doc)
+                .and_then(super::standard_font::program_for);
+        }
 
         // /ToUnicode stream (remapped through the identity encoding).
         font.to_unicode = load_to_unicode(doc, dict.dict_gets("ToUnicode"), &font.encoding);
@@ -369,6 +398,7 @@ impl Font {
             glyph_names: None,
             is_cid: true,
             cid_to_gid,
+            substitute: None,
         };
 
         // /ToUnicode, remapped from code->Unicode to CID->Unicode.
@@ -519,6 +549,25 @@ impl Font {
                 .and_then(|o| o.as_deref())
                 .or_else(|| t1.encoding_name(cid as u8));
             return name.and_then(|n| t1.outline(n));
+        }
+        if let Some(sub) = &self.substitute {
+            // A substitute is addressed by glyph NAME. The document's own GIDs
+            // index a font program we do not have, so `select_gid` here would
+            // draw arbitrary wrong glyphs -- confident nonsense, worse than a
+            // box. Same reasoning as the Type1 branch above.
+            //
+            // The PDF's `/Encoding` (+ `/Differences`) names the glyph; when it
+            // does not, fall back to the substitute's own built-in encoding,
+            // which for these faces is Adobe StandardEncoding and so still
+            // resolves plain ASCII correctly.
+            let named = self
+                .glyph_names
+                .as_ref()
+                .and_then(|gn| gn.get(cid as usize))
+                .and_then(|o| o.as_deref())
+                .and_then(|n| sub.gid_for_name(n));
+            let gid = named.or_else(|| sub.gid_for_code(cid))?;
+            return sub.outline(gid);
         }
         let program = self.program.as_ref()?;
         let gid = self.select_gid(cid, program);
@@ -954,6 +1003,7 @@ endcmap\nend\nend";
             glyph_names: None,
             is_cid: false,
             cid_to_gid: CidToGid::Identity,
+            substitute: None,
         };
         let d = font.decode(0x41);
         assert_eq!(d.unicode, '\u{FFFD}');

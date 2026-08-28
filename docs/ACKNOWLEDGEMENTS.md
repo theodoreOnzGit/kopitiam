@@ -200,6 +200,42 @@ vendored or committed.
 
 ---
 
+## hayro — standard-14 font substitution (ported heuristic + reused font data)
+
+[`hayro`](https://github.com/LaurenzV/hayro) (Apache-2.0 OR MIT, © Laurenz
+Stampfl) is already a mandatory dependency: it is `kopitiam-pdf`'s cross-engine
+fallback renderer. It is credited twice over, because a second, separate piece
+of it is now used.
+
+**Ported logic.** `mupdf/standard_font.rs`'s `select_standard_font` is a port of
+`hayro-interpret 0.7.0`'s function of the same name
+(`src/font/standard_font.rs`): literal matching against the 14 standard
+PostScript names, then a keyword heuristic over the lowercased `/BaseFont`
+combined with the descriptor's `/FontWeight` and `/ItalicAngle`. It is **ported
+rather than called** because it is `pub(crate)` upstream and so unreachable —
+the same precondition check this file's `hayro-font` note records failing, here
+passing for `StandardFont` and `get_font_data()`, which are `pub`. One
+deliberate divergence, noted at the call site: hayro's `exact` flag is dropped,
+since nothing on our side consumes it.
+
+**Reused font data.** The substitute faces are the **Foxit** base-14 set bundled
+inside `hayro-interpret`'s `assets/` under its default `embed-fonts` feature.
+They are extracted from **PDFium** (BSD-3-Clause, © 2014 PDFium Authors;
+original code © Foxit Software Inc. — see `LICENSE_FOXIT` in that crate). They
+are obtained at runtime through `StandardFont::get_font_data()` rather than
+re-bundled: the bytes are already in our binary via hayro, so shipping a second
+copy would add megabytes and a second licence obligation for nothing.
+
+Both licences are permissive and absorb into AGPLv3 with their notices carried,
+per the licence-compatibility rules below.
+
+Worth recording for whoever meets these files next: despite the `.pfb`
+extension the payloads are **bare CFF** (they begin `01 00 04 02`, a CFF header,
+not a PFB `80 01` segment marker), which is why `mupdf/glyph_cff.rs` parses them
+directly and no Type1 path is involved.
+
+---
+
 ## kovan (sibling project — reader features ported across)
 
 `kovan` is the maintainer's own literature/digitiser workbench, living in

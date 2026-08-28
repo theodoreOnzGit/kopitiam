@@ -162,10 +162,20 @@ impl CffProgram {
             parse_encoding(bytes, enc_off)
         };
 
-        // Predefined encoding (no custom Encoding table): resolve `name -> GID`
-        // via the charset's SIDs, so `gid_for_code` can chain
-        // `code -> name -> GID` for the (common) predefined-Standard case.
-        let name_to_gid = if !is_cid && encoding.is_empty() {
+        // `name -> GID` via the charset's SIDs. Two callers need it:
+        //
+        // * [`CffProgram::gid_for_code`], to chain `code -> name -> GID` for
+        //   the (common) predefined-Standard-encoding case.
+        // * [`CffProgram::gid_for_name`], used when this program is a
+        //   **substitute** for a non-embedded font (see
+        //   [`super::standard_font`]) -- there the PDF's own `/Encoding`
+        //   names the glyph and the document's GIDs are meaningless, so name
+        //   lookup is the only correct selection path.
+        //
+        // Built for every non-CID font, not only ones with a predefined
+        // encoding: a substitute with its own custom `Encoding` table still
+        // has to be addressable by name, and it used to come back empty.
+        let name_to_gid = if !is_cid {
             let mut m = HashMap::with_capacity(gid_to_sid.len());
             for (gid, &sid) in gid_to_sid.iter().enumerate() {
                 if let Some(name) = sid_name(sid, &strings, bytes) {
@@ -233,6 +243,17 @@ impl CffProgram {
     /// chain `code -> name -> gid` (see the module docs). `None` when neither
     /// resolves the code (e.g. a predefined Expert encoding) so the caller can
     /// fall back to the advance box.
+    /// `name -> GID` through the charset.
+    ///
+    /// The selection path for a **substitute** font: when a PDF names a font
+    /// it does not embed, the document's own GIDs refer to a program we do
+    /// not have, so the only meaningful link between the document and the
+    /// substitute is the glyph *name* from the PDF `/Encoding`. Empty for
+    /// CID-keyed fonts, whose charset maps to CIDs rather than names.
+    pub fn gid_for_name(&self, name: &str) -> Option<u16> {
+        self.name_to_gid.get(name).copied()
+    }
+
     pub fn gid_for_code(&self, code: u32) -> Option<u16> {
         if let Some(&g) = self.encoding.get(&code) {
             return Some(g);

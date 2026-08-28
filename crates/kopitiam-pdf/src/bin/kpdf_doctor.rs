@@ -61,6 +61,7 @@ fn main() {
     println!("{path}: {n} pages, inspecting {}..={}", first + 1, last + 1);
 
     let mut boxed_fonts = 0usize;
+    let mut substituted = 0usize;
     let mut togglable = 0usize;
     let mut stuck = 0usize;
 
@@ -69,7 +70,7 @@ fn main() {
             continue;
         };
         let page = page.clone();
-        let fonts = report_fonts(&doc, &page, page_index, &mut boxed_fonts);
+        let fonts = report_fonts(&doc, &page, page_index, &mut boxed_fonts, &mut substituted);
         let fields = report_fields(&doc, page_index, &mut togglable, &mut stuck);
         if fonts || fields {
             println!();
@@ -79,6 +80,9 @@ fn main() {
     println!("== summary ==");
     println!(
         "  fonts with NO decodable outline (these draw as boxes): {boxed_fonts}",
+    );
+    println!(
+        "  fonts NOT embedded, rendered via a substituted standard-14 face: {substituted}",
     );
     println!("  form fields kpdf can toggle: {togglable}");
     println!("  form fields kpdf will NOT toggle: {stuck}");
@@ -106,7 +110,13 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
 }
 
 /// Per-font facts for one page. Returns whether anything was printed.
-fn report_fonts(doc: &PdfDocument, page: &Object, page_index: usize, boxed: &mut usize) -> bool {
+fn report_fonts(
+    doc: &PdfDocument,
+    page: &Object,
+    page_index: usize,
+    boxed: &mut usize,
+    substituted: &mut usize,
+) -> bool {
     let Ok(res) = doc.resolve_get(page, "Resources") else {
         return false;
     };
@@ -145,6 +155,10 @@ fn report_fonts(doc: &PdfDocument, page: &Object, page_index: usize, boxed: &mut
         let verdict = match (source, &err) {
             (Some(OutlineSource::Program), _) => "ok (embedded program)".to_string(),
             (Some(OutlineSource::Type1), _) => "ok (Type1 program)".to_string(),
+            (Some(OutlineSource::Substitute), _) => {
+                *substituted += 1;
+                "ok (SUBSTITUTED standard-14 face -- font not embedded)".to_string()
+            }
             (Some(OutlineSource::None), _) => {
                 *boxed += 1;
                 "NO OUTLINES -> draws as boxes".to_string()
