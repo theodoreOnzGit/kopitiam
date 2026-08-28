@@ -53,6 +53,35 @@
 //! exist to serve: lecturing with a tablet. Worth putting in a shell alias
 //! before a lecture rather than discovering it in front of a room.
 //!
+//! # Rendering: one UI thread, one worker
+//!
+//! Rasterising a page costs a **median 135 ms and up to 444 ms** at 150 dpi.
+//! Doing that while painting — which kpdf did until 0.3.0 — stalls the window
+//! for that long every time a page scrolls into view.
+//!
+//! So painting **never rasterises**. The first
+//! [`SYNC_PRERENDER_PAGES`] pages are rendered synchronously at open, so the
+//! document is readable the moment the window appears (measured on the
+//! 506-page Irodori book: 165 ms to parse, 635 ms for those pages, ~800 ms to
+//! a usable window). Everything after that belongs to a single
+//! [`RenderWorker`] thread, which delivers pages **one at a time as each
+//! finishes** so they fill in progressively rather than arriving in a lump.
+//!
+//! A page that is not ready yet draws its real outline with a
+//! `page N — loading…` label, so "still working" is never mistaken for a
+//! blank page.
+//!
+//! Zoom invalidates in-flight work by generation rather than trying to cancel
+//! it: a render already running is allowed to finish and is discarded on
+//! arrival, which cannot leave a wrong-resolution texture on screen.
+//!
+//! Two honest limits. The worker needs **its own copy of the file's bytes**,
+//! because a `PdfDocument` holds `RefCell`s and is `Send` but not `Sync` —
+//! real for a 100 MB book, and alongside the search worker that is a third
+//! copy. And **there is no GPU rasterisation**: `kopitiam-pdf` draws on the
+//! CPU, so the "GPU thread pool" of the wider design has nothing to attach to
+//! until raster kernels exist.
+//!
 //! # Find and contents (`/` `?` `n` `N` `t`)
 //!
 //! MuPDF's and vim's own bindings, as asked for:
@@ -388,6 +417,20 @@ const THUMBNAIL_DPI: f32 = 24.0;
 /// visible in continuous scroll at normal zoom.
 const SEARCH_PREFETCH_RADIUS: usize = 2;
 
+/// How many pages are rasterised **synchronously** when a document opens.
+///
+/// The maintainer's call: the first pages should simply be there when the
+/// window appears, rather than flashing placeholders on the one part of the
+/// document a reader always looks at. Everything past this is the worker's.
+/// At a measured ~135 ms median per page this costs roughly a second at open,
+/// traded for a readable first screen.
+const SYNC_PRERENDER_PAGES: usize = 8;
+
+/// How many pages either side of the current one the rasteriser is kept
+/// working on. Modest by choice (the maintainer's budget answer): a page
+/// texture is several megabytes, and the existing LRU bounds what is kept.
+const RENDER_PREFETCH_RADIUS: usize = 3;
+
 /// How many pages ahead of a parked scan to queue at once.
 ///
 /// The scan needs its frontier page before it can move, so queuing only that
@@ -458,6 +501,112 @@ type PageTextureKey = (usize, u32, bool);
 /// exact on the first frame, so there is nothing to refine and the layout is
 /// built exactly once per (dpi, document, fallback) combination.
 type SlotsCacheKey = (u32, usize, bool);
+
+/// A background page rasteriser.
+///
+/// # The problem
+///
+/// Rasterising a page costs a **median of 135 ms and up to 444 ms** at
+/// 150 dpi (measured on the 506-page Irodori book). Done on the UI thread —
+/// which is how kpdf worked until now — every page scrolling into view stalls
+/// the window for that long.
+///
+/// # The shape, per the maintainer's design
+///
+/// One UI thread, one worker. The first few pages are rasterised
+/// synchronously at open ([`SYNC_PRERENDER_PAGES`]) so the document is
+/// readable the instant it appears; everything after that is the worker's,
+/// delivered **one page at a time** as each finishes rather than batched, so
+/// pages fill in progressively instead of arriving in a lump.
+///
+/// A page still being rendered draws a labelled placeholder, so "not ready
+/// yet" is never mistaken for "blank page".
+///
+/// # Generations
+///
+/// Zoom changes the dpi, which invalidates every in-flight render. Rather
+/// than try to cancel work already running, each request carries a
+/// generation; results from an older one are dropped on arrival. Cheap, and
+/// it cannot leave a stale texture on screen.
+///
+/// # The copy this costs
+///
+/// A `PdfDocument` holds `RefCell`s — `Send`, not `Sync` — so the worker
+/// needs its own, opened from a copy of the file's bytes. That is a second
+/// full copy of the document in memory (a third, alongside the search
+/// worker), which is real for a 100 MB book. Making `PdfDocument` share its
+/// bytes behind an `Arc` would leave only the parsed tables duplicated; that
+/// is a change the maintainer has not taken yet, and it is the honest cost of
+/// this design until they do.
+struct RenderWorker {
+    req: std::sync::mpsc::Sender<RenderRequest>,
+    res: std::sync::mpsc::Receiver<RenderedPage>,
+    /// Pages asked for and not yet delivered, so a page visible across many
+    /// frames is requested once.
+    inflight: std::collections::HashSet<PageTextureKey>,
+    /// Bumped whenever dpi or the fallback toggle changes.
+    generation: u64,
+}
+
+struct RenderRequest {
+    page: usize,
+    dpi: f32,
+    fallback: bool,
+    generation: u64,
+}
+
+/// A finished page, as raw RGBA ready for texture upload. The pixmap is
+/// converted on the worker thread, not the UI thread — it is a per-pixel pass
+/// over a multi-megabyte buffer and belongs with the rendering.
+struct RenderedPage {
+    key: PageTextureKey,
+    generation: u64,
+    size: [usize; 2],
+    rgba: Vec<u8>,
+}
+
+impl RenderWorker {
+    /// Start a rasteriser over a private copy of `bytes`.
+    ///
+    /// `None` if the thread cannot be spawned; the caller then falls back to
+    /// rendering inline, which is slow but always correct.
+    fn spawn(bytes: Vec<u8>) -> Option<RenderWorker> {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<RenderRequest>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<RenderedPage>();
+        std::thread::Builder::new()
+            .name("kpdf-render".to_string())
+            .spawn(move || {
+                let Ok(doc) = PdfDocument::open(bytes) else {
+                    return;
+                };
+                while let Ok(r) = req_rx.recv() {
+                    let Ok(pix) =
+                        rasterize_page_with_fallback(&doc, r.page, r.dpi, r.fallback)
+                    else {
+                        continue;
+                    };
+                    let page = RenderedPage {
+                        key: (r.page, r.dpi.to_bits(), r.fallback),
+                        generation: r.generation,
+                        size: [pix.w as usize, pix.h as usize],
+                        rgba: rgb_to_rgba(&pix),
+                    };
+                    // Send each page as it finishes: the UI shows progress
+                    // rather than waiting for the batch.
+                    if res_tx.send(page).is_err() {
+                        return; // UI gone
+                    }
+                }
+            })
+            .ok()?;
+        Some(RenderWorker {
+            req: req_tx,
+            res: res_rx,
+            inflight: std::collections::HashSet::new(),
+            generation: 0,
+        })
+    }
+}
 
 /// A background text-search worker for one query.
 ///
@@ -591,6 +740,12 @@ struct KpdfApp {
     /// `/MediaBox` sizing was introduced to remove, and a reader only ever
     /// needs the next hit.
     find_hits: HashMap<usize, Vec<SearchHit>>,
+    /// The background page rasteriser, if one could be started.
+    render_worker: Option<RenderWorker>,
+    /// Whether the opening-pages prerender has run for the current document.
+    /// Separate from `render_worker` being `Some`, so a machine where the
+    /// thread could not be spawned does not retry the spawn every frame.
+    render_started: bool,
     /// An in-progress scan for the next hit, when the answer is not yet
     /// known from cached pages alone.
     ///
@@ -773,6 +928,8 @@ impl KpdfApp {
             find: None,
             find_query: String::new(),
             find_hits: HashMap::new(),
+            render_worker: None,
+            render_started: false,
             find_scan: None,
             find_worker: None,
             find_current: None,
@@ -835,6 +992,10 @@ impl KpdfApp {
                 self.find_hits.clear();
                 self.find_current = None;
                 self.find_worker = None;
+                // A new document needs a new rasteriser: the old worker holds
+                // the old file.
+                self.render_worker = None;
+                self.render_started = false;
                 self.outline.clear();
                 self.page_count = page_count;
                 self.page = 0;
@@ -921,10 +1082,12 @@ impl KpdfApp {
 
     fn zoom_in(&mut self) {
         self.dpi = (self.dpi + DPI_STEP).min(DPI_MAX);
+        self.bump_render_generation();
     }
 
     fn zoom_out(&mut self) {
         self.dpi = (self.dpi - DPI_STEP).max(DPI_MIN);
+        self.bump_render_generation();
     }
 
     /// Reset zoom to [`DPI_DEFAULT`] -- the on-screen zoom readout doubles as
@@ -932,6 +1095,7 @@ impl KpdfApp {
     /// discoverable affordance every other viewer offers.
     fn zoom_reset(&mut self) {
         self.dpi = DPI_DEFAULT;
+        self.bump_render_generation();
     }
 
     /// Ctrl+scroll-wheel zoom over the page, the gesture users reach for
@@ -1062,6 +1226,36 @@ impl KpdfApp {
     /// unlike [`KpdfApp::thumbnail_texture`]: a full-resolution page is
     /// several megabytes, so an unbounded cache over a long document would
     /// reproduce the exact gh-88 memory concern this pass exists to close.
+    /// The page's texture **only if it is already rasterised**.
+    ///
+    /// This is what the paint loop uses, and the distinction from
+    /// [`KpdfApp::ensure_page_texture`] is the entire point of the render
+    /// worker: painting must never rasterise, because that costs a median
+    /// 135 ms and up to 444 ms per page and would put it straight back on the
+    /// UI thread. A page that is not ready draws a labelled placeholder and
+    /// the worker delivers it a frame or two later.
+    ///
+    /// The one exception is a machine where the worker thread could not be
+    /// spawned: with nothing else able to produce the page, painting falls
+    /// back to rendering inline. Slow beats permanently blank.
+    fn cached_page_texture(
+        &mut self,
+        ctx: &egui::Context,
+        page: usize,
+    ) -> Option<egui::TextureHandle> {
+        let key: PageTextureKey = (page, self.dpi.to_bits(), self.fallback_enabled);
+        if let Some(evicted) = self.page_textures_lru.touch(key) {
+            self.page_textures.remove(&evicted);
+        }
+        if let Some(t) = self.page_textures.get(&key) {
+            return Some(t.clone());
+        }
+        if self.render_worker.is_none() {
+            return self.ensure_page_texture(ctx, page);
+        }
+        None
+    }
+
     fn ensure_page_texture(
         &mut self,
         ctx: &egui::Context,
@@ -2077,9 +2271,14 @@ impl KpdfApp {
                 // many threw the session away. Quitting is `:q` / `:wq`
                 // only, which is the vim contract the maintainer asked for.
                 egui::Key::Escape => {
-                    // Nothing to cancel at top level; say so rather than
-                    // appear dead.
-                    if self.find_query.is_empty() {
+                    // Escape is "go back one step", innermost first: leave
+                    // reflow before touching the search, so a reader who
+                    // pressed `r` by accident gets out with the key they
+                    // already reach for.
+                    if self.mode == Mode::Reflow {
+                        self.mode = Mode::Image;
+                        self.status = Some("image mode".into());
+                    } else if self.find_query.is_empty() {
                         self.status = Some("nothing to cancel — :q to quit".into());
                     } else {
                         // A second Escape clears the search and its
@@ -2205,6 +2404,105 @@ impl KpdfApp {
     /// scrolled into view are rasterized/uploaded, rather than every page in
     /// the document up front (the sidebar's own scroll position is
     /// independent of the main continuous view's).
+    /// Take delivered pages from the rasteriser and queue the ones about to
+    /// be looked at. Called once per frame; never blocks.
+    fn pump_render_worker(&mut self, ctx: &egui::Context) {
+        let Some(worker) = self.render_worker.as_mut() else {
+            return;
+        };
+        let generation = worker.generation;
+        let mut uploaded = false;
+        let mut arrived: Vec<(PageTextureKey, [usize; 2], Vec<u8>)> = Vec::new();
+        while let Ok(done) = worker.res.try_recv() {
+            worker.inflight.remove(&done.key);
+            // A result from before the last zoom is stale: drop it rather
+            // than put a wrong-resolution texture on screen.
+            if done.generation == generation {
+                arrived.push((done.key, done.size, done.rgba));
+            }
+        }
+        for (key, size, rgba) in arrived {
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+            let tex = ctx.load_texture(format!("kpdf-page-{}", key.0), image, egui::TextureOptions::LINEAR);
+            if let Some(evicted) = self.page_textures_lru.touch(key) {
+                self.page_textures.remove(&evicted);
+            }
+            self.page_textures.insert(key, tex);
+            uploaded = true;
+        }
+
+        // Queue the window around the current page, nearest first, so what
+        // the reader is looking at renders before what is further away.
+        let n = self.page_count;
+        let mut wanted: Vec<usize> = Vec::new();
+        for d in 0..=RENDER_PREFETCH_RADIUS {
+            if self.page + d < n {
+                wanted.push(self.page + d);
+            }
+            if d > 0 && self.page >= d {
+                wanted.push(self.page - d);
+            }
+        }
+        let dpi = self.dpi;
+        let fallback = self.fallback_enabled;
+        let mut died = false;
+        let Some(worker) = self.render_worker.as_mut() else {
+            return;
+        };
+        for page in wanted {
+            let key: PageTextureKey = (page, dpi.to_bits(), fallback);
+            if self.page_textures.contains_key(&key) || worker.inflight.contains(&key) {
+                continue;
+            }
+            if worker
+                .req
+                .send(RenderRequest { page, dpi, fallback, generation })
+                .is_err()
+            {
+                died = true;
+                break;
+            }
+            worker.inflight.insert(key);
+        }
+        if died {
+            self.render_worker = None; // inline path takes over
+            return;
+        }
+        let busy = self
+            .render_worker
+            .as_ref()
+            .is_some_and(|w| !w.inflight.is_empty());
+        if uploaded || busy {
+            // Pages arrive asynchronously, so keep frames coming or a
+            // finished page would not appear until the next input event.
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+    }
+
+    /// Invalidate in-flight renders after a zoom or a fallback toggle.
+    ///
+    /// Work already running cannot be cancelled, so it is allowed to finish
+    /// and is discarded on arrival by generation.
+    fn bump_render_generation(&mut self) {
+        if let Some(w) = self.render_worker.as_mut() {
+            w.generation = w.generation.wrapping_add(1);
+            w.inflight.clear();
+        }
+    }
+
+    /// Rasterise the opening pages on this thread, so the document is
+    /// readable the moment the window appears.
+    ///
+    /// Deliberately synchronous, and deliberately bounded to
+    /// [`SYNC_PRERENDER_PAGES`]: the alternative is a first screen of
+    /// placeholders on the one part of the document every reader looks at.
+    fn prerender_opening_pages(&mut self, ctx: &egui::Context) {
+        let last = SYNC_PRERENDER_PAGES.min(self.page_count);
+        for page in 0..last {
+            let _ = self.ensure_page_texture(ctx, page);
+        }
+    }
+
     /// Collect finished pages from the background searcher, and ask it for
     /// pages that are on screen but not yet searched.
     ///
@@ -2537,6 +2835,16 @@ impl eframe::App for KpdfApp {
         // RELOAD_CHECK_INTERVAL inside `HotReload::poll`.
         self.check_hot_reload(ui.ctx());
 
+        // Start the rasteriser and lay down the opening pages the first time
+        // we paint. Done here rather than in `open` because both need an
+        // egui Context to upload textures into.
+        if self.render_worker.is_none() && !self.render_started {
+            self.render_started = true;
+            self.render_worker = RenderWorker::spawn(self.doc.raw_bytes().to_vec());
+            self.prerender_opening_pages(ui.ctx());
+        }
+        self.pump_render_worker(ui.ctx());
+
         // Collect finished search pages and queue the ones about to be looked
         // at. A window around the current page rather than the exact visible
         // set: in continuous scroll those are the same pages, and this needs
@@ -2821,7 +3129,7 @@ impl eframe::App for KpdfApp {
                                 origin + egui::vec2(0.0, slot.top),
                                 egui::vec2(slot.width, slot.height),
                             );
-                            if let Some(tex) = self.ensure_page_texture(ui.ctx(), slot.page_index) {
+                            if let Some(tex) = self.cached_page_texture(ui.ctx(), slot.page_index) {
                                 painter.image(
                                     tex.id(),
                                     page_screen_rect,
@@ -2832,10 +3140,33 @@ impl eframe::App for KpdfApp {
                                     egui::Color32::WHITE,
                                 );
                             } else {
+                                // Not rasterized yet. Draw the page's real
+                                // outline and SAY SO: a bare grey rectangle
+                                // is indistinguishable from a blank page, so
+                                // a reader cannot tell "still loading" from
+                                // "nothing here".
                                 painter.rect_filled(
                                     page_screen_rect,
                                     0.0,
-                                    egui::Color32::from_gray(235),
+                                    egui::Color32::from_gray(245),
+                                );
+                                painter.rect_stroke(
+                                    page_screen_rect,
+                                    0.0,
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(200)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                painter.text(
+                                    page_screen_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("page {} — loading…", slot.page_index + 1),
+                                    egui::FontId::proportional(
+                                        // Scale with the slot so the label
+                                        // stays legible when zoomed out and
+                                        // does not overflow a small page.
+                                        (slot.width * 0.035).clamp(9.0, 18.0),
+                                    ),
+                                    egui::Color32::from_gray(130),
                                 );
                             }
 
@@ -3008,6 +3339,54 @@ mod search_worker_tests {
         assert!(
             expected.iter().any(|(_, h)| !h.is_empty()),
             "the fixture must actually contain the query, or this proves nothing"
+        );
+    }
+
+    /// The rasteriser must produce **exactly** what rendering on the UI
+    /// thread produces. It exists to move the cost, never to change the
+    /// picture, so the direct render is the correctness reference.
+    #[test]
+    fn the_render_worker_matches_a_direct_render() {
+        let Some(bytes) = fixture() else { return };
+        let dpi = 72.0;
+
+        let doc = PdfDocument::open(bytes.clone()).expect("fixture opens");
+        let expected: Vec<(usize, usize, Vec<u8>)> = (0..3)
+            .map(|p| {
+                let pix = rasterize_page_with_fallback(&doc, p, dpi, true).expect("renders");
+                (pix.w as usize, pix.h as usize, rgb_to_rgba(&pix))
+            })
+            .collect();
+
+        let mut worker = RenderWorker::spawn(bytes).expect("worker spawns");
+        for page in 0..3 {
+            worker
+                .req
+                .send(RenderRequest { page, dpi, fallback: true, generation: 7 })
+                .expect("accepts requests");
+        }
+
+        let mut got: Vec<RenderedPage> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while got.len() < 3 && Instant::now() < deadline {
+            match worker.res.recv_timeout(Duration::from_millis(500)) {
+                Ok(v) => got.push(v),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+        got.sort_by_key(|r| r.key.0);
+        assert_eq!(got.len(), 3, "every requested page comes back");
+        for (i, page) in got.iter().enumerate() {
+            let (w, h, ref rgba) = expected[i];
+            assert_eq!(page.generation, 7, "the generation is carried through");
+            assert_eq!(page.size, [w, h], "page {i} size");
+            assert_eq!(&page.rgba, rgba, "page {i} pixels must be identical");
+        }
+        // A blank result would make the comparison meaningless.
+        assert!(
+            expected.iter().any(|(_, _, px)| px.iter().any(|&b| b < 200)),
+            "the fixture must actually draw something"
         );
     }
 
