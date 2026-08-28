@@ -73,11 +73,19 @@
 //! that `/MediaBox` page sizing was introduced to remove, and a reader only
 //! ever needs the next hit.
 //!
-//! A consequence worth knowing: highlights are painted only for pages that
-//! have already been searched, so scrolling onto a page of hits shows nothing
-//! until `n` reaches it. Painting would otherwise have to extract text mid-
-//! frame, which is the cost being avoided. A background prefetch would close
-//! that gap without reintroducing the stall.
+//! Pages around the one in view are searched **on a background thread**, so
+//! scrolling onto a page of hits highlights it without `n` having to reach it
+//! first. That is not a nicety: extracting a page's text costs a median of
+//! 5.4 ms on the arXiv fixture but a **p90 of 300 ms and a worst case of
+//! 349 ms** (the plot-heavy pages), so doing it as pages scroll into view
+//! would drop a third of a second at a time — and a per-frame time budget
+//! could not help either, since that cost is paid inside one indivisible
+//! extraction. See [`SearchWorker`].
+//!
+//! Still on the UI thread, honestly: pressing `n` when the next hit is on a
+//! page nothing has searched yet must search it there and then, because it
+//! has to answer *where* the next hit is. The prefetch makes that rare rather
+//! than impossible.
 //!
 //! # Live lecturing: blank pages on demand
 //!
@@ -362,6 +370,12 @@ const MIN_HIT_AREA_SCREEN: f32 = 16.0;
 /// Either value is a judgment call, not a measured one.
 const THUMBNAIL_DPI: f32 = 24.0;
 
+/// How many pages either side of the current one the background searcher is
+/// asked to search ahead. Five pages at a time keeps the queue short enough
+/// that jumping elsewhere is served promptly, while covering everything
+/// visible in continuous scroll at normal zoom.
+const SEARCH_PREFETCH_RADIUS: usize = 2;
+
 /// Vertical gap (screen points) between consecutive pages in the continuous
 /// layout -- large enough that the boundary between two pages is visually
 /// obvious (and unambiguous for [`screen_to_page_at`]'s "this point is in
@@ -425,6 +439,74 @@ type PageTextureKey = (usize, u32, bool);
 /// built exactly once per (dpi, document, fallback) combination.
 type SlotsCacheKey = (u32, usize, bool);
 
+/// A background text-search worker for one query.
+///
+/// # Why this exists
+///
+/// Highlights can only be drawn for pages that have been searched, and
+/// searching a page means extracting its text. Measured on the arXiv fixture,
+/// that costs a **median of 5.4 ms but a p90 of 300 ms and a worst case of
+/// 349 ms** — the plot-heavy pages. So neither obvious approach works on the
+/// UI thread: extracting on scroll drops a third of a second whenever such a
+/// page comes into view, and a per-frame time budget cannot help either,
+/// because the cost is paid inside one indivisible extraction that cannot be
+/// preempted partway.
+///
+/// So the work moves off the thread entirely. The UI asks for pages it wants
+/// highlighted, keeps drawing, and picks up results whenever they arrive.
+///
+/// # The copy this costs
+///
+/// The worker opens its own [`PdfDocument`] from a copy of the bytes, because
+/// a document is not shareable across threads. That is a second copy of the
+/// file in memory — real, and worth knowing for a 100 MB document — so the
+/// worker exists only while a search is active and is dropped the moment the
+/// query is cleared or replaced.
+struct SearchWorker {
+    /// Pages the UI wants searched. Dropping this closes the channel, which
+    /// is how the worker is told to exit.
+    req: std::sync::mpsc::Sender<usize>,
+    /// Finished pages coming back.
+    res: std::sync::mpsc::Receiver<(usize, Vec<SearchHit>)>,
+    /// Pages already asked for, so a page visible across many frames is
+    /// requested once rather than every frame.
+    requested: std::collections::HashSet<usize>,
+}
+
+impl SearchWorker {
+    /// Start a worker searching `query` over a private copy of `bytes`.
+    ///
+    /// Returns `None` if the thread cannot be spawned; the caller then simply
+    /// has no prefetch, and `n`/`N` still work because they search on demand.
+    fn spawn(bytes: Vec<u8>, query: String) -> Option<SearchWorker> {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<usize>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Vec<SearchHit>)>();
+        std::thread::Builder::new()
+            .name("kpdf-search".to_string())
+            .spawn(move || {
+                let Ok(doc) = PdfDocument::open(bytes) else {
+                    return;
+                };
+                // Ends when the UI drops the request sender.
+                while let Ok(page) = req_rx.recv() {
+                    let hits = page_to_stext(&doc, page, StextOptions::default())
+                        .map(|sp| search_page(&sp, &query))
+                        .unwrap_or_default();
+                    // A send error means the UI is gone; stop.
+                    if res_tx.send((page, hits)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .ok()?;
+        Some(SearchWorker {
+            req: req_tx,
+            res: res_rx,
+            requested: std::collections::HashSet::new(),
+        })
+    }
+}
+
 /// The find bar's transient state while it is open.
 ///
 /// `backward` records which key opened it — `/` searches forward, `?`
@@ -479,6 +561,8 @@ struct KpdfApp {
     /// `/MediaBox` sizing was introduced to remove, and a reader only ever
     /// needs the next hit.
     find_hits: HashMap<usize, Vec<SearchHit>>,
+    /// The background searcher for the current query, if one is running.
+    find_worker: Option<SearchWorker>,
     /// The hit the view is currently on: `(page, index within that page)`.
     find_current: Option<(usize, usize)>,
     /// The document outline, loaded once per document.
@@ -649,6 +733,7 @@ impl KpdfApp {
             find: None,
             find_query: String::new(),
             find_hits: HashMap::new(),
+            find_worker: None,
             find_current: None,
             outline: Vec::new(),
             show_outline: false,
@@ -708,6 +793,7 @@ impl KpdfApp {
                 // Search hits and the outline belong to the OLD document.
                 self.find_hits.clear();
                 self.find_current = None;
+                self.find_worker = None;
                 self.outline.clear();
                 self.page_count = page_count;
                 self.page = 0;
@@ -1311,12 +1397,18 @@ impl KpdfApp {
             self.find_query.clear();
             self.find_hits.clear();
             self.find_current = None;
+            self.find_worker = None; // stops the thread, frees its copy
             return;
         }
         if query != self.find_query {
             self.find_query = query;
             self.find_hits.clear();
             self.find_current = None;
+            // Replace the worker: the old one is searching for the old query,
+            // and dropping it both stops that thread and frees its copy of
+            // the document.
+            self.find_worker =
+                SearchWorker::spawn(self.doc.raw_bytes().to_vec(), self.find_query.clone());
         }
         // Search starts from the page in view, not from page 1 — the reader is
         // looking for the next occurrence from where they are.
@@ -2012,6 +2104,32 @@ impl KpdfApp {
     /// scrolled into view are rasterized/uploaded, rather than every page in
     /// the document up front (the sidebar's own scroll position is
     /// independent of the main continuous view's).
+    /// Collect finished pages from the background searcher, and ask it for
+    /// pages that are on screen but not yet searched.
+    ///
+    /// Called once per frame, before anything paints. Never blocks: it drains
+    /// whatever has arrived and returns.
+    fn pump_search_worker(&mut self, visible: &[usize]) {
+        let Some(worker) = self.find_worker.as_mut() else {
+            return;
+        };
+        // Everything finished since the last frame.
+        while let Ok((page, hits)) = worker.res.try_recv() {
+            self.find_hits.insert(page, hits);
+        }
+        for page in visible {
+            if self.find_hits.contains_key(page) || worker.requested.contains(page) {
+                continue;
+            }
+            // A send failure means the worker died; stop asking.
+            if worker.req.send(*page).is_err() {
+                self.find_worker = None;
+                return;
+            }
+            worker.requested.insert(*page);
+        }
+    }
+
     /// Paint this page's search hits.
     ///
     /// Every hit on the page is shaded; the one the view is *on* is drawn
@@ -2286,6 +2404,21 @@ impl eframe::App for KpdfApp {
         // file (hot reload). Cheap -- throttled to one `stat` per
         // RELOAD_CHECK_INTERVAL inside `HotReload::poll`.
         self.check_hot_reload(ui.ctx());
+
+        // Collect finished search pages and queue the ones about to be looked
+        // at. A window around the current page rather than the exact visible
+        // set: in continuous scroll those are the same pages, and this needs
+        // no viewport geometry, so it can run before any layout happens.
+        if self.find_worker.is_some() {
+            let lo = self.page.saturating_sub(SEARCH_PREFETCH_RADIUS);
+            let hi = (self.page + SEARCH_PREFETCH_RADIUS).min(self.page_count.saturating_sub(1));
+            let window: Vec<usize> = (lo..=hi).collect();
+            self.pump_search_worker(&window);
+            // Results land asynchronously, so ask for another frame soon —
+            // otherwise a highlight would not appear until the next input
+            // event.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
         self.handle_key(ui.ctx());
         self.handle_scroll_zoom(ui.ctx());
 
@@ -2684,4 +2817,88 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("kpdf", native_options, Box::new(|_cc| Ok(Box::new(app))))
+}
+
+#[cfg(test)]
+mod search_worker_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The workspace's arXiv fixture, or `None` when it is not present (a
+    /// packaged build, say) — the test then skips rather than fails.
+    fn fixture() -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/arxiv-2608.17504v1.pdf");
+        std::fs::read(path).ok()
+    }
+
+    /// The background searcher must return **exactly** what searching on the
+    /// UI thread would have returned. It exists to move the cost, never to
+    /// change the answer, so the synchronous path is the correctness
+    /// reference and this asserts equivalence against it.
+    #[test]
+    fn the_worker_agrees_with_a_direct_search() {
+        let Some(bytes) = fixture() else { return };
+        let query = "reactor";
+
+        // Reference: search on this thread, the way `n` does.
+        let doc = PdfDocument::open(bytes.clone()).expect("fixture opens");
+        let pages: Vec<usize> = (0..6).collect();
+        let expected: Vec<(usize, Vec<SearchHit>)> = pages
+            .iter()
+            .map(|&p| {
+                let hits = page_to_stext(&doc, p, StextOptions::default())
+                    .map(|sp| search_page(&sp, query))
+                    .unwrap_or_default();
+                (p, hits)
+            })
+            .collect();
+
+        let mut worker =
+            SearchWorker::spawn(bytes, query.to_string()).expect("worker thread spawns");
+        for &p in &pages {
+            worker.req.send(p).expect("worker accepts requests");
+        }
+
+        // Collect, bounded — a hung worker must fail the test, not the suite.
+        let mut got: Vec<(usize, Vec<SearchHit>)> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while got.len() < pages.len() && Instant::now() < deadline {
+            match worker.res.recv_timeout(Duration::from_millis(500)) {
+                Ok(v) => got.push(v),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+        got.sort_by_key(|(p, _)| *p);
+        assert_eq!(got.len(), pages.len(), "every requested page comes back");
+        assert_eq!(got, expected, "the worker's hits must match a direct search");
+        assert!(
+            expected.iter().any(|(_, h)| !h.is_empty()),
+            "the fixture must actually contain the query, or this proves nothing"
+        );
+    }
+
+    /// Dropping the request sender is how the worker is told to stop; it must
+    /// then exit rather than linger holding its copy of the document.
+    #[test]
+    fn dropping_the_worker_stops_the_thread() {
+        let Some(bytes) = fixture() else { return };
+        let worker = SearchWorker::spawn(bytes, "reactor".to_string()).expect("spawns");
+        let res = worker.res;
+        drop(worker.req); // the UI going away
+        // With the request side closed the worker returns, which closes the
+        // result side; recv then reports disconnection rather than blocking.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match res.recv_timeout(Duration::from_millis(500)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {
+                    continue;
+                }
+                Err(_) => panic!("worker did not exit within the timeout"),
+                Ok(_) => continue, // drain anything already in flight
+            }
+        }
+    }
 }
