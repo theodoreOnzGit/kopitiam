@@ -650,6 +650,23 @@ impl Font {
 
     /// Decode a whole PDF string into a sequence of [`Decoded`] characters,
     /// splitting it into codes and mapping each (`show_string`'s loop).
+    /// The substituted face's own advance for `cid`, in 1/1000 em.
+    ///
+    /// Resolved by glyph **name** (the PDF `/Encoding`, else the substitute's
+    /// built-in encoding), exactly like [`Font::glyph_outline`] -- the
+    /// document's GIDs mean nothing in a font it never embedded.
+    fn substitute_advance(&self, cid: u32) -> Option<f32> {
+        let sub = self.substitute.as_ref()?;
+        let named = self
+            .glyph_names
+            .as_ref()
+            .and_then(|gn| gn.get(cid as usize))
+            .and_then(|o| o.as_deref())
+            .and_then(|n| sub.gid_for_name(n));
+        let gid = named.or_else(|| sub.gid_for_code(cid))?;
+        sub.advance_width(gid)
+    }
+
     pub fn decode_string(&self, buf: &[u8]) -> Vec<Decoded> {
         let mut out = Vec::new();
         let mut i = 0;
@@ -673,7 +690,20 @@ impl Font {
         // code -> CID (identity for simple fonts). A code the CMap cannot map
         // falls back to the code itself rather than being dropped.
         let cid = self.encoding.lookup(code).unwrap_or(code);
-        let advance = self.lookup_hmtx(cid) as f32;
+        let advance = match self.lookup_hmtx(cid) {
+            // A PDF that names a standard-14 font may legally omit /Widths
+            // entirely (§9.6.2.2), which leaves `hmtx` empty and
+            // `/MissingWidth` absent, i.e. an advance of zero for every glyph.
+            // Zero is not merely wrong spacing: the draw device skips a glyph
+            // whose advance is <= 0, so the text becomes INVISIBLE. That is
+            // what made typed form-field text vanish -- an AcroForm `/DR`
+            // font (`/Helv`, `/BaseFont /Helvetica`) carries no `/Widths` at
+            // all. Fall back to the substituted face's own declared width:
+            // those faces are metric-compatible stand-ins for the standard
+            // 14, so their widths are the right answer.
+            0 => self.substitute_advance(cid).unwrap_or(0.0),
+            w => w as f32,
+        };
         let unicode = self.decode_unicode(cid);
         Decoded {
             unicode,

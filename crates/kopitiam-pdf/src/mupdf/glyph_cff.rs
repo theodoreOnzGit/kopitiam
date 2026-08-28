@@ -268,6 +268,35 @@ impl CffProgram {
     /// Decode glyph `gid` to an em-space [`Path`] (y-up, 1 em = 1.0), or `None`
     /// for an empty / out-of-range glyph.
     pub fn outline(&self, gid: u16) -> Option<Path> {
+        self.run_charstring(gid).and_then(|(path, _)| {
+            if super::glyph::path_is_empty(&path) {
+                None
+            } else {
+                Some(path)
+            }
+        })
+    }
+
+    /// The glyph's horizontal advance in **1/1000 em**, as the charstring
+    /// itself declares it (the optional leading width operand, relative to the
+    /// Private DICT's `nominalWidthX`, defaulting to `defaultWidthX` —
+    /// CFF spec §16 / Type2 charstring spec §3.1).
+    ///
+    /// This is the metric source of last resort for a **substituted** font.
+    /// A PDF that names a standard-14 font usually omits `/Widths` entirely
+    /// (§9.6.2.2 lets it), which leaves the viewer with no advance at all —
+    /// and a zero advance means every glyph is skipped, so the text is not
+    /// merely mis-spaced but *invisible*. The bundled faces are
+    /// metric-compatible stand-ins for the standard 14, so their own declared
+    /// widths are the right answer, and reading them here avoids porting the
+    /// AFM tables to get the same numbers.
+    pub fn advance_width(&self, gid: u16) -> Option<f32> {
+        self.run_charstring(gid).map(|(_, w)| w)
+    }
+
+    /// Interpret one glyph's charstring, returning its em-space path and the
+    /// advance width the charstring declared.
+    fn run_charstring(&self, gid: u16) -> Option<(Path, f32)> {
         let g = gid as usize;
         let span = *self.charstrings.get(g)?;
 
@@ -315,11 +344,7 @@ impl CffProgram {
         if ctx.open {
             ctx.path.close();
         }
-        if super::glyph::path_is_empty(&ctx.path) {
-            None
-        } else {
-            Some(ctx.path)
-        }
+        Some((ctx.path, ctx.width))
     }
 }
 
@@ -337,7 +362,6 @@ struct T2Ctx<'a> {
     open: bool,
     have_width: bool,
     nstems: u32,
-    #[allow(dead_code)]
     width: f32,
     nominal_width: f32,
     gsubrs: &'a [Span],

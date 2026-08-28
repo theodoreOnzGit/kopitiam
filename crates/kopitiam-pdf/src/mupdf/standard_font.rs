@@ -409,6 +409,46 @@ mod tests {
         }
     }
 
+    /// The bug that made typed form text invisible: a PDF naming a standard-14
+    /// font may omit `/Widths` entirely, leaving the advance at zero — and the
+    /// draw device skips any glyph whose advance is `<= 0`, so the text does
+    /// not merely mis-space, it vanishes. The substituted face must therefore
+    /// declare usable widths of its own.
+    #[test]
+    fn substituted_faces_declare_nonzero_advances() {
+        for face in [
+            StandardFont::Helvetica,
+            StandardFont::HelveticaBold,
+            StandardFont::TimesRoman,
+            StandardFont::Courier,
+        ] {
+            let p = program_for(face).expect("face parses");
+            for name in ["A", "space", "period", "zero"] {
+                let gid = p.gid_for_name(name).unwrap_or_else(|| panic!("{name} missing"));
+                let w = p.advance_width(gid).unwrap_or_else(|| panic!("no width for {name}"));
+                assert!(w > 0.0, "{name} advance must be > 0, got {w}");
+                assert!(w < 2000.0, "{name} advance {w} is implausible for 1/1000 em");
+            }
+        }
+    }
+
+    /// Courier is genuinely monospaced at 600/1000 em, so it is the one face
+    /// whose widths can be checked against a known constant rather than a
+    /// range — a cheap guard that the numbers are real metrics and not a
+    /// default being echoed back.
+    #[test]
+    fn courier_widths_are_the_known_monospace_value() {
+        let p = program_for(StandardFont::Courier).unwrap();
+        for name in ["A", "i", "W", "period"] {
+            let gid = p.gid_for_name(name).unwrap();
+            let w = p.advance_width(gid).unwrap();
+            assert!(
+                (w - 600.0).abs() < 1.0,
+                "Courier {name} should advance 600/1000 em, got {w}"
+            );
+        }
+    }
+
     /// The cache must hand back the same allocation, not re-parse.
     #[test]
     fn programs_are_cached() {
