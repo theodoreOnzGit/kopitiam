@@ -19,7 +19,7 @@ name = "kopitiam-pdf"
 # changes what *other* crates resolve against -- it does NOT change what
 # `cargo publish` uploads. The crate's own `[package] version` here is the
 # other half, and both have to move together.
-version = "0.2.9"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
