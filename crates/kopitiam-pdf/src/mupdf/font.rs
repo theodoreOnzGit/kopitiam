@@ -141,6 +141,41 @@ pub struct Font {
     cid_to_gid: CidToGid,
 }
 
+/// Where a loaded font's glyph outlines come from — the single fact that
+/// decides whether a page draws real text or the advance-box fallback.
+///
+/// Exposed for diagnostics ([`Font::outline_source`]): when a page renders as
+/// solid boxes, the question is always "which font, and did its program
+/// decode?", and that is otherwise invisible from outside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineSource {
+    /// A decoded `/FontFile2` (TrueType) or `/FontFile3` (CFF/OpenType),
+    /// selected by GID.
+    Program,
+    /// A decoded `/FontFile` Type1 program, selected by glyph name.
+    Type1,
+    /// Nothing decodable. **This is the advance-box fallback condition**: the
+    /// draw device has no outlines to draw, so it emits a filled box of the
+    /// glyph's advance width. Either the font embeds no program at all (a
+    /// non-embedded base-14 font) or the embedded program was rejected by our
+    /// decoders.
+    None,
+}
+
+impl Font {
+    /// Where this font's outlines come from; [`OutlineSource::None`] means
+    /// every glyph drawn with it becomes an advance box.
+    pub fn outline_source(&self) -> OutlineSource {
+        if self.program.is_some() {
+            OutlineSource::Program
+        } else if self.type1.is_some() {
+            OutlineSource::Type1
+        } else {
+            OutlineSource::None
+        }
+    }
+}
+
 impl Font {
     // -----------------------------------------------------------------------
     // Loading

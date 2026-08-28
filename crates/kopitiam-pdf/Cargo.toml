@@ -142,6 +142,10 @@ default = ["kpdf"]
 kpdf = ["dep:eframe", "dep:egui", "dep:rfd"]
 
 [[bin]]
+name = "kpdf-doctor"
+path = "src/bin/kpdf_doctor.rs"
+
+[[bin]]
 name = "kpdf"
 path = "src/bin/kpdf.rs"
 # Without this, `cargo build --no-default-features` would try to build the
