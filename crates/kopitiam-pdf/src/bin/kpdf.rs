@@ -69,7 +69,18 @@
 //!
 //! A page that is not ready yet draws its real outline with a
 //! `page N — loading…` label, so "still working" is never mistaken for a
-//! blank page.
+//! blank page. Sidebar thumbnails go through the same worker: rendered
+//! inline they cost ~76 ms each, and `show_rows` uncovers about ten at once
+//! when you jump, which froze the window for most of a second *and* delayed
+//! the page queue behind it.
+//!
+//! **Jumps discard queued work.** The request queue is FIFO, so after `G` it
+//! is full of pages near where you used to be. Rendering those first, at
+//! 135 ms each, is what made a jump sit on "loading…" for seconds. A jump
+//! (a move further than the prefetch radius) bumps the generation, which the
+//! worker reads through an atomic and uses to drop stale requests *before*
+//! paying for them. An ordinary step does not bump, so its neighbours
+//! survive.
 //!
 //! Zoom invalidates in-flight work by generation rather than trying to cancel
 //! it: a render already running is allowed to finish and is discarded on
@@ -544,8 +555,27 @@ struct RenderWorker {
     /// Pages asked for and not yet delivered, so a page visible across many
     /// frames is requested once.
     inflight: std::collections::HashSet<PageTextureKey>,
-    /// Bumped whenever dpi or the fallback toggle changes.
+    /// Bumped whenever dpi, the fallback toggle, or the reading position
+    /// changes enough to make queued work irrelevant.
     generation: u64,
+    /// The same counter, visible to the worker.
+    ///
+    /// Without this the queue is strictly FIFO, so jumping to the end of a
+    /// 506-page book left the worker grinding through every page queued near
+    /// the old position — at 135 ms each — before it reached the pages
+    /// actually on screen. That is exactly what "press G and everything says
+    /// loading for a while" was. The worker now checks this before rendering
+    /// and drops a stale request in microseconds instead of minutes.
+    shared_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// What a render request is for. Thumbnails are the same rasteriser at a
+/// much lower dpi; they are distinguished only so the result lands in the
+/// right cache.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RenderKind {
+    Page,
+    Thumbnail,
 }
 
 struct RenderRequest {
@@ -553,6 +583,7 @@ struct RenderRequest {
     dpi: f32,
     fallback: bool,
     generation: u64,
+    kind: RenderKind,
 }
 
 /// A finished page, as raw RGBA ready for texture upload. The pixmap is
@@ -563,6 +594,7 @@ struct RenderedPage {
     generation: u64,
     size: [usize; 2],
     rgba: Vec<u8>,
+    kind: RenderKind,
 }
 
 impl RenderWorker {
@@ -573,6 +605,8 @@ impl RenderWorker {
     fn spawn(bytes: Vec<u8>) -> Option<RenderWorker> {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<RenderRequest>();
         let (res_tx, res_rx) = std::sync::mpsc::channel::<RenderedPage>();
+        let shared_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_generation = std::sync::Arc::clone(&shared_generation);
         std::thread::Builder::new()
             .name("kpdf-render".to_string())
             .spawn(move || {
@@ -580,6 +614,15 @@ impl RenderWorker {
                     return;
                 };
                 while let Ok(r) = req_rx.recv() {
+                    // Drop work the UI has already moved on from BEFORE
+                    // paying for it. This check is the difference between a
+                    // jump costing one page's render and costing the whole
+                    // queued backlog.
+                    if r.generation
+                        != worker_generation.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        continue;
+                    }
                     let Ok(pix) =
                         rasterize_page_with_fallback(&doc, r.page, r.dpi, r.fallback)
                     else {
@@ -590,6 +633,7 @@ impl RenderWorker {
                         generation: r.generation,
                         size: [pix.w as usize, pix.h as usize],
                         rgba: rgb_to_rgba(&pix),
+                        kind: r.kind,
                     };
                     // Send each page as it finishes: the UI shows progress
                     // rather than waiting for the batch.
@@ -604,6 +648,7 @@ impl RenderWorker {
             res: res_rx,
             inflight: std::collections::HashSet::new(),
             generation: 0,
+            shared_generation,
         })
     }
 }
@@ -742,6 +787,9 @@ struct KpdfApp {
     find_hits: HashMap<usize, Vec<SearchHit>>,
     /// The background page rasteriser, if one could be started.
     render_worker: Option<RenderWorker>,
+    /// The page the rasteriser last planned around, so a jump can be told
+    /// from a step.
+    last_pumped_page: usize,
     /// Whether the opening-pages prerender has run for the current document.
     /// Separate from `render_worker` being `Some`, so a machine where the
     /// thread could not be spawned does not retry the spawn every frame.
@@ -929,6 +977,7 @@ impl KpdfApp {
             find_query: String::new(),
             find_hits: HashMap::new(),
             render_worker: None,
+            last_pumped_page: 0,
             render_started: false,
             find_scan: None,
             find_worker: None,
@@ -1148,6 +1197,29 @@ impl KpdfApp {
         if let Some(t) = self.thumbnails.get(&page) {
             return Some(t.clone());
         }
+        // Queue it and draw nothing this frame. A thumbnail costs ~76 ms, and
+        // `show_rows` asks for every row it can see: jumping to the end of a
+        // 506-page book uncovers about ten uncached rows at once, which
+        // rendered inline is most of a second of frozen window. That stall
+        // also delayed the page pump, so the pages themselves started late --
+        // together, "press G and everything says loading for a while".
+        if let Some(worker) = self.render_worker.as_mut() {
+            let key: PageTextureKey = (page, THUMBNAIL_DPI.to_bits(), self.fallback_enabled);
+            if !worker.inflight.contains(&key) {
+                let req = RenderRequest {
+                    page,
+                    dpi: THUMBNAIL_DPI,
+                    fallback: self.fallback_enabled,
+                    generation: worker.generation,
+                    kind: RenderKind::Thumbnail,
+                };
+                if worker.req.send(req).is_ok() {
+                    worker.inflight.insert(key);
+                }
+            }
+            return None;
+        }
+        // No worker: render inline, as before. Slow beats never.
         let pix =
             rasterize_page_with_fallback(&self.doc, page, THUMBNAIL_DPI, self.fallback_enabled)
                 .ok()?;
@@ -2402,32 +2474,59 @@ impl KpdfApp {
     /// Okular-style page picker. Ported from `kovan`'s `thumbnail_strip`
     /// (see the module docs): `show_rows` so only the thumbnails actually
     /// scrolled into view are rasterized/uploaded, rather than every page in
-    /// the document up front (the sidebar's own scroll position is
-    /// independent of the main continuous view's).
     /// Take delivered pages from the rasteriser and queue the ones about to
     /// be looked at. Called once per frame; never blocks.
     fn pump_render_worker(&mut self, ctx: &egui::Context) {
+        if self.render_worker.is_none() {
+            return;
+        }
+        // A JUMP (`G`, `gg`, `:N`, a search hit) makes everything queued
+        // around the old position irrelevant. Bumping the generation lets the
+        // worker skip that backlog instead of rendering it first, which is
+        // what made `G` show "loading…" for seconds. An ordinary step keeps
+        // its neighbours, which are still worth having.
+        let moved = self.page.abs_diff(self.last_pumped_page);
+        self.last_pumped_page = self.page;
+        if moved > RENDER_PREFETCH_RADIUS {
+            self.bump_render_generation();
+        }
         let Some(worker) = self.render_worker.as_mut() else {
             return;
         };
         let generation = worker.generation;
         let mut uploaded = false;
-        let mut arrived: Vec<(PageTextureKey, [usize; 2], Vec<u8>)> = Vec::new();
+        let mut arrived: Vec<RenderedPage> = Vec::new();
         while let Ok(done) = worker.res.try_recv() {
             worker.inflight.remove(&done.key);
-            // A result from before the last zoom is stale: drop it rather
-            // than put a wrong-resolution texture on screen.
+            // A result from before the last zoom or jump is stale: drop it
+            // rather than put a wrong texture on screen.
             if done.generation == generation {
-                arrived.push((done.key, done.size, done.rgba));
+                arrived.push(done);
             }
         }
-        for (key, size, rgba) in arrived {
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
-            let tex = ctx.load_texture(format!("kpdf-page-{}", key.0), image, egui::TextureOptions::LINEAR);
-            if let Some(evicted) = self.page_textures_lru.touch(key) {
-                self.page_textures.remove(&evicted);
+        for done in arrived {
+            let image = egui::ColorImage::from_rgba_unmultiplied(done.size, &done.rgba);
+            match done.kind {
+                RenderKind::Page => {
+                    let tex = ctx.load_texture(
+                        format!("kpdf-page-{}", done.key.0),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    if let Some(evicted) = self.page_textures_lru.touch(done.key) {
+                        self.page_textures.remove(&evicted);
+                    }
+                    self.page_textures.insert(done.key, tex);
+                }
+                RenderKind::Thumbnail => {
+                    let tex = ctx.load_texture(
+                        format!("kpdf-thumb-{}", done.key.0),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumbnails.insert(done.key.0, tex);
+                }
             }
-            self.page_textures.insert(key, tex);
             uploaded = true;
         }
 
@@ -2456,7 +2555,7 @@ impl KpdfApp {
             }
             if worker
                 .req
-                .send(RenderRequest { page, dpi, fallback, generation })
+                .send(RenderRequest { page, dpi, fallback, generation, kind: RenderKind::Page })
                 .is_err()
             {
                 died = true;
@@ -2486,6 +2585,10 @@ impl KpdfApp {
     fn bump_render_generation(&mut self) {
         if let Some(w) = self.render_worker.as_mut() {
             w.generation = w.generation.wrapping_add(1);
+            // Publish it so the worker can skip everything already queued,
+            // rather than rendering it and having the UI throw it away.
+            w.shared_generation
+                .store(w.generation, std::sync::atomic::Ordering::Relaxed);
             w.inflight.clear();
         }
     }
@@ -2720,6 +2823,22 @@ impl KpdfApp {
                                 ui.add(
                                     egui::Image::new(&tex)
                                         .fit_to_exact_size(egui::vec2(w, w * aspect)),
+                                );
+                            } else {
+                                // Not rendered yet. Hold the row's height with
+                                // a placeholder so the list does not reflow
+                                // under the reader as thumbnails arrive --
+                                // rows jumping around while scrolling is worse
+                                // than a moment of grey.
+                                let w = 72.0_f32;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(w, w * 1.414),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    egui::Color32::from_gray(225),
                                 );
                             }
                             ui.label(format!("{}", page + 1));
@@ -3359,10 +3478,22 @@ mod search_worker_tests {
             .collect();
 
         let mut worker = RenderWorker::spawn(bytes).expect("worker spawns");
+        // The worker only renders requests matching the CURRENT generation,
+        // so publish the one this test uses. (Getting this wrong is how the
+        // first run of this test hung: every request was skipped as stale.)
+        worker
+            .shared_generation
+            .store(7, std::sync::atomic::Ordering::Relaxed);
         for page in 0..3 {
             worker
                 .req
-                .send(RenderRequest { page, dpi, fallback: true, generation: 7 })
+                .send(RenderRequest {
+                    page,
+                    dpi,
+                    fallback: true,
+                    generation: 7,
+                    kind: RenderKind::Page,
+                })
                 .expect("accepts requests");
         }
 
@@ -3387,6 +3518,48 @@ mod search_worker_tests {
         assert!(
             expected.iter().any(|(_, _, px)| px.iter().any(|&b| b < 200)),
             "the fixture must actually draw something"
+        );
+    }
+
+    /// The fix for "press G and every page says loading for a while".
+    ///
+    /// The queue is FIFO, so after a jump it is full of pages near the old
+    /// position. Rendering those first, at 135 ms each, is what made the jump
+    /// feel frozen. A request whose generation is stale must be dropped
+    /// without being rendered at all.
+    #[test]
+    fn stale_requests_are_skipped_without_rendering() {
+        let Some(bytes) = fixture() else { return };
+        let mut worker = RenderWorker::spawn(bytes).expect("worker spawns");
+        worker
+            .shared_generation
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        // Three stale requests (generation 1) then one current (generation 2).
+        for page in 0..3 {
+            worker
+                .req
+                .send(RenderRequest { page, dpi: 72.0, fallback: true, generation: 1, kind: RenderKind::Page })
+                .expect("accepts requests");
+        }
+        worker
+            .req
+            .send(RenderRequest { page: 5, dpi: 72.0, fallback: true, generation: 2, kind: RenderKind::Page })
+            .expect("accepts requests");
+
+        let got = worker
+            .res
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the current request comes back");
+        assert_eq!(
+            got.key.0, 5,
+            "the current page must arrive FIRST -- the stale ones were skipped, not rendered"
+        );
+        assert_eq!(got.generation, 2);
+        // And nothing else is delivered: the stale three produced no work.
+        assert!(
+            worker.res.recv_timeout(Duration::from_millis(500)).is_err(),
+            "stale requests must produce no results at all"
         );
     }
 
