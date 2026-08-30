@@ -31,5 +31,5 @@ pub mod gui_frontend;
 pub use extractor::{ExtractError, extract, extract_from_bytes};
 pub use font::FontStyle;
 pub use geometry::Rect;
-pub use mupdf_extract::{extract_mupdf, extract_mupdf_from_bytes};
+pub use mupdf_extract::{extract_mupdf, extract_mupdf_from_bytes, extract_mupdf_page};
 pub use page::{Page, TextSpan};

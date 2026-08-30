@@ -359,7 +359,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
 // Reusable page-layout/zoom/hit-testing/forms-UI/tool-state/continuous-scroll/
@@ -383,7 +383,7 @@ use kopitiam_pdf::mupdf::outline::{OutlineItem, load_outline};
 use kopitiam_pdf::mupdf::stext_search::{SearchHit, search_page};
 use kopitiam_pdf::mupdf::structured_text::StextOptions;
 use kopitiam_pdf::mupdf::{PdfDocument, Rect, page_to_stext, rasterize_page_with_fallback};
-use kopitiam_pdf::{Page as TextPage, extract_mupdf_from_bytes};
+use kopitiam_pdf::{Page as TextPage, extract_mupdf_page};
 
 /// Ink color for a newly-drawn stroke (DeviceRGB, 0..=1) -- plain black, the
 /// least surprising default for a "draw on the page" tool. No UI to pick a
@@ -653,6 +653,74 @@ impl RenderWorker {
     }
 }
 
+/// A background reflow-text extractor.
+///
+/// # Why
+///
+/// Reflow mode used to call `extract_mupdf_from_bytes` on first entry, which
+/// **re-reads the whole file and extracts every page** before returning. On
+/// the 506-page Irodori book that is a 106 MB read plus 506 extractions at a
+/// median 5.4 ms and up to 349 ms each — the same tens-of-seconds freeze the
+/// inline search scan used to cause, just triggered by pressing `r` instead.
+///
+/// So pages are extracted one at a time on a worker and delivered as they
+/// finish. Reflow shows what has arrived, with the rest reported as still
+/// coming, instead of showing nothing at all until everything is done.
+struct ReflowWorker {
+    res: std::sync::mpsc::Receiver<(usize, TextPage)>,
+    /// How many pages the document has, so the view can say how far along it
+    /// is rather than just appearing to stop.
+    total: usize,
+    /// Pages delivered so far. Progress only -- **not** the completion test.
+    /// The worker skips pages it cannot extract, so `done` can legitimately
+    /// stop short of `total` on a damaged document; waiting for `done ==
+    /// total` would then leave the pump asking for a frame every 120 ms for
+    /// the rest of the session. Completion is the channel disconnecting, when
+    /// the worker thread drops its sender -- which happens whether it
+    /// finished, skipped, or bailed on an unopenable file.
+    done: usize,
+}
+
+impl ReflowWorker {
+    /// Start extracting `bytes` page by page.
+    fn spawn(bytes: Vec<u8>, total: usize) -> Option<ReflowWorker> {
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, TextPage)>();
+        std::thread::Builder::new()
+            .name("kpdf-reflow".to_string())
+            .spawn(move || {
+                let Ok(doc) = PdfDocument::open(bytes) else {
+                    return;
+                };
+                for index in 0..doc.page_count() {
+                    // An unreadable page must not stop the rest.
+                    let Some(page) = extract_mupdf_page(&doc, index) else {
+                        continue;
+                    };
+                    if tx.send((index, page)).is_err() {
+                        return; // UI gone
+                    }
+                }
+            })
+            .ok()?;
+        Some(ReflowWorker { res: rx, total, done: 0 })
+    }
+}
+
+/// Put `page` at its own `index` in a sparse, page-indexed vector, growing
+/// with `None` holes as needed.
+///
+/// Pulled out of [`KpdfApp::pump_reflow_worker`] purely so it can be tested:
+/// the pump needs an egui `Context`, this needs nothing. A hole means "that
+/// page produced no text page" -- either it has not arrived yet, or the
+/// worker could not extract it at all. Both render the same way, and neither
+/// is allowed to shift a page that *did* arrive.
+fn place_reflow_page(pages: &mut Vec<Option<TextPage>>, index: usize, page: TextPage) {
+    if index >= pages.len() {
+        pages.resize_with(index + 1, || None);
+    }
+    pages[index] = Some(page);
+}
+
 /// A background text-search worker for one query.
 ///
 /// # Why this exists
@@ -852,7 +920,12 @@ struct KpdfApp {
     /// Lazily extracted once, on first entry to reflow mode -- extraction
     /// walks the whole document, so it is not worth doing eagerly for a
     /// session that might only ever use image mode.
-    reflow_pages: Option<Result<Vec<TextPage>, String>>,
+    /// Sparse and **page-indexed**: `reflow_pages[i]` is page `i`'s text, or
+    /// `None` if it has not arrived (or could not be extracted). Never a
+    /// densely-packed arrival-order list -- see [`place_reflow_page`].
+    reflow_pages: Option<Result<Vec<Option<TextPage>>, String>>,
+    /// The background reflow extractor, while it is still working.
+    reflow_worker: Option<ReflowWorker>,
     reflow_scroll: f32,
     status: Option<String>,
     /// How many drawable annotations the current page carries -- shown in the
@@ -993,6 +1066,7 @@ impl KpdfApp {
             hide_thumbnails: false,
             fallback_enabled: true,
             reflow_pages: None,
+            reflow_worker: None,
             reflow_scroll: 0.0,
             status: has_acroform
                 .then(|| "form document -- Forms mode on, click a field to fill it".to_string()),
@@ -1045,6 +1119,7 @@ impl KpdfApp {
                 // the old file.
                 self.render_worker = None;
                 self.render_started = false;
+                self.reflow_worker = None;
                 self.outline.clear();
                 self.page_count = page_count;
                 self.page = 0;
@@ -1369,10 +1444,58 @@ impl KpdfApp {
         if self.reflow_pages.is_some() {
             return;
         }
-        self.reflow_pages = Some(match std::fs::read(&self.path) {
-            Ok(bytes) => extract_mupdf_from_bytes(&bytes).map_err(|e| e.to_string()),
-            Err(e) => Err(format!("{}: {e}", self.path.display())),
-        });
+        // Start with an empty (Ok) result and fill it in as pages arrive.
+        // Extracting the whole document here is what froze the window for
+        // tens of seconds on a long book -- see `ReflowWorker`.
+        self.reflow_pages = Some(Ok(Vec::new()));
+        self.reflow_worker =
+            ReflowWorker::spawn(self.doc.raw_bytes().to_vec(), self.page_count);
+        if self.reflow_worker.is_none() {
+            // No thread available: fall back to doing it here, which is slow
+            // but still correct.
+            self.reflow_pages = Some(
+                kopitiam_pdf::extract_mupdf_from_bytes(self.doc.raw_bytes())
+                    .map(|pages| pages.into_iter().map(Some).collect())
+                    .map_err(|e| e.to_string()),
+            );
+        }
+    }
+
+    /// Collect reflow pages delivered since the last frame. Never blocks.
+    fn pump_reflow_worker(&mut self, ctx: &egui::Context) {
+        let Some(worker) = self.reflow_worker.as_mut() else {
+            return;
+        };
+        let dest = match self.reflow_pages.as_mut() {
+            Some(Ok(pages)) => pages,
+            // An error result means the fallback path already ran; nothing to
+            // collect into.
+            _ => return,
+        };
+        let mut finished = false;
+        loop {
+            match worker.res.try_recv() {
+                Ok((index, page)) => {
+                    // Place by the page's OWN index, never by arrival order.
+                    // The worker `continue`s past a page it cannot extract, so
+                    // pushing in arrival order shifts every later page up by
+                    // one -- reflow would then show page 41's text under the
+                    // heading for page 42, silently, for the rest of the file.
+                    place_reflow_page(dest, index, page);
+                    worker.done += 1;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.reflow_worker = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
     }
 
     /// Switch tools, via the pure [`select_tool`] transition.
@@ -2963,6 +3086,7 @@ impl eframe::App for KpdfApp {
             self.prerender_opening_pages(ui.ctx());
         }
         self.pump_render_worker(ui.ctx());
+        self.pump_reflow_worker(ui.ctx());
 
         // Collect finished search pages and queue the ones about to be looked
         // at. A window around the current page rather than the exact visible
@@ -3352,13 +3476,27 @@ impl eframe::App for KpdfApp {
                 egui::ScrollArea::vertical()
                     .vertical_scroll_offset(scroll)
                     .show(ui, |ui| match &self.reflow_pages {
-                        Some(Ok(pages)) => {
-                            if let Some(p) = pages.get(self.page) {
+                        // Indexed by real page number, so this is the right
+                        // page's text or nothing -- never a neighbour's.
+                        Some(Ok(pages)) => match pages.get(self.page).and_then(|p| p.as_ref()) {
+                            Some(p) => {
                                 for span in &p.spans {
                                     ui.label(&span.text);
                                 }
                             }
-                        }
+                            // Still extracting, or this page yielded no text.
+                            // Say which, rather than showing a blank pane that
+                            // looks like the reader has hung.
+                            None => {
+                                let msg = match self.reflow_worker.as_ref() {
+                                    Some(w) => {
+                                        format!("(page loading... {}/{})", w.done, w.total)
+                                    }
+                                    None => "(no text on this page)".to_string(),
+                                };
+                                ui.weak(msg);
+                            }
+                        },
                         Some(Err(e)) => {
                             ui.colored_label(egui::Color32::LIGHT_RED, e.as_str());
                         }
@@ -3369,9 +3507,21 @@ impl eframe::App for KpdfApp {
             }
         });
 
-        // Repaint continuously enough to notice key events promptly even
-        // when nothing else is animating.
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        // NO blanket repaint here, deliberately. This used to ask for a frame
+        // every 50 ms unconditionally, "to notice key events promptly" -- but
+        // egui already wakes on input, so all that achieved was pinning kpdf
+        // at 20 fps forever, laying out the whole window twenty times a second
+        // with an idle document on screen. That is the lag the maintainer
+        // reported while in reflow mode; reflow only made it visible, it was
+        // burning a core the entire time.
+        //
+        // Every genuinely asynchronous source asks for its own frame instead,
+        // and only while it actually has work outstanding:
+        //   * `check_hot_reload`      -> RELOAD_CHECK_INTERVAL (500 ms)
+        //   * `pump_render_worker`    -> 60 ms, while pages are in flight
+        //   * `pump_reflow_worker`    -> 120 ms, until the worker disconnects
+        //   * the search pump         -> 120 ms, while a query is running
+        // Idle, with hot reload on, that is 2 wakeups a second instead of 20.
     }
 }
 
@@ -3584,5 +3734,166 @@ mod search_worker_tests {
                 Ok(_) => continue, // drain anything already in flight
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reflow_worker_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Same arXiv fixture as the search tests; absent means skip, not fail.
+    fn fixture() -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/arxiv-2608.17504v1.pdf");
+        std::fs::read(path).ok()
+    }
+
+    /// A minimal marker page. `number` is used here purely as an arbitrary
+    /// tag so a placement test can ask "is this the page I put here?" -- it
+    /// is NOT the 1-based page number a real extraction produces (see
+    /// `mupdf_extract::extract_mupdf_page`), and nothing reads it as one.
+    fn marker(number: usize) -> TextPage {
+        TextPage {
+            number,
+            width: 100.0,
+            height: 100.0,
+            spans: Vec::new(),
+        }
+    }
+
+    /// The bug this pins: the pump used to `push` in arrival order and throw
+    /// the page index away. The worker skips a page it cannot extract, so one
+    /// bad page shifted **every** later page up by one -- reflow then showed
+    /// the wrong page's text, quietly, for the rest of the document.
+    ///
+    /// Placement by index means a gap stays a gap.
+    #[test]
+    fn a_skipped_page_leaves_a_hole_instead_of_shifting_later_pages() {
+        let mut pages: Vec<Option<TextPage>> = Vec::new();
+        // Pages 0 and 1 arrive; page 2 is unextractable and never arrives.
+        place_reflow_page(&mut pages, 0, marker(0));
+        place_reflow_page(&mut pages, 1, marker(1));
+        place_reflow_page(&mut pages, 3, marker(3));
+
+        assert_eq!(pages.len(), 4, "the vector grows to hold the highest index");
+        assert!(pages[0].is_some());
+        assert!(pages[1].is_some());
+        assert!(
+            pages[2].is_none(),
+            "the skipped page must stay a hole -- filling it with page 3's \
+             text is exactly the off-by-one this test exists to catch"
+        );
+        assert_eq!(
+            pages[3].as_ref().map(|p| p.number),
+            Some(3),
+            "page 3 must land at index 3, not index 2"
+        );
+    }
+
+    /// Out-of-order arrival must land by index too. Nothing in the channel
+    /// contract promises order once more than one producer is conceivable, and
+    /// the fix must not quietly depend on it.
+    #[test]
+    fn placement_does_not_depend_on_arrival_order() {
+        let mut pages: Vec<Option<TextPage>> = Vec::new();
+        place_reflow_page(&mut pages, 5, marker(5));
+        place_reflow_page(&mut pages, 2, marker(2));
+        assert_eq!(pages.len(), 6);
+        assert_eq!(pages[2].as_ref().map(|p| p.number), Some(2));
+        assert_eq!(pages[5].as_ref().map(|p| p.number), Some(5));
+        for i in [0usize, 1, 3, 4] {
+            assert!(pages[i].is_none(), "index {i} must be untouched");
+        }
+    }
+
+    /// Re-placing an index overwrites rather than appending, so a reload that
+    /// re-delivers a page cannot double it up.
+    #[test]
+    fn replacing_a_page_overwrites_in_place() {
+        let mut pages: Vec<Option<TextPage>> = Vec::new();
+        place_reflow_page(&mut pages, 1, marker(1));
+        place_reflow_page(&mut pages, 1, marker(1));
+        assert_eq!(pages.len(), 2);
+    }
+
+    /// The worker must deliver every page **and then hang up**.
+    ///
+    /// The hang-up is the point: the pump asks for a repaint every 120 ms
+    /// while the worker lives, so a worker that never disconnects pins the UI
+    /// at ~8 fps for the rest of the session. Completion used to be tested as
+    /// `done >= total`, which a single skipped page makes unreachable -- hence
+    /// disconnect, which happens however the worker ends.
+    #[test]
+    fn the_worker_delivers_every_page_then_disconnects() {
+        let Some(bytes) = fixture() else { return };
+        let total = PdfDocument::open(bytes.clone())
+            .expect("fixture opens")
+            .page_count();
+        assert!(total > 0, "fixture must have pages for this to mean anything");
+
+        let worker = ReflowWorker::spawn(bytes, total).expect("worker thread spawns");
+
+        let mut pages: Vec<Option<TextPage>> = Vec::new();
+        let mut delivered = 0usize;
+        let mut disconnected = false;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            match worker.res.recv_timeout(Duration::from_millis(500)) {
+                Ok((index, page)) => {
+                    place_reflow_page(&mut pages, index, page);
+                    delivered += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+        assert!(
+            disconnected,
+            "the worker must drop its sender when done -- without that the \
+             pump keeps requesting frames forever"
+        );
+        assert_eq!(
+            delivered, total,
+            "every page of a clean fixture should extract"
+        );
+        assert_eq!(pages.len(), total, "and land at its own index");
+        for (i, p) in pages.iter().enumerate() {
+            let p = p
+                .as_ref()
+                .unwrap_or_else(|| panic!("hole at index {i} on a clean fixture"));
+            // `Page::number` is 1-based (human-facing), the vector is
+            // 0-based -- see `mupdf_extract::extract_mupdf_page`.
+            assert_eq!(
+                p.number,
+                i + 1,
+                "page {} landed at index {i}, so placement is off",
+                p.number
+            );
+        }
+    }
+
+    /// Extraction happens on the worker, not the caller: `spawn` must return
+    /// promptly even for a document that takes a long while to extract. This
+    /// is the whole reason the worker exists -- entering reflow used to block
+    /// the UI thread for the full extraction.
+    #[test]
+    fn spawning_does_not_block_on_extraction() {
+        let Some(bytes) = fixture() else { return };
+        let total = PdfDocument::open(bytes.clone())
+            .expect("fixture opens")
+            .page_count();
+        let t0 = Instant::now();
+        let worker = ReflowWorker::spawn(bytes, total).expect("worker thread spawns");
+        let elapsed = t0.elapsed();
+        drop(worker);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "spawn took {elapsed:?} -- it must hand off to the thread, not \
+             extract inline"
+        );
     }
 }

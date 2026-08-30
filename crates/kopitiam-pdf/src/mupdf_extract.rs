@@ -86,6 +86,22 @@ pub fn extract_mupdf_from_bytes(bytes: &[u8]) -> Result<Vec<Page>, ExtractError>
 
 /// Map a reading-order [`StextPage`] to a [`Page`], emitting one [`TextSpan`]
 /// per [`StextLine`] in block/line order (already reading order).
+/// Extract **one** page's text layout.
+///
+/// [`extract_mupdf_from_bytes`] does the whole document before it returns
+/// anything, which is right for a batch conversion and wrong for a viewer: on
+/// a 506-page book that is tens of seconds before the first word can be
+/// shown. This is the incremental entry point a UI wants — extract a page,
+/// display it, extract the next — and it is what `kpdf`'s reflow mode uses to
+/// fill in progressively instead of freezing.
+///
+/// `None` for a page that cannot be read, so one broken page does not stop a
+/// caller walking the rest.
+pub fn extract_mupdf_page(doc: &MupdfDocument, index: usize) -> Option<Page> {
+    let stext = mupdf::page_to_stext_segmented(doc, index, StextOptions::default()).ok()?;
+    Some(stext_to_page(index, &stext))
+}
+
 fn stext_to_page(index: usize, stext: &StextPage) -> Page {
     let mb = stext.mediabox;
     let width = (mb.x1 - mb.x0).max(0.0);

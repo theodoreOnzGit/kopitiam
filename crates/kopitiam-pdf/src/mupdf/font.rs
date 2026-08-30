@@ -603,10 +603,28 @@ impl Font {
                         self.map_cid_to_gid(cid)
                     }
                 } else {
-                    // Simple CFF (Type1C): code -> GID via the custom CFF Encoding;
-                    // predefined-encoding CFF falls back to identity (see the CFF
-                    // module's documented ceiling).
-                    cff.gid_for_code(cid).unwrap_or(cid as u16)
+                    // Simple CFF (Type1C). The PDF's own `/Encoding` (+
+                    // `/Differences`) names the glyph for each code, and that
+                    // name is AUTHORITATIVE (§9.6.6) — it overrides whatever
+                    // the font's built-in encoding says.
+                    //
+                    // Selecting by code alone, as this used to, is wrong for
+                    // every subset font whose producer remapped codes through
+                    // `/Differences`, which is most TeX and publisher output.
+                    // Measured on a real paper (STIX-Regular, Type1C): only
+                    // **11 of 512** codes resolved to a glyph, so quotes and
+                    // maths silently drew as advance boxes. Name-first takes
+                    // that to the whole font.
+                    //
+                    // Falls back to the CFF's own encoding, then identity, so
+                    // a font with no `/Differences` behaves exactly as before.
+                    self.glyph_names
+                        .as_ref()
+                        .and_then(|gn| gn.get(cid as usize))
+                        .and_then(|o| o.as_deref())
+                        .and_then(|n| cff.gid_for_name(n))
+                        .or_else(|| cff.gid_for_code(cid))
+                        .unwrap_or(cid as u16)
                 }
             }
             // gh-91: no primary decoder behind this one -- skrifa parsed a
@@ -920,6 +938,108 @@ mod tests {
     /// catalog/pages/page, with `extra` object bodies appended as objects 4, 5,
     /// … (each `body` is wrapped in `N 0 obj … endobj`; a body may itself contain
     /// a `stream … endstream`). Uses a classic xref table.
+    /// A simple Type1C font whose PDF `/Encoding` `/Differences` names the
+    /// glyph for a code the font's own encoding does not reach.
+    ///
+    /// This is the shape of a real bug found in an open-access paper
+    /// (`STIX-Regular`, Type1C): glyph selection went by code only, ignoring
+    /// `/Differences`, so **11 of 512** codes resolved and everything else —
+    /// quotes, maths — silently drew as advance boxes. `/Differences` is
+    /// authoritative for a simple font (§9.6.6), so the name must win.
+    ///
+    /// Built from the bundled Foxit CFF rather than a fixture file: it is a
+    /// real Type1C program already in the binary, it has `quotedblleft` at a
+    /// glyph the *code* path cannot reach, and it costs the repository
+    /// nothing.
+    #[test]
+    fn a_simple_cff_selects_glyphs_by_the_pdf_encoding_name() {
+        use hayro::hayro_interpret::font::StandardFont;
+
+        let (data, _) = StandardFont::Helvetica.get_font_data();
+        let cff: &[u8] = (*data).as_ref();
+
+        // The premise: code 1 is unreachable through the font's own encoding,
+        // but `quotedblleft` is a real glyph in it. If this ever stops being
+        // true the test below proves nothing, so assert it outright.
+        let program = crate::mupdf::glyph_cff::CffProgram::parse(cff).expect("bundled CFF parses");
+        assert!(
+            program.gid_for_code(1).is_none(),
+            "premise: code 1 must NOT resolve through the font's own encoding"
+        );
+        let named = program
+            .gid_for_name("quotedblleft")
+            .expect("premise: the face has quotedblleft");
+        assert!(program.outline(named).is_some(), "premise: it has an outline");
+
+        let mut stream: Vec<u8> =
+            format!("<< /Length {} /Subtype /Type1C >>\nstream\n", cff.len()).into_bytes();
+        stream.extend_from_slice(cff);
+        stream.extend_from_slice(b"\nendstream");
+
+        let pdf = build_pdf(&[
+            // 4: the font, mapping code 1 to `quotedblleft` via /Differences.
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Test+Stix                /FirstChar 1 /LastChar 1 /Widths [500]                /Encoding << /Type /Encoding /Differences [1 /quotedblleft] >>                /FontDescriptor 5 0 R >>",
+            // 5: descriptor pointing at the embedded Type1C program.
+            b"<< /Type /FontDescriptor /FontName /Test+Stix /Flags 4 /FontFile3 6 0 R >>",
+            &stream,
+        ]);
+
+        let doc = PdfDocument::open(pdf).expect("fixture opens");
+        let dict = doc
+            .resolve(&Object::new_indirect(4, 0))
+            .expect("font dict resolves");
+        let font = Font::load(&doc, &dict).expect("font loads");
+        assert_eq!(
+            font.outline_source(),
+            OutlineSource::Program,
+            "the embedded Type1C must be the outline source"
+        );
+        // ASSERTING `is_some()` HERE WOULD PROVE NOTHING, and the first cut of
+        // this test made exactly that mistake. With the bug, `gid_for_code(1)`
+        // returns None and selection falls back to *identity* — so code 1
+        // picks glyph 1, the letter "A", which has a perfectly good outline.
+        // The fault is the WRONG glyph, not a missing one. So compare the
+        // actual outline against the one `/Differences` names.
+        //
+        // Compared as a (point count, FNV-1a digest) fingerprint rather than
+        // the raw point list: two different glyphs run to hundreds of points
+        // each, and dumping both into an `assert_eq!` message buries the one
+        // fact you want ("these differ") under a screenful of coordinates.
+        let shape = |path: &crate::mupdf::draw_path::Path| -> (usize, u64) {
+            let pts: Vec<(u32, u32)> = path
+                .flatten(crate::mupdf::geometry::Matrix::scale(1000.0, 1000.0))
+                .iter()
+                .flat_map(|poly| {
+                    poly.iter()
+                        .map(|p| (p.x.round() as u32, p.y.round() as u32))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for (x, y) in &pts {
+                for b in x.to_le_bytes().iter().chain(y.to_le_bytes().iter()) {
+                    h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            (pts.len(), h)
+        };
+        let got = font.glyph_outline(1).expect("code 1 draws something");
+        let want = program.outline(named).expect("quotedblleft draws something");
+        let wrong = program.outline(1).expect("glyph 1 is the identity-fallback pick");
+
+        assert_eq!(
+            shape(&got),
+            shape(&want),
+            "code 1 must draw the glyph /Differences names (quotedblleft)"
+        );
+        assert_ne!(
+            shape(&got),
+            shape(&wrong),
+            "drawing glyph 1 means selection fell back to identity, ignoring \
+             /Differences — that is the bug"
+        );
+    }
+
     fn build_pdf(extra: &[&[u8]]) -> Vec<u8> {
         let mut bodies: Vec<Vec<u8>> = vec![
             b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
