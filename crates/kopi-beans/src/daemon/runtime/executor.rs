@@ -891,6 +891,19 @@ mod tests {
         }
     }
 
+    /// Reads a store's `StoreMeta` off disk, plus a fresh `MemoryWalIndex`.
+    ///
+    /// **The index it hands back is EMPTY, and stays empty.** Since the SQLite
+    /// backend went away, `MemoryWalIndex::open` ignores both `store_dir` and
+    /// `meta` and just constructs a blank in-memory view -- the WAL segments are
+    /// the source of truth, and a view gets repopulated by `rebuild_index`, not
+    /// by opening it. So this index is NOT a window onto what the daemon wrote
+    /// through its own handle; the two are independent copies.
+    ///
+    /// Use this for the `StoreMeta` -- that part is real, it comes off disk. Do
+    /// NOT assert that the returned index observed a mutation. That assertion
+    /// either fails forever, or "passes" by reading zeroes that prove nothing.
+    /// A batch of tests did exactly that and had to be trimmed; see gh-101.
     fn open_index_for_store(store_id: StoreId) -> (MemoryWalIndex, StoreMeta) {
         let store_dir = crate::daemon::paths::store_dir(store_id);
         let meta_path = crate::daemon::paths::store_meta_path(store_id);
@@ -900,48 +913,6 @@ mod tests {
         let index = MemoryWalIndex::open(&store_dir, &meta, IndexDurabilityMode::Cache)
             .expect("open wal index");
         (index, meta)
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct WalIndexSnapshot {
-        event_sha: Option<[u8; 32]>,
-        durable_seq: Option<u64>,
-        durable_head: Option<[u8; 32]>,
-        max_origin_seq: u64,
-        orset_counter: u64,
-    }
-
-    fn wal_index_snapshot(
-        index: &MemoryWalIndex,
-        namespace: &NamespaceId,
-        origin: ReplicaId,
-        seq: Seq1,
-    ) -> WalIndexSnapshot {
-        let reader = index.reader();
-        let event_id = EventId::new(origin, namespace.clone(), seq);
-        let event_sha = reader
-            .lookup_event_sha(namespace, &event_id)
-            .expect("lookup event sha");
-        let watermark = reader
-            .load_watermarks()
-            .expect("load watermarks")
-            .into_iter()
-            .find(|row| row.namespace == *namespace && row.origin == origin);
-        let (durable_seq, durable_head) = watermark
-            .map(|row| (Some(row.durable_seq()), row.durable_head_sha()))
-            .unwrap_or((None, None));
-        let max_origin_seq = reader
-            .max_origin_seq(namespace, &origin)
-            .expect("max origin seq")
-            .get();
-        let orset_counter = reader.load_orset_counter().expect("load orset counter");
-        WalIndexSnapshot {
-            event_sha,
-            durable_seq,
-            durable_head,
-            max_origin_seq,
-            orset_counter,
-        }
     }
 
     fn make_state_with_bead(id: &str, actor: &ActorId) -> CanonicalState {
@@ -1190,11 +1161,19 @@ mod tests {
         ];
 
         let captured = spans.lock().expect("span capture");
+        // `.expect`, NOT `.unwrap_or_default()`. With the default, "no mutation
+        // span was captured at all" degraded into an empty map, and the very first
+        // per-field assertion below then failed with "mutation span missing
+        // store_id: {}" -- which sends you hunting for a missing FIELD when the
+        // truth is there was no SPAN. This test still flakes under parallel test
+        // threads (~2 runs in 8; green with --test-threads=1), so whoever picks
+        // that up deserves a failure message that names the real problem. See
+        // gh-101.
         let fields = captured
             .iter()
             .find(|fields| fields.contains_key(schema::STORE_ID))
             .cloned()
-            .unwrap_or_default();
+            .expect("no mutation span with a store_id field was captured");
 
         for key in expected_keys {
             assert!(
@@ -1408,12 +1387,17 @@ mod tests {
         let store_id = StoreId::new(Uuid::from_bytes([31u8; 16]));
         let remote = RemoteUrl::new("example.com/test/repo");
         insert_store_for_tests(&mut daemon, store_id, remote, &repo_path).expect("insert store");
-        let (index, meta) = open_index_for_store(store_id);
-        let namespace = NamespaceId::core();
-        let origin = meta.replica_id;
-        let seq = Seq1::from_u64(1).expect("nonzero seq");
         let (git_tx, _git_rx) = crossbeam::channel::unbounded();
 
+        // NO `open_index_for_store` observer here, and don't add one back -- see
+        // that helper's doc comment for why it can only ever read zeroes. This
+        // test used to assert through one twice: once expecting all-zeroes, which
+        // passed VACUOUSLY (it would have passed even if rollback did nothing at
+        // all), and once expecting seq 1, which could never pass. What is real is
+        // the observable contract below: the mutation FAILS while the failpoint is
+        // armed, and SUCCEEDS on retry once it is disarmed. To inspect index state
+        // instead, go through the daemon's own runtime handle or rebuild from the
+        // WAL. See gh-101.
         let failpoint = crate::daemon::runtime::test_hooks::set_atomic_commit_fail_stage_for_tests(
             "wal_mutation_before_atomic_commit",
         );
@@ -1431,17 +1415,6 @@ mod tests {
             other => panic!("expected failed mutation response, got {other:?}"),
         }
 
-        let before = wal_index_snapshot(&index, &namespace, origin, seq);
-        assert_eq!(
-            before,
-            WalIndexSnapshot {
-                event_sha: None,
-                durable_seq: None,
-                durable_head: None,
-                max_origin_seq: 0,
-                orset_counter: 0,
-            }
-        );
 
         let retried = daemon.handle_request(
             create_request(
@@ -1459,12 +1432,6 @@ mod tests {
             "expected op response payload"
         );
 
-        let after = wal_index_snapshot(&index, &namespace, origin, seq);
-        assert_eq!(after.max_origin_seq, 1);
-        assert_eq!(after.durable_seq, Some(1));
-        let event_sha = after.event_sha.expect("event row present");
-        assert_eq!(after.durable_head, Some(event_sha));
-        assert_eq!(after.orset_counter, 0);
     }
 
     #[test]
@@ -1481,11 +1448,14 @@ mod tests {
         let store_id = StoreId::new(Uuid::from_bytes([41u8; 16]));
         let remote = RemoteUrl::new("example.com/test/repo");
         insert_store_for_tests(&mut daemon, store_id, remote, &repo_path).expect("insert store");
-        let (index, meta) = open_index_for_store(store_id);
-        let namespace = NamespaceId::core();
-        let origin = meta.replica_id;
-        let seq = Seq1::from_u64(1).expect("nonzero seq");
         let (git_tx, _git_rx) = crossbeam::channel::unbounded();
+
+        // The "...without_rewriting_store_meta" half is what still bites, and it
+        // is what this test now covers: a hot-path mutation must NOT rewrite
+        // store meta on disk, checked below by bytes AND mtime. The old
+        // "allocates_dot_counter_in_wal_index" half asserted through a second
+        // `open_index_for_store` handle, which is always empty, so it could never
+        // pass. See gh-101.
         let meta_path = crate::daemon::paths::store_meta_path(store_id);
         let meta_before = std::fs::read_to_string(&meta_path).expect("read meta before mutation");
         let modified_before = std::fs::metadata(&meta_path)
@@ -1521,9 +1491,6 @@ mod tests {
             "expected op response payload"
         );
 
-        let snapshot = wal_index_snapshot(&index, &namespace, origin, seq);
-        assert_eq!(snapshot.max_origin_seq, 2);
-        assert_eq!(snapshot.orset_counter, 1);
 
         let meta_after = std::fs::read_to_string(&meta_path).expect("read meta after mutation");
         let modified_after = std::fs::metadata(&meta_path)

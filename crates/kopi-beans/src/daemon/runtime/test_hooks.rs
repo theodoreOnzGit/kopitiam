@@ -39,24 +39,41 @@ pub(crate) fn maybe_pause(_stage: &str) {}
 #[derive(Clone, Debug)]
 struct AtomicCommitFailpoint {
     stage: String,
-    owner: std::thread::ThreadId,
 }
 
+/// Which atomic-commit stage (if any) should blow up on **this thread**.
+///
+/// Thread-local on purpose, and it must stay that way — same pattern as
+/// [`crate::daemon::paths`]'s `TEST_DATA_DIR_OVERRIDE`, for the same reason.
+/// This used to be one process-wide `static OnceLock<Mutex<Option<_>>>`, i.e.
+/// ONE slot shared by every test thread. That slot carried a `ThreadId` owner
+/// so a failpoint could never fire on the wrong thread — which sounds safe, but
+/// it guards the wrong hazard. The bug was that arming never STACKED:
+///
+/// 1. thread A arms stage `X` — slot is `Some(X, A)`
+/// 2. thread B arms stage `Y` — slot is now `Some(Y, B)`, A's entry stashed in
+///    B's guard as `previous`
+/// 3. thread A reaches its injection point and asks for `X` — the slot says
+///    `Y`, no match, so **A's failure never fires**
+/// 4. A's "and then it rolled back" assertion sees nothing rolled back, fails
+/// 5. B drops and politely restores `Some(X, A)` — which is exactly why this
+///    showed up as an intermittent flake (2 tests, ~3 runs in 8) instead of a
+///    constant failure, and why it went away under `--test-threads=1`
+///
+/// Per-thread state means one test cannot disarm another's failpoint, so the
+/// `owner: ThreadId` field is gone — there is no longer any way to observe a
+/// sibling's arming, let alone fire on it. See gh-101.
 #[cfg(any(test, feature = "test-harness"))]
-fn atomic_commit_failpoint_slot() -> &'static std::sync::Mutex<Option<AtomicCommitFailpoint>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<AtomicCommitFailpoint>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+thread_local! {
+    static ATOMIC_COMMIT_FAILPOINT: std::cell::RefCell<Option<AtomicCommitFailpoint>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-harness"))]
 pub(crate) fn maybe_fail_atomic_commit(stage: &str) -> Result<(), WalIndexError> {
-    let slot = atomic_commit_failpoint_slot();
-    let active = slot.lock().expect("atomic commit failpoint lock");
-    if let Some(failpoint) = active.as_ref()
-        && failpoint.stage == stage
-        && failpoint.owner == std::thread::current().id()
-    {
+    let armed = ATOMIC_COMMIT_FAILPOINT
+        .with(|slot| slot.borrow().as_ref().is_some_and(|fp| fp.stage == stage));
+    if armed {
         return Err(WalIndexError::Sql {
             message: format!("injected atomic commit failure at {stage}"),
         });
@@ -69,6 +86,10 @@ pub(crate) fn maybe_fail_atomic_commit(_stage: &str) -> Result<(), WalIndexError
     Ok(())
 }
 
+/// Disarms on drop, restoring whatever this thread had armed before.
+///
+/// Nesting on one thread still works (the previous entry comes back), which is
+/// the only nesting that can happen now that the slot is thread-local.
 #[cfg(test)]
 pub(crate) struct AtomicCommitFailpointGuard {
     previous: Option<AtomicCommitFailpoint>,
@@ -77,18 +98,17 @@ pub(crate) struct AtomicCommitFailpointGuard {
 #[cfg(test)]
 impl Drop for AtomicCommitFailpointGuard {
     fn drop(&mut self) {
-        let slot = atomic_commit_failpoint_slot();
-        *slot.lock().expect("atomic commit failpoint lock") = self.previous.take();
+        let previous = self.previous.take();
+        ATOMIC_COMMIT_FAILPOINT.with(|slot| *slot.borrow_mut() = previous);
     }
 }
 
 #[cfg(test)]
 pub(crate) fn set_atomic_commit_fail_stage_for_tests(stage: &str) -> AtomicCommitFailpointGuard {
-    let slot = atomic_commit_failpoint_slot();
-    let mut active = slot.lock().expect("atomic commit failpoint lock");
-    let previous = active.replace(AtomicCommitFailpoint {
-        stage: stage.to_string(),
-        owner: std::thread::current().id(),
+    let previous = ATOMIC_COMMIT_FAILPOINT.with(|slot| {
+        slot.borrow_mut().replace(AtomicCommitFailpoint {
+            stage: stage.to_string(),
+        })
     });
     AtomicCommitFailpointGuard { previous }
 }

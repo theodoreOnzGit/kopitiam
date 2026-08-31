@@ -3452,6 +3452,29 @@ mod tests {
         assert_eq!(tmp_count, 1);
     }
 
+    /// HLC must not walk backwards when the daemon restarts.
+    ///
+    /// This matters for ordering correctness: the hybrid logical clock is what
+    /// stamps writes, so if a restart resets it, a later write can be stamped
+    /// EARLIER than one already on disk and lose a conflict resolution it should
+    /// have won.
+    ///
+    /// HOW THE STATE ACTUALLY SURVIVES, because it is not obvious: the WAL index
+    /// is `MemoryWalIndex` -- an in-memory view holding no durable state of its
+    /// own. HLC is durable because every WAL event record carries an `hlc_max` in
+    /// its payload, and replay decodes it and feeds `update_hlc` on the way back
+    /// up (`daemon_core::wal::replay`, the `decode_event_hlc_max` call). So the
+    /// WAL is the durable clock, and the index is just where replay puts it.
+    ///
+    /// That is exactly what the earlier version of this test got wrong. It seeded
+    /// by calling `txn.update_hlc(..)` straight into the live index with a
+    /// timestamp 60s in the future, dropped the daemon, and expected the value
+    /// back. Under the old SQLite index that write was durable, so it worked.
+    /// Now it is a view-only write that never reaches the WAL, so it evaporated
+    /// with the handle and the test could never pass again -- it was measuring
+    /// the departed storage engine, not the invariant. Seed through a real
+    /// mutation instead, so the clock travels the path it travels in production.
+    /// See gh-101.
     #[test]
     fn restores_hlc_state_for_non_daemon_actor() {
         let tmp = test_store_dir();
@@ -3460,71 +3483,87 @@ mod tests {
         std::fs::create_dir_all(&repo_path).unwrap();
         let store_id = store_id_from_remote(&remote);
         let actor = ActorId::new("alice").unwrap();
-        let future_ms = WallClock::now().0 + 60_000;
 
-        {
+        // `alice` is deliberately NOT the daemon's own actor -- the daemon runs as
+        // `test_actor()`. A non-daemon actor's clock is the interesting case: it is
+        // reconstructed purely from the WAL, with nothing in memory to fall back on.
+        let hlc_for = |daemon: &Daemon| -> Option<WriteStamp> {
+            let runtime = daemon.store_sessions.get(&store_id).unwrap().runtime();
+            runtime
+                .wal_index
+                .reader()
+                .load_hlc()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.actor_id == actor)
+                .map(|row| WriteStamp::new(row.last_physical_ms, row.last_logical))
+        };
+
+        let mutate = |daemon: &mut Daemon, title: &str| {
+            let (git_tx, _git_rx) = crossbeam::channel::unbounded();
+            let response = daemon.handle_request(
+                Request::Create {
+                    ctx: MutationCtx::new(
+                        repo_path.clone(),
+                        MutationMeta {
+                            actor_id: Some(actor.clone()),
+                            ..MutationMeta::default()
+                        },
+                    ),
+                    payload: CreatePayload {
+                        id: None,
+                        parent: None,
+                        title: title.to_string(),
+                        bead_type: BeadType::Task,
+                        priority: Priority::MEDIUM,
+                        description: None,
+                        design: None,
+                        acceptance_criteria: None,
+                        assignee: None,
+                        external_ref: None,
+                        estimated_minutes: None,
+                        labels: Vec::new(),
+                        dependencies: Vec::new(),
+                    },
+                },
+                &git_tx,
+            );
+            match response {
+                HandleOutcome::Response(Response::Ok {
+                    ok: ResponsePayload::Op(_),
+                }) => {}
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        };
+
+        // First daemon: one real mutation, so an event carrying alice's hlc_max
+        // lands in the WAL.
+        let before_restart = {
             let mut daemon = Daemon::new(test_actor());
             insert_store_for_tests(&mut daemon, store_id, remote.clone(), &repo_path).unwrap();
+            mutate(&mut daemon, "hlc seed");
+            hlc_for(&daemon).expect("hlc row for actor after seeding mutation")
+        };
 
-            let runtime = daemon.store_sessions.get(&store_id).unwrap().runtime();
-            let mut txn = runtime.wal_index.writer().begin_txn().unwrap();
-            txn.update_hlc(&HlcRow {
-                actor_id: actor.clone(),
-                last_physical_ms: future_ms,
-                last_logical: 0,
-            })
-            .unwrap();
-            txn.commit().unwrap();
-        }
-
+        // Second daemon over the same store dir: opening replays the WAL, which is
+        // where the clock has to come back from.
         let mut daemon = Daemon::new(test_actor());
         insert_store_for_tests(&mut daemon, store_id, remote.clone(), &repo_path).unwrap();
 
-        let (git_tx, _git_rx) = crossbeam::channel::unbounded();
-        let response = daemon.handle_request(
-            Request::Create {
-                ctx: MutationCtx::new(
-                    repo_path.clone(),
-                    MutationMeta {
-                        actor_id: Some(actor.clone()),
-                        ..MutationMeta::default()
-                    },
-                ),
-                payload: CreatePayload {
-                    id: None,
-                    parent: None,
-                    title: "hlc".to_string(),
-                    bead_type: BeadType::Task,
-                    priority: Priority::MEDIUM,
-                    description: None,
-                    design: None,
-                    acceptance_criteria: None,
-                    assignee: None,
-                    external_ref: None,
-                    estimated_minutes: None,
-                    labels: Vec::new(),
-                    dependencies: Vec::new(),
-                },
-            },
-            &git_tx,
+        let restored = hlc_for(&daemon).expect("hlc row for actor must survive restart");
+        assert!(
+            restored >= before_restart,
+            "restart lost clock state: restored {restored:?} < pre-restart {before_restart:?}"
         );
 
-        match response {
-            HandleOutcome::Response(Response::Ok {
-                ok: ResponsePayload::Op(_),
-            }) => {}
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-
-        let runtime = daemon.store_sessions.get(&store_id).unwrap().runtime();
-        let rows = runtime.wal_index.reader().load_hlc().unwrap();
-        let row = rows
-            .iter()
-            .find(|row| row.actor_id == actor)
-            .expect("hlc row for actor");
-        let restored = WriteStamp::new(row.last_physical_ms, row.last_logical);
-        let persisted = WriteStamp::new(future_ms, 0);
-        assert!(restored > persisted);
+        // And the recovered clock must still move FORWARD on the next write --
+        // recovering a value but then stamping under it would be just as broken.
+        mutate(&mut daemon, "hlc after restart");
+        let after = hlc_for(&daemon).expect("hlc row for actor after post-restart mutation");
+        assert!(
+            after > restored,
+            "clock did not advance after restart: {after:?} <= {restored:?}"
+        );
     }
 
     #[test]
