@@ -189,6 +189,45 @@ pub type PageTextureKey = super::render::RenderKey;
 /// built exactly once per (dpi, document, fallback) combination.
 pub type SlotsCacheKey = (u32, usize, bool);
 
+/// What the document pane should claim from the pointer, given the active
+/// tool.
+///
+/// # Why this is a decision and not a constant
+///
+/// The pane used to allocate itself with `Sense::click_and_drag()`
+/// unconditionally, which broke panning in a way that took a maintainer with
+/// a mouse to notice. Two things have to line up:
+///
+/// 1. `ScrollArea` pans on a pointer drag only when its `ScrollSource::drag`
+///    is enabled. egui's default is [`DragScroll::OnTouch`] --
+///    *"only active when a touch screen is detected"* -- so on a desktop it
+///    is simply off, and the reader must ask for
+///    [`DragScroll::Always`](egui::containers::scroll_area::DragScroll::Always).
+/// 2. Even then, a contained widget that senses drags takes the drag first.
+///    egui interacts the scroll background *before* the content precisely so
+///    the content wins (`scroll_area.rs`: "We must do this BEFORE adding
+///    content... or we will steal input from the widgets we contain"). So a
+///    pane that always senses drag always steals it, and the Pan tool -- whose
+///    handler does nothing, because panning IS the scroll area's job -- left
+///    the drag going nowhere at all.
+///
+/// So: claim the drag only for the tools that consume it.
+///
+/// Click is claimed in every case, and that costs nothing here: egui tracks a
+/// potential *click* target separately from a potential *drag* target, so a
+/// click-sensing pane and a drag-sensing scroll background coexist -- forms
+/// stay clickable while the same gesture, dragged, pans.
+fn pointer_sense(forms_mode: bool, tool: Tool) -> egui::Sense {
+    if !forms_mode && matches!(tool, Tool::Draw | Tool::Erase) {
+        // The pen and eraser follow the pointer; the drag is the input.
+        // Panning by drag is unavailable while they are selected, which is
+        // what the Pan tool is for.
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::click()
+    }
+}
+
 /// A background reflow-text extractor.
 ///
 /// # Why
@@ -2430,6 +2469,13 @@ impl PdfReader {
 
                 let output = egui::ScrollArea::both()
                     .id_salt("kpdf_continuous_scroll")
+                    // Drag to pan with a MOUSE, not only a touch screen.
+                    // egui's default is `DragScroll::OnTouch`, so on a desktop
+                    // drag-to-scroll is off entirely -- see `pointer_sense`.
+                    .scroll_source(egui::containers::scroll_area::ScrollSource {
+                        drag: egui::containers::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .show(ui, |ui| {
                         if pending_delta != egui::Vec2::ZERO {
                             ui.scroll_with_delta(pending_delta);
@@ -2437,7 +2483,7 @@ impl PdfReader {
 
                         let (rect, response) = ui.allocate_exact_size(
                             egui::vec2(total_w, total_h.max(1.0)),
-                            egui::Sense::click_and_drag(),
+                            pointer_sense(self.forms_mode, self.tool),
                         );
                         let origin = rect.min;
                         let viewport = ui.clip_rect();
@@ -3495,5 +3541,58 @@ mod edit_reload_tests {
             before + 1,
             "the viewport must see the new page, or it cannot be navigated to"
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_sense_tests {
+    use super::*;
+
+    /// The Pan tool must NOT claim the drag: panning is the scroll area's
+    /// job, and `Tool::Pan`'s own handler deliberately does nothing. A pane
+    /// that senses drag takes it first (egui interacts the scroll background
+    /// before the content), so claiming it here is exactly what left
+    /// click-and-drag doing nothing at all.
+    #[test]
+    fn the_pan_tool_leaves_the_drag_to_the_scroll_area() {
+        let sense = pointer_sense(false, Tool::Pan);
+        assert!(
+            !sense.senses_drag(),
+            "Pan must not claim the drag, or the scroll area never sees it \
+             and the document cannot be dragged"
+        );
+        assert!(
+            sense.senses_click(),
+            "clicks are still ours -- egui tracks click and drag targets \
+             separately, so keeping click costs the scroll area nothing"
+        );
+    }
+
+    /// The pen and eraser DO consume the drag -- the drag is their input.
+    /// Losing it would make them unusable, which is the opposite failure.
+    #[test]
+    fn the_drawing_tools_claim_the_drag() {
+        for tool in [Tool::Draw, Tool::Erase] {
+            let sense = pointer_sense(false, tool);
+            assert!(
+                sense.senses_drag(),
+                "{tool:?} follows the pointer; the drag IS the input"
+            );
+        }
+    }
+
+    /// Forms mode is click-driven, so it leaves the drag alone and a form can
+    /// still be panned around while being filled in -- and it wins over
+    /// whatever tool happens to be selected underneath, matching
+    /// `toggle_forms_mode`'s invariant.
+    #[test]
+    fn forms_mode_is_click_only_whatever_tool_is_selected() {
+        for tool in [Tool::Pan, Tool::Draw, Tool::Erase] {
+            let sense = pointer_sense(true, tool);
+            assert!(
+                sense.senses_click() && !sense.senses_drag(),
+                "forms mode with {tool:?} must stay clickable and pannable"
+            );
+        }
     }
 }
