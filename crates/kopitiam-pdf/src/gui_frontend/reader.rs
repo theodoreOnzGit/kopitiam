@@ -228,6 +228,17 @@ fn pointer_sense(forms_mode: bool, tool: Tool) -> egui::Sense {
     }
 }
 
+/// What to tell a reader whose document arrived encrypted.
+///
+/// One sentence, on the status line, saying the thing they could not
+/// otherwise know: the copy they are editing has had its protection removed,
+/// and saving writes it that way. Deliberately not a modal -- it is
+/// information, not a decision to interrupt them for -- but it is repeated on
+/// every save, because "I saw it an hour ago" is not consent.
+pub const DECRYPTED_WARNING: &str =
+    "this PDF was encrypted -- kopitiam opened a DECRYPTED copy, so saving \
+     writes it without the original's password protection";
+
 /// A background reflow-text extractor.
 ///
 /// # Why
@@ -2288,6 +2299,16 @@ impl PdfReader {
             r.tool = Tool::Pan;
             r.status = Some("form document -- Forms mode on, click a field to fill it".into());
         }
+        // An encrypted document was rewritten as plaintext at open, so the
+        // copy in memory no longer carries the original's owner restrictions.
+        // Saying so is not optional: saving writes a DECRYPTED file, which is
+        // a real change to what the document is, and doing that silently to
+        // somebody's official form would be indefensible. This warning wins
+        // the status line over the forms hint above, because it is the one the
+        // reader cannot infer from what is on screen.
+        if r.doc.was_decrypted() {
+            r.status = Some(DECRYPTED_WARNING.to_string());
+        }
         Ok(r)
     }
 
@@ -2383,6 +2404,16 @@ impl PdfReader {
     /// Tell the reader the host has persisted the current bytes.
     pub fn mark_saved(&mut self) {
         self.unsaved_edits = false;
+    }
+
+    /// Whether the open document arrived encrypted and is held decrypted.
+    ///
+    /// A host that can save **must** surface this. `kpdf` does so on open and
+    /// again on every save; an embedder with its own chrome should do the
+    /// equivalent rather than let a user hand out an unprotected copy of a
+    /// document they believed was protected.
+    pub fn was_decrypted(&self) -> bool {
+        self.doc.was_decrypted()
     }
 
     pub fn config(&self) -> &PdfReaderConfig {

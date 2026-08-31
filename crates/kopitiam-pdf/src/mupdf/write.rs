@@ -427,6 +427,18 @@ fn write_xref_subsection(out: &mut Vec<u8>, offsets: &BTreeMap<i32, i64>, start:
 /// `offsets`, split into contiguous subsections (a gap in object numbers
 /// needs its own `start count` header — folding a non-contiguous range into
 /// one subsection is exactly the mistake the module docs warn about).
+/// [`write_classic_xref`] for callers outside this module -- `xref.rs`'s
+/// decrypt-on-open rewrite emits the same table shape and must not grow a
+/// second copy of it.
+pub fn write_classic_xref_pub(out: &mut Vec<u8>, offsets: &BTreeMap<i32, i64>) {
+    write_classic_xref(out, offsets);
+}
+
+/// [`dict_without_key`] for callers outside this module, same reasoning.
+pub fn dict_without_key_pub(obj: &Object, key: &[u8]) -> Object {
+    dict_without_key(obj, key)
+}
+
 fn write_classic_xref(out: &mut Vec<u8>, offsets: &BTreeMap<i32, i64>) {
     out.extend_from_slice(b"xref\n");
     let nums: Vec<i32> = offsets.keys().copied().collect();

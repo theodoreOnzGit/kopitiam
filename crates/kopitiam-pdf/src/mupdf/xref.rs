@@ -105,6 +105,9 @@ pub struct PdfDocument {
     /// exists), but relying on cache-population order for correctness is the
     /// kind of accident that survives until someone clears a cache.
     encrypt_obj_num: Option<i32>,
+    /// Set when this document arrived encrypted and was rewritten as
+    /// plaintext at open -- see [`rewrite_decrypted`](Self::rewrite_decrypted).
+    was_decrypted: bool,
     /// The ordered, inheritance-flattened page dicts.
     pages: Vec<Object>,
     /// Resolved-object cache (MuPDF caches the parsed `pdf_obj` on the entry).
@@ -132,6 +135,7 @@ impl PdfDocument {
             trailer,
             decryptor: None,
             encrypt_obj_num: None,
+            was_decrypted: false,
             pages: Vec::new(),
             cache: RefCell::new(HashMap::new()),
             resolving: RefCell::new(Vec::new()),
@@ -156,6 +160,32 @@ impl PdfDocument {
                 _ => None,
             };
             doc.decryptor = Some(doc.build_decryptor(b"")?);
+            // Convert the WHOLE document to plaintext now, then carry on as if
+            // it had never been encrypted.
+            //
+            // Everything that writes in this crate appends to the existing
+            // bytes, which only works when those bytes are the same kind as
+            // the ones being appended. Rather than teach every writer about
+            // encryption -- or refuse to edit these documents at all -- the
+            // encryption is dealt with once, here, and no other module needs
+            // to know it ever existed.
+            //
+            // The caller MUST tell the user: saving now writes a decrypted
+            // copy, without the original's owner restrictions. See
+            // `was_decrypted`.
+            let plain = doc.rewrite_decrypted()?;
+            let (entries, trailer) = load_xref(&plain)?;
+            doc = PdfDocument {
+                bytes: plain,
+                entries,
+                trailer,
+                decryptor: None,
+                encrypt_obj_num: None,
+                was_decrypted: true,
+                pages: Vec::new(),
+                cache: RefCell::new(HashMap::new()),
+                resolving: RefCell::new(Vec::new()),
+            };
         }
         doc.pages = doc.load_pages()?;
         Ok(doc)
@@ -238,6 +268,145 @@ impl PdfDocument {
             },
             password,
         )
+    }
+
+    /// Rewrite this whole document as **plaintext**, dropping `/Encrypt`.
+    ///
+    /// # Why decrypt-on-open rather than decrypt-on-save
+    ///
+    /// Everything that writes in this crate does an *incremental update*: it
+    /// appends new objects to the existing bytes. That is only coherent when
+    /// the existing bytes are in the same form as the ones being appended --
+    /// so appending plaintext to a ciphertext file produces a document that no
+    /// viewer, including this one, reads correctly.
+    ///
+    /// Encrypting on write would be the other way to square that, and the
+    /// maintainer's call was explicit: **saving decrypted, with a warning, and
+    /// encryption is another application's job**. So the conversion happens
+    /// once, at open, and every existing edit, undo and save path then works
+    /// on an ordinary unencrypted document with no special cases at all.
+    ///
+    /// # What the caller must tell the user
+    ///
+    /// The document in memory is no longer the document on disk: its owner
+    /// restrictions are gone. Saving it writes a **decrypted copy**. That is a
+    /// real change to what the file *is*, so a caller must say so --
+    /// [`was_decrypted`](Self::was_decrypted) exists to drive that warning, and
+    /// `kpdf` shows it both on open and on save.
+    ///
+    /// # Shape of the output
+    ///
+    /// A plain sequential file: every in-use object written directly, a
+    /// classic cross-reference table, and the original trailer minus
+    /// `/Encrypt`. Object streams and cross-reference streams are **dropped**
+    /// rather than rewritten -- their contents are emitted as ordinary
+    /// objects, so the containers have nothing left to hold, and nothing
+    /// except the cross-reference we are rebuilding ever referred to them.
+    ///
+    /// The result is larger than the original (no object-stream compression),
+    /// which is a fair trade for a file that opens everywhere.
+    fn rewrite_decrypted(&self) -> Result<Vec<u8>> {
+        use super::write::write_object;
+
+        let mut out: Vec<u8> = b"%PDF-1.7
+".to_vec();
+        // A binary comment marks the file as containing 8-bit data, which is
+        // what stops a well-meaning transfer turning it into mojibake
+        // (§7.5.2).
+        out.extend_from_slice(&[b'%', 0xE2, 0xE3, 0xCF, 0xD3, b'\n']);
+        let mut offsets: std::collections::BTreeMap<i32, i64> = std::collections::BTreeMap::new();
+
+        let count = self.entries.len();
+        for num in 1..count as i32 {
+            match self.entries.get(num as usize).and_then(|e| e.as_ref()) {
+                Some(XrefEntry::Uncompressed { .. }) | Some(XrefEntry::Compressed { .. }) => {}
+                _ => continue,
+            }
+            // An object we cannot read is skipped rather than fatal: a
+            // damaged corner of a 300-page form should not cost the other 299
+            // pages.
+            let Ok(obj) = self.get_object(num) else {
+                continue;
+            };
+            // Containers whose contents we are about to emit individually.
+            let type_name = obj
+                .dict_gets("Type")
+                .map(|o| o.to_name().to_vec())
+                .unwrap_or_default();
+            if type_name == b"ObjStm" || type_name == b"XRef" {
+                continue;
+            }
+
+            offsets.insert(num, out.len() as i64);
+            out.extend_from_slice(format!("{num} 0 obj
+").as_bytes());
+
+            // A stream needs its (already decrypted) bytes and a /Length that
+            // matches them. Filters are left alone -- the bytes stay
+            // Flate-compressed, they are simply no longer encrypted.
+            let stream = self.is_stream(num).then(|| self.stream_raw_num(num)).transpose();
+            match stream {
+                Ok(Some((raw, _, _))) => {
+                    let mut dict = obj.clone();
+                    dict.dict_put("Length", Object::new_int(raw.len() as i64));
+                    write_object(&mut out, &dict);
+                    out.extend_from_slice(b"
+stream
+");
+                    out.extend_from_slice(&raw);
+                    out.extend_from_slice(b"
+endstream");
+                }
+                _ => write_object(&mut out, &obj),
+            }
+            out.extend_from_slice(b"
+endobj
+");
+        }
+
+        let xref_offset = out.len() as i64;
+        super::write::write_classic_xref_pub(&mut out, &offsets);
+
+        // The trailer keeps /Root, /Info and /ID; it loses /Encrypt (there is
+        // nothing left to decrypt) and the stream-xref pointers, which
+        // describe a layout this file no longer has.
+        let mut trailer = self.trailer.clone();
+        for key in [&b"Encrypt"[..], b"XRefStm", b"Prev", b"Type", b"W", b"Index", b"Filter", b"Length"] {
+            trailer = super::write::dict_without_key_pub(&trailer, key);
+        }
+        trailer.dict_put("Size", Object::new_int(count as i64));
+        out.extend_from_slice(b"trailer
+");
+        write_object(&mut out, &trailer);
+        out.extend_from_slice(b"
+startxref
+");
+        out.extend_from_slice(xref_offset.to_string().as_bytes());
+        out.extend_from_slice(b"
+%%EOF
+");
+        Ok(out)
+    }
+
+    /// Whether this object number holds a stream.
+    fn is_stream(&self, num: i32) -> bool {
+        self.ensure_cached(num).is_ok()
+            && self
+                .cache
+                .borrow()
+                .get(&num)
+                .is_some_and(|c| c.stm_ofs.is_some())
+    }
+
+    /// Whether this document arrived encrypted and was rewritten as plaintext
+    /// on open.
+    ///
+    /// **A caller that can save must warn on this.** The bytes in memory no
+    /// longer carry the original's owner restrictions, so writing them out
+    /// produces a decrypted copy -- a real change to what the file is, and not
+    /// something to do silently to somebody's official form.
+    pub fn was_decrypted(&self) -> bool {
+        self.was_decrypted
     }
 
     /// Whether this document is encrypted.
@@ -1728,6 +1897,7 @@ mod tests {
             trailer,
             decryptor: None,
             encrypt_obj_num: None,
+            was_decrypted: false,
             pages: Vec::new(),
             cache: RefCell::new(HashMap::new()),
             resolving: RefCell::new(Vec::new()),
@@ -1744,6 +1914,71 @@ mod tests {
     fn an_unencrypted_document_reports_no_encryption() {
         let doc = PdfDocument::open(minimal_classic_pdf()).expect("opens");
         assert!(doc.encryption_summary().is_none());
+    }
+
+    /// Decrypt-on-open must produce a document that is genuinely ORDINARY:
+    /// no `/Encrypt`, and every writer able to append to it. That is the
+    /// entire justification for doing the conversion at open rather than at
+    /// save, so it is the thing to pin.
+    ///
+    /// Uses the synthetic AES fixture, which declares encryption without
+    /// being encrypted -- so it exercises the plumbing (detect, rewrite,
+    /// reopen, flag) with a key check that would reject it. The key check is
+    /// therefore bypassed by constructing the document directly, which is
+    /// what makes this a test of the REWRITE rather than of the cipher.
+    #[test]
+    fn a_decrypted_rewrite_drops_encrypt_and_stays_readable() {
+        let bytes = pdf_declaring_aes_encryption();
+        let (entries, trailer) = load_xref(&bytes).expect("xref loads");
+        let doc = PdfDocument {
+            bytes,
+            entries,
+            trailer,
+            // No decryptor: the fixture's bytes are already plaintext, so the
+            // rewrite is exercised without the cipher in the way.
+            decryptor: None,
+            encrypt_obj_num: None,
+            was_decrypted: false,
+            pages: Vec::new(),
+            cache: RefCell::new(HashMap::new()),
+            resolving: RefCell::new(Vec::new()),
+        };
+
+        let plain = doc.rewrite_decrypted().expect("rewrites");
+        let reopened = PdfDocument::open(plain).expect("the rewrite must be a valid PDF");
+
+        assert!(
+            reopened.trailer().dict_gets("Encrypt").is_none(),
+            "/Encrypt must be gone -- a decrypted file that still claims to \
+             be encrypted is worse than either"
+        );
+        assert!(!reopened.is_encrypted());
+        assert_eq!(reopened.page_count(), 1, "the page survives the rewrite");
+    }
+
+    /// The rewrite must survive a re-parse. A file we emit that only we can
+    /// read is not a decrypted copy, it is a private format.
+    #[test]
+    fn the_rewrite_round_trips_through_our_own_parser() {
+        let doc = PdfDocument::open(minimal_classic_pdf()).expect("opens");
+        let plain = doc.rewrite_decrypted().expect("rewrites");
+        assert!(plain.starts_with(b"%PDF-"), "must look like a PDF");
+        assert!(
+            plain.windows(5).any(|w| w == b"%%EOF"),
+            "must be terminated"
+        );
+        let again = PdfDocument::open(plain).expect("re-opens");
+        assert_eq!(again.page_count(), doc.page_count());
+    }
+
+    /// `was_decrypted` is what drives the user-facing warning, so it must be
+    /// false for an ordinary document -- a spurious "this was decrypted" note
+    /// on every PDF would train the maintainer to ignore the real one.
+    #[test]
+    fn an_ordinary_document_is_not_flagged_as_decrypted() {
+        let doc = PdfDocument::open(minimal_classic_pdf()).expect("opens");
+        assert!(!doc.was_decrypted());
+        assert!(!doc.is_encrypted());
     }
 
 }

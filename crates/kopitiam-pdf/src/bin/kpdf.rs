@@ -476,8 +476,16 @@ impl KpdfApp {
                 // see hot_reload.rs's module docs.
                 self.hot_reload.mark_current(&self.path);
                 self.reader.mark_saved();
+                // Repeat the decryption warning at the moment it matters. The
+                // file now on disk has no password protection, and a note seen
+                // when the document was opened an hour ago is not consent.
+                let note = if self.reader.was_decrypted() {
+                    " (DECRYPTED -- no password protection)"
+                } else {
+                    ""
+                };
                 self.reader
-                    .set_status(format!("saved {}", self.path.display()));
+                    .set_status(format!("saved {}{note}", self.path.display()));
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_path);
@@ -515,8 +523,13 @@ impl KpdfApp {
                     self.hot_reload.mark_current(&self.path);
                     self.reader.mark_saved();
                 }
+                let note = if self.reader.was_decrypted() {
+                    " (DECRYPTED -- no password protection)"
+                } else {
+                    ""
+                };
                 self.reader
-                    .set_status(format!("saved {}", target.display()));
+                    .set_status(format!("saved {}{note}", target.display()));
             }
             Err(e) => self
                 .reader

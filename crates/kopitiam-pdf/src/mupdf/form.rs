@@ -298,18 +298,12 @@ pub fn page_form_fields(doc: &PdfDocument, page_index: usize) -> Vec<FormField> 
 /// Combobox/Listbox refuse unconditionally (see the module's "Scope
 /// decisions"). Button/Signature/Unknown have no settable text value at all.
 pub fn set_field_value(doc: &PdfDocument, field: &FormField, value: &str) -> Result<Vec<u8>> {
-    // REFUSE on an encrypted document. We can decrypt but not encrypt
-    // (gh-98), so appending a plaintext object here would produce a file that
-    // still opens in kpdf -- we would read our own plaintext back through a
-    // decryptor that mangles it -- and is unreadable everywhere else. Silent
-    // corruption of someone's form is the one outcome worth failing loudly to
-    // avoid.
-    if doc.is_encrypted() {
-        return Err(Error::unsupported(
-            "cannot fill in an encrypted PDF -- kopitiam-pdf can decrypt but \
-             not yet encrypt, so writing would corrupt the file",
-        ));
-    }
+    // No encryption guard here, and that is deliberate: a document that
+    // arrived encrypted was rewritten as plaintext at open
+    // (`PdfDocument::rewrite_decrypted`), so by the time any writer sees it
+    // there is nothing encrypted left to corrupt. What the CALLER owes the
+    // user is a warning that saving produces a decrypted copy -- see
+    // `PdfDocument::was_decrypted`.
     if field.read_only {
         return Err(Error::argument(format!(
             "field '{}' is read-only",
