@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "kopitiam-bibliography"
-version = "0.2.5"
+version = "0.0.1"
 dependencies = [
  "kopitiam-document",
  "kopitiam-ontology",

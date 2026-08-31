@@ -1,6 +1,14 @@
 [package]
 name = "kopitiam-bibliography"
-version.workspace = true
+# Own version, held at 0.0.1 on purpose — deliberately BEHIND the workspace
+# version (0.2.5), same pattern as kopitiam-gpu (0.0.1) and kopitiam-ocr
+# (0.1.0). This crate has never been published to crates.io at all — 0.0.1 is
+# just the early name-reservation number lah, reserved for whenever it does go
+# up. Overrides `version.workspace` on purpose, per CLAUDE.md's "no new
+# commits, no version bump" rule: a crate's version only moves when that
+# crate's own code moved, so this one stays pinned instead of riding the
+# workspace's bump.
+version = "0.0.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

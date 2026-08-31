@@ -236,7 +236,7 @@ kopitiam-web = { path = "crates/kopitiam-web", version = "0.2.5" }
 # citation graph. Depends only on ontology + the Document Engine -- deliberately
 # NOT on kopitiam-web, so a bibliography model can never grow a network
 # dependency by accident (see docs/ai-decisions/AID-0018).
-kopitiam-bibliography = { path = "crates/kopitiam-bibliography", version = "0.2.5" }
+kopitiam-bibliography = { path = "crates/kopitiam-bibliography", version = "0.0.1" }
 
 # Kopitiam Runtime: the CPU-first, local-first inference engine that will sit
 # behind kopitiam-ai's ModelAdapter. Layered core -> tensor -> {loader,
