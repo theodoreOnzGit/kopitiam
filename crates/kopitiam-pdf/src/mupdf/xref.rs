@@ -91,6 +91,20 @@ pub struct PdfDocument {
     entries: Vec<Option<XrefEntry>>,
     /// The newest trailer dict (`pdf_trailer`): `/Root`, `/Size`, …
     trailer: Object,
+    /// The document's decryptor, when it is encrypted and we could open it.
+    ///
+    /// `None` for the ordinary unencrypted document, in which case every
+    /// decryption site below is a no-op branch. See [`crypt`](super::crypt).
+    decryptor: Option<super::crypt::Decryptor>,
+    /// The object number of the `/Encrypt` dictionary, when there is one.
+    ///
+    /// Kept so its own strings -- `/O` and `/U`, which are the *inputs* to the
+    /// key derivation -- are never themselves decrypted (§7.6.2). Today the
+    /// cache happens to protect them (the dictionary is resolved while
+    /// building the decryptor, so it is cached in the clear before one
+    /// exists), but relying on cache-population order for correctness is the
+    /// kind of accident that survives until someone clears a cache.
+    encrypt_obj_num: Option<i32>,
     /// The ordered, inheritance-flattened page dicts.
     pages: Vec<Object>,
     /// Resolved-object cache (MuPDF caches the parsed `pdf_obj` on the entry).
@@ -116,31 +130,131 @@ impl PdfDocument {
             bytes,
             entries,
             trailer,
+            decryptor: None,
+            encrypt_obj_num: None,
             pages: Vec::new(),
             cache: RefCell::new(HashMap::new()),
             resolving: RefCell::new(Vec::new()),
         };
-        // Refuse an ENCRYPTED document here, before anything tries to read
-        // through it.
+        // Set up decryption BEFORE anything reads through the document.
         //
-        // Not a nicety: without this the failure surfaces as
-        // "corrupt object stream (134 0 R)", because the stream is not corrupt
-        // at all -- it is ciphertext, and inflating ciphertext produces
-        // exactly the garbage a corruption check is built to catch. A
-        // maintainer handed a government form got that message and reasonably
-        // concluded the file was broken. It was not; we simply cannot read it
-        // yet. An honest "unsupported" beats a confident wrong diagnosis.
+        // Order is the whole point. Without a decryptor in place, the first
+        // read inflates ciphertext and reports "corrupt object stream" -- the
+        // stream is not corrupt, it is encrypted, and inflating ciphertext
+        // produces exactly the garbage a corruption check is built to catch.
+        // A maintainer handed a government form got that message and
+        // reasonably concluded the file was broken.
         //
-        // `FZ_ERROR_UNSUPPORTED` is the category MuPDF itself uses for
-        // encryption it cannot handle, which is why the error says
-        // "unsupported" rather than "format".
-        if let Some(enc) = doc.encryption_summary() {
-            return Err(Error::unsupported(format!(
-                "encrypted PDF ({enc}) -- decryption is not implemented yet"
-            )));
+        // The empty user password is tried, and only that: it is the case
+        // that matters (an owner-restricted form that every other viewer
+        // opens with no prompt), and nothing in this crate has anywhere to
+        // ask a human for a real one yet. A document needing a real password
+        // fails with a message that says so.
+        if let Some(enc_ref) = doc.trailer.dict_gets("Encrypt") {
+            doc.encrypt_obj_num = match enc_ref {
+                Object::Ref { num, .. } => Some(*num),
+                _ => None,
+            };
+            doc.decryptor = Some(doc.build_decryptor(b"")?);
         }
         doc.pages = doc.load_pages()?;
         Ok(doc)
+    }
+
+    /// Build this document's decryptor from its `/Encrypt` dictionary and a
+    /// user password.
+    ///
+    /// The `/Encrypt` dictionary is itself never encrypted (§7.6.2), so this
+    /// can run before any key exists -- which is just as well, since it is
+    /// what produces the key.
+    fn build_decryptor(&self, password: &[u8]) -> Result<super::crypt::Decryptor> {
+        use super::crypt::{Decryptor, Method, method_for_filter};
+
+        let enc = self.resolve(
+            self.trailer
+                .dict_gets("Encrypt")
+                .ok_or_else(|| Error::format("no /Encrypt dictionary"))?,
+        )?;
+        let filter = String::from_utf8_lossy(self.resolve_get(&enc, "Filter")?.to_name()).into_owned();
+        let v = self.resolve_get(&enc, "V").map(|o| o.to_int()).unwrap_or(0);
+        let r = self.resolve_get(&enc, "R").map(|o| o.to_int()).unwrap_or(0);
+        let length = self
+            .resolve_get(&enc, "Length")
+            .map(|o| o.to_int())
+            .unwrap_or(40);
+        let o = self.resolve_get(&enc, "O")?.to_string_bytes().to_vec();
+        let u = self.resolve_get(&enc, "U")?.to_string_bytes().to_vec();
+        let p = self.resolve_get(&enc, "P").map(|o| o.to_int()).unwrap_or(0);
+        // /EncryptMetadata defaults TRUE when absent (§7.6.3.2). Defaulting it
+        // false would mix an extra FF FF FF FF into the key and open nothing.
+        let encrypt_metadata = self
+            .resolve_get(&enc, "EncryptMetadata")
+            .map(|o| !matches!(o, Object::Bool(false)))
+            .unwrap_or(true);
+
+        // The first /ID element is part of the key. A document with no /ID
+        // contributes nothing rather than failing -- MuPDF is equally
+        // forgiving, and some producers omit it.
+        let first_id = self
+            .resolve(self.trailer.dict_gets("ID").unwrap_or(&Object::Null))
+            .ok()
+            .and_then(|arr| arr.array_get(0).cloned())
+            .and_then(|o| self.resolve(&o).ok())
+            .map(|o| o.to_string_bytes().to_vec())
+            .unwrap_or_default();
+
+        // /V 1 and 2 are RC4 throughout; /V 4 names crypt filters per use.
+        let (stream_method, string_method) = if v >= 4 {
+            let resolve = |obj: &Object, key: &str| self.resolve_get(obj, key).ok();
+            let stm = self
+                .resolve_get(&enc, "StmF")
+                .map(|o| o.to_name().to_vec())
+                .unwrap_or_else(|_| b"Identity".to_vec());
+            let str_ = self
+                .resolve_get(&enc, "StrF")
+                .map(|o| o.to_name().to_vec())
+                .unwrap_or_else(|_| b"Identity".to_vec());
+            (
+                method_for_filter(&resolve, &enc, &stm),
+                method_for_filter(&resolve, &enc, &str_),
+            )
+        } else {
+            (Method::Rc4, Method::Rc4)
+        };
+
+        Decryptor::new(
+            &super::crypt::EncryptDict {
+                filter: &filter,
+                v,
+                r,
+                length_bits: length,
+                o: &o,
+                u: &u,
+                p,
+                first_id: &first_id,
+                encrypt_metadata,
+                stream_method,
+                string_method,
+            },
+            password,
+        )
+    }
+
+    /// Whether this document is encrypted.
+    ///
+    /// Matters far beyond curiosity: **kopitiam-pdf can decrypt but cannot
+    /// encrypt**. Every writer in this crate ([`add_ink_annot`],
+    /// [`set_field_value`], the page editors) appends plaintext objects, which
+    /// is correct for an ordinary PDF and silently *corrupting* for an
+    /// encrypted one -- the file would still open here, because we would read
+    /// our own plaintext back through a decryptor that mangles it, and would
+    /// be unreadable to every other viewer. So a caller that is about to write
+    /// must check this first and refuse.
+    ///
+    /// [`add_ink_annot`]: super::annot_edit::add_ink_annot
+    /// [`set_field_value`]: super::form::set_field_value
+    pub fn is_encrypted(&self) -> bool {
+        self.decryptor.is_some()
     }
 
     /// A short description of the document's `/Encrypt` dictionary, or `None`
@@ -305,8 +419,23 @@ impl PdfDocument {
                         ind.num
                     )));
                 }
+                // Decrypt this object's strings -- and ONLY on this path.
+                //
+                // An object parsed out of an object stream must NOT be
+                // decrypted: it was encrypted as part of the containing
+                // stream's bytes and is already plaintext by the time it is
+                // parsed. Decrypting it again with its own object number
+                // yields garbage that still parses, which is the worst kind of
+                // wrong -- a document that loads and shows nonsense. Hence the
+                // split: the `Compressed` arm below leaves strings alone.
+                let mut obj = ind.object;
+                if let Some(d) = &self.decryptor
+                    && self.encrypt_obj_num != Some(num)
+                {
+                    decrypt_strings(d, num as u32, ind.generation as u16, &mut obj);
+                }
                 Ok(Cached {
-                    obj: ind.object,
+                    obj,
                     stm_ofs: ind.stream.map(|s| s.start),
                 })
             }
@@ -494,6 +623,20 @@ impl PdfDocument {
             self.bytes[start..end].to_vec()
         } else {
             Vec::new()
+        };
+
+        // DECRYPT BEFORE FILTERING. The bytes on disk are the *encrypted*
+        // form of the filtered stream, so the order is decrypt-then-inflate.
+        // Inflating first is what produced "corrupt object stream" on every
+        // encrypted document. This is the single chokepoint for raw stream
+        // bytes, which is why it is the only place that needs to know.
+        //
+        // The XRef stream itself is never encrypted (§7.6.2) -- but it is also
+        // read by `load_xref`, before any decryptor exists, so it cannot reach
+        // here with one in place.
+        let raw = match &self.decryptor {
+            Some(d) => d.decrypt_stream(num as u32, 0, &raw),
+            None => raw,
         };
 
         // /Filter and /DecodeParms (abbreviations /F and /DP), resolved.
@@ -687,6 +830,29 @@ fn read_start_xref(bytes: &[u8]) -> Result<i64> {
 }
 
 // MuPDF: pdf_load_xref / pdf_read_xref_sections (pdf-xref.c:1775, 1636).
+/// Rewrite every string inside `obj` in place, decrypted with `num`/`gen`.
+///
+/// Recursive because strings hide anywhere -- a field's `/V`, an annotation's
+/// `/Contents`, a date buried three dictionaries down. Indirect references are
+/// **not** followed: each referenced object is decrypted with its own object
+/// number when it is itself loaded, and chasing it here would decrypt it twice.
+fn decrypt_strings(d: &super::crypt::Decryptor, num: u32, generation: u16, obj: &mut Object) {
+    match obj {
+        Object::String(bytes) => *bytes = d.decrypt_string(num, generation, bytes),
+        Object::Array(items) => {
+            for item in items {
+                decrypt_strings(d, num, generation, item);
+            }
+        }
+        Object::Dict(entries) => {
+            for (_, v) in entries.iter_mut() {
+                decrypt_strings(d, num, generation, v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build the xref table and pick out the newest trailer, following the
 /// `/Prev` chain (and hybrid `/XRefStm`).
 fn load_xref(bytes: &[u8]) -> Result<(Vec<Option<XrefEntry>>, Object)> {
@@ -1479,7 +1645,12 @@ mod tests {
             b"<< /Type /Catalog /Pages 2 0 R >>",
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            // /O and /U as 32-byte hex strings. Their contents are arbitrary,
+            // which is the point: no password can match them, so the document
+            // is undecryptable and must be refused with an explanation.
             b"<< /Filter /Standard /V 4 /R 4 /Length 128 /P -1052 \
+               /O <0000000000000000000000000000000000000000000000000000000000000000> \
+               /U <1111111111111111111111111111111111111111111111111111111111111111> \
                /StmF /StdCF /StrF /StdCF \
                /CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV2 /Length 16 >> >> >>",
         ];
@@ -1508,15 +1679,17 @@ mod tests {
         pdf
     }
 
-    /// An encrypted document must be refused with an UNSUPPORTED error that
-    /// says so.
+    /// An encrypted document we cannot open must fail with an UNSUPPORTED
+    /// error that says WHY -- never by blaming the file for corruption.
     ///
-    /// The regression this pins is a wrong diagnosis, not a crash. Without the
-    /// check, the reader ploughs on, inflates ciphertext, and reports
-    /// "corrupt object stream" -- which sent a maintainer looking for a
-    /// damaged file that was perfectly intact. The error must name encryption.
+    /// The synthetic fixture declares AES-128 but its `/O`/`/U` are zeros, so
+    /// no password matches: the failure is "needs a password", which is
+    /// exactly the honest answer. The regression pinned here is the wrong
+    /// diagnosis, not the failure: before any of this, the reader ploughed on,
+    /// inflated ciphertext and reported "corrupt object stream", which sent a
+    /// maintainer looking for damage in a perfectly intact file.
     #[test]
-    fn an_encrypted_document_is_refused_by_name_not_blamed_on_corruption() {
+    fn an_undecryptable_document_is_refused_by_name_not_blamed_on_corruption() {
         let Err(err) = PdfDocument::open(pdf_declaring_aes_encryption()) else {
             panic!("an encrypted document must not open");
         };
@@ -1528,26 +1701,40 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("encrypted"),
-            "the message must say encrypted, got: {msg}"
+            msg.contains("password") || msg.contains("encrypted"),
+            "the message must explain the encryption, got: {msg}"
         );
         assert!(
             !msg.contains("corrupt"),
-            "and must not accuse the file of corruption, got: {msg}"
+            "and must never accuse the file of corruption, got: {msg}"
         );
     }
 
-    /// The message names the actual scheme, so a maintainer can tell an
-    /// owner-restricted form (empty user password, freely readable elsewhere)
-    /// from a genuinely password-protected file without a hex editor.
+    /// `encryption_summary` names the scheme, so a maintainer (or a bug
+    /// report) can tell an owner-restricted form from a genuinely
+    /// password-protected file without reaching for a hex editor.
+    ///
+    /// Read straight off the dictionary rather than through `open`, since a
+    /// document we CAN decrypt opens successfully and never produces an error
+    /// to inspect.
     #[test]
-    fn the_refusal_names_the_scheme() {
-        let Err(err) = PdfDocument::open(pdf_declaring_aes_encryption()) else {
-            panic!("refused");
+    fn the_encryption_summary_names_the_scheme() {
+        // Build far enough to have a document, without the /U check.
+        let bytes = pdf_declaring_aes_encryption();
+        let (entries, trailer) = load_xref(&bytes).expect("xref loads");
+        let doc = PdfDocument {
+            bytes,
+            entries,
+            trailer,
+            decryptor: None,
+            encrypt_obj_num: None,
+            pages: Vec::new(),
+            cache: RefCell::new(HashMap::new()),
+            resolving: RefCell::new(Vec::new()),
         };
-        let msg = err.to_string();
+        let summary = doc.encryption_summary().expect("it is encrypted");
         for expected in ["/Standard", "V4", "R4", "AESV2"] {
-            assert!(msg.contains(expected), "message lacks {expected}: {msg}");
+            assert!(summary.contains(expected), "summary lacks {expected}: {summary}");
         }
     }
 

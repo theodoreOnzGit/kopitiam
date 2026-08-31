@@ -75,6 +75,36 @@ pdf-extract = "0.12"
 # (via flate2), so promoting it to a direct workspace dep adds no new crate to
 # the tree. Pure Rust, no C toolchain.
 miniz_oxide = "0.8"
+
+# --- PDF encryption (the standard security handler, gh-98) ----------------
+# RustCrypto primitives for §7.6's standard security handler, so `kpdf` can
+# open the owner-restricted forms that make up a large share of real-world
+# government and company PDFs. All four are pure Rust with no C toolchain,
+# actively maintained, and MIT OR Apache-2.0 -- permissive upstreams whose
+# notices travel with the code, which combines cleanly into an AGPL-3.0-only
+# work (see CLAUDE.md's licence-compatibility note).
+#
+# Adopted under the Pure Rust Core hard rule's "prefer an existing crate"
+# clause, on the maintainer's explicit call. Each is precisely scoped -- one
+# primitive apiece, no framework -- so this is four small crates rather than
+# one heavy one. And crypto is the last place to hand-roll: a subtly wrong
+# MD5 or CBC here fails silently on someone's real document.
+#
+# `md-5` is the MD5 used by Algorithms 2, 4 and 5 for key derivation and the
+# password check. It is NOT used as a security hash -- MD5's collision
+# weakness is irrelevant to reproducing a key the specification defines in
+# terms of it -- and this comment exists so nobody "upgrades" it to SHA-256
+# and breaks every R2-R4 document.
+# Pinned to the versions ALREADY in the tree transitively (via hayro/lopdf),
+# not the newest published. aes 0.9 / cbc 0.2 / md-5 0.11 sit on cipher 0.5 and
+# digest 0.11, which would put a SECOND copy of each primitive in the build
+# beside the cipher-0.4 / digest-0.10 ones already there -- twice the crypto
+# code compiled to do one job. Matching the incumbents keeps the tree flat.
+# Revisit when the rest of the tree moves up.
+aes = "0.8"
+cbc = "0.1"
+md-5 = "0.10"
+rc4 = "0.1"
 # `lopdf` is already pulled in transitively by `pdf-extract` (pinned to the
 # same "0.42" line here so Cargo unifies to the one copy already present,
 # adding no new crate to the dependency tree). kopitiam-pdf depends on it

@@ -71,6 +71,7 @@ pub mod annot_edit;
 pub mod annot_run;
 pub mod buffer;
 pub mod cmap;
+pub mod crypt;
 pub mod destination;
 pub mod doc_info;
 pub mod doc_stream;

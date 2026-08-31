@@ -157,6 +157,18 @@ pub fn page_annot_refs(doc: &PdfDocument, page_index: usize) -> Vec<AnnotRef> {
 /// stroke empty) — mirroring `synthesize_ap`'s own "nothing to paint, nothing
 /// to build" contract rather than writing an invisible annotation.
 pub fn add_ink_annot(doc: &PdfDocument, spec: &InkAnnotSpec) -> Result<Vec<u8>> {
+    // REFUSE on an encrypted document. We can decrypt but not encrypt
+    // (gh-98), so appending a plaintext object here would produce a file that
+    // still opens in kpdf -- we would read our own plaintext back through a
+    // decryptor that mangles it -- and is unreadable everywhere else. Silent
+    // corruption of someone's form is the one outcome worth failing loudly to
+    // avoid.
+    if doc.is_encrypted() {
+        return Err(Error::unsupported(
+            "cannot annotate an encrypted PDF -- kopitiam-pdf can decrypt but \
+             not yet encrypt, so writing would corrupt the file",
+        ));
+    }
     let (page_num, page_gen, page_dict) = locate_page(doc, spec.page_index)?;
 
     let width = if spec.width.is_finite() {

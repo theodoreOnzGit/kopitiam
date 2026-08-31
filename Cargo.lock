@@ -4289,12 +4289,16 @@ dependencies = [
 name = "kopitiam-pdf"
 version = "0.3.2"
 dependencies = [
+ "aes",
+ "cbc",
  "eframe",
  "egui",
  "hayro",
  "lopdf",
+ "md-5",
  "miniz_oxide",
  "pdf-extract",
+ "rc4",
  "rfd",
  "skrifa 0.42.1",
  "thiserror 2.0.18",
@@ -6142,6 +6146,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rc4"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f1256e23efe6097f27aa82d6ca6889361c001586ae0f6917cbad072f05eb275"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
