@@ -160,6 +160,18 @@ egui = ["dep:egui"]
 # less than an embedder gets.
 kpdf = ["egui", "dep:eframe", "dep:rfd"]
 
+# Proves gh-96 acceptance criterion 1 -- "a minimal third-party egui
+# application can embed a functional reader using public library APIs" -- by
+# being one. It compiles against the same public surface kovan would use, so a
+# regression that makes the reader un-embeddable breaks the build rather than
+# being discovered downstream months later.
+#
+# Needs `eframe` for its own window, hence `kpdf` rather than bare `egui`;
+# what it must NOT need is anything out of `src/bin/kpdf.rs`.
+[[example]]
+name = "embed_reader"
+required-features = ["kpdf"]
+
 [[bin]]
 name = "kpdf-doctor"
 path = "src/bin/kpdf_doctor.rs"

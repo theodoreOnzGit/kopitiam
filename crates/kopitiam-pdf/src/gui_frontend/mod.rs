@@ -32,38 +32,49 @@
 //! deliberately not want). Verified: `cargo tree` for the `egui`-only build
 //! contains neither crate.
 //!
-//! What that gets you today is the *engine* half -- you drive it yourself:
+//! Then hand it bytes and paint it. [`PdfReader`] is the whole reader --
+//! rendering, search, thumbnails, vim navigation, forms, annotations:
 //!
 //! ```no_run
-//! # use kopitiam_pdf::gui_frontend::{RenderWorker, RenderRequest, RenderKind};
-//! # fn demo(bytes: Vec<u8>) -> Option<()> {
-//! let mut worker = RenderWorker::spawn(bytes)?;
-//! worker.request(RenderRequest {
-//!     page: 0,
-//!     dpi: 150.0,
-//!     fallback: true,
-//!     generation: worker.generation(),
-//!     kind: RenderKind::Page,
-//! });
-//! // ...later, once per frame, never blocking:
-//! while let Some(done) = worker.try_recv() {
-//!     if done.generation == worker.generation() {
-//!         // upload `done.rgba` at `done.size` as a texture and paint it
+//! # use kopitiam_pdf::gui_frontend::{PdfReader, PdfReaderConfig, ReaderAction};
+//! # fn demo(bytes: Vec<u8>, ui: &mut egui::Ui) -> Result<(), String> {
+//! // Read-only: every reading feature, no path that rewrites the PDF.
+//! let mut reader = PdfReader::open_bytes_with(bytes, PdfReaderConfig::read_only())?;
+//!
+//! // ...then once per frame, inside whatever Ui you give it:
+//! for action in reader.show(ui).actions {
+//!     match action {
+//!         ReaderAction::PageChanged { page } => { /* update your own chrome */ }
+//!         ReaderAction::SaveRequested => { /* YOU decide what saving means */ }
+//!         _ => {}
 //!     }
 //! }
-//! # Some(()) }
+//! # Ok(()) }
 //! ```
 //!
-//! A single `PdfReader` type that assembles all of this for you is the goal
-//! of gh-96's later phases; it does not exist yet. Until it does, the pieces
-//! here are usable directly, and `kpdf.rs` is the worked example of how they
-//! fit together.
+//! `crates/kopitiam-pdf/examples/embed_reader.rs` is a complete third-party
+//! host doing exactly this, and it is compiled by CI precisely so this stays
+//! true.
 //!
-//! When that reader does arrive, its shape is already settled (AID-0057):
-//! `reader.ui(ui)` will paint **the document pane only**, with thumbnails and
-//! outline as separate methods you call into a `Ui` you own. An
-//! `egui::Panel` cannot be created inside a `Ui`, so the host keeps layout;
-//! the library keeps the engines.
+//! ## Two entry points
+//!
+//! [`PdfReader::show`] above assembles kpdf's chrome for you. The primitive
+//! underneath it is [`PdfReader::ui`], which paints **the document pane
+//! only** into the `Ui` you hand it, leaving you to place -- or omit --
+//! [`thumbnail_sidebar`](PdfReader::thumbnail_sidebar),
+//! [`outline_sidebar`](PdfReader::outline_sidebar) and
+//! [`find_bar`](PdfReader::find_bar) yourself. Reach for `ui` when the reader
+//! shares a window with your own tooling and you want control of the layout;
+//! `show` when you just want a viewer. See AID-0057 for why the pane is the
+//! primitive and the chrome is the convenience, rather than the other way
+//! round.
+//!
+//! ## Driving the engines directly
+//!
+//! Everything `PdfReader` is built from is public too --
+//! [`RenderWorker`], [`SearchWorker`], [`Viewport`], [`Thumbnails`] -- for a
+//! host that wants, say, background rasterisation without any of the reading
+//! UI. `PdfReader` is the assembly, not a wall.
 //!
 //! Named `gui_frontend` rather than `egui` on purpose (maintainer's call):
 //! a module literally named `egui` would shadow the external `egui` crate
@@ -80,6 +91,8 @@
 //! this module and never pulls in egui at all -- the headless core stays
 //! headless.
 
+pub mod action;
+pub mod config;
 pub mod forms;
 pub mod geometry;
 pub mod hit_test;
@@ -87,11 +100,16 @@ pub mod hot_reload;
 pub mod keys;
 pub mod lru;
 pub mod pixmap;
+pub mod reader;
 pub mod render;
 pub mod search;
+pub mod thumbnails;
 pub mod tools;
+pub mod viewport;
 pub mod zoom;
 
+pub use action::{PdfReaderOutput, ReaderAction};
+pub use config::PdfReaderConfig;
 pub use forms::{
     FieldHighlight, consume_commit_enter, field_highlight_kind, highlight_colors,
     should_commit_on_enter,
@@ -111,6 +129,9 @@ pub use lru::Lru;
 pub use pixmap::{drawable_annot_count, rgb_to_rgba};
 pub use render::{RenderKey, RenderKind, RenderRequest, RenderWorker, RenderedPage};
 pub use search::{FindScan, SearchWorker, scan_page_order};
+pub use reader::PdfReader;
+pub use thumbnails::{THUMBNAIL_DPI, Thumbnails};
+pub use viewport::{CONTINUOUS_GAP, SlotsCacheKey, Viewport};
 pub use tools::{Tool, select_tool, toggle_forms_mode};
 pub use zoom::{
     DPI_DEFAULT, DPI_MAX, DPI_MIN, DPI_STEP, ZOOM_DELTA_PER_STEP, zoom_percent,

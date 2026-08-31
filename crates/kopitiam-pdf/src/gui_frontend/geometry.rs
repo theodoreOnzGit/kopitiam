@@ -609,7 +609,6 @@ mod tests {
 
     // -- page_size_pts ---------------------------------------------------
 
-    #[test]
     /// The regression that shipped: stext coordinates are y-DOWN, so putting
     /// them through `page_to_screen` (which flips for y-up user space) mirrors
     /// every highlight vertically. A point near the top of the page must map
