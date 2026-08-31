@@ -1279,6 +1279,23 @@ impl PdfReader {
                     Some(_) => {}
                 }
             }
+            // ASK FOR ANOTHER FRAME, or the ink you just drew is invisible
+            // until something else happens to repaint.
+            //
+            // The preview is painted per-page INSIDE the scroll-area closure,
+            // and this runs after that closure returns -- so the line on
+            // screen is always the stroke as of the *previous* frame, and the
+            // segment appended just now needs a following frame to appear at
+            // all. That used to come free from a blanket 50 ms repaint, which
+            // was removed in 0.3.1 because it pinned the whole app at 20 fps
+            // (the reported lag). Removing it was right; not replacing it
+            // here was the bug -- an in-progress stroke is an asynchronous
+            // source with work outstanding, exactly like the render, reflow
+            // and search pumps, and like them it must request its own frame.
+            //
+            // Bounded by the drag: it stops the moment the pointer is
+            // released, so this cannot reintroduce an idle busy-loop.
+            response.ctx.request_repaint();
         }
 
         if response.drag_stopped() {
@@ -3157,5 +3174,171 @@ mod embedding_tests {
         let mut r = PdfReader::open_bytes(bytes).expect("opens");
         r.set_status("saved /tmp/paper.pdf");
         assert_eq!(r.status(), Some("saved /tmp/paper.pdf"));
+    }
+}
+
+// The freehand pen's *interaction* is deliberately not unit-tested here, and
+// the reason is worth recording so nobody adds a test that looks like it
+// covers it.
+//
+// Two attempts failed honestly:
+//
+//  1. Asserting `Context::requested_repaint_last_pass()` around a synthetic
+//     drag. It PASSED WITH THE FIX REMOVED -- egui requests repaints of its
+//     own during any interaction, so the assertion was measuring egui, not
+//     us. A test that cannot fail is worse than no test: it reports safety
+//     that is not there.
+//  2. Driving a real drag through `Context::run_ui` with synthetic
+//     `PointerMoved`/`PointerButton` input. `Response::dragged()` stays false
+//     and `interact_pointer_pos()` stays `None` across passes, with or
+//     without a `screen_rect` -- egui's interaction state does not come up in
+//     a bare headless pass.
+//
+// So "the preview line is visible while drawing" is maintainer-dogfooding
+// territory, per the workspace rule about unverifiable interactive surfaces.
+// What IS covered lives elsewhere and is worth knowing: the ink annotation
+// that a finished stroke commits round-trips through our own reader and
+// through poppler (`tests/authoring.rs`), and the stroke-to-page attribution
+// rule is enforced by `handle_draw_update`'s `Some(_) => {}` arm.
+
+#[cfg(test)]
+mod forms_tests {
+    use super::*;
+
+    fn stream_obj(dict_fields: &str, content: &[u8]) -> Vec<u8> {
+        let mut body =
+            format!("<< {dict_fields} /Length {} >>\nstream\n", content.len()).into_bytes();
+        body.extend_from_slice(content);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    fn build_pdf(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offsets = vec![0usize; bodies.len() + 1];
+        for (idx, body) in bodies.iter().enumerate() {
+            let num = idx + 1;
+            offsets[num] = pdf.len();
+            pdf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_ofs = pdf.len();
+        let size = bodies.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_ofs}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// One page carrying a text field and a checkbox, behind a real
+    /// `/AcroForm` -- the minimum a reader must light up for.
+    fn form_pdf() -> Vec<u8> {
+        build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R] >> >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [4 0 R 5 0 R] >>"
+                .to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (Alice)               /Rect [10 10 210 30] /DA (/Helv 0 Tf 0 g) >>"
+                .to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Btn /T (Agree) /Rect [10 40 30 60]               /AS /Off /V /Off /AP << /N << /Yes 6 0 R /Off 7 0 R >> >> >>"
+                .to_vec(),
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 20]",
+                b"1 g 0 0 20 20 re f",
+            ),
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 20]",
+                b"0 g 0 0 20 20 re f",
+            ),
+        ])
+    }
+
+    /// The whole chain the paint path walks, in order. A form document must
+    /// open with forms mode ON (a form is for filling in), the field cache
+    /// must actually populate, and each field must resolve to a *visible*
+    /// highlight -- `FieldHighlight::None` is skipped by the painter, so a
+    /// field that lands there is invisible however correct everything else is.
+    ///
+    /// Covers the gh-96 move: every one of these links is a place the
+    /// extraction could have quietly dropped a wire.
+    #[test]
+    fn a_form_document_opens_with_visible_fields() {
+        let mut r = PdfReader::open_bytes(form_pdf()).expect("form fixture opens");
+
+        assert!(r.has_acroform, "the /AcroForm dict must be detected");
+        assert!(
+            r.forms_mode,
+            "a form document opens ready to fill in -- otherwise every click \
+             goes to the pan tool and the document looks broken"
+        );
+        assert_eq!(
+            r.tool,
+            Tool::Pan,
+            "forms mode implies the Pan tool, or a Pen would swallow field clicks"
+        );
+
+        r.refresh_form_fields_cache(0);
+        let fields = r.form_fields_cache.get(&0).expect("page 0 is cached");
+        assert!(
+            !fields.is_empty(),
+            "the page's /Annots widgets must reach the cache the painter reads"
+        );
+
+        let visible = fields
+            .iter()
+            .filter(|f| field_highlight_kind(f.kind, f.read_only) != FieldHighlight::None)
+            .count();
+        assert!(
+            visible > 0,
+            "at least one field must map to a drawable highlight -- \
+             FieldHighlight::None is skipped by the painter, so all-None \
+             means a form that is there but cannot be seen"
+        );
+    }
+
+    /// The toolbar's Forms toggle is gated on `has_acroform`, so a document
+    /// without one must not offer it -- and must not open in forms mode.
+    #[test]
+    fn a_plain_document_offers_no_forms_mode() {
+        let plain = build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_vec(),
+        ]);
+        let r = PdfReader::open_bytes(plain).expect("plain fixture opens");
+        assert!(!r.has_acroform);
+        assert!(!r.forms_mode);
+    }
+
+    /// Swapping documents must re-decide forms mode from the NEW document.
+    /// Carrying the old answer over is how a plain PDF ends up in forms mode
+    /// (nothing to click) or a form opens with forms off (looks broken).
+    #[test]
+    fn forms_mode_is_re_decided_on_every_document_swap() {
+        let plain = build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_vec(),
+        ]);
+        let mut r = PdfReader::open_bytes(plain.clone()).expect("opens");
+        assert!(!r.forms_mode);
+
+        r.load_bytes(form_pdf()).expect("loads the form");
+        assert!(r.forms_mode, "a form loaded later must switch forms on");
+        assert!(
+            r.form_fields_cache.is_empty(),
+            "the previous document's field cache must not survive the swap"
+        );
+
+        r.load_bytes(plain).expect("loads the plain doc again");
+        assert!(!r.forms_mode, "and switch back off for a plain document");
     }
 }
