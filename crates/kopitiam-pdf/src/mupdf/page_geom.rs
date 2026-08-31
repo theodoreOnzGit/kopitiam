@@ -43,6 +43,67 @@ pub const DEFAULT_SIZE_PTS: (f32, f32) = (612.0, 792.0);
 /// [`DEFAULT_SIZE_PTS`]. A viewer wants a plausible slot far more than it
 /// wants an error — the page still renders, and a wrong-sized slot is
 /// recoverable while a failed open is not.
+/// The page's `/MediaBox` in PDF points, **origin included**.
+///
+/// # Why the origin matters, and why returning only a size was a bug
+///
+/// [`page_size_points`] answers "how big is this page", which is all a layout
+/// needs. Anything that converts between a point on screen and a point in the
+/// PDF needs more than that, because **default user space does not start at
+/// (0, 0)**: §7.7.3.3 puts the media box's lower-left corner at
+/// `(x0, y0)`, so a mark at the visual bottom-left of a page whose box is
+/// `[9 9 621 801]` has user-space coordinates `(9, 9)`, not `(0, 0)`.
+///
+/// Plenty of PDFs -- cropped scans, journal typesetting, anything that has
+/// been imposed or trimmed -- carry a non-zero origin. Treating it as zero
+/// places every annotation and every form-field highlight off by exactly
+/// `(x0, y0)`: not obviously broken, just persistently *slightly wrong*,
+/// which is how it survived until a maintainer drew on a real paper and said
+/// the ink landed in the wrong place.
+///
+/// A page that has no usable `/MediaBox` falls back to
+/// [`DEFAULT_SIZE_PTS`] at the origin, matching [`page_size_points`].
+///
+/// # Rotation
+///
+/// `/Rotate` 90 or 270 swaps the returned extents, exactly as
+/// [`page_size_points`] does, so the box describes the page **as displayed**.
+/// The origin is passed through unrotated. That is right for the overwhelmingly
+/// common `/Rotate 0` case and for the size in every case, but a *fully*
+/// rotation-correct screen<->user-space mapping needs the whole rotation
+/// applied to the point as well, which this crate does not do yet -- see the
+/// note on `screen_to_page`.
+pub fn page_media_box_points(doc: &PdfDocument, page_index: usize) -> Rect {
+    let fallback = Rect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: DEFAULT_SIZE_PTS.0,
+        y1: DEFAULT_SIZE_PTS.1,
+    };
+    let Ok(page) = doc.page(page_index) else {
+        return fallback;
+    };
+    let Some(r) = media_box(doc, &page) else {
+        return fallback;
+    };
+    let rotate = page
+        .dict_gets("Rotate")
+        .and_then(|o| doc.resolve(o).ok())
+        .map(|o| o.to_int())
+        .unwrap_or(0)
+        .rem_euclid(360);
+    if rotate == 90 || rotate == 270 {
+        Rect {
+            x0: r.x0,
+            y0: r.y0,
+            x1: r.x0 + (r.y1 - r.y0),
+            y1: r.y0 + (r.x1 - r.x0),
+        }
+    } else {
+        r
+    }
+}
+
 pub fn page_size_points(doc: &PdfDocument, page_index: usize) -> (f32, f32) {
     let Ok(page) = doc.page(page_index) else {
         return DEFAULT_SIZE_PTS;
@@ -229,4 +290,70 @@ mod tests {
         );
         assert_eq!(page_size_points(&d, 99), DEFAULT_SIZE_PTS, "out of range");
     }
+    /// The origin is the whole reason `page_media_box_points` exists beside
+    /// `page_size_points`. A cropped or imposed page carries a non-zero
+    /// lower-left, and dropping it is what put ink slightly off the pen.
+    #[test]
+    fn the_media_box_origin_survives() {
+        let doc = build(
+            &["<< /Type /Page /Parent 2 0 R /MediaBox [9 9 621 801] >>"],
+            &[],
+        );
+        let mb = page_media_box_points(&doc, 0);
+        assert_eq!((mb.x0, mb.y0), (9.0, 9.0), "the origin must not be dropped");
+        assert_eq!(
+            (mb.x1 - mb.x0, mb.y1 - mb.y0),
+            page_size_points(&doc, 0),
+            "and the extents must still agree with page_size_points"
+        );
+    }
+
+    /// A box given corner-swapped (`[621 801 9 9]`) is still the same page --
+    /// `media_box` normalises it, and the origin must come out as the LOWER
+    /// left, not whichever number happened to be written first.
+    #[test]
+    fn a_reversed_box_still_reports_the_lower_left() {
+        let doc = build(
+            &["<< /Type /Page /Parent 2 0 R /MediaBox [621 801 9 9] >>"],
+            &[],
+        );
+        let mb = page_media_box_points(&doc, 0);
+        assert_eq!((mb.x0, mb.y0), (9.0, 9.0));
+    }
+
+    /// The ordinary case, which must stay exactly as it was.
+    #[test]
+    fn a_zero_origin_box_is_unchanged() {
+        let doc = build(
+            &["<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"],
+            &[],
+        );
+        let mb = page_media_box_points(&doc, 0);
+        assert_eq!((mb.x0, mb.y0, mb.x1, mb.y1), (0.0, 0.0, 612.0, 792.0));
+    }
+
+    /// A missing or unusable box falls back to the same default size
+    /// `page_size_points` uses, at the origin -- the two must not disagree
+    /// about what a broken page looks like.
+    #[test]
+    fn a_missing_box_falls_back_consistently() {
+        let doc = build(&["<< /Type /Page /Parent 2 0 R >>"], &[]);
+        let mb = page_media_box_points(&doc, 0);
+        assert_eq!((mb.x0, mb.y0), (0.0, 0.0));
+        assert_eq!((mb.x1 - mb.x0, mb.y1 - mb.y0), page_size_points(&doc, 0));
+    }
+
+    /// Rotation swaps the extents, matching `page_size_points`, so a layout
+    /// built from either agrees on how tall the page is.
+    #[test]
+    fn rotation_swaps_the_extents_the_same_way_as_page_size_points() {
+        let doc = build(
+            &["<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 >>"],
+            &[],
+        );
+        let mb = page_media_box_points(&doc, 0);
+        assert_eq!((mb.x1 - mb.x0, mb.y1 - mb.y0), (792.0, 612.0));
+        assert_eq!((mb.x1 - mb.x0, mb.y1 - mb.y0), page_size_points(&doc, 0));
+    }
+
 }

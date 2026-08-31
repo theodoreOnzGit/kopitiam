@@ -141,6 +141,18 @@ pub struct PageLayout {
     /// The page's physical size in PDF points -- from [`page_size_pts`].
     pub page_w_pts: f32,
     pub page_h_pts: f32,
+    /// The page's `/MediaBox` origin in PDF points -- the user-space
+    /// coordinates of its **bottom-left corner**.
+    ///
+    /// Not always `(0, 0)`, which is the entire reason this field exists.
+    /// §7.7.3.3 places the media box's lower-left at `(x0, y0)`, so on a page
+    /// boxed `[9 9 621 801]` the visual bottom-left corner is user-space
+    /// `(9, 9)`. Assuming zero puts every annotation and form-field highlight
+    /// off by exactly that much -- not obviously broken, just persistently
+    /// *slightly wrong*, which is how it survived until a maintainer drew on a
+    /// real paper and said the ink landed in the wrong place.
+    pub page_x0: f32,
+    pub page_y0: f32,
 }
 
 /// Screen space (ui points, origin top-left, y **down** -- what a pointer
@@ -159,12 +171,15 @@ pub fn screen_to_page(screen_x: f32, screen_y: f32, layout: PageLayout) -> (f32,
     }
     let fx = (screen_x - layout.image_x) / layout.image_w;
     let fy = (screen_y - layout.image_y) / layout.image_h;
-    let page_x = fx * layout.page_w_pts;
+    // Offset by the media box origin, NOT just scaled: default user space
+    // starts at the box's lower-left corner, which is only (0, 0) when the
+    // box says so. See `PageLayout::page_x0`.
+    let page_x = layout.page_x0 + fx * layout.page_w_pts;
     // The y-flip: screen y grows downward from the image's top; page y
     // grows upward from the page's bottom. fy=0 (image top) must map to
     // page_y = page_h_pts (page top); fy=1 (image bottom) must map to
     // page_y = 0 (page bottom).
-    let page_y = (1.0 - fy) * layout.page_h_pts;
+    let page_y = layout.page_y0 + (1.0 - fy) * layout.page_h_pts;
     (page_x, page_y)
 }
 
@@ -205,8 +220,9 @@ pub fn page_to_screen(page_x: f32, page_y: f32, layout: PageLayout) -> (f32, f32
     if layout.page_w_pts <= 0.0 || layout.page_h_pts <= 0.0 {
         return (layout.image_x, layout.image_y);
     }
-    let fx = page_x / layout.page_w_pts;
-    let fy = 1.0 - page_y / layout.page_h_pts;
+    // The inverse of `screen_to_page`: subtract the origin before scaling.
+    let fx = (page_x - layout.page_x0) / layout.page_w_pts;
+    let fy = 1.0 - (page_y - layout.page_y0) / layout.page_h_pts;
     (
         layout.image_x + fx * layout.image_w,
         layout.image_y + fy * layout.image_h,
@@ -317,6 +333,18 @@ pub struct PageSize {
     /// document lookup.
     pub page_w_pts: f32,
     pub page_h_pts: f32,
+    /// The page's `/MediaBox` origin in PDF points -- the user-space
+    /// coordinates of its **bottom-left corner**.
+    ///
+    /// Not always `(0, 0)`, which is the entire reason this field exists.
+    /// §7.7.3.3 places the media box's lower-left at `(x0, y0)`, so on a page
+    /// boxed `[9 9 621 801]` the visual bottom-left corner is user-space
+    /// `(9, 9)`. Assuming zero puts every annotation and form-field highlight
+    /// off by exactly that much -- not obviously broken, just persistently
+    /// *slightly wrong*, which is how it survived until a maintainer drew on a
+    /// real paper and said the ink landed in the wrong place.
+    pub page_x0: f32,
+    pub page_y0: f32,
 }
 
 /// One page's placement within a **continuous** (all-pages-stacked-
@@ -342,6 +370,18 @@ pub struct ContinuousSlot {
     /// The page's physical size in PDF points -- see [`PageSize`].
     pub page_w_pts: f32,
     pub page_h_pts: f32,
+    /// The page's `/MediaBox` origin in PDF points -- the user-space
+    /// coordinates of its **bottom-left corner**.
+    ///
+    /// Not always `(0, 0)`, which is the entire reason this field exists.
+    /// §7.7.3.3 places the media box's lower-left at `(x0, y0)`, so on a page
+    /// boxed `[9 9 621 801]` the visual bottom-left corner is user-space
+    /// `(9, 9)`. Assuming zero puts every annotation and form-field highlight
+    /// off by exactly that much -- not obviously broken, just persistently
+    /// *slightly wrong*, which is how it survived until a maintainer drew on a
+    /// real paper and said the ink landed in the wrong place.
+    pub page_x0: f32,
+    pub page_y0: f32,
 }
 
 impl ContinuousSlot {
@@ -373,6 +413,8 @@ pub fn layout_continuous_pages(sizes: &[PageSize], gap: f32) -> Vec<ContinuousSl
             height,
             page_w_pts: size.page_w_pts,
             page_h_pts: size.page_h_pts,
+            page_x0: size.page_x0,
+            page_y0: size.page_y0,
         });
         top += height + gap;
     }
@@ -426,6 +468,8 @@ pub fn screen_to_page_at(
         image_h: slot.height,
         page_w_pts: slot.page_w_pts,
         page_h_pts: slot.page_h_pts,
+        page_x0: slot.page_x0,
+        page_y0: slot.page_y0,
     };
     let (px, py) = screen_to_page(content_x, content_y, layout);
     Some((slot.page_index, px, py))
@@ -622,6 +666,8 @@ mod tests {
             image_h: 200.0,
             page_w_pts: 50.0,
             page_h_pts: 100.0,
+            page_x0: 0.0,
+            page_y0: 0.0,
         };
         // Top of the page in fitz space (y small) -> top of the image.
         let (_, top) = stext_to_screen(0.0, 10.0, layout);
@@ -647,6 +693,8 @@ mod tests {
             image_h: 200.0,
             page_w_pts: 50.0,
             page_h_pts: 100.0,
+            page_x0: 0.0,
+            page_y0: 0.0,
         };
         assert_eq!(stext_to_screen(0.0, 0.0, layout), (7.0, 11.0));
         assert_eq!(stext_to_screen(50.0, 100.0, layout), (107.0, 211.0));
@@ -662,6 +710,8 @@ mod tests {
             image_h: 10.0,
             page_w_pts: 0.0,
             page_h_pts: 0.0,
+            page_x0: 0.0,
+            page_y0: 0.0,
         };
         assert_eq!(stext_to_screen(5.0, 5.0, layout), (3.0, 4.0));
     }
@@ -706,6 +756,8 @@ mod tests {
             image_h: 400.0,
             page_w_pts: 612.0,
             page_h_pts: 792.0,
+            page_x0: 0.0,
+            page_y0: 0.0,
         }
     }
 
@@ -744,6 +796,95 @@ mod tests {
         );
         assert!((px - layout.page_w_pts / 2.0).abs() < 1e-2);
         assert!((py - layout.page_h_pts / 2.0).abs() < 1e-2);
+    }
+
+    /// THE "SLIGHTLY OFF" BUG. A page boxed `[9 9 621 801]` puts its visual
+    /// bottom-left corner at user-space `(9, 9)`, not `(0, 0)` (§7.7.3.3).
+    /// Ignoring that offsets every annotation and form highlight by exactly
+    /// the origin -- which is why ink drawn on a real paper landed near, but
+    /// not on, the pen.
+    ///
+    /// Both directions, and the corners specifically: the corners are where
+    /// the offset is unambiguous, and a scale-only bug would still get the
+    /// centre roughly right.
+    #[test]
+    fn a_non_zero_media_box_origin_shifts_page_coordinates() {
+        // 100x200 image showing a 612x792 page boxed at (9, 9).
+        let layout = PageLayout {
+            image_x: 0.0,
+            image_y: 0.0,
+            image_w: 100.0,
+            image_h: 200.0,
+            page_w_pts: 612.0,
+            page_h_pts: 792.0,
+            page_x0: 9.0,
+            page_y0: 9.0,
+        };
+
+        // Bottom-left of the image is the page's origin corner.
+        let (px, py) = screen_to_page(0.0, 200.0, layout);
+        assert!(
+            (px - 9.0).abs() < 0.01 && (py - 9.0).abs() < 0.01,
+            "bottom-left must be user-space (9, 9), got ({px}, {py}) -- \
+             (0, 0) means the media box origin was dropped"
+        );
+
+        // Top-right is origin + extent.
+        let (px, py) = screen_to_page(100.0, 0.0, layout);
+        assert!(
+            (px - 621.0).abs() < 0.01 && (py - 801.0).abs() < 0.01,
+            "top-right must be (621, 801), got ({px}, {py})"
+        );
+
+        // And the inverse agrees, or ink would be drawn at one place and
+        // painted back at another.
+        let (sx, sy) = page_to_screen(9.0, 9.0, layout);
+        assert!(
+            sx.abs() < 0.01 && (sy - 200.0).abs() < 0.01,
+            "page (9, 9) must paint back at the image's bottom-left, got ({sx}, {sy})"
+        );
+    }
+
+    /// A zero origin must behave exactly as before -- the overwhelming
+    /// majority of pages, and the case every other test in this module
+    /// assumes.
+    #[test]
+    fn a_zero_origin_is_unchanged_by_the_offset() {
+        let layout = PageLayout {
+            image_x: 0.0,
+            image_y: 0.0,
+            image_w: 100.0,
+            image_h: 200.0,
+            page_w_pts: 612.0,
+            page_h_pts: 792.0,
+            page_x0: 0.0,
+            page_y0: 0.0,
+        };
+        let (px, py) = screen_to_page(0.0, 200.0, layout);
+        assert!(px.abs() < 0.01 && py.abs() < 0.01);
+    }
+
+    /// The round trip must hold with an origin too, not only without one.
+    #[test]
+    fn round_trips_survive_a_non_zero_origin() {
+        let layout = PageLayout {
+            image_x: 17.0,
+            image_y: 23.0,
+            image_w: 300.0,
+            image_h: 400.0,
+            page_w_pts: 612.0,
+            page_h_pts: 792.0,
+            page_x0: 9.0,
+            page_y0: 9.0,
+        };
+        for (sx, sy) in [(17.0, 23.0), (317.0, 423.0), (100.0, 200.0)] {
+            let (px, py) = screen_to_page(sx, sy, layout);
+            let (bx, by) = page_to_screen(px, py, layout);
+            assert!(
+                (bx - sx).abs() < 0.01 && (by - sy).abs() < 0.01,
+                "({sx}, {sy}) -> ({px}, {py}) -> ({bx}, {by})"
+            );
+        }
     }
 
     #[test]
@@ -917,6 +1058,8 @@ mod tests {
                 display_h: 400.0,
                 page_w_pts: 612.0,
                 page_h_pts: 792.0,
+                page_x0: 0.0,
+                page_y0: 0.0,
             };
             3
         ]
@@ -955,12 +1098,16 @@ mod tests {
                 display_h: 400.0,
                 page_w_pts: 612.0,
                 page_h_pts: 792.0,
+                page_x0: 0.0,
+                page_y0: 0.0,
             },
             PageSize {
                 display_w: 300.0,
                 display_h: 200.0,
                 page_w_pts: 612.0,
                 page_h_pts: 396.0,
+                page_x0: 0.0,
+                page_y0: 0.0,
             },
         ];
         let slots = layout_continuous_pages(&sizes, 5.0);

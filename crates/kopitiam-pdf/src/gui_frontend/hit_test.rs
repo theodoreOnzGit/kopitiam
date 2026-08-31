@@ -166,6 +166,8 @@ mod tests {
             image_h: 400.0,
             page_w_pts: 612.0,
             page_h_pts: 792.0,
+            page_x0: 0.0,
+            page_y0: 0.0,
         }
     }
 

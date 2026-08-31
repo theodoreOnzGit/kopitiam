@@ -625,14 +625,21 @@ impl PdfReader {
             .slots(self.fallback_enabled, || {
                 (0..n)
                     .map(|p| {
-                        let (page_w_pts, page_h_pts) =
-                            crate::mupdf::page_geom::page_size_points(doc, p);
+                        // The full box, not just its size: annotations and
+                        // form fields are placed in user space, whose origin
+                        // is the box's lower-left corner and is NOT always
+                        // (0, 0). See `page_media_box_points`.
+                        let mb = crate::mupdf::page_geom::page_media_box_points(doc, p);
+                        let page_w_pts = mb.x1 - mb.x0;
+                        let page_h_pts = mb.y1 - mb.y0;
                         let scale = dpi / 72.0;
                         PageSize {
                             display_w: page_w_pts * scale,
                             display_h: page_h_pts * scale,
                             page_w_pts,
                             page_h_pts,
+                            page_x0: mb.x0,
+                            page_y0: mb.y0,
                         }
                     })
                     .collect()
@@ -1225,6 +1232,8 @@ impl PdfReader {
             image_h: slot.height,
             page_w_pts: slot.page_w_pts,
             page_h_pts: slot.page_h_pts,
+            page_x0: slot.page_x0,
+            page_y0: slot.page_y0,
         };
         let fields = crate::mupdf::form::page_form_fields(&self.doc, page);
         // Exact rect first; only fall back to the widened hit area
@@ -2507,6 +2516,8 @@ impl PdfReader {
                                 image_h: slot.height,
                                 page_w_pts: slot.page_w_pts,
                                 page_h_pts: slot.page_h_pts,
+                                page_x0: slot.page_x0,
+                                page_y0: slot.page_y0,
                             };
 
                             self.paint_search_highlights(ui, slot.page_index, layout);
