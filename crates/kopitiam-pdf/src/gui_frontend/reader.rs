@@ -860,11 +860,47 @@ impl PdfReader {
                 // page changes it -- and a stale count leaves the new page
                 // unreachable (navigation clamps to the old maximum) or lets
                 // the viewer address a page that no longer exists.
-                self.viewport.set_document(self.doc.page_count());
+                //
+                // Only when it ACTUALLY moved, though: `set_document` drops
+                // queued scroll intents, and an ink stroke that silently
+                // cancelled a pending jump would feel like the document
+                // lurching back under the pen.
+                let n = self.doc.page_count();
+                if n != self.viewport.page_count() {
+                    self.viewport.set_document(n);
+                }
                 self.page_textures.clear();
                 self.page_textures_lru = Lru::new(PAGE_TEXTURE_CACHE_CAPACITY);
                 self.thumbnails.clear();
                 self.viewport.invalidate_layout();
+
+                // THE WORKERS HOLD THEIR OWN COPY OF THE OLD BYTES. Dropping
+                // them is not tidiness -- it is the whole correctness of an
+                // edit.
+                //
+                // `RenderWorker::spawn` takes `self.doc.raw_bytes().to_vec()`
+                // and opens its own `PdfDocument` from it, because a document
+                // holds `RefCell`s and cannot cross threads. So a worker
+                // started before this edit keeps rasterising the PRE-EDIT
+                // file forever. Clearing the texture caches above then makes
+                // it worse rather than better: every visible page is
+                // re-requested and re-rendered, from the old bytes, so the
+                // ink that was just committed is nowhere on screen -- while
+                // `annot_count` below, read from the NEW document, cheerfully
+                // reports the annotation exists. That was the bug: "I can
+                // draw, the reader says there are annots, and I cannot see
+                // them."
+                //
+                // `render_started` must be cleared too, not just the worker:
+                // the spawn in `pump` is gated on `!render_started`, so
+                // leaving it set means no worker is ever started again and
+                // every page stays a placeholder.
+                self.render_worker = None;
+                self.render_started = false;
+                // Same reasoning: an in-flight reflow extractor is reading
+                // the old bytes and would deliver text for a document that no
+                // longer exists.
+                self.reflow_worker = None;
                 // Extracted reflow text is indexed by page, so inserting or
                 // removing a page shifts every entry after it out of step.
                 self.reflow_pages = None;
@@ -3340,5 +3376,113 @@ mod forms_tests {
 
         r.load_bytes(plain).expect("loads the plain doc again");
         assert!(!r.forms_mode, "and switch back off for a plain document");
+    }
+}
+
+#[cfg(test)]
+mod edit_reload_tests {
+    use super::*;
+
+    fn fixture() -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/arxiv-2608.17504v1.pdf");
+        std::fs::read(path).ok()
+    }
+
+    /// THE REGRESSION: "I can draw with the pen, but the moment I do the PDF
+    /// reloads and I cannot see the annotations -- though the reader still
+    /// says there are annots."
+    ///
+    /// The render worker owns a private `PdfDocument`, opened from a COPY of
+    /// the bytes as they were when it started, because a document holds
+    /// `RefCell`s and cannot cross threads. An edit replaces `self.doc` and
+    /// clears the texture caches -- which, with a live worker still holding
+    /// the pre-edit bytes, actively causes the bug: every visible page is
+    /// re-requested and re-rendered from the OLD file, so the new ink is
+    /// nowhere on screen, while `annot_count` (read from the new document)
+    /// reports it exists.
+    ///
+    /// So an edit must drop the worker. This test fails if it does not.
+    #[test]
+    fn an_edit_drops_the_render_worker_that_holds_the_old_bytes() {
+        let Some(bytes) = fixture() else { return };
+        let mut r = PdfReader::open_bytes(bytes.clone()).expect("opens");
+
+        // Stand in for the first painted frame, which is what starts the
+        // worker. Spawning a real one keeps this honest: the assertion below
+        // is about a worker that genuinely exists.
+        r.render_worker = RenderWorker::spawn(r.doc.raw_bytes().to_vec());
+        r.render_started = true;
+        assert!(r.render_worker.is_some(), "precondition: a worker is running");
+
+        r.reload_from_bytes(bytes);
+
+        assert!(
+            r.render_worker.is_none(),
+            "an edit must drop the rasteriser -- it holds the pre-edit bytes \
+             and will keep painting a document without the new annotation"
+        );
+        assert!(
+            !r.render_started,
+            "and must clear `render_started`, or `pump`'s spawn gate never \
+             fires again and every page stays a placeholder forever"
+        );
+        assert!(
+            r.page_textures.is_empty() && r.thumbnails.is_empty(),
+            "the caches hold pre-edit images and must go with it"
+        );
+    }
+
+    /// An in-flight reflow extractor is reading the old bytes too, and would
+    /// deliver text for a document that no longer exists.
+    #[test]
+    fn an_edit_drops_the_reflow_worker_as_well() {
+        let Some(bytes) = fixture() else { return };
+        let mut r = PdfReader::open_bytes(bytes.clone()).expect("opens");
+        r.reflow_worker = ReflowWorker::spawn(bytes.clone(), r.viewport.page_count());
+        assert!(r.reflow_worker.is_some(), "precondition");
+        r.reload_from_bytes(bytes);
+        assert!(r.reflow_worker.is_none());
+        assert!(r.reflow_pages.is_none(), "and the text it produced");
+    }
+
+    /// An ordinary annotation does not change the page count, and must not be
+    /// treated as a document swap: `set_document` drops queued scroll
+    /// intents, so a stroke that cancelled a pending jump would feel like the
+    /// document lurching back under the pen.
+    #[test]
+    fn an_edit_that_keeps_the_page_count_keeps_a_queued_jump() {
+        let Some(bytes) = fixture() else { return };
+        let mut r = PdfReader::open_bytes(bytes.clone()).expect("opens");
+        r.viewport.scroll_to(4);
+        assert!(r.viewport.has_scroll_target(), "precondition");
+
+        r.reload_from_bytes(bytes);
+
+        assert!(
+            r.viewport.has_scroll_target(),
+            "a same-length edit must not cancel a pending scroll"
+        );
+    }
+
+    /// A page insertion or deletion DOES change the count, and the viewport
+    /// has to hear about it -- otherwise navigation clamps to the old maximum
+    /// and the new page is unreachable.
+    #[test]
+    fn an_edit_that_changes_the_page_count_updates_the_viewport() {
+        let Some(bytes) = fixture() else { return };
+        let mut r = PdfReader::open_bytes(bytes).expect("opens");
+        let before = r.viewport.page_count();
+
+        let doc = PdfDocument::open(r.doc.raw_bytes().to_vec()).expect("reopens");
+        let grown = crate::mupdf::page_edit::insert_blank_page(&doc, before, None)
+            .expect("a blank page can be appended");
+        r.reload_from_bytes(grown);
+
+        assert_eq!(
+            r.viewport.page_count(),
+            before + 1,
+            "the viewport must see the new page, or it cannot be navigated to"
+        );
     }
 }
