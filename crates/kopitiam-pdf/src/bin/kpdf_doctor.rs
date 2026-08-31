@@ -219,10 +219,34 @@ fn main() {
 struct Ink {
     /// Pixels darker than mid-grey — "something was drawn here".
     dark: usize,
-    /// Pixels that are essentially pure black.
+    /// Pixels that are essentially pure black **and achromatic** — see
+    /// [`Ink::of`]'s chroma check for why both conditions matter.
     black: usize,
     total: usize,
 }
+
+/// How far apart an RGB pixel's channels may be and still count as
+/// "neutral" (grey/black) rather than a saturated colour.
+///
+/// # Why luma alone was wrong
+///
+/// A real government form the maintainer opened has navy-blue (`RGB(0, 42,
+/// 122)`) section banners. Luma alone: `0.299*0 + 0.587*42 + 0.114*122 =
+/// 38.5` — under the old `l < 40` cutoff, so 106,586 pixels of a perfectly
+/// normal, deliberately-coloured banner were counted as "black", tripping
+/// [`BLACK_PAGE_FRACTION`] and printing "suspect an image drawn without its
+/// /SMask" on a page that has **no image XObject on it at all**. A vivid
+/// colour can have low luminance; that is not what a missing `/SMask` looks
+/// like. A composited-without-its-mask image is neutral -- the base image's
+/// stored "hide me" background is black or a dark grey, not a saturated hue,
+/// because a producer has no reason to paint the throwaway background in a
+/// colour.
+///
+/// So a pixel must be dark *and* have R, G and B within this many levels of
+/// each other. 24 is generous enough to admit ordinary anti-aliasing and
+/// JPEG ringing around a genuinely black/grey region while still rejecting
+/// navy blue's channel spread of 122.
+const BLACK_CHROMA_TOLERANCE: u8 = 24;
 
 impl Ink {
     fn of(pix: &Pixmap) -> Ink {
@@ -235,7 +259,7 @@ impl Ink {
                     if l < 128 {
                         dark += 1;
                     }
-                    if l < 40 {
+                    if l < 40 && pix.pixel(x, y).is_some_and(is_neutral) {
                         black += 1;
                     }
                 }
@@ -255,6 +279,21 @@ impl Ink {
             self.black as f64 / self.total as f64
         }
     }
+}
+
+/// Whether an RGB(+) pixel's channels are close enough to call it grey/black
+/// rather than a saturated colour -- see [`BLACK_CHROMA_TOLERANCE`].
+///
+/// A 1-component (grayscale) pixmap is trivially neutral; only the first
+/// three bytes are read, since that is all [`Pixmap::luma`] itself looks at.
+fn is_neutral(sample: &[u8]) -> bool {
+    if sample.len() < 3 {
+        return true;
+    }
+    let (r, g, b) = (sample[0], sample[1], sample[2]);
+    let hi = r.max(g).max(b);
+    let lo = r.min(g).min(b);
+    hi - lo <= BLACK_CHROMA_TOLERANCE
 }
 
 /// Count dark pixels on one page of `doc`, or `None` if it will not render.
@@ -371,6 +410,16 @@ fn probe_fields(doc: &PdfDocument, page_index: usize, baseline_ink: usize) -> us
                 std::mem::discriminant(&f.kind) == std::mem::discriminant(&kind)
                     && !f.read_only
                     && f.on_state.is_some()
+                    // Excluded from SAMPLING, not just from the verdict: a
+                    // `/F` Hidden/NoView widget is invisible on screen by the
+                    // document's own design (kpdf's renderer already skips it
+                    // unconditionally, matching MuPDF -- see
+                    // `FormField::hidden`'s doc comment). Spending one of
+                    // FIELD_PROBES_PER_PAGE on a field that is GUARANTEED to
+                    // show zero pixel change wastes the sample budget on a
+                    // question with a known answer, on top of the false
+                    // "invisible" finding this used to print.
+                    && !f.hidden
             })
             .collect();
         toggles.extend(spread(of_kind, FIELD_PROBES_PER_PAGE));
@@ -394,7 +443,7 @@ fn probe_fields(doc: &PdfDocument, page_index: usize, baseline_ink: usize) -> us
     let texts: Vec<&FormField> = spread(
         fields
             .iter()
-            .filter(|f| matches!(f.kind, FieldKind::Text) && !f.read_only)
+            .filter(|f| matches!(f.kind, FieldKind::Text) && !f.read_only && !f.hidden)
             .collect(),
         FIELD_PROBES_PER_PAGE,
     );
@@ -583,4 +632,95 @@ fn report_fields(doc: &PdfDocument, page_index: usize, ok: &mut usize, stuck: &m
         printed = true;
     }
     printed
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::*;
+
+    /// THE REGRESSION. A real government form (the maintainer's) has navy-blue
+    /// (`RGB(0, 42, 122)`) section banners. Luma alone: `0.299*0 + 0.587*42 +
+    /// 0.114*122 = 38.5`, which the old `l < 40` cutoff counted as "black" --
+    /// 106,586 pixels of it, on a page with no image XObject at all, so
+    /// `render_checks` printed "suspect an image drawn without its /SMask" on
+    /// a page that could not possibly have that bug.
+    ///
+    /// A vivid, saturated colour is not what a missing `/SMask` looks like --
+    /// that failure mode is a NEUTRAL black/grey background a producer had no
+    /// reason to paint in a hue. So a pixel this dark but this far from grey
+    /// must not count.
+    #[test]
+    fn a_saturated_navy_banner_is_not_counted_as_black() {
+        assert!(
+            !is_neutral(&[0, 42, 122]),
+            "R=0 G=42 B=122 spans 122 levels -- a vivid colour, not a shade of \
+             black or grey"
+        );
+    }
+
+    /// The check this exists to keep working: a genuinely neutral near-black
+    /// pixel -- exactly what an image's opaque "hide me" background looks
+    /// like when its `/SMask` is never composited -- must still count.
+    #[test]
+    fn a_neutral_near_black_pixel_still_counts() {
+        for rgb in [[0u8, 0, 0], [3, 3, 3], [12, 10, 14], [37, 37, 37]] {
+            assert!(
+                is_neutral(&rgb),
+                "{rgb:?} is a shade of black/grey and must still be flagged"
+            );
+        }
+    }
+
+    /// The boundary is a real design choice (generous enough for
+    /// anti-aliasing and JPEG ringing, tight enough to reject a real hue), so
+    /// it is pinned at both edges rather than left to whatever the constant
+    /// happens to be.
+    #[test]
+    fn the_chroma_tolerance_boundary_is_where_it_is_meant_to_be() {
+        let base = 10u8;
+        assert!(is_neutral(&[base, base, base + BLACK_CHROMA_TOLERANCE]));
+        assert!(!is_neutral(&[base, base, base + BLACK_CHROMA_TOLERANCE + 1]));
+    }
+
+    /// A grayscale (1-component) pixmap has no colour to be saturated, so a
+    /// dark pixel there must never be excluded on chroma grounds -- `is_neutral`
+    /// must treat anything shorter than 3 bytes as trivially neutral.
+    #[test]
+    fn a_grayscale_sample_is_always_neutral() {
+        assert!(is_neutral(&[5]));
+        assert!(is_neutral(&[]));
+    }
+
+    /// End-to-end version of the regression: build a page whose only content
+    /// is a full-bleed navy rectangle (no image, no /SMask anywhere), and
+    /// confirm `Ink::of` does NOT count it as "black" ink -- the false
+    /// positive was exactly this shape, and the fix must hold at the level
+    /// `render_checks` actually calls, not only in the unit-tested helper.
+    #[test]
+    fn a_page_filled_with_a_saturated_colour_reports_no_black_ink() {
+        let mut pix = Pixmap::new_rgb(100, 100);
+        let (chunks, _) = pix.samples.as_chunks_mut::<3>();
+        for chunk in chunks {
+            *chunk = [0, 42, 122]; // the maintainer's navy
+        }
+        let ink = Ink::of(&pix);
+        assert_eq!(ink.black, 0, "a saturated fill must not read as black ink");
+        assert_eq!(
+            ink.dark,
+            ink.total,
+            "it is still legitimately DARK -- luma 38.5 is well under 128 -- \
+             just not black. Only the black/SMask heuristic changes."
+        );
+    }
+
+    /// And the case this file was fixing FOR must still work: a page that
+    /// really is mostly opaque neutral black (the un-composited-mask shape)
+    /// must still cross the threshold.
+    #[test]
+    fn a_page_filled_with_true_black_still_reports_black_ink() {
+        let pix = Pixmap::new_rgb(100, 100); // zeroed = (0,0,0) everywhere
+        let ink = Ink::of(&pix);
+        assert_eq!(ink.black, ink.total);
+        assert!(ink.black_fraction() > BLACK_PAGE_FRACTION);
+    }
 }

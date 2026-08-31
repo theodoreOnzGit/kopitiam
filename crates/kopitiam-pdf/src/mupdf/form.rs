@@ -134,6 +134,37 @@ pub struct FormField {
     /// and without this a UI has no way to know it should offer a multi-line
     /// editor rather than a single-line one. Always `false` for non-text kinds.
     pub multiline: bool,
+    /// `/F` Hidden or NoView (Table 165), on the widget's own annotation dict
+    /// -- **not** inheritable through `/Parent`, since `/F` is an annotation
+    /// property, not a field one.
+    ///
+    /// A widget carrying either bit is invisible on screen **by the
+    /// document's own design** -- kpdf's page renderer already skips it
+    /// unconditionally, matching MuPDF (`pdf_process_annot`,
+    /// `pdf-interpret.c:1886`/`1902` -- see [`super::annot_run`]). Filling in
+    /// such a field will never move a pixel, which is correct, not a defect;
+    /// a caller checking "did typing draw anything" (`kpdf-doctor --render`)
+    /// must exclude these or it reports the document's own intent as a
+    /// rendering bug. See [`invisible_on_screen`].
+    pub hidden: bool,
+}
+
+/// Whether the PDF itself marks a widget invisible on screen (`/F` Hidden or
+/// NoView), independent of whatever `page_form_fields` classified it as.
+///
+/// Exposed because a caller needs this **before** a `FormField` exists too --
+/// [`kpdf-doctor`](../../../bin/kpdf_doctor.rs)'s render probe wants to skip
+/// these fields from sampling entirely, not merely explain their result after
+/// the fact.
+pub fn invisible_on_screen(doc: &PdfDocument, widget: &Object) -> bool {
+    // Deliberately NOT `dict_get_inheritable`: `/F` lives on the annotation
+    // dictionary itself (PDF 32000-1 Table 165), never on a field's `/Parent`
+    // chain, which carries FIELD properties (`/FT`, `/Ff`, `/V`, `/DA`).
+    let flags = doc
+        .resolve_get(widget, "F")
+        .unwrap_or(Object::Null)
+        .to_int();
+    flags & (super::annot_run::ANNOT_FLAG_HIDDEN | super::annot_run::ANNOT_FLAG_NO_VIEW) != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +311,7 @@ pub fn page_form_fields(doc: &PdfDocument, page_index: usize) -> Vec<FormField> 
             read_only,
             on_state,
             multiline,
+            hidden: invisible_on_screen(doc, &widget),
         });
     }
     out
@@ -1443,6 +1475,7 @@ mod tests {
             read_only: true,
             on_state: Some("Yes".to_string()),
             multiline: false,
+            hidden: false,
         };
         assert!(toggle_checkbox(&doc, &ro_checkbox).is_err());
         ro_checkbox.read_only = false;
@@ -1666,4 +1699,94 @@ mod tests {
             assert_eq!(decode_pdf_text_string(&bytes), "héllo");
         }
     }
+    // -----------------------------------------------------------------------
+    // `/F` Hidden / NoView -- gh-98's follow-on: kpdf-doctor misdiagnosed a
+    // maintainer's real form's deliberately-hidden fields as an appearance
+    // bug ("typing into X changes NO pixels"), because nothing checked `/F`
+    // before asking whether typing should have moved a pixel.
+    // -----------------------------------------------------------------------
+
+    /// A widget carrying `/F` Hidden (bit 2, value 2) must be recognised --
+    /// this is the exact bit the maintainer's form set (`/F 6` = Hidden(2) +
+    /// Print(4)) on three fields kpdf's own renderer correctly draws nothing
+    /// for (matching MuPDF's `pdf_process_annot`; see `annot_run.rs`).
+    #[test]
+    fn hidden_flag_is_detected() {
+        let doc = build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [4 0 R] >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Ghost) /Rect [10 10 210 30] /F 6 >>"
+                .to_vec(),
+        ]);
+        let widget = doc.resolve(&Object::new_indirect(4, 0)).unwrap();
+        assert!(
+            invisible_on_screen(&doc, &widget),
+            "F=6 is Hidden(2)+Print(4) -- Hidden alone must be enough"
+        );
+        let fields = page_form_fields(&doc, 0);
+        assert!(field_named(&fields, "Ghost").hidden);
+    }
+
+    /// `/F` NoView (bit 6, value 32) has the same net effect on screen as
+    /// Hidden -- both are checked because `annot_run.rs`'s renderer skips on
+    /// either.
+    #[test]
+    fn no_view_flag_is_also_detected() {
+        let doc = build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [4 0 R] >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Ghost) /Rect [10 10 210 30] /F 32 >>"
+                .to_vec(),
+        ]);
+        let widget = doc.resolve(&Object::new_indirect(4, 0)).unwrap();
+        assert!(invisible_on_screen(&doc, &widget));
+    }
+
+    /// An ordinary `/F 4` (Print only, no Hidden/NoView bit) -- what a normal,
+    /// fully-visible widget carries -- must NOT be flagged. Getting this
+    /// backwards would make kpdf-doctor skip EVERY field, silently reporting
+    /// zero findings on a genuinely broken document.
+    #[test]
+    fn print_only_is_not_hidden() {
+        let doc = build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [4 0 R] >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Visible) /Rect [10 10 210 30] /F 4 >>"
+                .to_vec(),
+        ]);
+        let widget = doc.resolve(&Object::new_indirect(4, 0)).unwrap();
+        assert!(!invisible_on_screen(&doc, &widget));
+        let fields = page_form_fields(&doc, 0);
+        assert!(!field_named(&fields, "Visible").hidden);
+    }
+
+    /// `/F` is an ANNOTATION property (PDF 32000-1 Table 165), never a FIELD
+    /// property, so it must NOT be looked up through `/Parent` the way `/FT`,
+    /// `/Ff`, `/V` and `/DA` are. A widget with no `/F` of its own but a
+    /// Hidden PARENT must still read as visible -- the parent's `/F` (if it
+    /// even had one, which a field dict normally would not) says nothing
+    /// about this particular widget.
+    #[test]
+    fn f_is_read_from_the_widget_itself_never_inherited() {
+        let doc = build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Annots [4 0 R] >>".to_vec(),
+            // The widget itself carries no /F; its /Parent does (which real
+            // producers essentially never do for /F, but the absence of
+            // inheritance must hold regardless).
+            b"<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [10 10 210 30] >>".to_vec(),
+            b"<< /FT /Tx /T (Ghost) /F 6 >>".to_vec(),
+        ]);
+        let widget = doc.resolve(&Object::new_indirect(4, 0)).unwrap();
+        assert!(
+            !invisible_on_screen(&doc, &widget),
+            "/F does not inherit through /Parent -- a Hidden parent field \
+             dict must not make an unrelated widget read as hidden"
+        );
+    }
+
 }

@@ -128,6 +128,7 @@ mod tests {
             read_only: false,
             on_state: None,
             multiline: false,
+            hidden: false,
         }
     }
 

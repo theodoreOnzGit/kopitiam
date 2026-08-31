@@ -83,11 +83,15 @@ use super::xref::PdfDocument;
 /// `/F` bit 2 -- Hidden (PDF 32000-1:2008 Table 165). Checked in
 /// `pdf_process_annot` (pdf-interpret.c:1886), alongside `Invisible`
 /// (deliberately not ported -- see the module docs).
-const ANNOT_FLAG_HIDDEN: i64 = 1 << 1; // value 2
+///
+/// `pub(crate)` so [`super::form`] can recognise "this widget is deliberately
+/// invisible on screen" without duplicating the bit value -- see
+/// [`invisible_on_screen`](super::form::invisible_on_screen).
+pub(crate) const ANNOT_FLAG_HIDDEN: i64 = 1 << 1; // value 2
 /// `/F` bit 6 -- NoView (Table 165). Checked in `pdf_process_annot`
 /// (pdf-interpret.c:1902) for the "View" usage, which is the only usage
 /// KOPITIAM ever renders for.
-const ANNOT_FLAG_NO_VIEW: i64 = 1 << 5; // value 32
+pub(crate) const ANNOT_FLAG_NO_VIEW: i64 = 1 << 5; // value 32
 
 /// Cap on `/Parent` chain walks ([`dict_get_inheritable`]), so a cyclic (and
 /// therefore malformed) form-field hierarchy cannot loop forever.
