@@ -19,14 +19,32 @@ mod textnorm;
 pub mod mupdf;
 
 // Reusable egui-based PDF-viewer building blocks (page layout, zoom,
-// hit-testing, forms UI, ...), lifted out of the `kpdf` example binary so
-// other KOPITIAM front ends can reuse them. Gated on the same `kpdf`
-// feature that turns on the optional eframe/egui/rfd dependencies -- see
-// Cargo.toml's `[features]` section. Named `gui_frontend` rather than
-// `egui` on purpose, so it never shadows the external `egui` crate inside
-// its own files.
-#[cfg(feature = "kpdf")]
+// hit-testing, forms UI, ...), lifted out of the `kpdf` binary so other
+// KOPITIAM front ends can reuse them.
+//
+// Gated on `egui`, NOT on `kpdf` -- that distinction is the point (gh-96
+// Phase 11). `kpdf` means "the standalone viewer application", and pulls in
+// an eframe event loop and the `rfd` native file picker on top. An embedding
+// application supplies both of those itself, so it takes `egui` alone and
+// compiles neither. `kpdf` implies `egui`, so the binary still sees all of
+// this.
+//
+// Named `gui_frontend` rather than `egui` on purpose, so it never shadows
+// the external `egui` crate inside its own files.
+#[cfg(feature = "egui")]
 pub mod gui_frontend;
+
+// `kpdf` is defined as a superset of `egui` (Cargo.toml `[features]`). If that
+// ever stops holding -- someone edits the feature list, or a consumer manages
+// to select `kpdf` without `egui` -- the binary would compile against a crate
+// with no `gui_frontend` at all and fail deep inside kpdf.rs with a pile of
+// unresolved-import errors. Say it here instead, once, in a sentence.
+#[cfg(all(feature = "kpdf", not(feature = "egui")))]
+compile_error!(
+    "feature `kpdf` requires feature `egui` (kpdf = the reusable reader PLUS \
+     the standalone eframe/rfd shell). Fix Cargo.toml's [features] so `kpdf` \
+     lists `egui`."
+);
 
 pub use extractor::{ExtractError, extract, extract_from_bytes};
 pub use font::FontStyle;

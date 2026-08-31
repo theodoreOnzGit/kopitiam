@@ -19,7 +19,7 @@ name = "kopitiam-pdf"
 # changes what *other* crates resolve against -- it does NOT change what
 # `cargo publish` uploads. The crate's own `[package] version` here is the
 # other half, and both have to move together.
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -139,7 +139,26 @@ rfd = { version = "0.17", optional = true }
 # breaking change for library users; going the other way (hard dependency ->
 # optional) would be. Hence optional-from-the-start.
 default = ["kpdf"]
-kpdf = ["dep:eframe", "dep:egui", "dep:rfd"]
+
+# `egui` -- the REUSABLE reader half: `gui_frontend`, and nothing that only a
+# standalone application needs. This is the feature a downstream egui app
+# (kovan, kvim, anything) turns on to embed the reader inside its own window.
+#
+# The split exists because `kpdf` bundles two unrelated things: the reusable
+# reader, and the standalone *shell* around it (an eframe event loop, a native
+# file picker). An embedder already has both of those -- it has its own window
+# and its own idea of how a file gets chosen -- so making it compile `eframe`
+# and `rfd` to reach the reader is pure cost, and `rfd` in particular drags in
+# a desktop portal stack that a host application may deliberately not want.
+#
+# gh-96 Phase 11. Verified by `cargo build --no-default-features --features
+# egui`, which must compile `gui_frontend` with neither eframe nor rfd present.
+egui = ["dep:egui"]
+
+# `kpdf` -- the standalone GUI viewer binary: the reusable reader PLUS the
+# shell. Strictly a superset of `egui`, so turning it on can never give you
+# less than an embedder gets.
+kpdf = ["egui", "dep:eframe", "dep:rfd"]
 
 [[bin]]
 name = "kpdf-doctor"

@@ -368,13 +368,16 @@ use eframe::egui;
 // other egui-based KOPITIAM front ends can reuse them without
 // re-implementing this file.
 use kopitiam_pdf::gui_frontend::{
-    Command, ContinuousSlot, DPI_DEFAULT, DPI_MAX, DPI_MIN, DPI_STEP, FieldHighlight, GPending,
-    HotReload, Lru, PageLayout, PageSize, RELOAD_CHECK_INTERVAL, ReloadDecision, Tool, VIM_STEP,
+    Command, ContinuousSlot, DPI_DEFAULT, DPI_MAX, DPI_MIN, DPI_STEP, FieldHighlight, FindScan,
+    GPending,
+    HotReload, Lru, PageLayout, PageSize, RELOAD_CHECK_INTERVAL, ReloadDecision, RenderKey,
+    RenderKind, RenderRequest, RenderWorker, RenderedPage, SearchWorker, Tool, VIM_STEP,
     consume_commit_enter, continuous_slot_visible,
     current_page_in_view, drawable_annot_count, field_highlight_kind, field_rect_to_screen,
     g_pending_expired, half_viewport_step, highlight_colors, hit_test_annot, hit_test_field,
     hit_test_field_expanded, keys_captured, layout_continuous_pages, min_hit_rect, stext_to_screen,
-    page_to_screen, parse_command, rgb_to_rgba, screen_to_page_at, select_tool, toggle_forms_mode,
+    page_to_screen, parse_command, rgb_to_rgba, scan_page_order, screen_to_page_at, select_tool,
+    toggle_forms_mode,
     zoom_percent, zoom_steps_from_zoom_delta,
 };
 use kopitiam_pdf::mupdf::annot_edit::{EditHistory, InkAnnotSpec, InkStroke};
@@ -495,12 +498,15 @@ enum Mode {
     Reflow,
 }
 
-/// A page's full-resolution texture is cached by `(page_index, dpi.to_bits(),
-/// fallback_enabled)` -- `dpi` and the fallback toggle are both part of the
-/// key so changing either always shows a freshly rendered image rather than
-/// one from the previous setting. `f32` has no [`Eq`]/[`Hash`], hence
-/// `to_bits()`.
-type PageTextureKey = (usize, u32, bool);
+/// A page's full-resolution texture is cached under the same key the
+/// rasteriser produces it under -- `(page_index, dpi.to_bits(),
+/// fallback_enabled)`.
+///
+/// An alias for the library's [`RenderKey`] rather than a second definition,
+/// so the texture cache and the render worker can never drift apart on what
+/// identifies a page image. The local name is kept because on this side of
+/// the boundary the thing being keyed really is a texture.
+type PageTextureKey = RenderKey;
 
 /// Cache key for the continuous-layout slot list ([`KpdfApp::slots_cache`]):
 /// rebuild only when dpi, the page count (a new document) or the fallback
@@ -512,146 +518,6 @@ type PageTextureKey = (usize, u32, bool);
 /// exact on the first frame, so there is nothing to refine and the layout is
 /// built exactly once per (dpi, document, fallback) combination.
 type SlotsCacheKey = (u32, usize, bool);
-
-/// A background page rasteriser.
-///
-/// # The problem
-///
-/// Rasterising a page costs a **median of 135 ms and up to 444 ms** at
-/// 150 dpi (measured on the 506-page Irodori book). Done on the UI thread —
-/// which is how kpdf worked until now — every page scrolling into view stalls
-/// the window for that long.
-///
-/// # The shape, per the maintainer's design
-///
-/// One UI thread, one worker. The first few pages are rasterised
-/// synchronously at open ([`SYNC_PRERENDER_PAGES`]) so the document is
-/// readable the instant it appears; everything after that is the worker's,
-/// delivered **one page at a time** as each finishes rather than batched, so
-/// pages fill in progressively instead of arriving in a lump.
-///
-/// A page still being rendered draws a labelled placeholder, so "not ready
-/// yet" is never mistaken for "blank page".
-///
-/// # Generations
-///
-/// Zoom changes the dpi, which invalidates every in-flight render. Rather
-/// than try to cancel work already running, each request carries a
-/// generation; results from an older one are dropped on arrival. Cheap, and
-/// it cannot leave a stale texture on screen.
-///
-/// # The copy this costs
-///
-/// A `PdfDocument` holds `RefCell`s — `Send`, not `Sync` — so the worker
-/// needs its own, opened from a copy of the file's bytes. That is a second
-/// full copy of the document in memory (a third, alongside the search
-/// worker), which is real for a 100 MB book. Making `PdfDocument` share its
-/// bytes behind an `Arc` would leave only the parsed tables duplicated; that
-/// is a change the maintainer has not taken yet, and it is the honest cost of
-/// this design until they do.
-struct RenderWorker {
-    req: std::sync::mpsc::Sender<RenderRequest>,
-    res: std::sync::mpsc::Receiver<RenderedPage>,
-    /// Pages asked for and not yet delivered, so a page visible across many
-    /// frames is requested once.
-    inflight: std::collections::HashSet<PageTextureKey>,
-    /// Bumped whenever dpi, the fallback toggle, or the reading position
-    /// changes enough to make queued work irrelevant.
-    generation: u64,
-    /// The same counter, visible to the worker.
-    ///
-    /// Without this the queue is strictly FIFO, so jumping to the end of a
-    /// 506-page book left the worker grinding through every page queued near
-    /// the old position — at 135 ms each — before it reached the pages
-    /// actually on screen. That is exactly what "press G and everything says
-    /// loading for a while" was. The worker now checks this before rendering
-    /// and drops a stale request in microseconds instead of minutes.
-    shared_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-/// What a render request is for. Thumbnails are the same rasteriser at a
-/// much lower dpi; they are distinguished only so the result lands in the
-/// right cache.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RenderKind {
-    Page,
-    Thumbnail,
-}
-
-struct RenderRequest {
-    page: usize,
-    dpi: f32,
-    fallback: bool,
-    generation: u64,
-    kind: RenderKind,
-}
-
-/// A finished page, as raw RGBA ready for texture upload. The pixmap is
-/// converted on the worker thread, not the UI thread — it is a per-pixel pass
-/// over a multi-megabyte buffer and belongs with the rendering.
-struct RenderedPage {
-    key: PageTextureKey,
-    generation: u64,
-    size: [usize; 2],
-    rgba: Vec<u8>,
-    kind: RenderKind,
-}
-
-impl RenderWorker {
-    /// Start a rasteriser over a private copy of `bytes`.
-    ///
-    /// `None` if the thread cannot be spawned; the caller then falls back to
-    /// rendering inline, which is slow but always correct.
-    fn spawn(bytes: Vec<u8>) -> Option<RenderWorker> {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<RenderRequest>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<RenderedPage>();
-        let shared_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let worker_generation = std::sync::Arc::clone(&shared_generation);
-        std::thread::Builder::new()
-            .name("kpdf-render".to_string())
-            .spawn(move || {
-                let Ok(doc) = PdfDocument::open(bytes) else {
-                    return;
-                };
-                while let Ok(r) = req_rx.recv() {
-                    // Drop work the UI has already moved on from BEFORE
-                    // paying for it. This check is the difference between a
-                    // jump costing one page's render and costing the whole
-                    // queued backlog.
-                    if r.generation
-                        != worker_generation.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        continue;
-                    }
-                    let Ok(pix) =
-                        rasterize_page_with_fallback(&doc, r.page, r.dpi, r.fallback)
-                    else {
-                        continue;
-                    };
-                    let page = RenderedPage {
-                        key: (r.page, r.dpi.to_bits(), r.fallback),
-                        generation: r.generation,
-                        size: [pix.w as usize, pix.h as usize],
-                        rgba: rgb_to_rgba(&pix),
-                        kind: r.kind,
-                    };
-                    // Send each page as it finishes: the UI shows progress
-                    // rather than waiting for the batch.
-                    if res_tx.send(page).is_err() {
-                        return; // UI gone
-                    }
-                }
-            })
-            .ok()?;
-        Some(RenderWorker {
-            req: req_tx,
-            res: res_rx,
-            inflight: std::collections::HashSet::new(),
-            generation: 0,
-            shared_generation,
-        })
-    }
-}
 
 /// A background reflow-text extractor.
 ///
@@ -719,84 +585,6 @@ fn place_reflow_page(pages: &mut Vec<Option<TextPage>>, index: usize, page: Text
         pages.resize_with(index + 1, || None);
     }
     pages[index] = Some(page);
-}
-
-/// A background text-search worker for one query.
-///
-/// # Why this exists
-///
-/// Highlights can only be drawn for pages that have been searched, and
-/// searching a page means extracting its text. Measured on the arXiv fixture,
-/// that costs a **median of 5.4 ms but a p90 of 300 ms and a worst case of
-/// 349 ms** — the plot-heavy pages. So neither obvious approach works on the
-/// UI thread: extracting on scroll drops a third of a second whenever such a
-/// page comes into view, and a per-frame time budget cannot help either,
-/// because the cost is paid inside one indivisible extraction that cannot be
-/// preempted partway.
-///
-/// So the work moves off the thread entirely. The UI asks for pages it wants
-/// highlighted, keeps drawing, and picks up results whenever they arrive.
-///
-/// # The copy this costs
-///
-/// The worker opens its own [`PdfDocument`] from a copy of the bytes, because
-/// a document is not shareable across threads. That is a second copy of the
-/// file in memory — real, and worth knowing for a 100 MB document — so the
-/// worker exists only while a search is active and is dropped the moment the
-/// query is cleared or replaced.
-struct SearchWorker {
-    /// Pages the UI wants searched. Dropping this closes the channel, which
-    /// is how the worker is told to exit.
-    req: std::sync::mpsc::Sender<usize>,
-    /// Finished pages coming back.
-    res: std::sync::mpsc::Receiver<(usize, Vec<SearchHit>)>,
-    /// Pages already asked for, so a page visible across many frames is
-    /// requested once rather than every frame.
-    requested: std::collections::HashSet<usize>,
-}
-
-impl SearchWorker {
-    /// Start a worker searching `query` over a private copy of `bytes`.
-    ///
-    /// Returns `None` if the thread cannot be spawned; the caller then simply
-    /// has no prefetch, and `n`/`N` still work because they search on demand.
-    fn spawn(bytes: Vec<u8>, query: String) -> Option<SearchWorker> {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<usize>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Vec<SearchHit>)>();
-        std::thread::Builder::new()
-            .name("kpdf-search".to_string())
-            .spawn(move || {
-                let Ok(doc) = PdfDocument::open(bytes) else {
-                    return;
-                };
-                // Ends when the UI drops the request sender.
-                while let Ok(page) = req_rx.recv() {
-                    let hits = page_to_stext(&doc, page, StextOptions::default())
-                        .map(|sp| search_page(&sp, &query))
-                        .unwrap_or_default();
-                    // A send error means the UI is gone; stop.
-                    if res_tx.send((page, hits)).is_err() {
-                        return;
-                    }
-                }
-            })
-            .ok()?;
-        Some(SearchWorker {
-            req: req_tx,
-            res: res_rx,
-            requested: std::collections::HashSet::new(),
-        })
-    }
-}
-
-/// Where a hit-scan got to, so it can resume when more pages are searched.
-struct FindScan {
-    forward: bool,
-    /// The next page to examine, in scan order.
-    next: usize,
-    /// How many more pages to examine before concluding there is no match.
-    /// Counts down so the scan wraps the document exactly once.
-    remaining: usize,
 }
 
 /// The find bar's transient state while it is open.
@@ -1279,19 +1067,15 @@ impl KpdfApp {
         // also delayed the page pump, so the pages themselves started late --
         // together, "press G and everything says loading for a while".
         if let Some(worker) = self.render_worker.as_mut() {
-            let key: PageTextureKey = (page, THUMBNAIL_DPI.to_bits(), self.fallback_enabled);
-            if !worker.inflight.contains(&key) {
-                let req = RenderRequest {
-                    page,
-                    dpi: THUMBNAIL_DPI,
-                    fallback: self.fallback_enabled,
-                    generation: worker.generation,
-                    kind: RenderKind::Thumbnail,
-                };
-                if worker.req.send(req).is_ok() {
-                    worker.inflight.insert(key);
-                }
-            }
+            // `request` is a no-op for a key already in flight, so a
+            // thumbnail visible across many frames queues exactly once.
+            worker.request(RenderRequest {
+                page,
+                dpi: THUMBNAIL_DPI,
+                fallback: self.fallback_enabled,
+                generation: worker.generation(),
+                kind: RenderKind::Thumbnail,
+            });
             return None;
         }
         // No worker: render inline, as before. Slow beats never.
@@ -2616,13 +2400,13 @@ impl KpdfApp {
         let Some(worker) = self.render_worker.as_mut() else {
             return;
         };
-        let generation = worker.generation;
+        let generation = worker.generation();
         let mut uploaded = false;
         let mut arrived: Vec<RenderedPage> = Vec::new();
-        while let Ok(done) = worker.res.try_recv() {
-            worker.inflight.remove(&done.key);
+        while let Some(done) = worker.try_recv() {
             // A result from before the last zoom or jump is stale: drop it
-            // rather than put a wrong texture on screen.
+            // rather than put a wrong texture on screen. (`try_recv` has
+            // already released its in-flight mark either way.)
             if done.generation == generation {
                 arrived.push(done);
             }
@@ -2673,27 +2457,25 @@ impl KpdfApp {
         };
         for page in wanted {
             let key: PageTextureKey = (page, dpi.to_bits(), fallback);
-            if self.page_textures.contains_key(&key) || worker.inflight.contains(&key) {
+            if self.page_textures.contains_key(&key) || worker.is_inflight(&key) {
                 continue;
             }
-            if worker
-                .req
-                .send(RenderRequest { page, dpi, fallback, generation, kind: RenderKind::Page })
-                .is_err()
-            {
+            if !worker.request(RenderRequest {
+                page,
+                dpi,
+                fallback,
+                generation,
+                kind: RenderKind::Page,
+            }) {
                 died = true;
                 break;
             }
-            worker.inflight.insert(key);
         }
         if died {
             self.render_worker = None; // inline path takes over
             return;
         }
-        let busy = self
-            .render_worker
-            .as_ref()
-            .is_some_and(|w| !w.inflight.is_empty());
+        let busy = self.render_worker.as_ref().is_some_and(RenderWorker::busy);
         if uploaded || busy {
             // Pages arrive asynchronously, so keep frames coming or a
             // finished page would not appear until the next input event.
@@ -2707,12 +2489,10 @@ impl KpdfApp {
     /// and is discarded on arrival by generation.
     fn bump_render_generation(&mut self) {
         if let Some(w) = self.render_worker.as_mut() {
-            w.generation = w.generation.wrapping_add(1);
-            // Publish it so the worker can skip everything already queued,
-            // rather than rendering it and having the UI throw it away.
-            w.shared_generation
-                .store(w.generation, std::sync::atomic::Ordering::Relaxed);
-            w.inflight.clear();
+            // Publishes the new generation to the worker so it can skip
+            // everything already queued, and forgets what was in flight so
+            // those pages get re-requested rather than waited on forever.
+            w.bump_generation();
         }
     }
 
@@ -2740,7 +2520,7 @@ impl KpdfApp {
         };
         // Everything finished since the last frame.
         let mut arrived = false;
-        while let Ok((page, hits)) = worker.res.try_recv() {
+        while let Some((page, hits)) = worker.try_recv() {
             self.find_hits.insert(page, hits);
             arrived = true;
         }
@@ -2749,30 +2529,18 @@ impl KpdfApp {
         // user is waiting on it, and the pages it needs may be nowhere near
         // the ones on screen.
         let scan_pages: Vec<usize> = match &self.find_scan {
-            Some(scan) => {
-                let n = self.page_count.max(1);
-                (0..SEARCH_SCAN_LOOKAHEAD.min(scan.remaining.max(1)))
-                    .map(|k| {
-                        if scan.forward {
-                            (scan.next + k) % n
-                        } else {
-                            (scan.next + n - (k % n)) % n
-                        }
-                    })
-                    .collect()
-            }
+            Some(scan) => scan_page_order(scan, self.page_count, SEARCH_SCAN_LOOKAHEAD),
             None => Vec::new(),
         };
         for page in scan_pages.iter().chain(visible.iter()) {
-            if self.find_hits.contains_key(page) || worker.requested.contains(page) {
+            if self.find_hits.contains_key(page) || worker.is_requested(*page) {
                 continue;
             }
             // A send failure means the worker died; stop asking.
-            if worker.req.send(*page).is_err() {
+            if !worker.request(*page) {
                 self.find_worker = None;
                 return;
             }
-            worker.requested.insert(*page);
         }
 
         // Results changed the picture: see whether the parked scan can now
@@ -3549,192 +3317,6 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("kpdf", native_options, Box::new(|_cc| Ok(Box::new(app))))
-}
-
-#[cfg(test)]
-mod search_worker_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// The workspace's arXiv fixture, or `None` when it is not present (a
-    /// packaged build, say) — the test then skips rather than fails.
-    fn fixture() -> Option<Vec<u8>> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/arxiv-2608.17504v1.pdf");
-        std::fs::read(path).ok()
-    }
-
-    /// The background searcher must return **exactly** what searching on the
-    /// UI thread would have returned. It exists to move the cost, never to
-    /// change the answer, so the synchronous path is the correctness
-    /// reference and this asserts equivalence against it.
-    #[test]
-    fn the_worker_agrees_with_a_direct_search() {
-        let Some(bytes) = fixture() else { return };
-        let query = "reactor";
-
-        // Reference: search on this thread, the way `n` does.
-        let doc = PdfDocument::open(bytes.clone()).expect("fixture opens");
-        let pages: Vec<usize> = (0..6).collect();
-        let expected: Vec<(usize, Vec<SearchHit>)> = pages
-            .iter()
-            .map(|&p| {
-                let hits = page_to_stext(&doc, p, StextOptions::default())
-                    .map(|sp| search_page(&sp, query))
-                    .unwrap_or_default();
-                (p, hits)
-            })
-            .collect();
-
-        let mut worker =
-            SearchWorker::spawn(bytes, query.to_string()).expect("worker thread spawns");
-        for &p in &pages {
-            worker.req.send(p).expect("worker accepts requests");
-        }
-
-        // Collect, bounded — a hung worker must fail the test, not the suite.
-        let mut got: Vec<(usize, Vec<SearchHit>)> = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while got.len() < pages.len() && Instant::now() < deadline {
-            match worker.res.recv_timeout(Duration::from_millis(500)) {
-                Ok(v) => got.push(v),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            }
-        }
-        got.sort_by_key(|(p, _)| *p);
-        assert_eq!(got.len(), pages.len(), "every requested page comes back");
-        assert_eq!(got, expected, "the worker's hits must match a direct search");
-        assert!(
-            expected.iter().any(|(_, h)| !h.is_empty()),
-            "the fixture must actually contain the query, or this proves nothing"
-        );
-    }
-
-    /// The rasteriser must produce **exactly** what rendering on the UI
-    /// thread produces. It exists to move the cost, never to change the
-    /// picture, so the direct render is the correctness reference.
-    #[test]
-    fn the_render_worker_matches_a_direct_render() {
-        let Some(bytes) = fixture() else { return };
-        let dpi = 72.0;
-
-        let doc = PdfDocument::open(bytes.clone()).expect("fixture opens");
-        let expected: Vec<(usize, usize, Vec<u8>)> = (0..3)
-            .map(|p| {
-                let pix = rasterize_page_with_fallback(&doc, p, dpi, true).expect("renders");
-                (pix.w as usize, pix.h as usize, rgb_to_rgba(&pix))
-            })
-            .collect();
-
-        let mut worker = RenderWorker::spawn(bytes).expect("worker spawns");
-        // The worker only renders requests matching the CURRENT generation,
-        // so publish the one this test uses. (Getting this wrong is how the
-        // first run of this test hung: every request was skipped as stale.)
-        worker
-            .shared_generation
-            .store(7, std::sync::atomic::Ordering::Relaxed);
-        for page in 0..3 {
-            worker
-                .req
-                .send(RenderRequest {
-                    page,
-                    dpi,
-                    fallback: true,
-                    generation: 7,
-                    kind: RenderKind::Page,
-                })
-                .expect("accepts requests");
-        }
-
-        let mut got: Vec<RenderedPage> = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while got.len() < 3 && Instant::now() < deadline {
-            match worker.res.recv_timeout(Duration::from_millis(500)) {
-                Ok(v) => got.push(v),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            }
-        }
-        got.sort_by_key(|r| r.key.0);
-        assert_eq!(got.len(), 3, "every requested page comes back");
-        for (i, page) in got.iter().enumerate() {
-            let (w, h, ref rgba) = expected[i];
-            assert_eq!(page.generation, 7, "the generation is carried through");
-            assert_eq!(page.size, [w, h], "page {i} size");
-            assert_eq!(&page.rgba, rgba, "page {i} pixels must be identical");
-        }
-        // A blank result would make the comparison meaningless.
-        assert!(
-            expected.iter().any(|(_, _, px)| px.iter().any(|&b| b < 200)),
-            "the fixture must actually draw something"
-        );
-    }
-
-    /// The fix for "press G and every page says loading for a while".
-    ///
-    /// The queue is FIFO, so after a jump it is full of pages near the old
-    /// position. Rendering those first, at 135 ms each, is what made the jump
-    /// feel frozen. A request whose generation is stale must be dropped
-    /// without being rendered at all.
-    #[test]
-    fn stale_requests_are_skipped_without_rendering() {
-        let Some(bytes) = fixture() else { return };
-        let mut worker = RenderWorker::spawn(bytes).expect("worker spawns");
-        worker
-            .shared_generation
-            .store(2, std::sync::atomic::Ordering::Relaxed);
-
-        // Three stale requests (generation 1) then one current (generation 2).
-        for page in 0..3 {
-            worker
-                .req
-                .send(RenderRequest { page, dpi: 72.0, fallback: true, generation: 1, kind: RenderKind::Page })
-                .expect("accepts requests");
-        }
-        worker
-            .req
-            .send(RenderRequest { page: 5, dpi: 72.0, fallback: true, generation: 2, kind: RenderKind::Page })
-            .expect("accepts requests");
-
-        let got = worker
-            .res
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the current request comes back");
-        assert_eq!(
-            got.key.0, 5,
-            "the current page must arrive FIRST -- the stale ones were skipped, not rendered"
-        );
-        assert_eq!(got.generation, 2);
-        // And nothing else is delivered: the stale three produced no work.
-        assert!(
-            worker.res.recv_timeout(Duration::from_millis(500)).is_err(),
-            "stale requests must produce no results at all"
-        );
-    }
-
-    /// Dropping the request sender is how the worker is told to stop; it must
-    /// then exit rather than linger holding its copy of the document.
-    #[test]
-    fn dropping_the_worker_stops_the_thread() {
-        let Some(bytes) = fixture() else { return };
-        let worker = SearchWorker::spawn(bytes, "reactor".to_string()).expect("spawns");
-        let res = worker.res;
-        drop(worker.req); // the UI going away
-        // With the request side closed the worker returns, which closes the
-        // result side; recv then reports disconnection rather than blocking.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match res.recv_timeout(Duration::from_millis(500)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {
-                    continue;
-                }
-                Err(_) => panic!("worker did not exit within the timeout"),
-                Ok(_) => continue, // drain anything already in flight
-            }
-        }
-    }
 }
 
 #[cfg(test)]
