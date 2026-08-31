@@ -263,7 +263,8 @@ kopitiam-gpu = { path = "crates/kopitiam-gpu", version = "0.0.1" }
 # for aarch64-linux-android.
 #
 # Feature choice = no C for the acceptance targets. Verified empirically (isolated
-# `cargo generate-lockfile` probe against gix 0.86): the tree contains NONE of
+# `cargo generate-lockfile` probe against gix 0.86, re-verified against 0.87.1 on
+# 2026-08-31 by grepping the regenerated lock): the tree contains NONE of
 # `git2` / `libgit2-sys` / `openssl-sys` / `libz-sys` (gix's zlib is the pure-Rust
 # `flate2`/`miniz_oxide` path, matching this workspace's existing FlateDecode note).
 #
@@ -277,11 +278,24 @@ kopitiam-gpu = { path = "crates/kopitiam-gpu", version = "0.0.1" }
 # NO libgit2/OpenSSL/libz, so it clears every acceptance target, but it is not
 # literally zero-C. For a strictly-NDK-free Termux build prefer `ssh` remotes and
 # drop the http feature; enable the reqwest-rustls feature only when HTTPS remotes
-# are required. NOTE: gix 0.86 has NO high-level push (no `prepare_push`/
+# are required. NOTE: gix 0.87 STILL has no high-level push (no `prepare_push`/
 # `send_pack`/`push` on `Remote`; upstream issue #306 is still open) -- push must
 # be built on `gix-protocol`/`gix-transport` send-pack, which is the shim the
 # kopi-beans port carries. See NOTICE / kopi-beans for the migration.
-gix = { version = "0.86", default-features = false, features = [
+#
+# WHY 0.87.1 AND NOT 0.86 -- this pin is load-bearing, don't "tidy" it back down.
+# gix 0.86 requires `gix-protocol ^0.64.0`, and gix-protocol 0.64.0/0.65.0 depend
+# on `bisync ^0.3.0`. Every bisync ever published (0.1.0, 0.2.0-0.2.3, 0.3.0,
+# 0.3.1) is YANKED, and `^0.64.0` is a 0.x caret so it cannot climb to 0.65.
+# Net effect: gix 0.86 is unresolvable from a clean checkout --
+#   failed to select a version for the requirement `bisync = "^0.3.0"`
+#   version 0.3.0 is yanked / version 0.3.1 is yanked
+# Our committed Cargo.lock masked it (cargo keeps an already-locked yanked crate),
+# so it only bit fresh consumers: `cargo install kopi-beans`, CI without the lock,
+# a new clone running `cargo update`. gix-protocol 0.65.1 dropped bisync, and
+# gix 0.87.1 is the first gix that requires `^0.65.1` -- hence this pin. Bumping
+# 0.86 -> 0.87.1 needed NO source changes in kopi-beans (release build clean).
+gix = { version = "0.87.1", default-features = false, features = [
     "blocking-network-client",
     "blocking-http-transport-reqwest-rust-tls",
     "revision",
@@ -298,9 +312,9 @@ gix = { version = "0.86", default-features = false, features = [
 # `gix-worktree-stream` out of the tree entirely, so its `^0.35` pin can't bite,
 # and `sha1` resolves cleanly. Still C-free: no libgit2 / OpenSSL / libz.
 
-# NOTE: gix 0.86's `sha1` feature carries a weak `gix-worktree-stream?/sha1`
-# reference cargo version-resolves. gix-worktree-stream 0.35.0 is now published
-# on crates.io, so the `^0.35` pin resolves cleanly from the registry -- no
+# NOTE: gix's `sha1` feature carries a weak `gix-worktree-stream?/sha1`
+# reference cargo version-resolves. gix-worktree-stream is published on crates.io
+# (0.36.1 under gix 0.87.1), so the pin resolves cleanly from the registry -- no
 # `[patch.crates-io]` stub is needed (removing it is what makes kopi-beans
 # publishable: patches don't survive `cargo publish`). The optional dep is
 # still never compiled (worktree-mutation is off).

@@ -28,7 +28,16 @@ name = "kopi-beans"
 # The 53-file gap bd-s06 recorded (published tree three weeks ahead of git) is
 # CLOSED -- it was never lost work, it was sitting on the `develop` branch and
 # came across in the 2026-08-26 develop->main merge.
-version = "0.1.8"
+#
+# 0.1.9 (2026-08-31): unbreak a fresh resolve. 0.1.8 pinned `gix = "0.86"`, whose
+# `gix-protocol ^0.64.0` drags in `bisync ^0.3.0` -- and EVERY published bisync
+# version (0.1.0 .. 0.3.1) is yanked, so anyone without our exact Cargo.lock got
+# "failed to select a version for the requirement `bisync = ^0.3.0`". Our lock
+# hid it locally because cargo honours an already-locked yanked crate; a fresh
+# `cargo install kopi-beans` did not. Fixed at the workspace pin: gix 0.87.1 ->
+# gix-protocol 0.65.1, which dropped bisync entirely. See the gix block in the
+# workspace Cargo.toml.
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.91"
 publish = true
