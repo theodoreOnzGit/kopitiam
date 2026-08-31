@@ -120,8 +120,68 @@ impl PdfDocument {
             cache: RefCell::new(HashMap::new()),
             resolving: RefCell::new(Vec::new()),
         };
+        // Refuse an ENCRYPTED document here, before anything tries to read
+        // through it.
+        //
+        // Not a nicety: without this the failure surfaces as
+        // "corrupt object stream (134 0 R)", because the stream is not corrupt
+        // at all -- it is ciphertext, and inflating ciphertext produces
+        // exactly the garbage a corruption check is built to catch. A
+        // maintainer handed a government form got that message and reasonably
+        // concluded the file was broken. It was not; we simply cannot read it
+        // yet. An honest "unsupported" beats a confident wrong diagnosis.
+        //
+        // `FZ_ERROR_UNSUPPORTED` is the category MuPDF itself uses for
+        // encryption it cannot handle, which is why the error says
+        // "unsupported" rather than "format".
+        if let Some(enc) = doc.encryption_summary() {
+            return Err(Error::unsupported(format!(
+                "encrypted PDF ({enc}) -- decryption is not implemented yet"
+            )));
+        }
         doc.pages = doc.load_pages()?;
         Ok(doc)
+    }
+
+    /// A short description of the document's `/Encrypt` dictionary, or `None`
+    /// when the document is not encrypted.
+    ///
+    /// Reads only what identifies the scheme -- `/Filter`, `/V`, `/R` and the
+    /// default stream crypt filter's `/CFM` -- so the error a caller sees says
+    /// *which* encryption stopped it. That matters: the standard handler with
+    /// an empty user password (the common case for a form that is
+    /// owner-restricted but freely readable) is a very different amount of
+    /// work from a password-protected file, and the message should let a
+    /// maintainer tell them apart without a hex editor.
+    ///
+    /// The `/Encrypt` dictionary is itself never encrypted (§7.6.2), so it can
+    /// be resolved before any key exists.
+    pub fn encryption_summary(&self) -> Option<String> {
+        let enc = self.resolve(self.trailer.dict_gets("Encrypt")?).ok()?;
+        if !enc.is_dict() {
+            return None;
+        }
+        let filter = self
+            .resolve_get(&enc, "Filter")
+            .ok()
+            .map(|o| String::from_utf8_lossy(o.to_name()).into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "unknown handler".to_string());
+        let v = self.resolve_get(&enc, "V").map(|o| o.to_int()).unwrap_or(0);
+        let r = self.resolve_get(&enc, "R").map(|o| o.to_int()).unwrap_or(0);
+        // /V 4 and 5 put the actual method in a named crypt filter; /V 1 and 2
+        // are RC4 with the key length in /Length.
+        let cfm = self
+            .resolve_get(&enc, "CF")
+            .ok()
+            .and_then(|cf| self.resolve_get(&cf, "StdCF").ok())
+            .and_then(|std| self.resolve_get(&std, "CFM").ok())
+            .map(|o| String::from_utf8_lossy(o.to_name()).into_owned())
+            .filter(|n| !n.is_empty());
+        Some(match cfm {
+            Some(cfm) => format!("/{filter}, V{v} R{r}, {cfm}"),
+            None => format!("/{filter}, V{v} R{r}"),
+        })
     }
 
     /// The original PDF bytes this document was opened from. Used by
@@ -1406,4 +1466,97 @@ mod tests {
         doc.save_to(&mut buf).unwrap();
         buf
     }
+    /// Build a PDF whose trailer carries an `/Encrypt` dictionary describing
+    /// AES-128 under the standard security handler -- the shape a real
+    /// owner-restricted form uses (`/V 4 /R 4 /CFM /AESV2`).
+    ///
+    /// The bytes themselves are NOT encrypted; they do not need to be. What is
+    /// under test is that the reader notices the declaration and stops with an
+    /// honest message, rather than reading on and blaming whatever falls over
+    /// first.
+    fn pdf_declaring_aes_encryption() -> Vec<u8> {
+        let bodies: Vec<&[u8]> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            b"<< /Filter /Standard /V 4 /R 4 /Length 128 /P -1052 \
+               /StmF /StdCF /StrF /StdCF \
+               /CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV2 /Length 16 >> >> >>",
+        ];
+        let mut pdf: Vec<u8> = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0usize; bodies.len() + 1];
+        for (idx, body) in bodies.iter().enumerate() {
+            let num = idx + 1;
+            offsets[num] = pdf.len();
+            pdf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        let size = bodies.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R /Encrypt 4 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// An encrypted document must be refused with an UNSUPPORTED error that
+    /// says so.
+    ///
+    /// The regression this pins is a wrong diagnosis, not a crash. Without the
+    /// check, the reader ploughs on, inflates ciphertext, and reports
+    /// "corrupt object stream" -- which sent a maintainer looking for a
+    /// damaged file that was perfectly intact. The error must name encryption.
+    #[test]
+    fn an_encrypted_document_is_refused_by_name_not_blamed_on_corruption() {
+        let Err(err) = PdfDocument::open(pdf_declaring_aes_encryption()) else {
+            panic!("an encrypted document must not open");
+        };
+        assert_eq!(
+            err.kind(),
+            crate::mupdf::error::ErrorKind::Unsupported,
+            "encryption we cannot do is UNSUPPORTED, not a format error -- \
+             the file is fine, we are the limitation"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("encrypted"),
+            "the message must say encrypted, got: {msg}"
+        );
+        assert!(
+            !msg.contains("corrupt"),
+            "and must not accuse the file of corruption, got: {msg}"
+        );
+    }
+
+    /// The message names the actual scheme, so a maintainer can tell an
+    /// owner-restricted form (empty user password, freely readable elsewhere)
+    /// from a genuinely password-protected file without a hex editor.
+    #[test]
+    fn the_refusal_names_the_scheme() {
+        let Err(err) = PdfDocument::open(pdf_declaring_aes_encryption()) else {
+            panic!("refused");
+        };
+        let msg = err.to_string();
+        for expected in ["/Standard", "V4", "R4", "AESV2"] {
+            assert!(msg.contains(expected), "message lacks {expected}: {msg}");
+        }
+    }
+
+    /// And an ordinary document is untouched by the check -- no /Encrypt, no
+    /// summary, opens as before.
+    #[test]
+    fn an_unencrypted_document_reports_no_encryption() {
+        let doc = PdfDocument::open(minimal_classic_pdf()).expect("opens");
+        assert!(doc.encryption_summary().is_none());
+    }
+
 }
