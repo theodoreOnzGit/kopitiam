@@ -16,16 +16,16 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 
 | Status | Count |
 | --- | --- |
-| ported | 160 |
+| ported | 161 |
 | in-progress | 0 |
 | deliberately-diverged | 8 |
 | unported | 0 |
-| **total** | **168** |
+| **total** | **169** |
 
 | Upstream | License | Pinned commit | Entries |
 | --- | --- | --- | --- |
 | Leptonica | BSD-2-Clause | `10bdea2` | 8 |
-| MuPDF | AGPL-3.0 | `19f1284` | 106 |
+| MuPDF | AGPL-3.0 | `19f1284` | 107 |
 | pdf-to-markdown | MIT | `54baa2e` | 3 |
 | Tesseract | Apache-2.0 | `db0ec62` | 51 |
 
@@ -116,6 +116,7 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 | `source/pdf/pdf-cmap-load.c` | `crates/kopitiam-pdf/src/mupdf/cmap.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-cmap-parse.c` | `crates/kopitiam-pdf/src/mupdf/cmap.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-cmap.c` | `crates/kopitiam-pdf/src/mupdf/cmap.rs` | ported | `19f1284` |  |
+| `source/pdf/pdf-crypt.c` | `crates/kopitiam-pdf/src/mupdf/crypt.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-font.c` | `crates/kopitiam-pdf/src/mupdf/font.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-font.c` | `crates/kopitiam-pdf/src/mupdf/glyph_type1.rs` | deliberately-diverged | `19f1284` | clean-room adaptation: idea adapted, target header disclaims a faithful port |
 | `source/pdf/pdf-form.c` | `crates/kopitiam-pdf/src/mupdf/form.rs` | ported | `5fe54ce` |  |

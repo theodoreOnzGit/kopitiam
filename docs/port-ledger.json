@@ -88,6 +88,7 @@
     { "upstream": "mupdf", "source": "source/pdf/pdf-cmap-load.c", "target": "crates/kopitiam-pdf/src/mupdf/cmap.rs", "status": "ported", "commit": "19f1284", "notes": "" },
     { "upstream": "mupdf", "source": "source/pdf/pdf-cmap-parse.c", "target": "crates/kopitiam-pdf/src/mupdf/cmap.rs", "status": "ported", "commit": "19f1284", "notes": "" },
     { "upstream": "mupdf", "source": "source/pdf/pdf-cmap.c", "target": "crates/kopitiam-pdf/src/mupdf/cmap.rs", "status": "ported", "commit": "19f1284", "notes": "" },
+    { "upstream": "mupdf", "source": "source/pdf/pdf-crypt.c", "target": "crates/kopitiam-pdf/src/mupdf/crypt.rs", "status": "ported", "commit": "19f1284", "notes": "" },
     { "upstream": "mupdf", "source": "source/pdf/pdf-font.c", "target": "crates/kopitiam-pdf/src/mupdf/font.rs", "status": "ported", "commit": "19f1284", "notes": "" },
     { "upstream": "mupdf", "source": "source/pdf/pdf-font.c", "target": "crates/kopitiam-pdf/src/mupdf/glyph_type1.rs", "status": "deliberately-diverged", "commit": "19f1284", "notes": "clean-room adaptation: idea adapted, target header disclaims a faithful port" },
     { "upstream": "mupdf", "source": "source/pdf/pdf-form.c", "target": "crates/kopitiam-pdf/src/mupdf/form.rs", "status": "ported", "commit": "5fe54ce", "notes": "" },
@@ -180,16 +181,16 @@
     { "upstream": "tesseract", "source": "src/lstm/weightmatrix.h", "target": "crates/kopitiam-ocr/src/weightmatrix.rs", "status": "ported", "commit": "db0ec62", "notes": "" }
   ],
   "summary": {
-    "total_entries": 168,
+    "total_entries": 169,
     "by_status": {
-      "ported": 160,
+      "ported": 161,
       "in-progress": 0,
       "deliberately-diverged": 8,
       "unported": 0
     },
     "by_upstream": {
       "leptonica": 8,
-      "mupdf": 106,
+      "mupdf": 107,
       "pdf-to-markdown": 3,
       "tesseract": 51
     },
