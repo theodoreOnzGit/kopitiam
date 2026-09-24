@@ -19,7 +19,13 @@ name = "kopitiam-pdf"
 # changes what *other* crates resolve against -- it does NOT change what
 # `cargo publish` uploads. The crate's own `[package] version` here is the
 # other half, and both have to move together.
-version = "0.3.2"
+#
+# 0.4.0 (2026-09-24) is a MINOR bump, not a patch: CCITTFaxDecode moves out
+# of `is_deferred_codec`, so calls that previously returned an Unsupported
+# error on a scanned PDF now return decoded pixels. That is new behaviour on
+# an existing API, and a caller matching on that error to pick a fallback
+# path needs to know. Root `[workspace.dependencies]` moved to 0.4.0 with it.
+version = "0.4.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
