@@ -2843,7 +2843,25 @@ impl Editor {
             }
             KeyCode::Backspace => {
                 let cur = self.cursor;
-                if let Some(prev) = motion::step_left(self.current_buffer(), cur) {
+                // NOT `motion::step_left`. That is a *Normal-mode* step: at
+                // column 0 it lands on the previous line's last character
+                // (`len - 1`), because in Normal mode the cursor sits ON a
+                // character and may not rest past the end of a line. Deleting
+                // from there to the cursor removes the newline AND that
+                // character, so backspacing at the start of a line joined the
+                // lines while silently eating one character of the user's own
+                // text ("ab" + "cd" -> "acd", not "abcd").
+                //
+                // An insert-mode caret may sit one past the last grapheme, so
+                // the join target is the previous line's END (`line_len`).
+                let prev = if cur.col > 0 {
+                    Some(Position::new(cur.line, cur.col - 1))
+                } else if cur.line > 0 {
+                    Some(Position::new(cur.line - 1, self.current_buffer().line_len(cur.line - 1)))
+                } else {
+                    None
+                };
+                if let Some(prev) = prev {
                     let pos = self.current_buffer_mut().apply(Edit::delete(Range::new(prev, cur)))?;
                     self.cursor = pos;
                     self.unnote_inserted(1);
@@ -6831,5 +6849,81 @@ mod tests {
         // `!ip` on the first paragraph (lines 1..=2).
         feed(&mut ed, "!ip");
         assert_eq!(ed.command_line(), Some("1,2!"));
+    }
+}
+
+#[cfg(test)]
+mod backspace_join_tests {
+    use super::*;
+
+    fn editor_with(text: &str) -> Editor {
+        let mut ed = Editor::new();
+        let id = ed.current;
+        ed.buffers.insert(id, Buffer::from_str(text));
+        ed.cursor = Position::ORIGIN;
+        ed
+    }
+
+    fn feed(ed: &mut Editor, keys: &str) {
+        for k in key::parse(keys) {
+            ed.handle_key(k).unwrap_or_else(|e| panic!("key {k:?} errored: {e}"));
+        }
+    }
+
+    /// Backspace at column 0 must JOIN the two lines, removing the newline and
+    /// **nothing else**.
+    ///
+    /// Regression: the insert-mode handler stepped back with
+    /// [`motion::step_left`], which at column 0 lands on the previous line's
+    /// *last character* (`len - 1`) -- correct for Normal-mode `h`, where the
+    /// cursor sits ON a character. Deleting from there to the caret removed
+    /// the newline **and that character**, so every join silently ate one
+    /// character of the user's text. Reported from kovan's page-context
+    /// editor, 2026-09-24.
+    #[test]
+    fn backspace_at_column_zero_joins_without_eating_a_character() {
+        let mut ed = editor_with("ab\ncd");
+        feed(&mut ed, "ji<BS>");
+        assert_eq!(ed.buffer().text(), "abcd", "the join must keep every character");
+        assert_eq!(ed.cursor, Position::new(0, 2), "caret lands at the seam");
+    }
+
+    /// Joining onto an empty previous line must not underflow, nor reach past
+    /// it into the line above.
+    #[test]
+    fn backspace_joins_onto_an_empty_line() {
+        let mut ed = editor_with("\nxy");
+        feed(&mut ed, "ji<BS>");
+        assert_eq!(ed.buffer().text(), "xy");
+        assert_eq!(ed.cursor, Position::new(0, 0));
+    }
+
+    /// Backspace at the very start of the buffer is a no-op, not an error.
+    #[test]
+    fn backspace_at_buffer_start_does_nothing() {
+        let mut ed = editor_with("abc");
+        feed(&mut ed, "i<BS>");
+        assert_eq!(ed.buffer().text(), "abc");
+        assert_eq!(ed.cursor, Position::new(0, 0));
+    }
+
+    /// Ordinary mid-line backspace still deletes exactly one character.
+    #[test]
+    fn backspace_mid_line_deletes_one_character() {
+        let mut ed = editor_with("abc");
+        feed(&mut ed, "lli<BS>");
+        assert_eq!(ed.buffer().text(), "ac");
+    }
+
+    /// The cumulative form of the bug, which is how it was noticed: collapsing
+    /// a paragraph line by line must lose nothing.
+    #[test]
+    fn repeated_joins_lose_nothing() {
+        let mut ed = editor_with("aa\nbb\ncc");
+        feed(&mut ed, "jji<BS>");
+        assert_eq!(ed.buffer().text(), "aa\nbbcc");
+        let mut ed2 = editor_with("aa\nbbcc");
+        feed(&mut ed2, "ji<BS>");
+        assert_eq!(ed2.buffer().text(), "aabbcc");
     }
 }
