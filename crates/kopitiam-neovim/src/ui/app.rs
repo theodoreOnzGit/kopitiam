@@ -419,6 +419,13 @@ enum CompletionKind {
     /// same `textDocument/completion` the default menu folds in, but on its own
     /// so LSP is the *only* source.
     Omni,
+    /// Ex-command completion (`<C-x><C-v>`): kvim's `:`-command vocabulary
+    /// ([`crate::editor::command`]), offered *inside insert mode* — vim's
+    /// `i_CTRL-X_CTRL-V`, for writing a mapping or a doc line that names a
+    /// command. Names only: vim also completes a command's *arguments* here,
+    /// which kvim does on the `:` prompt itself (`<Tab>`) and not in this
+    /// submode. Documented scope cut, not an oversight.
+    Command,
 }
 
 /// The open insert-mode completion popup: the ranked candidates, which one is
@@ -1652,6 +1659,11 @@ impl<H: EditorHost> App<H> {
     //       `<C-x><C-f>`               filename.
     //       `<C-x><C-l>`               whole line.
     //       `<C-x><C-o>`               omni (the language server).
+    //       `<C-x><C-v>`               ex-command names.
+    //       `<C-x><C-e>`/`<C-x><C-y>`  scroll the window one line (not a
+    //                                  completion — vim parks the insert-mode
+    //                                  scrolls here so `<C-e>`/`<C-y>` keep
+    //                                  their copy-adjacent-character meaning).
     //   * inside a cycle: `<C-n>`/`<C-p>` (and Down/Up) move, `<C-y>` / `<CR>` /
     //     `<Tab>` accept, `<C-e>` cancel (revert to the typed text), `<Tab>` /
     //     `<S-Tab>` drive snippet tabstops while a snippet is active.
@@ -1691,6 +1703,15 @@ impl<H: EditorHost> App<H> {
                     Key::Char('f') => return Some(self.start_file_completion()),
                     Key::Char('l') => return Some(self.start_line_completion()),
                     Key::Char('o') => return Some(self.start_omni_completion()),
+                    Key::Char('v') => return Some(self.start_command_completion()),
+                    // `<C-x><C-e>`/`<C-x><C-y>`: scroll the window one line
+                    // without leaving insert mode. These are *not* completion
+                    // sources — vim puts them in CTRL-X mode so the insert-mode
+                    // `<C-e>`/`<C-y>` (copy the character below / above) stay
+                    // free. They work whether or not a menu is open, which is
+                    // why they sit here, above the open-menu-only arms below.
+                    Key::Char('e') => return Some(self.handle_scroll(ViewportScroll::LineDown)),
+                    Key::Char('y') => return Some(self.handle_scroll(ViewportScroll::LineUp)),
                     // `<C-x><C-n>`/`<C-x><C-p>`: keyword, this buffer only. If a
                     // menu is already up, just move within it (vim keeps cycling).
                     Key::Char('n') if self.completion.is_some() => return Some(self.menu_move(1)),
@@ -1891,6 +1912,7 @@ impl<H: EditorHost> App<H> {
                 CompletionKind::File => return self.reseed_file(),
                 CompletionKind::Line => return self.reseed_line(),
                 CompletionKind::Omni => return self.reseed_omni(),
+                CompletionKind::Command => return self.reseed_command(),
                 CompletionKind::Auto => {}
             }
         }
@@ -2153,6 +2175,38 @@ impl<H: EditorHost> App<H> {
         let lsp_items = self.lsp_completion_items();
         let ranked = completion::merge_and_rank(&prefix, lsp_items, vec![], vec![], vec![]);
         self.set_completion_kind(ranked, Position::new(cursor.line, anchor_col), true, CompletionKind::Omni)
+    }
+
+    /// Opens ex-command completion (`<C-x><C-v>`).
+    fn start_command_completion(&mut self) -> LoopAction {
+        if !self.reseed_command() {
+            return self.info("kopi got no `:` command matching that leh".to_string());
+        }
+        LoopAction::Redraw
+    }
+
+    /// Rebuilds the ex-command menu from kvim's own command vocabulary
+    /// ([`crate::editor::command::complete_names`]) against the identifier
+    /// prefix before the cursor — vim's `i_CTRL-X_CTRL-V`, which completes
+    /// command-line syntax while you are typing in the *buffer*.
+    ///
+    /// The candidates are tagged [`CompletionSource::Buffer`] rather than a
+    /// source of their own, the same way whole-line completion
+    /// ([`Self::reseed_line`]) does: the tag only picks the menu's badge and
+    /// its secondary sort, and a fifth source would have to be threaded through
+    /// `merge_and_rank`'s fixed five-slot signature for no behavioural gain.
+    fn reseed_command(&mut self) -> bool {
+        let cursor = self.host.cursor();
+        let line = self.host.buffer().line(cursor.line).unwrap_or_default();
+        let (anchor_col, prefix) = identifier_prefix(&line, cursor.col);
+        let names = crate::editor::command::complete_names(&prefix);
+        let items: Vec<CItem> = names.into_iter().map(|n| CItem::new(n, CompletionSource::Buffer)).collect();
+        // `complete_names` has already filtered by prefix and ordered the list
+        // the way vim's `:` completion does (shortest alias first); rank only
+        // to keep the one code path that installs a menu, and the prefix is
+        // re-applied there harmlessly.
+        let ranked = completion::merge_and_rank(&prefix, vec![], vec![], items, vec![]);
+        self.set_completion_kind(ranked, Position::new(cursor.line, anchor_col), true, CompletionKind::Command)
     }
 
     /// Fetches `textDocument/completion` for the active buffer and converts each
@@ -5004,6 +5058,41 @@ mod tests {
             "let answer = 42;",
             "accepting a line completion replaces what was typed on the line"
         );
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_v_completes_ex_command_names() {
+        // `i_CTRL-X_CTRL-V`: kvim's `:` vocabulary, offered in the buffer.
+        // `wq` must be there and `sort` must not — a menu that offered every
+        // command regardless of the typed prefix would pass a "something is
+        // offered" assertion, so the negative half is the one that bites.
+        let mut app = insert_app(vec!["wq"], Position::new(0, 2));
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('v'));
+        let menu = app.completion.as_ref().expect("<C-x><C-v> opens the ex-command menu");
+        assert_eq!(menu.kind, CompletionKind::Command);
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"wq"), "the typed prefix's own command must be offered: {labels:?}");
+        assert!(!labels.contains(&"sort"), "`sort` does not match the typed `wq`: {labels:?}");
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_e_and_ctrl_y_scroll_without_editing_or_leaving_insert() {
+        // `i_CTRL-X_CTRL-E`/`i_CTRL-X_CTRL-Y` scroll the window one line. They
+        // are the one pair of CTRL-X sub-keys that are not a completion, and
+        // they must not fall through to the insert-mode `<C-e>`/`<C-y>`, which
+        // would copy a character out of the adjacent line into the buffer.
+        let mut app = insert_app(vec!["one", "two", "three", "four"], Position::new(0, 0));
+        assert_eq!(app.windows.active().scroll.top, 0);
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('e'));
+        assert_eq!(app.windows.active().scroll.top, 1, "<C-x><C-e> scrolls the view down one line");
+        assert_eq!(app.host.buffer.line(0).unwrap(), "one", "scrolling must not edit the buffer");
+        assert_eq!(app.host.mode(), Mode::Insert, "the scroll stays in insert mode");
+        app.completion_intercept(ctrl('x'));
+        app.completion_intercept(ctrl('y'));
+        assert_eq!(app.windows.active().scroll.top, 0, "<C-x><C-y> scrolls back up one line");
+        assert_eq!(app.host.buffer.line(0).unwrap(), "one", "scrolling must not edit the buffer");
     }
 
     #[test]
