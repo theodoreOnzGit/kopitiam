@@ -53,3 +53,10 @@ vendor/
 *.traineddata
 # Scratch dir the netfetch tests use when pointed away from the XDG store.
 /.netfetch-models/
+
+# Decoded-scan output from `examples/fax_verify.rs` (AID-0058). The corpus it
+# runs on is proprietary literature supplied as a runtime argument and must
+# never be committed; these are its raw bitmaps, hundreds of MB per run.
+*.pbm
+*.pgm
+*.ppm
