@@ -38,19 +38,20 @@
 //!
 //! ## What is deferred (a later codec wave)
 //!
-//! `JPXDecode` (JPEG 2000), `JBIG2Decode`, and `CCITTFaxDecode` return a clear
+//! `JPXDecode` (JPEG 2000) and `JBIG2Decode` return a clear
 //! [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported) error (never a
 //! panic). Separation/DeviceN/Lab colorspaces are likewise unsupported. Soft
 //! masks / `/SMask` / stencil-mask compositing are not applied -- each image is
 //! returned as its own opaque sample buffer.
 
 use super::error::{Error, Result};
+use super::filter_fax::{self, FaxParams};
 use super::object::Object;
 use super::xref::PdfDocument;
 
-use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::JpegDecoder;
 
 /// A decoded raster image: 8-bit samples, row-major, either 1 component
 /// (grayscale) or 3 (RGB). This is the normalized form the OCR pipeline
@@ -134,11 +135,15 @@ impl ColorKind {
 }
 
 /// The image-only compression filters this module does not (yet) decode.
+///
+/// `CCITTFaxDecode` left this set on 2026-09-24, when [`filter_fax`] landed.
 fn is_deferred_codec(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"JPXDecode" | b"JBIG2Decode" | b"CCITTFaxDecode" | b"CCF"
-    )
+    matches!(name, b"JPXDecode" | b"JBIG2Decode")
+}
+
+/// The CCITT Group 3/4 fax filter names (`CCITTFaxDecode` / inline `CCF`).
+fn is_ccitt(name: &[u8]) -> bool {
+    matches!(name, b"CCITTFaxDecode" | b"CCF")
 }
 
 /// The JPEG filter names (`DCTDecode` / its inline abbreviation `DCT`).
@@ -155,7 +160,7 @@ fn is_dct(name: &[u8]) -> bool {
 /// resource-dictionary order.
 ///
 /// Returns an [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported) error if
-/// any image uses a deferred codec (JPX/JBIG2/CCITT) or colorspace; a page with
+/// any image uses a deferred codec (JPX/JBIG2) or colorspace; a page with
 /// no images yields an empty vector.
 pub fn page_images(doc: &PdfDocument, page_index: usize) -> Result<Vec<DecodedImage>> {
     let page = doc.page(page_index)?.clone();
@@ -317,6 +322,29 @@ fn decode_image_base(
         )));
     }
 
+    // CCITTFaxDecode: expand to packed 1-bit samples and fall through to the
+    // raw-sample path below, which is what MuPDF does -- its fax filter is a
+    // stream filter, so /ImageMask, /Decode, /BitsPerComponent and the
+    // colourspace are handled once, in common with every other filter, rather
+    // than re-implemented here.
+    let ccitt = if let Some(pos) = filters.iter().position(|n| is_ccitt(n)) {
+        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let coded = apply_leading_filters(raw, &filter, &parms, pos)?;
+        let params = fax_params(doc, dict, pos, height);
+        let (bits, rows) = filter_fax::decode(&coded, &params)
+            .map_err(|e| Error::syntax(format!("CCITTFaxDecode: {e}")))?;
+        if rows < height {
+            // A short decode is data loss, not a resize: the image dictionary
+            // is what the page's geometry is laid out against.
+            return Err(Error::syntax(format!(
+                "CCITTFaxDecode: decoded {rows} rows, image declares {height}"
+            )));
+        }
+        Some(to_pdf_convention(bits, params.black_is_1))
+    } else {
+        None
+    };
+
     if let Some(pos) = filters.iter().position(|n| is_dct(n)) {
         // DCTDecode: apply any *leading* non-image filters, then JPEG-decode.
         let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
@@ -349,7 +377,10 @@ fn decode_image_base(
         parse_colorspace(doc, &cs_obj)?
     };
 
-    let samples = doc.open_stream(stream_ref)?;
+    let samples = match ccitt {
+        Some(bits) => bits,
+        None => doc.open_stream(stream_ref)?,
+    };
     let decode = read_decode(doc, dict);
     Ok(decode_samples(
         width,
@@ -363,6 +394,56 @@ fn decode_image_base(
 
 /// Apply the filters *before* index `image_pos` in the chain (usually none), so
 /// the bytes handed to the JPEG decoder are the codec's own input.
+/// Read `/DecodeParms[pos]` into a [`FaxParams`].
+///
+/// The defaults are PDF 32000-1 table 11's, not the decoder's: `/K` 0 (pure
+/// 1-D G3), `/Columns` 1728, every flag false. `/Rows` is optional and is
+/// frequently absent, so the image's own `/Height` stands in -- which is what
+/// MuPDF passes from its image loader (`pdf-image.c`).
+fn fax_params(doc: &PdfDocument, dict: &Object, pos: usize, height: usize) -> FaxParams {
+    // /DecodeParms is a lone dictionary when /Filter is a lone name, and an
+    // array positionally matching /Filter otherwise. Either may be a null
+    // placeholder for a filter that takes no parameters.
+    let parms = geta(doc, dict, "DecodeParms", "DP");
+    let d = match parms {
+        Object::Array(ref items) => items
+            .get(pos)
+            .map(|o| doc.resolve(o).unwrap_or(Object::Null))
+            .unwrap_or(Object::Null),
+        other => doc.resolve(&other).unwrap_or(Object::Null),
+    };
+    let int = |k: &str, dflt: i64| match doc.resolve_get(&d, k) {
+        Ok(Object::Int(v)) => v,
+        Ok(Object::Real(v)) => v as i64,
+        _ => dflt,
+    };
+    let flag = |k: &str| matches!(doc.resolve_get(&d, k), Ok(Object::Bool(true)));
+    let rows = int("Rows", 0) as u32;
+    FaxParams {
+        k: int("K", 0) as i32,
+        end_of_line: flag("EndOfLine"),
+        encoded_byte_align: flag("EncodedByteAlign"),
+        columns: int("Columns", 1728) as u32,
+        rows: if rows == 0 { height as u32 } else { rows },
+        black_is_1: flag("BlackIs1"),
+    }
+}
+
+/// Convert the decoder's packed rows to the PDF sample convention.
+///
+/// [`filter_fax::decode`] sets a bit for a **black** pixel. PDF's default
+/// (`/BlackIs1 false`) is the opposite -- 0 is black -- so the bits are
+/// inverted unless `/BlackIs1` is set, after which they are ordinary 1-bit
+/// gray samples and the shared unpacker handles `/Decode` and `/ImageMask`.
+fn to_pdf_convention(mut bits: Vec<u8>, black_is_1: bool) -> Vec<u8> {
+    if !black_is_1 {
+        for b in &mut bits {
+            *b = !*b;
+        }
+    }
+    bits
+}
+
 fn apply_leading_filters(
     raw: Vec<u8>,
     filter: &Object,
@@ -859,9 +940,7 @@ mod tests {
         assert_eq!((im.width, im.height, im.components), (2, 2, 3));
         assert_eq!(
             im.pixels,
-            vec![
-                255, 0, 0, /**/ 0, 255, 0, /**/ 0, 0, 255, /**/ 255, 0, 0
-            ]
+            vec![255, 0, 0, /**/ 0, 255, 0, /**/ 0, 0, 255, /**/ 255, 0, 0]
         );
     }
 
@@ -983,4 +1062,143 @@ mod tests {
 
     // The embedded 16x8 baseline JPEG fixture (`const JPEG_16X8`).
     include!("page_image_test_jpeg.rs");
+
+    // -----------------------------------------------------------------------
+    // CCITTFaxDecode (filter_fax) integration
+    // -----------------------------------------------------------------------
+
+    /// A G4 row of 4 white then 4 black pixels, hand-coded from ITU-T T.6.
+    ///
+    /// Against the imaginary all-white reference line above row 0, `b1 = 8`
+    /// (the row width) while `a1 = 4`, so `a1 - b1 = -4` falls outside the
+    /// vertical range and the row must use horizontal mode:
+    ///
+    /// | field | code | bits |
+    /// |---|---|---|
+    /// | horizontal mode | `H` | `001` |
+    /// | white run 4 | T.4 white terminating | `1011` |
+    /// | black run 4 | T.4 black terminating | `011` |
+    ///
+    /// `001 1011 011` padded to a byte boundary is `0x36 0xC0`.
+    const G4_HALF_BLACK_ROW: [u8; 2] = [0x36, 0xC0];
+
+    #[test]
+    fn ccitt_g4_image_decodes_through_the_shared_sample_path() {
+        let img = stream_body(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 1 \
+             /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 /Rows 1 >>",
+            &G4_HALF_BLACK_ROW,
+        );
+        let s = scaffold("[0 0 8 1]", "<< /XObject << /Im0 4 0 R >> >>");
+        let bodies = vec![s[0].clone(), s[1].clone(), s[2].clone(), img];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+
+        let images = page_images(&doc, 0).unwrap();
+        assert_eq!(images.len(), 1);
+        let im = &images[0];
+        assert_eq!((im.width, im.height, im.components), (8, 1, 1));
+        // /BlackIs1 defaults false, so a 0 bit is black: white first, black last.
+        assert_eq!(im.pixels, vec![255, 255, 255, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ccitt_black_is_1_inverts_the_image() {
+        let img = stream_body(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 1 \
+             /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /CCITTFaxDecode \
+             /DecodeParms << /K -1 /Columns 8 /Rows 1 /BlackIs1 true >>",
+            &G4_HALF_BLACK_ROW,
+        );
+        let s = scaffold("[0 0 8 1]", "<< /XObject << /Im0 4 0 R >> >>");
+        let bodies = vec![s[0].clone(), s[1].clone(), s[2].clone(), img];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+
+        let im = &page_images(&doc, 0).unwrap()[0];
+        // Same coded bits, opposite sample convention.
+        assert_eq!(im.pixels, vec![0, 0, 0, 0, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn ccitt_is_no_longer_a_deferred_codec() {
+        assert!(!is_deferred_codec(b"CCITTFaxDecode"));
+        assert!(!is_deferred_codec(b"CCF"));
+        // The wave that has not landed yet.
+        assert!(is_deferred_codec(b"JPXDecode"));
+        assert!(is_deferred_codec(b"JBIG2Decode"));
+    }
+
+    #[test]
+    fn ccitt_rows_defaults_to_the_image_height() {
+        // /Rows is optional. Omitting it must not decode zero rows -- the
+        // image's own /Height stands in, as MuPDF's image loader passes it.
+        let img = stream_body(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 1 \
+             /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>",
+            &G4_HALF_BLACK_ROW,
+        );
+        let s = scaffold("[0 0 8 1]", "<< /XObject << /Im0 4 0 R >> >>");
+        let bodies = vec![s[0].clone(), s[1].clone(), s[2].clone(), img];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+
+        let im = &page_images(&doc, 0).unwrap()[0];
+        assert_eq!((im.width, im.height), (8, 1));
+        assert_eq!(im.pixels, vec![255, 255, 255, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ccitt_decode_parms_is_read_positionally_from_an_array() {
+        // /Filter as an array puts /DecodeParms in positional correspondence;
+        // reading index 0 instead of index 1 would take the Flate null and
+        // silently fall back to /K 0 (G3 1-D), which cannot decode G4 data.
+        let coded = compress_to_vec_zlib(&G4_HALF_BLACK_ROW, 6);
+        let img = stream_body(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 1 \
+             /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter [/FlateDecode /CCITTFaxDecode] \
+             /DecodeParms [null << /K -1 /Columns 8 /Rows 1 >>]",
+            &coded,
+        );
+        let s = scaffold("[0 0 8 1]", "<< /XObject << /Im0 4 0 R >> >>");
+        let bodies = vec![s[0].clone(), s[1].clone(), s[2].clone(), img];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+
+        let im = &page_images(&doc, 0).unwrap()[0];
+        assert_eq!(im.pixels, vec![255, 255, 255, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ccitt_short_decode_is_an_error_not_a_silent_resize() {
+        // The dictionary declares 4 rows; the data codes 1. Returning a
+        // 1-row image would misplace every glyph laid out against /Height.
+        let img = stream_body(
+            "/Type /XObject /Subtype /Image /Width 8 /Height 4 \
+             /ColorSpace /DeviceGray /BitsPerComponent 1 \
+             /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>",
+            &G4_HALF_BLACK_ROW,
+        );
+        let s = scaffold("[0 0 8 4]", "<< /XObject << /Im0 4 0 R >> >>");
+        let bodies = vec![s[0].clone(), s[1].clone(), s[2].clone(), img];
+        let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
+
+        let err = page_images(&doc, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("decoded 1 rows"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn to_pdf_convention_inverts_only_when_black_is_0() {
+        assert_eq!(
+            to_pdf_convention(vec![0b1010_1010], false),
+            vec![0b0101_0101]
+        );
+        assert_eq!(
+            to_pdf_convention(vec![0b1010_1010], true),
+            vec![0b1010_1010]
+        );
+    }
 }

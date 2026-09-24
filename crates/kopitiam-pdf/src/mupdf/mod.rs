@@ -82,6 +82,8 @@ pub mod encodings;
 pub mod error;
 pub mod filter_basic;
 pub mod filter_flate;
+pub mod filter_fax;
+pub mod filter_fax_tables;
 pub mod filter_lzw;
 pub mod filter_predict;
 pub mod font;
