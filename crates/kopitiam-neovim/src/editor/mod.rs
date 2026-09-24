@@ -5209,6 +5209,29 @@ mod tests {
     }
 
     #[test]
+    fn insert_ctrl_e_is_a_noop_when_the_line_below_is_too_short() {
+        // vim beeps and inserts nothing when the adjacent line has no character
+        // at the cursor's column. Clamping to that line's last character
+        // instead would quietly insert the wrong one.
+        assert_eq!(run("ab\nx", "A<C-e><Esc>"), "ab\nx", "no character below column 2 -- insert nothing");
+    }
+
+    #[test]
+    fn insert_ctrl_d_at_zero_indent_is_a_noop() {
+        // Nothing to dedent: the line, and the cursor's place in it, must be
+        // left exactly as they were rather than the cursor drifting.
+        let mut ed = editor_with("abc");
+        feed(&mut ed, "A<C-d>");
+        assert_eq!(ed.buffer().text(), "abc");
+        assert_eq!(ed.cursor(), Position::new(0, 3), "the cursor must not drift when there is no indent to remove");
+    }
+
+    #[test]
+    fn insert_ctrl_a_with_nothing_inserted_yet_is_a_noop() {
+        assert_eq!(run("abc", "i<C-a><Esc>"), "abc", "an empty `\".` register inserts nothing");
+    }
+
+    #[test]
     fn insert_ctrl_v_u_hex_inserts_a_unicode_codepoint() {
         let mut ed = editor_with("");
         feed(&mut ed, "i<C-v>u00e4<Esc>");
@@ -6395,6 +6418,51 @@ mod tests {
         assert_eq!(ed.cursor().line, 3);
         feed(&mut ed, "['"); // previous mark's line -> line 1
         assert_eq!(ed.cursor().line, 1);
+    }
+
+    #[test]
+    fn bracket_mark_jump_backtick_is_exact_and_quote_is_first_non_blank() {
+        // The two mark jumps differ only in the *column* they land on --
+        // `` [` `` restores the mark's exact column, `['` the line's first
+        // non-blank. A test that asserts only the line (as the one above does)
+        // cannot tell them apart, so this one asserts the column.
+        let mut ed = editor_with("\n    indented text\nlast");
+        feed(&mut ed, "j8|ma"); // mark 'a' on line 1, column 7 (inside "indented")
+        assert_eq!(ed.cursor(), Position::new(1, 7));
+        feed(&mut ed, "G"); // down to "last", so the mark is behind us
+        feed(&mut ed, "[`");
+        assert_eq!(ed.cursor(), Position::new(1, 7), "`` [` `` restores the mark's exact column");
+        feed(&mut ed, "G");
+        feed(&mut ed, "['");
+        assert_eq!(ed.cursor(), Position::new(1, 4), "`['` lands on the line's first non-blank");
+    }
+
+    #[test]
+    fn a_count_on_a_bracket_motion_repeats_it() {
+        // `2]m` must skip the first brace and land on the second; a count that
+        // was silently dropped would land on the first and still "work".
+        let mut ed = editor_with("fn a() {\n}\nfn b() {\n}");
+        feed(&mut ed, "2]m");
+        assert_eq!(ed.cursor(), Position::new(2, 7), "`2]m` reaches the second method brace");
+        // Same for walking out of nested parens: `2[(` goes out two levels.
+        let mut ed = editor_with("((a))");
+        feed(&mut ed, "2l[(");
+        assert_eq!(ed.cursor(), Position::new(0, 1), "`[(` walks out one level");
+        let mut ed = editor_with("((a))");
+        feed(&mut ed, "2l2[(");
+        assert_eq!(ed.cursor(), Position::new(0, 0), "`2[(` walks out two levels");
+    }
+
+    #[test]
+    fn section_motions_run_to_the_buffer_edges_when_there_is_no_further_section() {
+        // vim's `]]`/`[[` do not refuse at the last/first section: they land on
+        // the end / start of the buffer. Standing still would leave `]]` looking
+        // like a no-op key on a file with one top-level block.
+        let mut ed = editor_with("{\n body\n}\ntail");
+        feed(&mut ed, "]]");
+        assert_eq!(ed.cursor(), Position::new(3, 3), "`]]` with no further section runs to the buffer end");
+        feed(&mut ed, "[[");
+        assert_eq!(ed.cursor(), Position::ORIGIN, "`[[` with no earlier section runs to the buffer start");
     }
 
     // -----------------------------------------------------------------
