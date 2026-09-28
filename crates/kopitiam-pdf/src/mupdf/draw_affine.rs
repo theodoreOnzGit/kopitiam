@@ -94,6 +94,107 @@ fn sample_nearest(w: i64, h: i64, u: i64, v: i64) -> (i64, i64) {
     (u, v)
 }
 
+/// The fixed-point stepping state `fz_paint_image_imp` sets up before it
+/// dispatches to a span painter.
+struct Walk {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    u0: i64,
+    v0: i64,
+    fa: i64,
+    fb: i64,
+    fc: i64,
+    fd: i64,
+    sw: i64,
+    sh: i64,
+    dolerp: bool,
+}
+
+// MuPDF: the set-up half of fz_paint_image_imp (draw-affine.c:3926-4029).
+fn walk(
+    dst: &Pixmap,
+    scissor: IRect,
+    img_w: i32,
+    img_h: i32,
+    ctm: Matrix,
+    lerp_allowed: bool,
+    interpolate: bool,
+) -> Option<Walk> {
+    // Turn on interpolation for upscaled and non-rectilinear transforms ...
+    let mut dolerp = false;
+    if !is_rectilinear(ctm) {
+        dolerp = lerp_allowed;
+    }
+    let ew = (ctm.a * ctm.a + ctm.b * ctm.b).sqrt();
+    let eh = (ctm.c * ctm.c + ctm.d * ctm.d).sqrt();
+    if ew > img_w as f32 {
+        dolerp = lerp_allowed;
+    }
+    if eh > img_h as f32 {
+        dolerp = lerp_allowed;
+    }
+    // ... except at large magnifications.
+    if !interpolate {
+        if ew > (img_w * 2) as f32 {
+            dolerp = false;
+        }
+        if eh > (img_h * 2) as f32 {
+            dolerp = false;
+        }
+    }
+
+    let bbox = Rect::new(0.0, 0.0, 1.0, 1.0)
+        .transform(ctm)
+        .irect_from_rect()
+        .intersect(scissor)
+        .intersect(dst.bbox());
+    if bbox.is_empty() {
+        return None;
+    }
+
+    // Map from screen space (x,y) to image space (u,v).
+    let m = ctm.pre_scale(1.0 / img_w as f32, 1.0 / img_h as f32);
+    let mut m = m.try_invert()?;
+    m.a *= ONE as f32;
+    m.b *= ONE as f32;
+    m.c *= ONE as f32;
+    m.d *= ONE as f32;
+    m.e *= ONE as f32;
+    m.f *= ONE as f32;
+    let (x, y) = (bbox.x0, bbox.y0);
+    // Half step to start; kept in float as long as possible (bug 693021).
+    let mut u0 = ((m.a * x as f32) + (m.c * y as f32) + m.e + ((m.a + m.c) * 0.5)) as i32 as i64;
+    let mut v0 = ((m.b * x as f32) + (m.d * y as f32) + m.f + ((m.b + m.d) * 0.5)) as i32 as i64;
+    let mut sw = img_w as i64;
+    let mut sh = img_h as i64;
+    if sw >= LIMIT || sh >= LIMIT {
+        return None; // "image too large for fixed point math"
+    }
+    if dolerp {
+        u0 -= HALF;
+        v0 -= HALF;
+        sw = (sw << PREC) + HALF;
+        sh = (sh << PREC) + HALF;
+    }
+    Some(Walk {
+        x,
+        y,
+        w: bbox.x1 - bbox.x0,
+        h: bbox.y1 - bbox.y0,
+        u0,
+        v0,
+        fa: m.a as i64,
+        fb: m.b as i64,
+        fc: m.c as i64,
+        fd: m.d as i64,
+        sw,
+        sh,
+        dolerp,
+    })
+}
+
 // MuPDF: fz_paint_image_imp (draw-affine.c:3901), reduced as described in the
 // module docs. `img` must carry exactly the destination's 3 colour components
 // (+ alpha when `img.alpha`, premultiplied). `alpha` is 0..=255.
@@ -114,67 +215,10 @@ pub fn paint_image(
         return;
     }
     debug_assert_eq!(img.n - i32::from(img.alpha), 3, "paint_image wants RGB samples");
-
-    // Turn on interpolation for upscaled and non-rectilinear transforms ...
-    let mut dolerp = false;
-    if !is_rectilinear(ctm) {
-        dolerp = lerp_allowed;
-    }
-    let ew = (ctm.a * ctm.a + ctm.b * ctm.b).sqrt();
-    let eh = (ctm.c * ctm.c + ctm.d * ctm.d).sqrt();
-    if ew > img.w as f32 {
-        dolerp = lerp_allowed;
-    }
-    if eh > img.h as f32 {
-        dolerp = lerp_allowed;
-    }
-    // ... except at large magnifications.
-    if !interpolate {
-        if ew > (img.w * 2) as f32 {
-            dolerp = false;
-        }
-        if eh > (img.h * 2) as f32 {
-            dolerp = false;
-        }
-    }
-
-    let bbox = Rect::new(0.0, 0.0, 1.0, 1.0).transform(ctm).irect_from_rect().intersect(scissor);
-    let bbox = bbox.intersect(dst.bbox());
-    if bbox.is_empty() {
+    let Some(wk) = walk(dst, scissor, img.w, img.h, ctm, lerp_allowed, interpolate) else {
         return;
-    }
-    let (x, y) = (bbox.x0, bbox.y0);
-    let w = bbox.x1 - bbox.x0;
-    let h = bbox.y1 - bbox.y0;
-
-    // Map from screen space (x,y) to image space (u,v).
-    let m = ctm.pre_scale(1.0 / img.w as f32, 1.0 / img.h as f32);
-    let Some(mut m) = m.try_invert() else { return };
-    m.a *= ONE as f32;
-    m.b *= ONE as f32;
-    m.c *= ONE as f32;
-    m.d *= ONE as f32;
-    m.e *= ONE as f32;
-    m.f *= ONE as f32;
-    let fa = m.a as i64;
-    let fb = m.b as i64;
-    let fc = m.c as i64;
-    let fd = m.d as i64;
-    // Half step to start; kept in float as long as possible (bug 693021).
-    let mut u0 = ((m.a * x as f32) + (m.c * y as f32) + m.e + ((m.a + m.c) * 0.5)) as i32 as i64;
-    let mut v0 = ((m.b * x as f32) + (m.d * y as f32) + m.f + ((m.b + m.d) * 0.5)) as i32 as i64;
-
-    let mut sw = img.w as i64;
-    let mut sh = img.h as i64;
-    if sw >= LIMIT || sh >= LIMIT {
-        return; // "image too large for fixed point math"
-    }
-    if dolerp {
-        u0 -= HALF;
-        v0 -= HALF;
-        sw = (sw << PREC) + HALF;
-        sh = (sh << PREC) + HALF;
-    }
+    };
+    let (sw, sh, dolerp) = (wk.sw, wk.sh, wk.dolerp);
 
     let sn = 3usize;
     let sa = img.alpha;
@@ -183,12 +227,13 @@ pub fn paint_image(
     let dn = dst.n as usize;
     let sp = &img.samples;
 
-    for row in 0..h {
-        let py = y + row;
+    let (mut u0, mut v0) = (wk.u0, wk.v0);
+    for row in 0..wk.h {
+        let py = wk.y + row;
         let mut u = u0;
         let mut v = v0;
-        for col in 0..w {
-            let px = x + col;
+        for col in 0..wk.w {
+            let px = wk.x + col;
             // Per-pixel paint alpha: the constant alpha, folded with the
             // smask coverage when there is one (see the module docs).
             let a_px = match mask {
@@ -260,10 +305,94 @@ pub fn paint_image(
                     }
                 }
             }
-            u += fa;
-            v += fb;
+            u += wk.fa;
+            v += wk.fb;
         }
-        u0 += fc;
-        v0 += fd;
+        u0 += wk.fc;
+        v0 += wk.fd;
+    }
+}
+
+// MuPDF: FZ_EXPAND / FZ_COMBINE / FZ_BLEND (geometry.h:57-76).
+#[inline]
+fn fz_expand(a: i32) -> i32 {
+    a + (a >> 7)
+}
+#[inline]
+fn fz_combine(a: i32, b: i32) -> i32 {
+    (a * b) >> 8
+}
+#[inline]
+fn fz_blend(src: i32, dst: i32, amount: i32) -> i32 {
+    ((src - dst) * amount + (dst << 8)) >> 8
+}
+
+// MuPDF: fz_paint_image_with_color (draw-affine.c:4114) ->
+// template_affine_color_N_near / _lerp (draw-affine.c:1068, 1155).
+/// Paint `color` through a one-channel coverage pixmap `mask` (a stencil
+/// `/ImageMask` after decode + scaling), at `alpha` (0..=255): MuPDF's
+/// `fz_fill_image_mask` painter.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_image_color(
+    dst: &mut Pixmap,
+    scissor: IRect,
+    mask: &ScalePix,
+    ctm: Matrix,
+    color: [u8; 3],
+    alpha: i32,
+    lerp_allowed: bool,
+    interpolate: bool,
+) {
+    if alpha == 0 || mask.w <= 0 || mask.h <= 0 {
+        return;
+    }
+    debug_assert_eq!(mask.n, 1, "a stencil is one coverage channel");
+    let Some(wk) = walk(dst, scissor, mask.w, mask.h, ctm, lerp_allowed, interpolate) else {
+        return;
+    };
+    let (sw, sh) = (wk.sw, wk.sh);
+    let ss = mask.w as usize;
+    let sp = &mask.samples;
+    let dn = dst.n as usize;
+    let (mut u0, mut v0) = (wk.u0, wk.v0);
+    for row in 0..wk.h {
+        let py = wk.y + row;
+        let mut u = u0;
+        let mut v = v0;
+        for col in 0..wk.w {
+            let px = wk.x + col;
+            let ma = if wk.dolerp {
+                if u + HALF >= 0 && u + ONE < sw && v + HALF >= 0 && v + ONE < sh {
+                    let ui = u >> PREC;
+                    let vi = v >> PREC;
+                    let uf = (u & MASK) as i32;
+                    let vf = (v & MASK) as i32;
+                    let at = |uu: i64, vv: i64| {
+                        let (uu, vv) = sample_nearest(sw, sh, uu, vv);
+                        sp[vv as usize * ss + uu as usize] as i32
+                    };
+                    Some(bilerp(at(ui, vi), at(ui + 1, vi), at(ui, vi + 1), at(ui + 1, vi + 1), uf, vf))
+                } else {
+                    None
+                }
+            } else {
+                let ui = u >> PREC;
+                let vi = v >> PREC;
+                (ui >= 0 && ui < sw && vi >= 0 && vi < sh).then(|| sp[vi as usize * ss + ui as usize] as i32)
+            };
+            if let Some(ma) = ma {
+                let masa = fz_combine(fz_expand(ma), alpha);
+                if masa != 0 {
+                    let o = dst.offset(px, py).expect("bbox is inside dst");
+                    for (k, dk) in dst.samples[o..o + dn].iter_mut().enumerate().take(3) {
+                        *dk = fz_blend(color[k] as i32, *dk as i32, masa) as u8;
+                    }
+                }
+            }
+            u += wk.fa;
+            v += wk.fb;
+        }
+        u0 += wk.fc;
+        v0 += wk.fd;
     }
 }

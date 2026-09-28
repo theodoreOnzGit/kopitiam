@@ -15,6 +15,7 @@
 //!   CMYK conversion).
 //! * **Tranche 4 -- page boxes** (`pdf_page_obj_transform_box`: the CropBox
 //!   is the page).
+//! * **Tranche 5 -- stencils, inline images, encrypted streams**.
 
 use kopitiam_pdf::mupdf::structured_text::{StextBlock, StextChar, StextOptions};
 use kopitiam_pdf::mupdf::xref::PdfDocument;
@@ -471,4 +472,96 @@ fn cropbox_with_rotate_90_swaps_the_crop_extents() {
     let red = pix.samples.chunks(pix.n as usize).any(|p| p[0] > 200 && p[1] < 50 && p[2] < 50);
     let blue = pix.samples.chunks(pix.n as usize).any(|p| p[2] > 200 && p[0] < 50 && p[1] < 50);
     assert!(red && !blue);
+}
+
+// ---------------------------------------------------------------------------
+// Tranche 5 -- stencils, inline images, encrypted streams
+// ---------------------------------------------------------------------------
+
+fn rgb_at(pix: &kopitiam_pdf::mupdf::Pixmap, x: u32, y: u32) -> [u8; 3] {
+    let o = ((y * pix.w + x) * pix.n as u32) as usize;
+    [pix.samples[o], pix.samples[o + 1], pix.samples[o + 2]]
+}
+
+fn near(a: [u8; 3], b: [u8; 3]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (*x as i32 - y as i32).abs() <= 2)
+}
+
+/// `/ImageMask true` is a stencil: MuPDF paints the FILL COLOUR where a
+/// sample is 0 and leaves everything else alone (fz_fill_image_mask). 0.4.1
+/// drew it as an opaque black-and-white picture, wiping out what was under
+/// the "transparent" half. mutool on this page: x = 60 -> (254, 0, 0), x = 5
+/// -> the blue underneath (0, 0, 255).
+#[test]
+fn image_mask_paints_the_fill_colour_through_the_stencil() {
+    let mask: Vec<u8> = [0xF0u8, 0x0F].repeat(16);
+    let mut img = format!(
+        "<< /Length {} /Type /XObject /Subtype /Image /Width 16 /Height 16 /ImageMask true /BitsPerComponent 1 >>\nstream\n",
+        mask.len()
+    )
+    .into_bytes();
+    img.extend_from_slice(&mask);
+    img.extend_from_slice(b"\nendstream");
+    let bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /M 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", "0 0 1 rg 0 0 200 200 re f 1 0 0 rg q 200 0 0 200 0 0 cm /M Do Q"),
+        img,
+    ];
+    let doc = PdfDocument::open(build_pdf(&bodies)).expect("fixture opens");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert!(near(rgb_at(&pix, 60, 5), [254, 0, 0]), "{:?}", rgb_at(&pix, 60, 5));
+    assert!(near(rgb_at(&pix, 5, 5), [0, 0, 255]), "{:?}", rgb_at(&pix, 5, 5));
+}
+
+/// Inline images (`BI … ID … EI`) were skipped. MuPDF decodes and paints
+/// them; an 8x8 gray ramp stretched over the page gives, across a row, the
+/// column values 0, 32, …, 224 (mutool, point-sampled: it is an upscale
+/// beyond 2x, so no bilinear).
+#[test]
+fn inline_image_is_decoded_and_painted() {
+    let ramp: Vec<u8> = (0..8).flat_map(|_| (0..8u8).map(|x| x * 32)).collect();
+    let mut content = b"q 200 0 0 200 0 0 cm BI /W 8 /H 8 /CS /G /BPC 8 ID\n".to_vec();
+    content.extend_from_slice(&ramp);
+    content.extend_from_slice(b"\nEI Q");
+    let bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>".to_vec(),
+        raw_stream("", &content),
+    ];
+    let doc = PdfDocument::open(build_pdf(&bodies)).expect("fixture opens");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (x, want) in [(5u32, 0u8), (30, 32), (55, 64), (80, 96), (105, 128), (130, 160), (155, 192), (180, 224)] {
+        assert_eq!(rgb_at(&pix, x, 100)[0], want, "x = {x}");
+    }
+}
+
+/// A FILTERED inline image (ASCIIHex, abbreviated `/F /AHx`, `/CS /RGB`):
+/// its data has no length, so the end is found by decoding up to each
+/// candidate `EI`. Two pixels, red then green (mutool agrees).
+#[test]
+fn filtered_inline_image_with_abbreviations_decodes() {
+    let doc = page_with(
+        "<< >>",
+        "q 200 0 0 200 0 0 cm BI /W 2 /H 1 /CS /RGB /BPC 8 /F /AHx ID\nFF000000FF00>\nEI Q",
+        &[],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 50, 100), [255, 0, 0]);
+    assert_eq!(rgb_at(&pix, 150, 100), [0, 255, 0]);
+}
+
+/// An encrypted stream in an object with generation 1 was decrypted with
+/// generation 0 -- a different RC4 key -- so the page came out blank. The
+/// fixture (RC4-40, content stream `4 1 obj`) is made by MuPDF itself from a
+/// synthetic plaintext (tests/fixtures/make-encrypted-gen1.py); mutool shows
+/// the red square at (50, 50).
+#[test]
+fn encrypted_stream_uses_its_objects_generation() {
+    let bytes = include_bytes!("fixtures/encrypted-rc4-gen1.pdf").to_vec();
+    let doc = PdfDocument::open(bytes).expect("opens");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 50, 50), [255, 0, 0]);
 }

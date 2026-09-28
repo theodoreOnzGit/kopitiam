@@ -369,16 +369,27 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             Ok(img) => img,
             Err(_) => return, // deferred codec / unsupported colorspace: skip
         };
-        let (ctm, clip) = {
+        let is_mask = super::page_image::is_image_mask(self.doc, dict);
+        self.show_image(&img, is_mask);
+    }
+
+    // MuPDF: pdf_show_image_imp (pdf-op-run.c:860) -- a stencil `/ImageMask`
+    // goes to fz_fill_image_mask in the fill colour and alpha; anything else
+    // to fz_fill_image at the fill alpha.
+    pub(crate) fn show_image(&mut self, img: &super::page_image::DecodedImage, is_mask: bool) {
+        let (ctm, clip, color, alpha) = {
             let g = self.gstate();
-            (g.ctm, g.clip)
+            (g.ctm, g.clip, g.fill_color, g.fill_alpha)
         };
         // fitz image space (0,0 top-left, unit square) -> PDF user space unit square
         // (image top row at y=1): flip y, then apply the page/user CTM.
         let image_ctm = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0).concat(ctm);
-        // MuPDF: fz_fill_image(..., gstate->fill.alpha, ...) (pdf-op-run.c:879).
-        let alpha = self.gstate().fill_alpha;
-        self.dev.draw_image(&img, image_ctm, alpha, clip);
+        if is_mask {
+            self.dev.draw_image_mask(img, image_ctm, color, alpha, clip);
+        } else {
+            // MuPDF: fz_fill_image(..., gstate->fill.alpha, ...) (pdf-op-run.c:879).
+            self.dev.draw_image(img, image_ctm, alpha, clip);
+        }
     }
 
     // MuPDF: pdf_lookup_resource (pdf-interpret.c:33), returning the *raw*

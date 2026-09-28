@@ -270,6 +270,12 @@ pub(crate) fn decode_image_xobject(
     decode_image(doc, dict, stream_ref)
 }
 
+/// Whether an image dictionary is a stencil mask (`/ImageMask true`, inline
+/// `/IM true`).
+pub(crate) fn is_image_mask(doc: &PdfDocument, dict: &Object) -> bool {
+    geta(doc, dict, "ImageMask", "IM").to_bool()
+}
+
 // MuPDF: pdf_load_image_imp (pdf-image.c:33).
 /// Decode one Image XObject to a [`DecodedImage`].
 fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result<DecodedImage> {
@@ -317,10 +323,62 @@ fn decode_smask(doc: &PdfDocument, dict: &Object) -> Option<SoftMask> {
     })
 }
 
+/// Where an image's bytes come from: an image XObject stream, or the data of
+/// an inline image (`BI … ID <data> EI`), whose `/F` + `/DP` sit in its dict.
+#[derive(Clone, Copy)]
+enum ImgData<'a> {
+    Stream(&'a Object),
+    Inline(&'a [u8]),
+}
+
+impl ImgData<'_> {
+    /// The undecoded bytes plus the `/Filter` and `/DecodeParms` objects.
+    fn raw(self, doc: &PdfDocument, dict: &Object) -> Result<(Vec<u8>, Object, Object)> {
+        match self {
+            ImgData::Stream(r) => doc.stream_raw(r),
+            ImgData::Inline(bytes) => Ok((
+                bytes.to_vec(),
+                geta(doc, dict, "Filter", "F"),
+                geta(doc, dict, "DecodeParms", "DP"),
+            )),
+        }
+    }
+
+    /// The bytes through the whole (non-image) filter chain.
+    fn decoded(self, doc: &PdfDocument, dict: &Object) -> Result<Vec<u8>> {
+        match self {
+            ImgData::Stream(r) => doc.open_stream(r),
+            ImgData::Inline(_) => {
+                let (raw, f, p) = self.raw(doc, dict)?;
+                super::doc_stream::decode_stream(raw, &f, &p)
+            }
+        }
+    }
+}
+
+// MuPDF: pdf_load_inline_image (pdf-image.c:228) -> pdf_load_image_imp with
+// the content stream as the data source.
+/// Decode an inline image: `dict` is its (resource-expanded) parameter dict,
+/// `data` the bytes between `ID` and `EI`. Errors -- including "fewer decoded
+/// samples than the image needs", which the interpreter uses to find where
+/// compressed inline data really ends -- are clean `Syntax` errors.
+pub(crate) fn decode_inline_image(doc: &PdfDocument, dict: &Object, data: &[u8]) -> Result<DecodedImage> {
+    decode_image_base_from(doc, dict, ImgData::Inline(data), true)
+}
+
 fn decode_image_base(
     doc: &PdfDocument,
     dict: &Object,
     stream_ref: &Object,
+) -> Result<DecodedImage> {
+    decode_image_base_from(doc, dict, ImgData::Stream(stream_ref), false)
+}
+
+fn decode_image_base_from(
+    doc: &PdfDocument,
+    dict: &Object,
+    src: ImgData,
+    strict_len: bool,
 ) -> Result<DecodedImage> {
     let width = geta(doc, dict, "Width", "W").to_int();
     let height = geta(doc, dict, "Height", "H").to_int();
@@ -337,7 +395,7 @@ fn decode_image_base(
     // filter (pdf-stream.c build_filter passes JPX through untouched), because
     // the codestream carries its own size, colour space and alpha.
     if let Some(pos) = filters.iter().position(|n| is_jpx(n)) {
-        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let (raw, filter, parms) = src.raw(doc, dict)?;
         let data = apply_leading_filters(raw, &filter, &parms, pos)?;
         return decode_jpx(doc, dict, &data);
     }
@@ -347,7 +405,7 @@ fn decode_image_base(
     // path. jbig2dec paints 1 = black; filter-jbig2.c:119 inverts to PDF's
     // 0 = black, and so do we.
     let jbig2 = if let Some(pos) = filters.iter().position(|n| is_jbig2(n)) {
-        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let (raw, filter, parms) = src.raw(doc, dict)?;
         let coded = apply_leading_filters(raw, &filter, &parms, pos)?;
         let globals = jbig2_globals(doc, &parms, pos);
         Some(decode_jbig2(&coded, globals.as_deref())?)
@@ -361,7 +419,7 @@ fn decode_image_base(
     // colourspace are handled once, in common with every other filter, rather
     // than re-implemented here.
     let ccitt = if let Some(pos) = filters.iter().position(|n| is_ccitt(n)) {
-        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let (raw, filter, parms) = src.raw(doc, dict)?;
         let coded = apply_leading_filters(raw, &filter, &parms, pos)?;
         let params = fax_params(doc, dict, pos, height);
         let (bits, rows) = filter_fax::decode(&coded, &params)
@@ -380,7 +438,7 @@ fn decode_image_base(
 
     if let Some(pos) = filters.iter().position(|n| is_dct(n)) {
         // DCTDecode: apply any *leading* non-image filters, then JPEG-decode.
-        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let (raw, filter, parms) = src.raw(doc, dict)?;
         let jpeg = apply_leading_filters(raw, &filter, &parms, pos)?;
         return decode_jpeg(&jpeg, width, height, read_decode(doc, dict).as_deref());
     }
@@ -412,8 +470,16 @@ fn decode_image_base(
 
     let samples = match (ccitt, jbig2) {
         (Some(bits), _) | (None, Some(bits)) => bits,
-        (None, None) => doc.open_stream(stream_ref)?,
+        (None, None) => src.decoded(doc, dict)?,
     };
+    // Inline data has no /Length: the interpreter probes candidate `EI`
+    // positions and needs "too short" to be an error, not zero padding.
+    if strict_len {
+        let stride = (width * cs.source_components() * bpc as usize).div_ceil(8);
+        if samples.len() < stride * height {
+            return Err(Error::syntax("inline image data shorter than W x H"));
+        }
+    }
     let decode = read_decode(doc, dict);
     Ok(decode_samples(
         width,

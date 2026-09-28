@@ -35,19 +35,22 @@
 //!
 //! Path construction/painting (`m l c v y h re S s f f* B B* b b* n`),
 //! rectangular clipping (`W W*`), fill/stroke colour (`g G rg RG k K cs CS sc SC
-//! scn SCN`), the line width (`w`) and image/form XObjects (`Do`) now drive the
+//! scn SCN`), the line state (`w J j M d`, since 0.4.2), `gs`, inline images and
+//! image/form XObjects (`Do`) now drive the
 //! [`DrawDevice`](super::draw_device) via the [`TextDevice`] sink's path/colour/
 //! image callbacks. Colour is tracked in the graphics state and converted to
 //! DeviceRGB; see [`super::op_run`] and [`super::resources`].
 //!
 //! ## Still deferred (parsed-and-ignored so the stream still runs)
 //!
-//! Type3 glyph metrics (`d0 d1`), shadings (`sh`), the ExtGState body (`gs`),
-//! marked content (`MP DP BMC BDC EMC`) and the compatibility bracket (`BX EX`)
-//! are recognised and skipped; their operands are consumed so the operator stream
-//! stays in sync. Inline images (`BI … ID … EI`) are skipped as a raw byte span
-//! (see [`Processor::skip_inline_image`]) -- a best-effort resync, not a decode.
-//! Render modes 3 and 7 ("invisible") still emit glyphs: extraction needs them.
+//! Type3 glyph metrics (`d0 d1`), shadings (`sh`), marked content (`MP DP BMC
+//! BDC EMC`) and the compatibility bracket (`BX EX`) are recognised and
+//! skipped; their operands are consumed so the operator stream stays in sync.
+//! ~~the ExtGState body (`gs`)~~ and ~~inline images skipped as a raw byte
+//! span~~ -- **CORRECTED 2026-09-28 (0.4.2)**: `gs` applies its line-state,
+//! font and alpha keys ([`Processor::op_gs`]), and `BI … ID … EI` is decoded
+//! and painted ([`Processor::op_inline_image`]). Render modes 3 and 7
+//! ("invisible") still emit glyphs: extraction needs them.
 
 use std::collections::HashMap;
 
@@ -517,8 +520,8 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             // -- XObjects (Form recursion + Image painting) ----------------
             b"Do" => self.op_do(name.as_deref())?,
 
-            // -- inline images: skip the BI … ID <binary> EI span ----------
-            b"BI" => self.skip_inline_image(stm)?,
+            // -- inline images: BI <dict> ID <data> EI ---------------------
+            b"BI" => self.op_inline_image(stm)?,
 
             // Everything else (paths, colours, clips, shadings, gs, marked
             // content, Type3 metrics, BX/EX) is parsed-and-ignored: the operands
@@ -540,6 +543,138 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
     /// Skip an inline image: consume tokens up to the `ID` keyword, then scan the
     /// raw bytes for the terminating `EI` (bounded by whitespace/EOF). Best
     /// effort -- inline images are off the text path.
+    // MuPDF: parse_inline_image (pdf-interpret.c:805) + pdf_load_inline_image
+    // (pdf-image.c:228) + pdf_show_image (pdf-op-run.c:860).
+    /// `BI … ID <data> EI`: parse the abbreviated parameter dict, find where the
+    /// data ends, decode it like an image XObject and paint it.
+    ///
+    /// Finding the end is the subtle part. MuPDF runs the decoder over the
+    /// content stream and lets it consume exactly what it needs, then scans for
+    /// `EI` followed by white space, `<` or `/`. Our filter layer decodes whole
+    /// buffers, so: unfiltered data is cut at exactly `stride x H` bytes (it may
+    /// legally contain the bytes "EI"); filtered data is tried at each
+    /// candidate `EI` in turn, the first that decodes to a full image winning.
+    /// If nothing decodes, the image is skipped and the stream resyncs after the
+    /// first candidate (the pre-0.4.2 behaviour for every inline image).
+    fn op_inline_image(&mut self, stm: &mut Stream) -> Result<()> {
+        // The dict: `/Key value` pairs up to the ID keyword.
+        let mut dict = Object::new_dict();
+        loop {
+            match lex(stm)? {
+                Token::Eof => return Ok(()),
+                Token::Keyword(k) if k == b"ID" => break,
+                Token::Name(key) => {
+                    let val = match lex(stm)? {
+                        Token::Name(n) => Object::new_name(n),
+                        Token::Int(i) => Object::new_int(i),
+                        Token::Real(r) => Object::new_real(r),
+                        Token::True => Object::Bool(true),
+                        Token::False => Object::Bool(false),
+                        Token::String(b) => Object::new_string(b),
+                        Token::OpenArray => parse_array(stm)?,
+                        Token::OpenDict => parse_dict(stm)?,
+                        Token::Keyword(k) if k == b"ID" => break,
+                        _ => Object::Null,
+                    };
+                    dict.dict_put(key, val);
+                }
+                _ => {}
+            }
+        }
+        // "read whitespace after ID keyword" (CR LF counts as one).
+        if stm.read_byte()? == Some(b'\r') && stm.peek_byte()? == Some(b'\n') {
+            let _ = stm.read_byte()?;
+        }
+        let start = stm.tell();
+        let mut rest = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stm.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            rest.extend_from_slice(&buf[..n]);
+        }
+
+        let dict = self.expand_inline_image_dict(dict);
+        let filtered = !matches!(
+            dict.dict_gets("Filter").or_else(|| dict.dict_gets("F")),
+            None | Some(Object::Null)
+        );
+        let is_mask = super::page_image::is_image_mask(self.doc, &dict);
+
+        let mut decoded = None;
+        let resume;
+        if !filtered {
+            let need = inline_raw_len(self.doc, &dict).min(rest.len());
+            decoded = super::page_image::decode_inline_image(self.doc, &dict, &rest[..need]).ok();
+            resume = find_ei(&rest, need).map_or(rest.len(), |p| p + 2);
+        } else {
+            let mut first = None;
+            let mut hit = None;
+            let mut from = 0;
+            while let Some(p) = find_ei(&rest, from) {
+                first.get_or_insert(p);
+                if let Ok(img) = super::page_image::decode_inline_image(self.doc, &dict, &rest[..p]) {
+                    hit = Some((img, p));
+                    break;
+                }
+                from = p + 1;
+            }
+            let end = match hit {
+                Some((img, p)) => {
+                    decoded = Some(img);
+                    p
+                }
+                None => first.unwrap_or(rest.len().saturating_sub(2)),
+            };
+            resume = end + 2;
+        }
+        stm.seek(start + resume.min(rest.len()) as i64, super::stream::Whence::Set)?;
+        if let Some(img) = decoded {
+            self.show_image(&img, is_mask);
+        }
+        Ok(())
+    }
+
+    // MuPDF: the inline-image colour space rules of pdf_load_image_imp +
+    // pdf_load_colorspace's abbreviation table (/G /RGB /CMYK /I), with any
+    // other name looked up in the /ColorSpace resources.
+    fn expand_inline_image_dict(&self, mut dict: Object) -> Object {
+        let key = if dict.dict_gets("ColorSpace").is_some() { "ColorSpace" } else { "CS" };
+        if let Some(cs) = dict.dict_gets(key).cloned() {
+            let expanded = self.expand_inline_cs(&cs);
+            dict.dict_put(key.as_bytes().to_vec(), expanded);
+        }
+        dict
+    }
+
+    fn expand_inline_cs(&self, cs: &Object) -> Object {
+        match cs {
+            Object::Name(n) => match n.as_slice() {
+                b"G" => Object::new_name(b"DeviceGray".to_vec()),
+                b"RGB" => Object::new_name(b"DeviceRGB".to_vec()),
+                b"CMYK" => Object::new_name(b"DeviceCMYK".to_vec()),
+                b"I" => Object::new_name(b"Indexed".to_vec()),
+                b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Indexed" | b"Pattern" => cs.clone(),
+                other => {
+                    let r = self.lookup_resource("ColorSpace", other);
+                    if r.is_null() { cs.clone() } else { r }
+                }
+            },
+            Object::Array(items) => {
+                let mut out = Object::new_array();
+                for (i, it) in items.iter().enumerate() {
+                    // [/I base hival lookup]: expand the family and the base.
+                    out.array_push(if i <= 1 { self.expand_inline_cs(it) } else { it.clone() });
+                }
+                out
+            }
+            other => other.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
     fn skip_inline_image(&mut self, stm: &mut Stream) -> Result<()> {
         // Consume the image dictionary tokens until the `ID` keyword.
         loop {
@@ -594,4 +729,70 @@ pub(crate) fn line_join(v: i32) -> super::draw_path::LineJoin {
         2 => LineJoin::Bevel,
         _ => LineJoin::Miter,
     }
+}
+
+/// Byte length of UNFILTERED inline image data: `ceil(W x n x BPC / 8) x H`
+/// (an `/IM` stencil is 1 x 1 bit; an Indexed space has one component).
+// MuPDF: pdf_load_image_imp's `stride * h` for an inline image with no filter
+// (pdf-image.c:117, fz_open_null on `len` bytes).
+fn inline_raw_len(doc: &PdfDocument, dict: &Object) -> usize {
+    let get = |a: &str, b: &str| {
+        dict.dict_gets(a)
+            .or_else(|| dict.dict_gets(b))
+            .map(|o| doc.resolve(o).unwrap_or(Object::Null))
+            .unwrap_or(Object::Null)
+    };
+    let w = get("Width", "W").to_int().max(0) as usize;
+    let h = get("Height", "H").to_int().max(0) as usize;
+    let mask = get("ImageMask", "IM").to_bool();
+    let mut bpc = get("BitsPerComponent", "BPC").to_int().max(0) as usize;
+    if mask {
+        bpc = 1;
+    }
+    if bpc == 0 {
+        bpc = 8;
+    }
+    let n = if mask {
+        1
+    } else {
+        match get("ColorSpace", "CS") {
+            Object::Name(n) => match n.as_slice() {
+                b"DeviceRGB" | b"CalRGB" | b"Lab" => 3,
+                b"DeviceCMYK" => 4,
+                _ => 1,
+            },
+            Object::Array(items) => match items.first().map(|o| o.to_name().to_vec()) {
+                Some(f) if f == b"Indexed" => 1,
+                Some(f) if f == b"ICCBased" => items
+                    .get(1)
+                    .and_then(|o| doc.resolve(o).ok())
+                    .and_then(|d| d.dict_gets("N").map(|n| n.to_int() as usize))
+                    .unwrap_or(1),
+                Some(f) if f == b"CalRGB" || f == b"Lab" => 3,
+                Some(f) if f == b"DeviceN" => items.get(1).map_or(1, |a| a.array_len().max(1)),
+                _ => 1,
+            },
+            _ => 1,
+        }
+    };
+    (w * n * bpc).div_ceil(8) * h
+}
+
+/// The first `EI` at or after `from` that MuPDF's scan would accept: `E`,
+/// `I`, then a byte that is white space / control (<= 32), `<` or `/`, or the
+/// end of the stream. Returns the offset of the `E`.
+// MuPDF: parse_inline_image's "find EI" loop (pdf-interpret.c:838-857).
+fn find_ei(data: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < data.len() {
+        if data[i] == b'E' && data[i + 1] == b'I' {
+            match data.get(i + 2) {
+                None => return Some(i),
+                Some(&c) if c <= 32 || c == b'<' || c == b'/' => return Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }

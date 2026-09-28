@@ -76,6 +76,10 @@ enum XrefEntry {
 struct Cached {
     obj: Object,
     stm_ofs: Option<i64>,
+    /// The object's generation as parsed from its `N G obj` header (0 for an
+    /// object from an object stream, or a free/missing one). Needed because
+    /// the per-object encryption key mixes in the generation (§7.6.2 alg. 1).
+    generation: i32,
 }
 
 /// A loaded PDF document: the raw bytes, the xref table, the trailer, the
@@ -575,6 +579,7 @@ startxref
             None | Some(XrefEntry::Free) => Ok(Cached {
                 obj: Object::Null,
                 stm_ofs: None,
+                generation: 0,
             }),
             Some(XrefEntry::Uncompressed { offset }) => {
                 let offset = *offset;
@@ -606,6 +611,7 @@ startxref
                 Ok(Cached {
                     obj,
                     stm_ofs: ind.stream.map(|s| s.start),
+                    generation: ind.generation,
                 })
             }
             Some(XrefEntry::Compressed { stm_num, index }) => {
@@ -674,7 +680,11 @@ startxref
             let mut s = Stream::from_slice(&raw);
             s.seek(first + offs[i], Whence::Set)?;
             let obj = parse_stm_obj(&mut s)?;
-            let cached = Cached { obj, stm_ofs: None };
+            let cached = Cached {
+                obj,
+                stm_ofs: None,
+                generation: 0,
+            };
             if onum == target {
                 target_cached = Some(cached.clone());
             }
@@ -684,6 +694,7 @@ startxref
         Ok(target_cached.unwrap_or(Cached {
             obj: Object::Null,
             stm_ofs: None,
+            generation: 0,
         }))
     }
 
@@ -769,12 +780,12 @@ startxref
     /// The object-number form of [`stream_raw`].
     pub fn stream_raw_num(&self, num: i32) -> Result<(Vec<u8>, Object, Object)> {
         self.ensure_cached(num)?;
-        let (dict, stm_ofs) = {
+        let (dict, stm_ofs, generation) = {
             let cache = self.cache.borrow();
             let c = cache
                 .get(&num)
                 .ok_or_else(|| Error::format(format!("object is not a stream ({num} 0 R)")))?;
-            (c.obj.clone(), c.stm_ofs)
+            (c.obj.clone(), c.stm_ofs, c.generation)
         };
         let stm_ofs =
             stm_ofs.ok_or_else(|| Error::format(format!("object is not a stream ({num} 0 R)")))?;
@@ -803,8 +814,14 @@ startxref
         // The XRef stream itself is never encrypted (§7.6.2) -- but it is also
         // read by `load_xref`, before any decryptor exists, so it cannot reach
         // here with one in place.
+        //
+        // With the object's REAL generation: the key is MD5(key ‖ num ‖ gen)
+        // (§7.6.2 algorithm 1; MuPDF pdf_open_crypt(num, gen)). This used to
+        // pass 0, so any encrypted stream whose object had a non-zero
+        // generation decrypted to garbage -- while its strings, which did use
+        // the generation, came out fine.
         let raw = match &self.decryptor {
-            Some(d) => d.decrypt_stream(num as u32, 0, &raw),
+            Some(d) => d.decrypt_stream(num as u32, generation as u16, &raw),
             None => raw,
         };
 

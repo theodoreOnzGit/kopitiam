@@ -275,3 +275,32 @@ Tests: six `cropbox_*` cases in `tests/mupdf_parity.rs` (size, raster
 offset + clip, stext space, inherited from `/Pages`, larger than MediaBox,
 `/Rotate 90`); five fail on the 0.4.1 tree, the sixth pins the
 intersect-with-MediaBox rule.
+
+### Tranche 5 (stencils, inline images, encrypted streams) -- measured 2026-09-28
+
+1. **Stencil `/ImageMask`s paint the fill colour** through the mask
+   (`fz_fill_image_mask` -> `fz_paint_image_with_color`, the
+   `template_affine_color_N_near/_lerp` painters with MuPDF's
+   `FZ_EXPAND`/`FZ_COMBINE`/`FZ_BLEND` arithmetic), after the same subsample
+   + scale pipeline as images. 0.4.1 drew them as opaque black-and-white
+   pictures.
+2. **Inline images decode and paint** (`parse_inline_image` +
+   `pdf_load_inline_image`): abbreviated keys and colour spaces
+   (`/G /RGB /CMYK /I`, other names via `/ColorSpace` resources); unfiltered
+   data cut at exactly `stride x H` bytes; filtered data ends at the first
+   candidate `EI` (MuPDF's delimiter rule) up to which it decodes to a whole
+   image -- the buffer-decoder equivalent of MuPDF letting the decoder
+   consume the stream. 0.4.1 skipped every inline image.
+3. **Encrypted streams use their object's generation** in the RC4/AES key
+   (§7.6.2 algorithm 1, `pdf_open_crypt(num, gen)`). 0.4.1 always used 0, so
+   a stream in a generation-1 object decrypted to garbage (strings were fine).
+   The coverage audit found this by reading, not the harness -- no open-corpus
+   file is encrypted.
+
+| feature file / fixture | before | after |
+|---|---|---|
+| `feat-image-mask` | 100.00 % gross | **0.00 %** (mean 0.00: pixel-identical) |
+| `feat-inline-image` | 50.00 % gross | **0.00 %** (mean 0.25) |
+| `encrypted-rc4-gen1.pdf` (MuPDF-encrypted fixture) | blank page | red square, as mutool |
+
+Tests: 4 new, all fail on the pre-fix tree.

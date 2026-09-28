@@ -113,6 +113,22 @@ pub trait TextDevice {
     /// Default no-op: extraction sinks handle images out of band.
     fn draw_image(&mut self, _img: &DecodedImage, _ctm: Matrix, _alpha: f32, _clip: Option<Rect>) {}
 
+    // MuPDF: the fz_device fill_image_mask callback (fz_fill_image_mask,
+    // pdf-op-run.c:883) -- a stencil `/ImageMask` painted in the fill colour.
+    /// Paint `color` (DeviceRGB 0..=1) at `alpha` through the stencil `img`
+    /// (as decoded: 1 component, **0 = paint**, 255 = leave alone -- the
+    /// `/ImageMask` sample convention after `/Decode`), under `ctm`, clipped
+    /// to `clip`. Default no-op: extraction sinks ignore images.
+    fn draw_image_mask(
+        &mut self,
+        _img: &DecodedImage,
+        _ctm: Matrix,
+        _color: [f32; 3],
+        _alpha: f32,
+        _clip: Option<Rect>,
+    ) {
+    }
+
     // MuPDF: the fill material of pdf_gstate carried into fz_fill_text.
     /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph
     /// boxes pick up the content stream's fill colour; extraction sinks ignore it.

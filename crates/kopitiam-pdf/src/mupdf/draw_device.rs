@@ -513,6 +513,47 @@ impl TextDevice for DrawDevice {
         self.fill = rgb_to_bytes(color);
     }
 
+    // MuPDF: fz_draw_fill_image_mask (draw-device.c:1957) -- the stencil goes
+    // through the same l2factor subsample + smooth scale as any image
+    // (fz_get_pixmap_mask_from_image), then fz_paint_image_with_color.
+    fn draw_image_mask(&mut self, img: &DecodedImage, ctm: Matrix, color: [f32; 3], alpha: f32, clip: Option<Rect>) {
+        if img.width == 0 || img.height == 0 || alpha <= 0.0 {
+            return;
+        }
+        let clip = self.resolve_clip(clip).intersect(self.pix.bbox());
+        if clip.is_empty() {
+            return;
+        }
+        let local = draw_scale::gridfit_matrix(false, ctm.concat(self.base));
+        // An image mask's decoded pixmap is alpha with 0 = opaque inverted to
+        // 255 (image.c: "Invert 1-bit image masks"). Our decode kept the gray
+        // convention (0 = paint), so invert here.
+        let n = img.components.max(1) as usize;
+        let samples = img.pixels.iter().step_by(n).map(|v| 255 - *v).collect();
+        let mpix = ScalePix {
+            x: 0,
+            y: 0,
+            w: img.width as i32,
+            h: img.height as i32,
+            n: 1,
+            alpha: false,
+            samples,
+        };
+        let Some((mpix, mctm)) = prepare_image_pixmap(mpix, local, alpha, clip) else {
+            return;
+        };
+        draw_affine::paint_image_color(
+            &mut self.pix,
+            clip,
+            &mpix,
+            mctm,
+            rgb_to_bytes(color),
+            (alpha * 255.0) as i32,
+            true,
+            false,
+        );
+    }
+
     fn set_text_render_mode(&mut self, mode: i32) {
         self.text_render_mode = mode;
     }
