@@ -117,4 +117,21 @@ pub trait TextDevice {
     /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph
     /// boxes pick up the content stream's fill colour; extraction sinks ignore it.
     fn set_fill_color(&mut self, _color: [f32; 3]) {}
+
+    // MuPDF: pdf_flush_text_imp (pdf-op-run.c:1121) -- the `tos.text_mode`
+    // switch that picks dofill / dostroke / doclip / doinvisible per text run.
+    /// Set the text render mode (`Tr`, PDF 32000-1:2008 §9.3.6, Table 106) that
+    /// applies to the glyphs emitted after this call. The interpreter calls it
+    /// just before every [`show_glyph`](TextDevice::show_glyph), same as
+    /// [`set_fill_color`](TextDevice::set_fill_color).
+    ///
+    /// Why a separate hook and not a `show_glyph` argument: only a *painting*
+    /// device cares. Mode 3 ("neither fill nor stroke") and mode 7 ("add to
+    /// clip only") are **invisible** -- MuPDF hands them to the device as
+    /// `fz_ignore_text` / clip text, never `fz_fill_text` -- but an
+    /// **extraction** sink still wants every one of those glyphs, because that
+    /// invisible layer is exactly the OCR text of a scanned "searchable image"
+    /// PDF. So extraction sinks keep this default no-op and still see all the
+    /// glyphs; the draw device overrides it and paints nothing for 3 and 7.
+    fn set_text_render_mode(&mut self, _mode: i32) {}
 }

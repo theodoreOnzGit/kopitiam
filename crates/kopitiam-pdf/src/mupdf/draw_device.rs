@@ -82,6 +82,10 @@ pub struct DrawDevice {
     /// real outline. See [`rasterize_page_ex`] / the `hayro_fallback` module
     /// for what this is used for.
     fallback_glyphs: usize,
+    /// The current text render mode (`Tr`), pushed by the interpreter through
+    /// [`TextDevice::set_text_render_mode`] before each glyph. Modes 3
+    /// (invisible) and 7 (clip only) paint nothing -- see `show_glyph`.
+    text_render_mode: i32,
 }
 
 impl DrawDevice {
@@ -97,6 +101,7 @@ impl DrawDevice {
             clip,
             fill: [0, 0, 0],
             fallback_glyphs: 0,
+            text_render_mode: 0,
         }
     }
 
@@ -122,6 +127,7 @@ impl DrawDevice {
             clip,
             fill: [0, 0, 0],
             fallback_glyphs: 0,
+            text_render_mode: 0,
         }
     }
 
@@ -338,6 +344,20 @@ impl TextDevice for DrawDevice {
             return;
         }
 
+        // MuPDF pdf_flush_text_imp: mode 3 sets only `doinvisible`, mode 7 only
+        // `doclip` -- neither fills nor strokes, so nothing reaches the pixels.
+        // This is the OCR layer of every Acrobat Capture / ocrmypdf "searchable
+        // image" scan: the words sit in `3 Tr` right over the scanned glyphs.
+        // Painting them (as the port used to) doubled every letter with a
+        // substituted face slightly off the scan -- or, for a font with no
+        // substitute (BookAntiqua, CenturyGothic...), covered the scan with
+        // solid advance boxes AND counted those boxes as fallback glyphs, which
+        // kicked the whole page over to the hayro fallback for no reason.
+        // Clip-text (4..=7) is not modelled by this device; 4..=6 still paint.
+        if matches!(self.text_render_mode, 3 | 7) {
+            return;
+        }
+
         let m = trm.concat(self.base);
 
         // Preferred path: fill the glyph's real outline from the embedded font
@@ -422,6 +442,10 @@ impl TextDevice for DrawDevice {
 
     fn set_fill_color(&mut self, color: [f32; 3]) {
         self.fill = rgb_to_bytes(color);
+    }
+
+    fn set_text_render_mode(&mut self, mode: i32) {
+        self.text_render_mode = mode;
     }
 }
 

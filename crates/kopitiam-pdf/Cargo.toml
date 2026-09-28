@@ -25,7 +25,14 @@ name = "kopitiam-pdf"
 # error on a scanned PDF now return decoded pixels. That is new behaviour on
 # an existing API, and a caller matching on that error to pick a fallback
 # path needs to know. Root `[workspace.dependencies]` moved to 0.4.0 with it.
-version = "0.4.0"
+#
+# 0.4.1 (2026-09-28 SGT) is a PATCH: bug fixes for scanned "searchable
+# image" PDFs rendering blank -- an indirect `/Contents` array was never run,
+# invisible (`3 Tr`/`7 Tr`) text was painted, and unknown Nonsymbolic fonts got
+# no flag-based substitute (MuPDF parity, see
+# docs/engineering-journal/2026-09-28-scanned-paper-blank-indirect-contents.md).
+# The only API change is additive: a defaulted `TextDevice::set_text_render_mode`.
+version = "0.4.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

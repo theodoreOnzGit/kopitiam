@@ -67,11 +67,29 @@ pub fn run_page_dict<D: TextDevice + ?Sized>(
     proc.run_stream(&contents)
 }
 
-// MuPDF: pdf_page_contents (pdf-page.c:730) + fz_open_contents_stream
-// (concatenation of multiple content streams with a separating newline).
+// MuPDF: pdf_page_contents (pdf-page.c:730) + pdf_open_contents_stream
+// (pdf-stream.c:852) / pdf_open_object_array (concatenation of multiple
+// content streams with a separating newline).
 /// Fetch and concatenate a page's `/Contents` (a single stream or an array of
 /// streams). Streams are separated by a newline so an operator split across the
 /// stream boundary still lexes.
+///
+/// # `/Contents 12 0 R` pointing at an ARRAY, not a stream — must resolve first
+///
+/// §7.7.3.3 allows `/Contents` to be "a content stream or an array of
+/// streams", and the array itself can be an **indirect object**. Acrobat
+/// Capture scans (the 1990s "searchable image" PDFs — one CCITT strip image
+/// per `Do`, dozens of tiny LZW content streams) write exactly that:
+/// `/Contents 1169 0 R` with `1169 0 obj [ 1172 0 R 1174 0 R … ] endobj`.
+///
+/// MuPDF handles it without a special case, because `pdf_is_array` resolves
+/// the reference before testing (`pdf_open_contents_stream`: array → concat,
+/// stream → open, anything else → warn + empty). The old port here matched on
+/// the *unresolved* object: a `Ref` went straight to `open_stream`, which
+/// failed ("not a stream"), the error was swallowed, and the whole page ran
+/// with **zero** content bytes — blank page, no image, no text, no error.
+/// kpdf-doctor saw "page is completely blank (0 dark pixels)" on such a scan.
+/// So resolve first lah, then branch — same order as MuPDF.
 fn gather_contents(doc: &PdfDocument, page: &Object) -> super::error::Result<Vec<u8>> {
     let contents = match page.dict_gets("Contents") {
         Some(c) => c,
@@ -79,21 +97,33 @@ fn gather_contents(doc: &PdfDocument, page: &Object) -> super::error::Result<Vec
     };
 
     let mut out = Vec::new();
-    match contents {
-        Object::Array(items) => {
-            for item in items {
+    // A direct array, or a reference that resolves to one.
+    let items = match contents {
+        Object::Array(items) => Some(items.clone()),
+        Object::Ref { .. } => match doc.resolve(contents) {
+            Ok(Object::Array(items)) => Some(items),
+            _ => None,
+        },
+        _ => None,
+    };
+    match items {
+        Some(items) => {
+            for item in &items {
+                // MuPDF: a part that fails to load is warned about and
+                // skipped; the rest of the page still runs.
                 if let Ok(bytes) = doc.open_stream(item) {
                     out.extend_from_slice(&bytes);
                     out.push(b'\n');
                 }
             }
         }
-        Object::Ref { .. } => {
-            if let Ok(bytes) = doc.open_stream(contents) {
+        None => {
+            if matches!(contents, Object::Ref { .. })
+                && let Ok(bytes) = doc.open_stream(contents)
+            {
                 out.extend_from_slice(&bytes);
             }
         }
-        _ => {}
     }
     Ok(out)
 }

@@ -152,6 +152,10 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // boxes render in the text's colour (the sink ignores this by default).
         let fill_color = self.gstate().fill_color;
         self.dev.set_fill_color(fill_color);
+        // And the `Tr` mode, so a painting device can leave invisible (3) and
+        // clip-only (7) text unpainted while extraction still sees the glyph.
+        let render_mode = self.gstate().text.render;
+        self.dev.set_text_render_mode(render_mode);
 
         // Emit. Split-borrow via direct field access: `font` reads self.gstack,
         // `dev` is a disjoint field, so the borrow checker permits both (going

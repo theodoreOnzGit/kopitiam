@@ -94,8 +94,8 @@ enum Family {
 
 /// Pick a standard-14 face for a non-embedded font.
 ///
-/// Ported from hayro-interpret 0.7.0 `select_standard_font`
-/// (`src/font/standard_font.rs`). Two stages, in this order:
+/// Stages 1-2 ported from hayro-interpret 0.7.0 `select_standard_font`
+/// (`src/font/standard_font.rs`), stage 3 from MuPDF. In this order:
 ///
 /// 1. **Literal match** against the 14 standard PostScript names.
 /// 2. **Keyword heuristic** over the lowercased base name, combined with the
@@ -103,6 +103,12 @@ enum Family {
 ///    makes Word and LibreOffice output readable: `ArialMT` contains "arial"
 ///    and maps to Helvetica, `Arial-BoldMT` adds bold, `TimesNewRomanPSMT`
 ///    contains "times" and maps to Times.
+///
+/// 3. **Descriptor flags** (MuPDF `pdf_lookup_substitute_font`): no family
+///    keyword in the name, but the descriptor says Nonsymbolic -> FixedPitch
+///    picks Courier, Serif picks Times, else Helvetica. See
+///    [`family_from_descriptor_flags`] for why this stage is narrower than
+///    MuPDF's (which substitutes *everything*).
 ///
 /// Returns `None` when nothing matches, which is deliberate: an unrecognised
 /// symbolic font substituted with Helvetica would render confident nonsense,
@@ -169,8 +175,16 @@ pub fn select_standard_font(base_font: &str, descriptor: &Object, doc: &PdfDocum
     } else if lower.contains("zapfdingbats") || lower.contains("dingbats") {
         return Some(StandardFont::ZapfDingBats);
     } else {
-        return None;
+        // Stage 3 -- MuPDF's last resort, see `family_from_descriptor_flags`.
+        // `None` there means "refuse": the honest advance box.
+        family_from_descriptor_flags(descriptor, doc)?
     };
+
+    // The descriptor's own Italic / ForceBold flags count too (MuPDF
+    // `pdf_load_system_font` ORs them with the name test).
+    let flags = descriptor_flags(descriptor, doc);
+    let is_bold = is_bold || flags & FLAG_FORCE_BOLD != 0;
+    let is_italic = is_italic || flags & FLAG_ITALIC != 0;
 
     Some(match (family, is_bold, is_italic) {
         (Family::Helvetica, false, false) => StandardFont::Helvetica,
@@ -185,6 +199,62 @@ pub fn select_standard_font(base_font: &str, descriptor: &Object, doc: &PdfDocum
         (Family::Times, true, false) => StandardFont::TimesBold,
         (Family::Times, false, true) => StandardFont::TimesItalic,
         (Family::Times, true, true) => StandardFont::TimesBoldItalic,
+    })
+}
+
+// PDF 32000-1:2008 §9.8.2, Table 123 -- font descriptor flags (bit N is
+// `1 << (N - 1)`). MuPDF names: PDF_FD_FIXED_PITCH, PDF_FD_SERIF, ...
+const FLAG_FIXED_PITCH: i64 = 1 << 0;
+const FLAG_SERIF: i64 = 1 << 1;
+const FLAG_SYMBOLIC: i64 = 1 << 2;
+const FLAG_NONSYMBOLIC: i64 = 1 << 5;
+const FLAG_ITALIC: i64 = 1 << 6;
+const FLAG_FORCE_BOLD: i64 = 1 << 18;
+
+/// The descriptor's `/Flags`, or 0 when there is no descriptor / no entry.
+fn descriptor_flags(descriptor: &Object, doc: &PdfDocument) -> i64 {
+    descriptor
+        .dict_gets("Flags")
+        .and_then(|o| doc.resolve(o).ok())
+        .map(|o| o.to_int())
+        .unwrap_or(0)
+}
+
+/// Stage 3: pick the family from the font descriptor's `/Flags` alone, when
+/// the name gave no keyword at all -- `BookAntiqua`, `CenturyGothic`,
+/// `BookmanOldStyle`, `LetterGothicMT`, the whole zoo an Acrobat Capture OCR
+/// layer names without embedding.
+///
+/// # Upstream
+///
+/// MuPDF `pdf_load_system_font` -> `pdf_load_substitute_font` ->
+/// `pdf_lookup_substitute_font` (`source/pdf/pdf-font.c`): FixedPitch picks
+/// Courier, else Serif picks Times, else Helvetica. MuPDF never gives up --
+/// every non-embedded simple font ends on *some* base-14 face.
+///
+/// # Deliberate, narrower-than-MuPDF guard
+///
+/// This module refuses an unknown name rather than guess (see
+/// `select_standard_font`'s doc and the `an_unrecognised_name_is_refused`
+/// test: Wingdings-as-Helvetica is confident nonsense). So the flag stage
+/// only fires when the descriptor **positively says the font is a normal
+/// text font**: `/Flags` has Nonsymbolic set and Symbolic clear. A symbolic
+/// or flag-less font still gets `None` and the honest advance box. For a
+/// Nonsymbolic font the glyphs ARE Latin text in the standard character set
+/// (that is what the flag asserts, §9.8.2), and the PDF's own `/Widths` still
+/// drives layout, so a metric-approximate Times/Helvetica is legible and put
+/// in the right place -- strictly better than a row of boxes.
+fn family_from_descriptor_flags(descriptor: &Object, doc: &PdfDocument) -> Option<Family> {
+    let flags = descriptor_flags(descriptor, doc);
+    if flags & FLAG_NONSYMBOLIC == 0 || flags & FLAG_SYMBOLIC != 0 {
+        return None;
+    }
+    Some(if flags & FLAG_FIXED_PITCH != 0 {
+        Family::Courier
+    } else if flags & FLAG_SERIF != 0 {
+        Family::Times
+    } else {
+        Family::Helvetica
     })
 }
 
@@ -366,6 +436,52 @@ mod tests {
         let d = doc();
         assert!(select_standard_font("Wingdings", &no_descriptor(), &d).is_none());
         assert!(select_standard_font("SomeCorporateIcons", &no_descriptor(), &d).is_none());
+    }
+
+    /// Stage 3 (MuPDF `pdf_lookup_substitute_font`): a name with no family
+    /// keyword falls back to the descriptor's flags -- but ONLY for a font
+    /// the descriptor asserts is Nonsymbolic. These are the Acrobat Capture
+    /// OCR-layer names, with the flag values such files really carry
+    /// (e.g. `BookAntiqua,BoldItalic` /Flags 16482 = Serif|Nonsymbolic|Italic).
+    #[test]
+    fn descriptor_flags_pick_a_face_for_unknown_text_fonts() {
+        let d = doc();
+        let desc = |flags: i64| {
+            let mut o = Object::new_dict();
+            o.dict_put("Flags", Object::new_int(flags));
+            o
+        };
+        for (name, flags, want) in [
+            // Serif | Nonsymbolic | Italic, "Bold" in the name.
+            ("BookAntiqua,BoldItalic", 16482, StandardFont::TimesBoldItalic),
+            // Serif | Nonsymbolic.
+            ("BookmanOldStyle", 34, StandardFont::TimesRoman),
+            // Nonsymbolic only -> sans.
+            ("CenturyGothic,Bold", 32, StandardFont::HelveticaBold),
+            // FixedPitch | Nonsymbolic.
+            ("LetterGothicMT", 33, StandardFont::Courier),
+            // ForceBold flag, name says nothing.
+            ("Garamond", 32 | 2 | (1 << 18), StandardFont::TimesBold),
+        ] {
+            let got = select_standard_font(name, &desc(flags), &d).expect(name);
+            assert_eq!(key(got), key(want), "{name}");
+        }
+    }
+
+    /// The guard: an unknown name whose descriptor says Symbolic (or has no
+    /// Nonsymbolic bit) is still refused -- flags do not license guessing a
+    /// dingbat font's glyphs.
+    #[test]
+    fn descriptor_flags_do_not_substitute_symbolic_fonts() {
+        let d = doc();
+        for flags in [4, 4 | 2, 0, 2] {
+            let mut desc = Object::new_dict();
+            desc.dict_put("Flags", Object::new_int(flags));
+            assert!(
+                select_standard_font("Wingdings", &desc, &d).is_none(),
+                "Flags {flags} must not substitute"
+            );
+        }
     }
 
     /// Every one of the 14 faces must actually parse with our own CFF decoder,
