@@ -62,6 +62,7 @@ aes = { workspace = true }
 cbc = { workspace = true }
 md-5 = { workspace = true }
 rc4 = { workspace = true }
+sha2 = { workspace = true }
 # Pure-Rust JPEG decoder for the MuPDF port's embedded-image layer
 # (crates/kopitiam-pdf/src/mupdf/page_image.rs), decoding DCTDecode Image
 # XObjects. Substitutes MuPDF's C `<jpeglib.h>` (source/fitz/load-jpeg.c); no C

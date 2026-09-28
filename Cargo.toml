@@ -105,6 +105,10 @@ aes = "0.8"
 cbc = "0.1"
 md-5 = "0.10"
 rc4 = "0.1"
+# SHA-256/384/512 for the AES-256 (/R 5, /R 6) key derivation (0.4.2),
+# substituting MuPDF's crypt-sha2.c. The 0.10 line is already in Cargo.lock
+# (digest 0.10, same as md-5), so no new crate enters the tree.
+sha2 = "0.10"
 # `lopdf` is already pulled in transitively by `pdf-extract` (pinned to the
 # same "0.42" line here so Cargo unifies to the one copy already present,
 # adding no new crate to the dependency tree). kopitiam-pdf depends on it

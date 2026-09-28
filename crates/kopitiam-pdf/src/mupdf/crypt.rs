@@ -23,9 +23,19 @@
 //! | 2 | 1 | 40-bit, MD5 once | RC4 |
 //! | 3 | 2 | `/Length` bits, MD5 x51 | RC4 |
 //! | 4 | 4 | `/Length` bits, MD5 x51 | RC4 or AES-128, per `/CF` |
+//! | 5 | 5 | 256-bit, SHA-256, unwrapped from `/UE` | AES-256 (`/AESV3`) |
+//! | 6 | 5 | 256-bit, the SHA-2 "hardened hash", unwrapped from `/UE` | AES-256 (`/AESV3`) |
 //!
-//! `/R 5` and `/R 6` (AES-256, SHA-2 based, PDF 2.0) are **not** implemented;
-//! they use a completely different key derivation and are refused by name.
+//! ~~`/R 5` and `/R 6` (AES-256, SHA-2 based, PDF 2.0) are **not** implemented;
+//! they use a completely different key derivation and are refused by name.~~
+//! **CORRECTED 2026-09-28 (0.4.2)**: R5 and R6 are ported from MuPDF
+//! (`pdf_compute_encryption_key_r5` / `_r6`, `pdf_compute_hardened_hash_r6`,
+//! pdf-crypt.c:447-589), including MuPDF's order of trying the password as
+//! the user password first and then as the owner password, and its Acrobat
+//! rule that an EMPTY password never opens a file as the owner
+//! (pdf-crypt.c:817). The empty user password is what opens an Acrobat X+
+//! owner-restricted file. SHA-2 comes from the `sha2` crate
+//! (substituting crypt-sha2.c), AES from `aes`/`cbc` as before.
 //!
 //! # Why MD5, in 2026
 //!
@@ -44,8 +54,9 @@
 //! object numbers produces convincing garbage. See
 //! [`Decryptor::decrypt_string`]'s contract.
 
-use aes::Aes128;
-use aes::cipher::{BlockDecryptMut, KeyIvInit};
+use aes::{Aes128, Aes256};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use sha2::{Sha256, Sha384, Sha512};
 use md5::{Digest, Md5};
 use rc4::{KeyInit, Rc4, StreamCipher};
 
@@ -54,6 +65,8 @@ use super::error::{Error, Result};
 use super::object::Object;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
+type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
 /// Apply RC4 in place with a **runtime-length** key.
 ///
@@ -116,6 +129,9 @@ pub enum Method {
     Rc4,
     /// AES-128 in CBC mode, `/CFM /AESV2`.
     Aes128,
+    /// AES-256 in CBC mode, `/CFM /AESV3` (R5/R6). The object key is the
+    /// file key itself -- no per-object MD5 (pdf-crypt.c:1082).
+    Aes256,
 }
 
 /// The fields of an `/Encrypt` dictionary that the standard security handler
@@ -140,6 +156,12 @@ pub struct EncryptDict<'a> {
     pub o: &'a [u8],
     /// `/U`, the user-password entry, checked by Algorithm 6.
     pub u: &'a [u8],
+    /// `/OE` (R5/R6 only): the file key wrapped under the owner password.
+    /// Empty for R2-R4.
+    pub oe: &'a [u8],
+    /// `/UE` (R5/R6 only): the file key wrapped under the user password.
+    /// Empty for R2-R4.
+    pub ue: &'a [u8],
     /// `/P`, the permissions bitfield. **Signed** -- see [`file_key`].
     pub p: i64,
     /// The first element of the trailer's `/ID` array.
@@ -177,6 +199,8 @@ impl Decryptor {
             length_bits,
             o,
             u,
+            oe,
+            ue,
             p,
             first_id,
             encrypt_metadata,
@@ -189,10 +213,12 @@ impl Decryptor {
                 "security handler /{filter} (only /Standard is implemented)"
             )));
         }
+        if r == 5 || r == 6 {
+            return Decryptor::new_aes256(r, o, u, oe, ue, password, stream_method, string_method);
+        }
         if !(2..=4).contains(&r) {
             return Err(Error::unsupported(format!(
-                "standard security handler revision R{r} (only R2-R4 are \
-                 implemented; R5/R6 use AES-256 with a different key derivation)"
+                "standard security handler revision R{r} (only R2-R6 are implemented)"
             )));
         }
         if o.len() < 32 {
@@ -233,6 +259,64 @@ impl Decryptor {
         })
     }
 
+    // MuPDF: pdf_authenticate_password (pdf-crypt.c) for R5/R6 -- the user
+    // password (pdf_authenticate_user_password -> pdf_compute_user_password),
+    // then the same bytes as the owner password
+    // (pdf_authenticate_owner_password); each side-effects crypt->key, which
+    // here is the returned key.
+    #[allow(clippy::too_many_arguments)]
+    fn new_aes256(
+        r: i64,
+        o: &[u8],
+        u: &[u8],
+        oe: &[u8],
+        ue: &[u8],
+        password: &[u8],
+        stream_method: Method,
+        string_method: Method,
+    ) -> Result<Decryptor> {
+        // pdf_new_crypt: /O and /U are 48 bytes, /OE and /UE 32, for R5/R6.
+        if o.len() < 48 || u.len() < 48 {
+            return Err(Error::format("/Encrypt /O and /U must be 48 bytes for R5/R6"));
+        }
+        if oe.len() != 32 {
+            return Err(Error::format("encryption dictionary missing owner encryption key"));
+        }
+        if ue.len() != 32 {
+            return Err(Error::format("encryption dictionary missing user encryption key"));
+        }
+        // "illegal encryption method for revision 5/6, assuming AESV3"
+        // (pdf_parse_crypt_filter).
+        let fix = |m: Method| if m == Method::None { m } else { Method::Aes256 };
+        // "Step 2 - truncate UTF-8 password to 127 characters"
+        let pw = &password[..password.len().min(127)];
+        // pdf_authenticate_password: "To match Acrobat, we choose not to
+        // allow an empty owner password, unless the user password is also
+        // the empty one" (pdf-crypt.c:817) -- so for the empty password only
+        // the user side may open the file.
+        let sides: &[bool] = if pw.is_empty() { &[false] } else { &[false, true] };
+        for &ownerkey in sides {
+            let (validation, key) = if r == 5 {
+                encryption_key_r5(pw, o, u, oe, ue, ownerkey)
+            } else {
+                encryption_key_r6(pw, o, u, oe, ue, ownerkey)
+            };
+            // user: memcmp(output, crypt->u, 32); owner: memcmp(key, crypt->o, 32)
+            let expect = if ownerkey { &o[..32] } else { &u[..32] };
+            if validation[..] == expect[..] {
+                return Ok(Decryptor {
+                    key: key.to_vec(),
+                    stream_method: fix(stream_method),
+                    string_method: fix(string_method),
+                });
+            }
+        }
+        Err(Error::unsupported(
+            "encrypted PDF needs a user password (the empty password does not \
+             open it)",
+        ))
+    }
+
     /// Decrypt a stream's raw bytes, **before** any `/Filter` is applied.
     ///
     /// Order matters and is not negotiable: the bytes on disk are
@@ -264,6 +348,8 @@ impl Decryptor {
                 out
             }
             Method::Aes128 => decrypt_aes_cbc(&self.object_key(num, generation, true), data),
+            // pdf_compute_object_key: AESV3 uses the file key as is.
+            Method::Aes256 => decrypt_aes_cbc(&self.key, data),
         }
     }
 
@@ -373,24 +459,130 @@ fn decrypt_aes_cbc(key: &[u8], data: &[u8]) -> Vec<u8> {
     }
     let (iv, body) = data.split_at(AES_BLOCK);
     let mut buf = body.to_vec();
-    let Ok(mut dec) = Aes128CbcDec::new_from_slices(key, iv) else {
-        return Vec::new();
-    };
     // Decrypt block by block WITHOUT the library's padding check, then strip
     // the padding ourselves. A malformed trailer should then cost us a few
     // bytes rather than the whole stream: a PDF is untrusted input, and a
     // viewer that shows nothing because the last block is off is worse than
-    // one that shows the page.
+    // one that shows the page. The key length picks AES-128 or AES-256.
     let (blocks, _) = buf.as_mut_slice().as_chunks_mut::<AES_BLOCK>();
-    for chunk in blocks {
-        let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
-        dec.decrypt_block_mut(block);
+    macro_rules! run {
+        ($dec:ty) => {{
+            let Ok(mut dec) = <$dec>::new_from_slices(key, iv) else {
+                return Vec::new();
+            };
+            for chunk in blocks {
+                let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+                dec.decrypt_block_mut(block);
+            }
+        }};
+    }
+    if key.len() == 32 {
+        run!(Aes256CbcDec);
+    } else {
+        run!(Aes128CbcDec);
     }
     let pad = *buf.last().unwrap_or(&0) as usize;
     if (1..=AES_BLOCK).contains(&pad) && pad <= buf.len() {
         buf.truncate(buf.len() - pad);
     }
     buf
+}
+
+// MuPDF: pdf_compute_encryption_key_r5 (pdf-crypt.c:447), PDF 1.7
+// ExtensionLevel 3 algorithm 3.2a. Returns (validation hash, file key):
+// SHA-256(password || validation salt [|| U]) is compared with /U (or /O);
+// SHA-256(password || key salt [|| U]) unwraps /UE (or /OE) with AES-256-CBC,
+// zero IV, no padding.
+fn encryption_key_r5(pw: &[u8], o: &[u8], u: &[u8], oe: &[u8], ue: &[u8], ownerkey: bool) -> ([u8; 32], [u8; 32]) {
+    use sha2::Digest as _;
+    let hash = |salt: &[u8]| -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(pw);
+        h.update(salt);
+        if ownerkey {
+            h.update(&u[..48]);
+        }
+        h.finalize().into()
+    };
+    let src = if ownerkey { o } else { u };
+    let validation = hash(&src[32..40]);
+    let kek = hash(&src[40..48]);
+    (validation, unwrap_file_key(&kek, if ownerkey { oe } else { ue }))
+}
+
+// MuPDF: pdf_compute_encryption_key_r6 (pdf-crypt.c:569) -- the same shape
+// as R5 with the hardened hash in place of one SHA-256.
+fn encryption_key_r6(pw: &[u8], o: &[u8], u: &[u8], oe: &[u8], ue: &[u8], ownerkey: bool) -> ([u8; 32], [u8; 32]) {
+    let src = if ownerkey { o } else { u };
+    let okey = if ownerkey { Some(&u[..48]) } else { None };
+    let validation = hardened_hash_r6(pw, &src[32..40], okey);
+    let kek = hardened_hash_r6(pw, &src[40..48], okey);
+    (validation, unwrap_file_key(&kek, if ownerkey { oe } else { ue }))
+}
+
+// fz_aes_crypt_cbc(FZ_AES_DECRYPT, 32 bytes, zero IV) of /UE or /OE.
+fn unwrap_file_key(kek: &[u8; 32], wrapped: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&wrapped[..32]);
+    if let Ok(mut dec) = Aes256CbcDec::new_from_slices(kek, &[0u8; 16]) {
+        let (blocks, _) = out.as_mut_slice().as_chunks_mut::<AES_BLOCK>();
+        for chunk in blocks {
+            dec.decrypt_block_mut(aes::cipher::generic_array::GenericArray::from_mut_slice(chunk));
+        }
+    }
+    out
+}
+
+// MuPDF: pdf_compute_hardened_hash_r6 (pdf-crypt.c:502), the ISO 32000-2
+// algorithm 2.B: at least 64 rounds of "repeat (password || block || U) 64
+// times, AES-128-CBC-encrypt it keyed by the block, pick SHA-256/384/512 by
+// the first 16 bytes mod 3", ending once the last byte of the round's data
+// is below round - 32.
+fn hardened_hash_r6(pw: &[u8], salt: &[u8], ownerkey: Option<&[u8]>) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut block = [0u8; 64];
+    let mut h = Sha256::new();
+    h.update(pw);
+    h.update(salt);
+    if let Some(k) = ownerkey {
+        h.update(k);
+    }
+    block[..32].copy_from_slice(&h.finalize());
+    let mut block_size = 32usize;
+    let mut data: Vec<u8> = Vec::new();
+    let mut i = 0u32;
+    // `for (i = 0; i < 64 || i < data[data_len * 64 - 1] + 32; i++)`
+    while i < 64 || i < u32::from(*data.last().unwrap_or(&0)) + 32 {
+        // Step 2: password || block || [ownerkey], 64 times.
+        let mut one = Vec::with_capacity(pw.len() + block_size + 48);
+        one.extend_from_slice(pw);
+        one.extend_from_slice(&block[..block_size]);
+        if let Some(k) = ownerkey {
+            one.extend_from_slice(k);
+        }
+        data = one.repeat(64);
+        // Step 3: AES-128-CBC, key = block[0..16], iv = block[16..32].
+        // data_len * 64 is always a multiple of 16 (64 x anything).
+        if let Ok(mut enc) = Aes128CbcEnc::new_from_slices(&block[..16], &block[16..32]) {
+            let (blocks, _) = data.as_mut_slice().as_chunks_mut::<AES_BLOCK>();
+            for chunk in blocks {
+                enc.encrypt_block_mut(aes::cipher::generic_array::GenericArray::from_mut_slice(chunk));
+            }
+        }
+        // Step 4: the hash size, from the first 16 bytes' sum mod 3.
+        let sum: u32 = data[..16].iter().map(|&b| u32::from(b)).sum();
+        block_size = 32 + (sum % 3) as usize * 16;
+        // Step 5: the next block.
+        match block_size {
+            32 => block[..32].copy_from_slice(&Sha256::digest(&data)),
+            48 => block[..48].copy_from_slice(&Sha384::digest(&data)),
+            _ => block[..64].copy_from_slice(&Sha512::digest(&data)),
+        }
+        i += 1;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&block[..32]);
+    out
 }
 
 /// Read a crypt filter's method out of `/CF << /<name> << /CFM ... >> >>`.
@@ -415,6 +607,7 @@ pub fn method_for_filter(
     match resolve(&entry, "CFM").as_ref().map(Object::to_name) {
         Some(b"V2") => Method::Rc4,
         Some(b"AESV2") => Method::Aes128,
+        Some(b"AESV3") => Method::Aes256,
         _ => Method::None,
     }
 }
@@ -432,6 +625,8 @@ mod tests {
             length_bits: 128,
             o,
             u,
+            oe: &[],
+            ue: &[],
             p: -1052,
             first_id: b"id",
             encrypt_metadata: true,
@@ -562,10 +757,98 @@ mod tests {
     /// R5/R6 use a different derivation entirely, and a confident wrong answer
     /// is worse than a refusal.
     #[test]
-    fn aes_256_revisions_are_refused_with_an_explanation() {
+    fn aes_256_revisions_need_their_48_byte_entries_and_r7_is_refused() {
+        // ~~R6 is not implemented~~ (CORRECTED 0.4.2: it is). A 32-byte /O
+        // is malformed for R5/R6 (pdf_new_crypt), and an unknown revision is
+        // still refused by name.
         let err = Decryptor::new(&dict("Standard", 5, 6, &[0u8; 32], &[0u8; 48]), b"")
-            .expect_err("R6 is not implemented");
-        assert!(err.to_string().contains("R6"), "{err}");
+            .expect_err("a 32-byte /O is malformed for R6");
+        assert!(err.to_string().contains("48 bytes"), "{err}");
+        let err = Decryptor::new(&dict("Standard", 5, 7, &[0u8; 48], &[0u8; 48]), b"")
+            .expect_err("R7 does not exist");
+        assert!(err.to_string().contains("R7"), "{err}");
+    }
+
+    /// R6 end to end against the SPEC's shape rather than a fixture: build
+    /// /U and /UE the way a writer does (pdf_compute_user_password_r6,
+    /// pdf-crypt.c:1357 -- validation hash of the validation salt, key salt
+    /// hash wrapping the file key), then check the decryptor authenticates the
+    /// empty password and unwraps exactly that key, and that a wrong password
+    /// is refused. The committed mutool-made fixture in tests/mupdf_parity.rs
+    /// is the cross-implementation check.
+    #[test]
+    fn r6_authenticates_and_unwraps_the_file_key_it_was_built_with() {
+        let file_key = [0x5au8; 32];
+        let (vsalt, ksalt) = ([1u8, 2, 3, 4, 5, 6, 7, 8], [9u8, 10, 11, 12, 13, 14, 15, 16]);
+        let mut u = hardened_hash_r6(b"", &vsalt, None).to_vec();
+        u.extend_from_slice(&vsalt);
+        u.extend_from_slice(&ksalt);
+        let kek = hardened_hash_r6(b"", &ksalt, None);
+        let mut ue = file_key;
+        let mut enc = cbc::Encryptor::<Aes256>::new_from_slices(&kek, &[0u8; 16]).unwrap();
+        for chunk in ue.as_mut_slice().as_chunks_mut::<AES_BLOCK>().0 {
+            enc.encrypt_block_mut(aes::cipher::generic_array::GenericArray::from_mut_slice(chunk));
+        }
+        let o = [0u8; 48];
+        let d = EncryptDict { oe: &[0u8; 32], ue: &ue, ..dict("Standard", 5, 6, &o, &u) };
+        let dec = Decryptor::new(&d, b"").expect("the empty password is the user password");
+        assert_eq!(dec.key, file_key.to_vec());
+        assert_eq!(dec.stream_method, Method::Aes256, "R6 forces AESV3");
+        assert!(Decryptor::new(&d, b"wrong").is_err());
+    }
+
+    fn wrap(kek: &[u8; 32], key: [u8; 32]) -> [u8; 32] {
+        let mut w = key;
+        let mut enc = cbc::Encryptor::<Aes256>::new_from_slices(kek, &[0u8; 16]).unwrap();
+        for chunk in w.as_mut_slice().as_chunks_mut::<AES_BLOCK>().0 {
+            enc.encrypt_block_mut(aes::cipher::generic_array::GenericArray::from_mut_slice(chunk));
+        }
+        w
+    }
+
+    /// The OWNER path, both revisions: user password "secret", owner
+    /// password "own" (pdf_authenticate_owner_password: validation over
+    /// password || salt || the 48-byte /U, key unwrapped from /OE). Then
+    /// MuPDF's Acrobat rule: with an EMPTY owner password, the empty
+    /// password must still be refused (pdf-crypt.c:817) -- the committed
+    /// mutool-made encrypted-aes256-r6-empty-owner.pdf pins that for R6.
+    #[test]
+    fn owner_passwords_open_r5_and_r6_but_an_empty_one_does_not() {
+        use sha2::Digest as _;
+        let file_key = [0xc3u8; 32];
+        let (uv, uk, ov, ok) = ([1u8; 8], [2u8; 8], [3u8; 8], [4u8; 8]);
+        for (r, owner) in [(5i64, &b"own"[..]), (6, b"own"), (5, b""), (6, b"")] {
+            let h = |pw: &[u8], salt: &[u8], k: Option<&[u8]>| -> [u8; 32] {
+                if r == 6 {
+                    hardened_hash_r6(pw, salt, k)
+                } else {
+                    let mut d = Sha256::new();
+                    d.update(pw);
+                    d.update(salt);
+                    if let Some(k) = k {
+                        d.update(k);
+                    }
+                    d.finalize().into()
+                }
+            };
+            let mut u = h(b"secret", &uv, None).to_vec();
+            u.extend_from_slice(&uv);
+            u.extend_from_slice(&uk);
+            let ue = wrap(&h(b"secret", &uk, None), file_key);
+            let mut o = h(owner, &ov, Some(&u)).to_vec();
+            o.extend_from_slice(&ov);
+            o.extend_from_slice(&ok);
+            let oe = wrap(&h(owner, &ok, Some(&u)), file_key);
+            let d = EncryptDict { oe: &oe, ue: &ue, ..dict("Standard", 5, r, &o, &u) };
+            let dec = Decryptor::new(&d, b"secret").unwrap_or_else(|e| panic!("R{r}: user auth: {e}"));
+            assert_eq!(dec.key, file_key.to_vec(), "R{r}");
+            if owner.is_empty() {
+                assert!(Decryptor::new(&d, b"").is_err(), "R{r}: an empty owner password must not open");
+            } else {
+                let dec = Decryptor::new(&d, owner).unwrap_or_else(|e| panic!("R{r}: owner auth: {e}"));
+                assert_eq!(dec.key, file_key.to_vec(), "R{r}");
+            }
+        }
     }
 
     #[test]

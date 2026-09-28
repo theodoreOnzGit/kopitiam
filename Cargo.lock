@@ -4333,6 +4333,7 @@ dependencies = [
  "pdf-extract",
  "rc4",
  "rfd",
+ "sha2",
  "skrifa 0.42.1",
  "thiserror 2.0.18",
  "unicode-general-category",

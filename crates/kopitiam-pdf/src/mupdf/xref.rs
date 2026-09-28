@@ -263,6 +263,9 @@ impl PdfDocument {
             .unwrap_or(40);
         let o = self.resolve_get(&enc, "O")?.to_string_bytes().to_vec();
         let u = self.resolve_get(&enc, "U")?.to_string_bytes().to_vec();
+        // R5/R6: the wrapped file keys (pdf_new_crypt, pdf-crypt.c:163).
+        let oe = self.resolve_get(&enc, "OE").map(|o| o.to_string_bytes().to_vec()).unwrap_or_default();
+        let ue = self.resolve_get(&enc, "UE").map(|o| o.to_string_bytes().to_vec()).unwrap_or_default();
         let p = self.resolve_get(&enc, "P").map(|o| o.to_int()).unwrap_or(0);
         // /EncryptMetadata defaults TRUE when absent (§7.6.3.2). Defaulting it
         // false would mix an extra FF FF FF FF into the key and open nothing.
@@ -309,6 +312,8 @@ impl PdfDocument {
                 length_bits: length,
                 o: &o,
                 u: &u,
+                oe: &oe,
+                ue: &ue,
                 p,
                 first_id: &first_id,
                 encrypt_metadata,

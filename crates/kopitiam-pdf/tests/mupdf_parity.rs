@@ -981,3 +981,25 @@ q 200 0 0 100 0 0 cm /B Do Q q 100 0 0 100 100 100 cm /C Do Q",
         assert_eq!(rgb_at(&pix, p.0, p.1), want, "at {p:?}");
     }
 }
+
+/// AES-256 (`/V 5 /R 6`, `/AESV3`), made by mutool itself
+/// (`tests/fixtures/make-encrypted-aes256.py`). 0.4.1 refused R5/R6 by name,
+/// so this Acrobat X+-style owner-restricted file (empty user password) did
+/// not open at all. mutool renders the red square at (50, 50); the Info
+/// title string decrypts too. The second fixture has user password
+/// "secret" and an EMPTY owner password: the empty password authenticates
+/// as the owner, but MuPDF refuses that "to match Acrobat"
+/// (pdf-crypt.c:817) and mutool will not open it without `-p`; so must we.
+#[test]
+fn aes_256_r6_file_opens_with_the_empty_user_password() {
+    let doc = PdfDocument::open(include_bytes!("fixtures/encrypted-aes256-r6.pdf").to_vec())
+        .expect("R6 with an empty user password opens");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 50, 50), [255, 0, 0], "the red square decrypts");
+    assert_eq!(rgb_at(&pix, 5, 5), [255, 255, 255]);
+    let info = doc.resolve(doc.trailer().dict_gets("Info").expect("/Info")).expect("resolves");
+    let title = doc.resolve_get(&info, "Title").expect("title");
+    assert_eq!(title.to_string_bytes(), b"AES-256 fixture");
+    let refused = PdfDocument::open(include_bytes!("fixtures/encrypted-aes256-r6-empty-owner.pdf").to_vec());
+    assert!(refused.is_err(), "an empty owner password must not open the file");
+}
