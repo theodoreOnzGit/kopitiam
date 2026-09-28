@@ -115,3 +115,39 @@ What the baseline says, in one breath each:
   codecs (JPX blank on NUREG/CR-7289, JBIG2 blank) and on the WASH-1400 CCITT
   scan (1-bit image downscaling, bd-6lx), plus a handful of vector pages still
   to be diagnosed.
+
+### After tranche 1 (structured text) -- measured 2026-09-28
+
+Fixes (all in `pdf-op-run.c` / `stext-device.c` control flow; the formulas
+were already right):
+
+1. **One-to-many ToUnicode fillers** (`pdf_show_char`, pdf-op-run.c:1449): the
+   2nd+ code points of a ToUnicode entry are now shown as zero-advance filler
+   chars (new defaulted `TextDevice::show_filler_char`; the draw device paints
+   nothing for them, same as MuPDF's `gid = -1`).
+2. **The no-glyph / non-spacing-mark pen rule** (stext-device.c:850-858):
+   fillers, ligature tails and `Mn` combining marks sit on the pen and do not
+   move it.
+3. **`glyph` sign convention**: real glyphs now carry `glyph >= 0` into
+   `add_char_imp`, which re-enables MuPDF's fake-bold overprint drop (it was
+   silently off because every glyph arrived as `-1`).
+4. **Presentation-form decomposition** (stext-device.c:1097-1104).
+
+Only the text columns moved; the raster and object columns are identical to
+the baseline row for row, as they should be.
+
+| file | text pages pass (before -> after) | chars missing / extra, after (of MuPDF's) | max origin err (pt) |
+|---|---|---|---|
+| ML13325A086.pdf | 328 -> **349/349** | 0 / 0 (of 420628) | 0.000 |
+| ML22063A060.pdf | 195 -> 208/209 | 0 / 144 (of 309291) | 0.000 |
+| physor2026-306 | 0 -> **8/8** | 0 / 0 | 0.000 |
+| physor2026-449 | 0 -> **8/8** | 0 / 0 | 0.000 |
+| arxiv-2608.17504v1 | 6 -> **78/78** | 0 / 0 (of 170547) | 0.000 |
+| every other file | unchanged, all pages pass | 0 / 0 | 0.000 |
+| **total** | 1245 -> **1367/1368** | **0 / 144 (of 2023821)** | **0.000** |
+
+The one remaining page (NUREG/CR-7289 p. 2) is **ActualText**: the paragraph
+sits in a marked-content span `/ActualText ()` (empty), which MuPDF emits
+instead of the glyphs, so its text vanishes from MuPDF's stext. We ignore
+marked content, so we keep the 144 glyph chars. Recorded as a gap in the
+coverage map, not fixed in this tranche.

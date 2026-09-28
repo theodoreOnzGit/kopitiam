@@ -4333,6 +4333,8 @@ dependencies = [
  "rfd",
  "skrifa 0.42.1",
  "thiserror 2.0.18",
+ "unicode-general-category",
+ "unicode-normalization",
  "zune-jpeg",
 ]
 

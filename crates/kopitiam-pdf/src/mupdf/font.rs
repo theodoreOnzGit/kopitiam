@@ -763,6 +763,38 @@ impl Font {
         }
     }
 
+    // MuPDF: pdf_show_char's "add filler glyphs for one-to-many unicode
+    // mapping" loop (pdf-op-run.c:1449-1451).
+    /// The *extra* code points a one-to-many `/ToUnicode` entry maps `cid` to
+    /// -- `ucsbuf[1..ucslen]` in MuPDF. Empty for the ordinary one-to-one case.
+    ///
+    /// Why this matter: a TeX or InDesign PDF draws "fi" as ONE ligature glyph
+    /// whose ToUnicode says `<0C> <00660069>` ("f" "i"). [`Font::decode`] only
+    /// carries the first code point (`ucsbuf[0]`, the one that gets the glyph and
+    /// the advance); MuPDF then shows every remaining code point as a zero-advance
+    /// "filler" glyph (`gid = -1`) at the same pen position. Drop the fillers and
+    /// every "fi"/"fl"/"ffi" in the document extracts as a bare "f" -- that was
+    /// the 0.4.1 behaviour, caught by the mupdf_oracle harness (hundreds of lost
+    /// `i`/`l` on the PHYSOR + arXiv papers).
+    ///
+    /// Only the ToUnicode path can produce more than one code point; the
+    /// `cid_to_ucs` fallback is strictly one-to-one, same as MuPDF.
+    pub fn decode_fillers(&self, code: u32) -> Vec<char> {
+        let cid = self.encoding.lookup(code).unwrap_or(code);
+        let Some(tu) = &self.to_unicode else {
+            return Vec::new();
+        };
+        let mut ucsbuf: Vec<u32> = Vec::new();
+        let ucslen = tu.lookup_full(cid, &mut ucsbuf);
+        if ucslen <= 1 {
+            return Vec::new();
+        }
+        ucsbuf[1..ucslen.min(ucsbuf.len())]
+            .iter()
+            .map(|&u| char::from_u32(u).unwrap_or('\u{FFFD}'))
+            .collect()
+    }
+
     // MuPDF: pdf_show_char's ucs resolution (pdf-op-run.c:1414-1435).
     fn decode_unicode(&self, cid: u32) -> char {
         let mut ucsbuf: Vec<u32> = Vec::new();

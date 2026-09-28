@@ -42,19 +42,19 @@
 //!
 //! * **Accurate glyph bboxes / FreeType** (`FZ_STEXT_ACCURATE_BBOXES`,
 //!   `_ASCENDERS`, `_SIDE_BEARINGS`): this port is scalar-metrics only, so the
-//!   `NON_ACCURATE_GLYPH` path is always taken and `glyph` is never a real gid.
+//!   non-accurate quad path is always taken. (`glyph` does carry MuPDF's
+//!   sign convention since 0.4.2: `>= 0` real glyph, `-1` no-glyph filler.)
 //! * **Vertical writing mode** (`wmode == 1`): the horizontal path is complete;
 //!   the vertical quad/positioning arm is stubbed (`a=(1,0) d=(0,0)`) and
 //!   vertical space-synthesis is not tuned. Horizontal is the common case.
 //! * **Bidi / RTL reordering**: the interpreter supplies no bidi level, so
 //!   every char is treated LTR/neutral; the RTL/visual-order branch and
 //!   `reverse_bidi_line` are omitted.
-//! * **Combining marks**: MuPDF skips pen-advance for `UCDN_GENERAL_CATEGORY_MN`
-//!   glyphs; without a UCD table this port treats them as normal chars.
-//! * **General ligature decomposition**: the explicit ff/fi/fl/ffi/ffl/st
-//!   ligatures are expanded; the broader Unicode presentation-form
-//!   decomposition (`ucdn_compat_decompose`) is deferred.
-//! * **ActualText, clipping, styles/fake-bold, images, structure, tables,
+//! * ~~**Combining marks**~~ and ~~**general ligature decomposition**~~ --
+//!   **DONE 2026-09-28 (0.4.2)**: `Mn` chars and no-glyph fillers ride on the
+//!   pen (the `glyph == -1 || MN` arm), and presentation forms decompose
+//!   (`unicode-general-category` / `unicode-normalization` stand in for ucdn).
+//! * **ActualText, styles, images, structure, tables,
 //!   segmentation**: recognised via [`StextOptions`] flags but not acted upon
 //!   (later waves). Layout analysis (reading order / paragraphs) is the *next*
 //!   wave.
@@ -84,11 +84,9 @@ const BASE_MAX_DIST: f32 = 0.8;
 /// treated as fake-bold overprint and dropped.
 const FAKE_BOLD_MAX_DIST: f32 = 0.1;
 
-// MuPDF: stext-device.c:435-436 -- glyph sentinels for the non-accurate path.
+// MuPDF: stext-device.c:435 -- glyph sentinel for the non-accurate path.
 /// The glyph is a synthesised space in accurate mode (unused here; scalar mode).
 const NON_ACCURATE_GLYPH_ADDED_SPACE: i32 = -2;
-/// The glyph is drawn with scalar (ascender/descender) metrics, not outlines.
-const NON_ACCURATE_GLYPH: i32 = -1;
 
 /// The structured-text device: implements [`TextDevice`], folding positioned
 /// glyphs into a [`StextPage`]. Construct with [`StextDevice::new`], drive it
@@ -165,10 +163,19 @@ impl StextDevice {
     // normalisation, then dispatch to the assembly core.
     /// Fold one glyph into the page, applying (unless the matching option is
     /// set) ligature expansion and whitespace normalisation first.
+    ///
+    /// `glyph` follows MuPDF's `fz_add_stext_char` argument: `>= 0` for a char
+    /// that has a real glyph behind it, `-1` for a no-glyph char (a filler from
+    /// a one-to-many ToUnicode, or the 2nd+ letter of an expanded ligature).
+    /// The sign is load-bearing in the assembly core: `-1` chars ride on the pen
+    /// without moving it, and only `>= 0` chars can be dropped as fake-bold
+    /// overprint.
+    #[allow(clippy::too_many_arguments)]
     fn add_char(
         &mut self,
         font_idx: usize,
         mut c: char,
+        glyph: i32,
         trm: Matrix,
         adv: f32,
         wmode: u8,
@@ -178,8 +185,7 @@ impl StextDevice {
 
         // MuPDF expands ligatures unless FZ_STEXT_PRESERVE_LIGATURES.
         if !opts.has(StextOptions::PRESERVE_LIGATURES) {
-            // The explicit Latin ligatures (stext-device.c:1065-1093). The
-            // broader Unicode presentation-form decomposition is deferred.
+            // The explicit Latin ligatures (stext-device.c:1065-1093).
             let parts: &[char] = match c {
                 '\u{FB00}' => &['f', 'f'],
                 '\u{FB01}' => &['f', 'i'],
@@ -190,21 +196,35 @@ impl StextDevice {
                 _ => &[],
             };
             if !parts.is_empty() {
-                // First part carries the real advance/force_new_line; the rest
-                // ride along at the same origin with zero advance.
-                self.add_char_imp(
-                    font_idx,
-                    parts[0],
-                    NON_ACCURATE_GLYPH,
-                    trm,
-                    adv,
-                    wmode,
-                    force_new_line,
-                );
+                // First part carries the real glyph/advance/force_new_line; the
+                // rest are no-glyph (-1) chars with zero advance -- exactly the
+                // C, so they sit on the pen instead of on top of the `f`.
+                self.add_char_imp(font_idx, parts[0], glyph, trm, adv, wmode, force_new_line);
                 for &p in &parts[1..] {
-                    self.add_char_imp(font_idx, p, NON_ACCURATE_GLYPH, trm, 0.0, wmode, false);
+                    self.add_char_imp(font_idx, p, -1, trm, 0.0, wmode, false);
                 }
                 return;
+            }
+
+            // MuPDF: "alphabetic and arabic presentation forms"
+            // (stext-device.c:1097-1104) via ucdn_compat_decompose. We use
+            // unicode-normalization's compatibility decomposition. Two recorded
+            // differences, both harmless: ucdn returns ONE level of the
+            // decomposition record while `decompose_compatible` recurses fully
+            // (only a handful of Hebrew forms like U+FB2C decompose twice), and
+            // for an unassigned code point in the range ucdn returns 0 and the C
+            // then reads an uninitialised `lig[0]` -- here the char is kept as-is.
+            let cu = c as u32;
+            if (0xFB00..=0xFDFF).contains(&cu) || (0xFE70..=0xFEFC).contains(&cu) {
+                let mut lig: Vec<char> = Vec::new();
+                unicode_normalization::char::decompose_compatible(c, |d| lig.push(d));
+                if !lig.is_empty() && lig != [c] {
+                    self.add_char_imp(font_idx, lig[0], glyph, trm, adv, wmode, force_new_line);
+                    for &p in &lig[1..] {
+                        self.add_char_imp(font_idx, p, -1, trm, 0.0, wmode, false);
+                    }
+                    return;
+                }
             }
         }
 
@@ -214,20 +234,13 @@ impl StextDevice {
             c = normalize_whitespace(c);
         }
 
-        self.add_char_imp(
-            font_idx,
-            c,
-            NON_ACCURATE_GLYPH,
-            trm,
-            adv,
-            wmode,
-            force_new_line,
-        );
+        self.add_char_imp(font_idx, c, glyph, trm, adv, wmode, force_new_line);
     }
 
     // MuPDF: fz_add_stext_char_imp (stext-device.c:758). THE line/block/space
-    // decision. `glyph` is always NON_ACCURATE_GLYPH (>= 0 real gids and the
-    // combining-mark/actualtext sentinels are out of scope for this port).
+    // decision. `glyph` is `>= 0` for a real glyph, `-1` for a no-glyph char
+    // (see [`add_char`](Self::add_char)); the ACCURATE_BBOXES per-glyph quads
+    // and the actualtext `-2` sentinel are still out of scope for this port.
     #[allow(clippy::too_many_arguments)]
     fn add_char_imp(
         &mut self,
@@ -271,6 +284,32 @@ impl StextDevice {
             StextBlock::Text(tb) => tb.lines.last().map(|l| (l.wmode, l.dir)),
             _ => None,
         });
+
+        // MuPDF: "Don't advance pen or break lines for either no-glyph or
+        // marking non-spacing characters in a cluster" (stext-device.c:850-858).
+        // A filler / ligature tail / combining mark goes on the CURRENT line,
+        // spanning pen..pen, and leaves pen + lag_pen alone. Before 0.4.2 this
+        // arm was missing, so the `i` of every "fi" landed on top of the `f`
+        // (and a combining accent could open a new line).
+        if cur_line_info.is_some()
+            && (glyph == -1
+                || unicode_general_category::get_general_category(c)
+                    == unicode_general_category::GeneralCategory::NonspacingMark)
+        {
+            let bi = cur_block.expect("cur_line implies cur_block");
+            let font_asc = self.page.fonts[font_idx].ascender();
+            let font_desc = self.page.fonts[font_idx].descender();
+            let ch = make_char(
+                c, trm, size, font_idx, wmode, self.pen, self.pen, font_asc, font_desc, 0, 0,
+            );
+            if let StextBlock::Text(tb) = &mut self.page.blocks[bi] {
+                let li = tb.lines.len() - 1;
+                tb.lines[li].chars.push(ch);
+                self.lastline = Some((bi, li));
+            }
+            self.lastchar = c as i32;
+            return;
+        }
 
         let mut new_para = false;
         // MuPDF initialises new_line = 1; the first two arms leave it at that
@@ -473,8 +512,21 @@ impl TextDevice for StextDevice {
         // adv comes in as em units (Widths/1000); MuPDF's `adv` is likewise the
         // per-glyph em advance, and `dir` (which carries the font size) scales
         // it. So we pass it straight through.
-        let _ = cid;
-        self.add_char(font_idx, unicode, trm, adv, wmode, force_new_line);
+        // MuPDF passes the glyph id here (do_extract: `span->items[i].gid`).
+        // Outside ACCURATE_BBOXES only its SIGN matters -- ">= 0 = a real glyph",
+        // which is what lets the fake-bold overprint check fire -- so the CID
+        // (never negative) stands in for it. Before 0.4.2 this passed -1 for
+        // every glyph, which silently disabled fake-bold suppression: text a
+        // producer printed twice for a bold effect came out doubled.
+        let glyph = i32::try_from(cid).unwrap_or(i32::MAX);
+        self.add_char(font_idx, unicode, glyph, trm, adv, wmode, force_new_line);
+    }
+
+    // MuPDF: fz_stext_extract with `span->items[i].gid < 0` -> `adv = 0`
+    // (stext-device.c:1191-1194), then fz_add_stext_char as usual.
+    fn show_filler_char(&mut self, font: &Font, trm: Matrix, unicode: char, wmode: u8) {
+        let font_idx = self.intern_font(font);
+        self.add_char(font_idx, unicode, -1, trm, 0.0, wmode, false);
     }
 }
 

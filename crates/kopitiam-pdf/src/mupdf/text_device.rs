@@ -134,4 +134,15 @@ pub trait TextDevice {
     /// PDF. So extraction sinks keep this default no-op and still see all the
     /// glyphs; the draw device overrides it and paints nothing for 3 and 7.
     fn set_text_render_mode(&mut self, _mode: i32) {}
+
+    // MuPDF: the `gid = -1` glyphs pdf_show_char adds "for one-to-many unicode
+    // mapping" (pdf-op-run.c:1449), which fz_stext_extract turns into chars
+    // with zero advance (stext-device.c:1191) and the draw device never paints.
+    /// A zero-advance **filler** char at the same `trm` as the glyph just shown:
+    /// the second and later code points of a one-to-many `/ToUnicode` entry
+    /// (the `i` of an "fi" ligature, say). There is no glyph to draw -- the real
+    /// glyph already went through [`show_glyph`](TextDevice::show_glyph) -- so a
+    /// painting device keeps this default no-op; an extraction sink adds the
+    /// char so "fi" does not come out as "f".
+    fn show_filler_char(&mut self, _font: &Font, _trm: Matrix, _unicode: char, _wmode: u8) {}
 }

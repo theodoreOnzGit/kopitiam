@@ -122,7 +122,11 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                 let font = self.gstate().text.font.as_ref().unwrap();
                 font.decode(code)
             };
-            self.show_char(dec.unicode, dec.advance, dec.cid);
+            let fillers = {
+                let font = self.gstate().text.font.as_ref().unwrap();
+                font.decode_fillers(code)
+            };
+            self.show_char(dec.unicode, dec.advance, dec.cid, &fillers);
 
             // Bug 703151 parity: a single-byte space also advances by Tw.
             if code == 32 && w == 1 {
@@ -137,7 +141,7 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // accumulation and bbox tracking are dropped.)
     /// Emit one glyph for `cid`/`unicode` with nominal `width` (1/1000 em),
     /// then advance the text matrix.
-    fn show_char(&mut self, unicode: char, width: f32, cid: u32) {
+    fn show_char(&mut self, unicode: char, width: f32, cid: u32, fillers: &[char]) {
         let wmode = self.gstate().text.font.as_ref().unwrap().wmode();
 
         // Compute the text-space trm + advances from the current text state & Tm.
@@ -164,6 +168,11 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
             self.dev
                 .show_glyph(font, trm_dev, adv_em, unicode, cid, wmode as u8);
+            // MuPDF: "add filler glyphs for one-to-many unicode mapping"
+            // (pdf-op-run.c:1449) -- same trm, zero advance, no glyph.
+            for &f in fillers {
+                self.dev.show_filler_char(font, trm_dev, f, wmode as u8);
+            }
         }
 
         // MuPDF: pdf_tos_move_after_char (pdf-interpret.c:2062) -- advance Tm.

@@ -123,6 +123,17 @@ hayro = "=0.7.1"
 # that stops being true the moment either side exposes skrifa types in its API.
 skrifa = "0.42"
 
+# Unicode data the stext device needs where MuPDF calls its bundled `ucdn`
+# (source/fitz/ucdn.c): the general category (the `UCDN_GENERAL_CATEGORY_MN`
+# "combining mark rides on the pen" arm of fz_add_stext_char_imp) and the
+# compatibility decomposition (presentation-form ligatures, `ucdn_compat_
+# decompose`). Both are pure Rust, MIT/Apache-2.0, and ALREADY in the lock
+# file as transitive deps -- same versions, so this adds no new code to the
+# build, only makes the use direct. Substitution per AID-0052 (MuPDF's C
+# helper library -> an existing pure-Rust crate).
+unicode-general-category = "1.1"
+unicode-normalization = "0.1.25"
+
 # --- kpdf GUI stack (optional, behind the default `kpdf` feature) -------------
 # `src/bin/kpdf.rs` -- a lightweight native PDF reader. These were
 # `[dev-dependencies]` while kpdf was an example; promoting kpdf to a real
