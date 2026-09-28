@@ -838,11 +838,14 @@ fn component01(raw: u32, maxval: f32, decode: Option<&[f32]>, i: usize) -> f32 {
 
 /// Naive subtractive CMYK->RGB (each channel in `[0, 1]`), matching the common
 /// `r = (1-c)(1-k)` device conversion.
+// MuPDF: fast_cmyk_to_rgb (color-fast.c:942) -- `255 - min(c + k, 255)`,
+// the no-ICC conversion. (Was `(1-c)(1-k)` before 0.4.2; see
+// draw_device::cmyk_to_rgb for the correction note.)
 fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (u8, u8, u8) {
     (
-        to8((1.0 - c) * (1.0 - k)),
-        to8((1.0 - m) * (1.0 - k)),
-        to8((1.0 - y) * (1.0 - k)),
+        to8(1.0 - (c + k).min(1.0)),
+        to8(1.0 - (m + k).min(1.0)),
+        to8(1.0 - (y + k).min(1.0)),
     )
 }
 

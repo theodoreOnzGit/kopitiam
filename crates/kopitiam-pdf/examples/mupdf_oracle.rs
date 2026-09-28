@@ -38,9 +38,10 @@
 //!    origin error over matched chars is reported, not gated.
 //! 3. **Raster.** `mutool draw -r DPI -c rgb` (PPM) vs our
 //!    [`rasterize_page_ex`] -- the *native* kopitiam engine, never the hayro
-//!    fallback, because it is the port under test. Compared on luma. A pixel is
-//!    a *gross* mismatch when `|Δluma| > 128` (one side says ink, the other
-//!    paper). PASS per page = gross mismatches ≤ [`RASTER_GROSS_PASS`] of the
+//!    fallback, because it is the port under test. A pixel is a *gross*
+//!    mismatch when any RGB channel differs by more than 128 (one side says
+//!    ink, the other paper -- or the ink is the wrong hue); the first version
+//!    used luma only, which let red-for-green through (see `compare_raster`). PASS per page = gross mismatches ≤ [`RASTER_GROSS_PASS`] of the
 //!    page. Why a tolerance at all: AID-0052 -- our glyph outlines come from
 //!    from-spec decoders / skrifa, not FreeType, and the scan converter is not a
 //!    fixed-point GEL clone, so anti-aliased edges legitimately differ by
@@ -645,33 +646,42 @@ fn read_ppm(p: &Path) -> Option<(u32, u32, Vec<u8>)> {
 /// Gross-mismatch fraction and mean |Δluma| over the union of both rasters
 /// (a size mismatch counts the non-overlapping strip as paper on the smaller
 /// side, so an off-by-one page size costs a line of pixels, not a crash).
+///
+/// A pixel is gross when ANY of R, G, B differs by more than [`GROSS_LUMA`].
+/// (Amended 2026-09-28, before the feature-corpus measurements: the first
+/// version compared luma only, and luma hides hue errors -- pure red and pure
+/// green differ by just 74 in luma, so a red square painted where MuPDF
+/// paints green passed. Every result in docs/mupdf-code-to-code.md from the
+/// "feature corpus" section on uses this per-channel rule.)
 fn compare_raster(ours: &[u8], ow: u32, oh: u32, on: u8, mu: &[u8], mw: u32, mh: u32) -> (f64, f64) {
     let w = ow.max(mw) as usize;
     let h = oh.max(mh) as usize;
-    let luma_ours = |x: usize, y: usize| -> i32 {
+    let rgb_ours = |x: usize, y: usize| -> [i32; 3] {
         if x >= ow as usize || y >= oh as usize {
-            return 255;
+            return [255; 3];
         }
         let i = (y * ow as usize + x) * on as usize;
         match on {
-            1 | 2 => ours[i] as i32,
-            _ => (ours[i] as i32 * 77 + ours[i + 1] as i32 * 151 + ours[i + 2] as i32 * 28) >> 8,
+            1 | 2 => [ours[i] as i32; 3],
+            _ => [ours[i] as i32, ours[i + 1] as i32, ours[i + 2] as i32],
         }
     };
-    let luma_mu = |x: usize, y: usize| -> i32 {
+    let rgb_mu = |x: usize, y: usize| -> [i32; 3] {
         if x >= mw as usize || y >= mh as usize {
-            return 255;
+            return [255; 3];
         }
         let i = (y * mw as usize + x) * 3;
-        (mu[i] as i32 * 77 + mu[i + 1] as i32 * 151 + mu[i + 2] as i32 * 28) >> 8
+        [mu[i] as i32, mu[i + 1] as i32, mu[i + 2] as i32]
     };
+    let luma = |c: [i32; 3]| (c[0] * 77 + c[1] * 151 + c[2] * 28) >> 8;
     let mut gross = 0u64;
     let mut sum = 0u64;
     for y in 0..h {
         for x in 0..w {
-            let d = (luma_ours(x, y) - luma_mu(x, y)).abs();
-            sum += d as u64;
-            if d > GROSS_LUMA {
+            let a = rgb_ours(x, y);
+            let b = rgb_mu(x, y);
+            sum += (luma(a) - luma(b)).unsigned_abs() as u64;
+            if (0..3).any(|k| (a[k] - b[k]).abs() > GROSS_LUMA) {
                 gross += 1;
             }
         }

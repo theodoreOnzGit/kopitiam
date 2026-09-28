@@ -156,6 +156,9 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // boxes render in the text's colour (the sink ignores this by default).
         let fill_color = self.gstate().fill_color;
         self.dev.set_fill_color(fill_color);
+        // MuPDF fills text at `gstate->fill.alpha` (pdf_flush_text_imp).
+        let fill_alpha = self.gstate().fill_alpha;
+        self.dev.set_fill_alpha(fill_alpha);
         // And the `Tr` mode, so a painting device can leave invisible (3) and
         // clip-only (7) text unpainted while extraction still sees the glyph.
         let render_mode = self.gstate().text.render;
@@ -168,6 +171,23 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
             self.dev
                 .show_glyph(font, trm_dev, adv_em, unicode, cid, wmode as u8);
+            // MuPDF pdf_flush_text_imp: modes 1, 2, 5, 6 also `dostroke` --
+            // the glyph outline stroked with the stroke colour, alpha and
+            // line state (fz_stroke_text).
+            if matches!(render_mode, 1 | 2 | 5 | 6) {
+                let g = self.gstack.last().unwrap();
+                let mut style = g.stroke_style.clone();
+                style.line_width = g.line_width;
+                self.dev.stroke_glyph(
+                    font,
+                    trm_dev,
+                    g.ctm,
+                    cid,
+                    &style,
+                    g.stroke_color,
+                    g.stroke_alpha,
+                );
+            }
             // MuPDF: "add filler glyphs for one-to-many unicode mapping"
             // (pdf-op-run.c:1449) -- same trm, zero advance, no glyph.
             for &f in fillers {
@@ -273,23 +293,113 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         self.end_path();
     }
 
-    // MuPDF: fz_fill_path via dev->fill_path (the fill material's DeviceRGB colour).
+    // MuPDF: fz_fill_path via dev->fill_path (the fill material's DeviceRGB
+    // colour at `gstate->fill.alpha`).
     fn fill_current(&mut self, rule: FillRule) {
-        let (ctm, color, clip) = {
+        let (ctm, color, alpha, clip) = {
             let g: &GState = self.gstate();
-            (g.ctm, g.fill_color, g.clip)
+            (g.ctm, g.fill_color, g.fill_alpha, g.clip)
         };
         // Split field borrow: `self.dev` (mut) and `self.path` (shared) are disjoint.
-        self.dev.fill_path(&self.path, rule, ctm, color, 1.0, clip);
+        self.dev.fill_path(&self.path, rule, ctm, color, alpha, clip);
     }
 
-    // MuPDF: fz_stroke_path via dev->stroke_path (line width from the gstate).
+    // MuPDF: fz_stroke_path via dev->stroke_path with `gstate->stroke_state`
+    // (width, caps, join, miter limit, dash) at `gstate->stroke.alpha`.
     fn stroke_current(&mut self) {
-        let (ctm, color, lw, clip) = {
+        let (ctm, color, alpha, clip, style) = {
             let g: &GState = self.gstate();
-            (g.ctm, g.stroke_color, g.line_width, g.clip)
+            let mut style = g.stroke_style.clone();
+            style.line_width = g.line_width;
+            (g.ctm, g.stroke_color, g.stroke_alpha, g.clip, style)
         };
-        self.dev.stroke_path(&self.path, ctm, lw, color, 1.0, clip);
+        self.dev
+            .stroke_path_styled(&self.path, ctm, &style, color, alpha, clip);
+    }
+
+    // MuPDF: pdf_run_d (pdf-op-run.c:2639) -- the dash array + phase.
+    pub(crate) fn op_d(&mut self, arr: &Object, phase: f32) {
+        let mut dash = Vec::with_capacity(arr.array_len());
+        for i in 0..arr.array_len() {
+            let v = arr
+                .array_get(i)
+                .map(|o| self.doc.resolve(o).unwrap_or(Object::Null).to_real() as f32)
+                .unwrap_or(0.0);
+            dash.push(v);
+        }
+        let g = self.gstate_mut();
+        g.stroke_style.dash = dash;
+        g.stroke_style.dash_phase = phase;
+    }
+
+    // MuPDF: pdf_run_gs -> pdf_process_extgstate (pdf-interpret.c:875), the
+    // keys this port's graphics state models: LW, LC, LJ, ML, D, Font, CA, ca.
+    // RI/FL/OP/op/OPM/UseBlackPtComp/TR/TR2 change nothing we paint (MuPDF
+    // itself only warns about transfer functions); BM and SMask (blend modes,
+    // soft masks) are the transparency tranche and still ignored here.
+    pub(crate) fn op_gs(&mut self, name: &[u8]) -> super::error::Result<()> {
+        let dict = self.lookup_resource("ExtGState", name);
+        if !dict.is_dict() {
+            // MuPDF: "cannot find ExtGState resource" -- a syntax error that
+            // pdf_process_keyword catches and warns about; drawing goes on.
+            return Ok(());
+        }
+        let get = |k: &str| self.doc.resolve_get(&dict, k).unwrap_or(Object::Null);
+        let lw = get("LW");
+        if lw.is_number() {
+            self.gstate_mut().line_width = lw.to_real() as f32;
+        }
+        let lc = get("LC");
+        if lc.is_int() {
+            self.gstate_mut().stroke_style.cap = super::interpret::line_cap(lc.to_int() as i32);
+        }
+        let lj = get("LJ");
+        if lj.is_int() {
+            self.gstate_mut().stroke_style.join = super::interpret::line_join(lj.to_int() as i32);
+        }
+        let ml = get("ML");
+        if ml.is_number() {
+            self.gstate_mut().stroke_style.miter_limit = ml.to_real() as f32;
+        }
+        let d = get("D");
+        if d.is_array() {
+            let arr = d
+                .array_get(0)
+                .map(|o| self.doc.resolve(o).unwrap_or(Object::Null))
+                .unwrap_or(Object::Null);
+            let phase = d
+                .array_get(1)
+                .map(|o| self.doc.resolve(o).unwrap_or(Object::Null).to_real() as f32)
+                .unwrap_or(0.0);
+            self.op_d(&arr, phase);
+        }
+        let font = get("Font");
+        if font.is_array() {
+            // [font-ref size]: load the referenced dict like Tf would.
+            let size = font
+                .array_get(1)
+                .map(|o| self.doc.resolve(o).unwrap_or(Object::Null).to_real() as f32)
+                .unwrap_or(0.0);
+            let fobj = font
+                .array_get(0)
+                .map(|o| self.doc.resolve(o).unwrap_or(Object::Null))
+                .unwrap_or(Object::Null);
+            self.gstate_mut().text.size = size;
+            if fobj.is_dict() {
+                if let Ok(f) = super::font::Font::load(self.doc, &fobj) {
+                    self.gstate_mut().text.font = Some(f);
+                }
+            }
+        }
+        let ca_stroke = get("CA");
+        if ca_stroke.is_number() {
+            self.gstate_mut().stroke_alpha = (ca_stroke.to_real() as f32).clamp(0.0, 1.0);
+        }
+        let ca_fill = get("ca");
+        if ca_fill.is_number() {
+            self.gstate_mut().fill_alpha = (ca_fill.to_real() as f32).clamp(0.0, 1.0);
+        }
+        Ok(())
     }
 
     // MuPDF: the tail of every path-painting operator -- apply a pending clip then

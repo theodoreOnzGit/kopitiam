@@ -118,6 +118,49 @@ pub trait TextDevice {
     /// boxes pick up the content stream's fill colour; extraction sinks ignore it.
     fn set_fill_color(&mut self, _color: [f32; 3]) {}
 
+    // MuPDF: the fill alpha of pdf_gstate carried into fz_fill_text
+    // (`gstate->fill.alpha`, set by an ExtGState `/ca`).
+    /// Set the current fill alpha (0..=1) for the glyphs that follow. Called
+    /// right after [`set_fill_color`](TextDevice::set_fill_color); extraction
+    /// sinks ignore it.
+    fn set_fill_alpha(&mut self, _alpha: f32) {}
+
+    // MuPDF: fz_stroke_text (pdf_flush_text_imp's `dostroke`, render modes
+    // 1 / 2 / 5 / 6).
+    /// Stroke one glyph's outline: `trm` is its device-space text-rendering
+    /// matrix (as for [`show_glyph`](TextDevice::show_glyph)), `ctm` the user
+    /// CTM the line width is measured in. Default no-op: extraction already
+    /// got the glyph from `show_glyph`.
+    #[allow(clippy::too_many_arguments)]
+    fn stroke_glyph(
+        &mut self,
+        _font: &Font,
+        _trm: Matrix,
+        _ctm: Matrix,
+        _cid: u32,
+        _style: &super::draw_path::StrokeStyle,
+        _color: [f32; 3],
+        _alpha: f32,
+    ) {
+    }
+
+    // MuPDF: dev->stroke_path with the whole fz_stroke_state.
+    /// Stroke `path` with the full line style (width, caps, join, miter limit,
+    /// dash). The default forwards to [`stroke_path`](TextDevice::stroke_path)
+    /// with just the width, so a sink that only cares about geometry keeps
+    /// working unchanged; the draw device overrides it.
+    fn stroke_path_styled(
+        &mut self,
+        path: &Path,
+        ctm: Matrix,
+        style: &super::draw_path::StrokeStyle,
+        color: [f32; 3],
+        alpha: f32,
+        clip: Option<Rect>,
+    ) {
+        self.stroke_path(path, ctm, style.line_width, color, alpha, clip);
+    }
+
     // MuPDF: pdf_flush_text_imp (pdf-op-run.c:1121) -- the `tos.text_mode`
     // switch that picks dofill / dostroke / doclip / doinvisible per text run.
     /// Set the text render mode (`Tr`, PDF 32000-1:2008 §9.3.6, Table 106) that

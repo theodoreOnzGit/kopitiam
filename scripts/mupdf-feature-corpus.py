@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Write the SYNTHETIC feature corpus for the kopitiam-pdf <-> MuPDF
+code-to-code harness (crates/kopitiam-pdf/examples/mupdf_oracle.rs).
+
+Why this exists, hor: after the 0.4.2 image tranche every page of the open
+corpus (NRC reports + PHYSOR papers + the arXiv paper) rendered within 1 % of
+MuPDF -- yet the coverage map (docs/mupdf-port-coverage.md) still lists
+shadings, `gs` alpha, dashes, stencil masks, inline images, patterns, Type3,
+... as missing. Those features just do not occur (or occur too small) in that
+corpus, so the corpus stopped being able to fail. These files each exercise
+ONE feature over a big area, so a missing feature fails the raster gate loudly
+and a fixed one passes it.
+
+Every file is generated here from nothing but this script -- no third-party
+content, nothing to license. Output is deterministic.
+
+    python3 scripts/mupdf-feature-corpus.py OUTDIR
+    target/release/examples/mupdf_oracle --mutool MUTOOL --no-objects OUTDIR/*.pdf
+"""
+
+import pathlib
+import sys
+
+
+def pdf(objs, page_dict_extra=b"", resources=b"<< >>", content=b"", mediabox=b"[0 0 200 200]",
+        catalog=b"<< /Type /Catalog /Pages 2 0 R >>"):
+    """Objects 1..3 are catalog/pages/page, 4 is the content stream; `objs` are
+    appended from 5 on (bytes bodies)."""
+    body = [
+        catalog,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox " + mediabox + b" /Resources " + resources
+        + b" /Contents 4 0 R" + page_dict_extra + b" >>",
+        stream(content),
+    ] + list(objs)
+    out = b"%PDF-1.7\n"
+    offs = []
+    for i, o in enumerate(body):
+        offs.append(len(out))
+        out += b"%d 0 obj\n" % (i + 1) + o + b"\nendobj\n"
+    x = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(body) + 1)
+    for o in offs:
+        out += b"%010d 00000 n \n" % o
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(body) + 1, x)
+    return out
+
+
+def stream(data, extra=b""):
+    return b"<< /Length %d" % len(data) + extra + b" >>\nstream\n" + data + b"\nendstream"
+
+
+FILES = {}
+
+# 1. Line style: dash (d), caps (J), joins (j), miter limit (M).
+FILES["line-style"] = pdf([], content=b"""
+0 0 1 RG 12 w
+0 J [30 15] 0 d 20 170 m 180 170 l S
+1 J [] 0 d 20 140 m 180 140 l S
+2 J 20 110 m 180 110 l S
+0 j 10 M 30 20 m 60 90 l 90 20 l S
+1 j 90 20 m 120 90 l 150 20 l S
+2 j 140 20 m 170 90 l 190 20 l S
+""")
+
+# 2. ExtGState: constant alpha, line width, dash, via `gs`.
+FILES["extgstate"] = pdf(
+    [],
+    resources=b"<< /ExtGState << /A << /ca 0.5 /CA 0.5 >> /B << /LW 10 /D [[20 10] 0] /LC 1 >> >> >>",
+    content=b"""
+1 0 0 rg 20 20 120 120 re f
+q /A gs 0 0 1 rg 60 60 120 120 re f Q
+q /B gs 0 0.6 0 RG 20 185 m 180 185 l S Q
+""")
+
+# 3. Stencil image mask painted in the fill colour over a blue square.
+mask = bytes([0xF0, 0x0F] * 16)  # 16x16, 1 bpc: left/right half stripes per row
+FILES["image-mask"] = pdf(
+    [stream(mask, b" /Type /XObject /Subtype /Image /Width 16 /Height 16 /ImageMask true /BitsPerComponent 1")],
+    resources=b"<< /XObject << /M 5 0 R >> >>",
+    content=b"0 0 1 rg 0 0 200 200 re f 1 0 0 rg q 200 0 0 200 0 0 cm /M Do Q",
+)
+
+# 4. Inline images: a gray ramp and an inline stencil.
+ramp = bytes(range(0, 256, 32)) * 8  # 8x8 gray
+FILES["inline-image"] = pdf([], content=(
+    b"q 200 0 0 100 0 100 cm BI /W 8 /H 8 /CS /G /BPC 8 ID\n" + ramp + b"\nEI Q\n"
+    + b"0 0.5 0 rg q 200 0 0 100 0 0 cm BI /W 16 /H 16 /IM true ID\n" + mask + b"\nEI Q"
+))
+
+# 5. Shadings via `sh`: axial (type 2) and radial (type 3), exponential functions.
+FILES["shading-sh"] = pdf(
+    [],
+    resources=b"""<< /Shading <<
+ /Ax << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 200 0] /Extend [true true]
+        /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>
+ /Ra << /ShadingType 3 /ColorSpace /DeviceRGB /Coords [100 100 0 100 100 60] /Extend [false false]
+        /Function << /FunctionType 2 /Domain [0 1] /C0 [1 1 0] /C1 [0 1 0] /N 1 >> >>
+>> >>""",
+    content=b"q 0 0 200 100 re W n /Ax sh Q q 0 100 200 100 re W n /Ra sh Q",
+)
+
+# 6. Shading pattern as a fill colour (scn /P).
+FILES["shading-pattern"] = pdf(
+    [],
+    resources=b"""<< /Pattern << /P << /PatternType 2 /Shading
+ << /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 0 200]
+    /Function << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> >> >> >> >>""",
+    content=b"/Pattern cs /P scn 20 20 160 160 re f",
+)
+
+# 7. Non-rectangular clip: a circle (4 beziers), then a full-page fill.
+k = 0.5523 * 80
+circ = (b"100 180 m %.2f 180 180 %.2f 180 100 c 180 %.2f %.2f 20 100 20 c %.2f 20 20 %.2f 20 100 c 20 %.2f %.2f 180 100 180 c h"
+        % (100 + k, 100 + k, 100 - k, 100 + k, 100 - k, 100 - k, 100 + k, 100 - k))
+FILES["clip-path"] = pdf([], content=b"q " + circ + b" W n 1 0 0 rg 0 0 200 200 re f Q")
+
+# 8. Type3 font: two glyphs drawn by content procs.
+FILES["type3"] = pdf(
+    [
+        b"""<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0]
+ /CharProcs << /sq 6 0 R /tri 7 0 R >> /Encoding << /Type /Encoding /Differences [65 /sq /tri] >>
+ /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Resources << >> >>""",
+        stream(b"1000 0 0 0 1000 1000 d1 0 0 1000 1000 re f"),
+        stream(b"1000 0 0 0 1000 1000 d1 0 0 m 1000 0 l 500 1000 l f"),
+    ],
+    resources=b"<< /Font << /T3 5 0 R >> >>",
+    content=b"0 0 1 rg BT /T3 60 Tf 20 100 Td (ABAB) Tj ET",
+)
+
+# 9. Text render modes: stroke (1), fill+stroke (2), fill+clip (4).
+FILES["text-render-modes"] = pdf(
+    [b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"],
+    resources=b"<< /Font << /F 5 0 R >> >>",
+    content=b"""0 0 1 RG 2 w 1 0 0 rg
+BT /F 48 Tf 1 Tr 10 140 Td (Stroke) Tj ET
+BT /F 48 Tf 2 Tr 10 80 Td (Both) Tj ET
+q BT /F 48 Tf 7 Tr 10 20 Td (Clip) Tj ET 0 0.6 0 rg 0 0 200 70 re f Q""",
+)
+
+# 10. Colour spaces for fills: Indexed, Separation, Lab, ICCBased-less CalRGB.
+FILES["fill-colorspaces"] = pdf(
+    [],
+    resources=b"""<< /ColorSpace <<
+ /I [/Indexed /DeviceRGB 1 <FF000000FF00>]
+ /S [/Separation /Spot /DeviceCMYK << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 1 1 0] /N 1 >>]
+ /L [/Lab << /WhitePoint [0.9505 1 1.089] /Range [-100 100 -100 100] >>]
+ /C [/CalRGB << /WhitePoint [0.9505 1 1.089] >>] >> >>""",
+    content=b"""/I cs 1 sc 0 100 100 100 re f
+/S cs 1 sc 100 100 100 100 re f
+/L cs 50 60 40 sc 0 0 100 100 re f
+/C cs 0.2 0.4 0.8 sc 100 0 100 100 re f""",
+)
+
+# 11. CropBox smaller than MediaBox (the page must be the crop).
+FILES["cropbox"] = pdf(
+    [],
+    page_dict_extra=b" /CropBox [50 50 250 250]",
+    mediabox=b"[0 0 300 300]",
+    content=b"1 0 0 rg 0 0 300 300 re f 0 0 1 rg 50 50 100 100 re f",
+)
+
+# 12. Tiling pattern (checkerboard).
+FILES["tiling-pattern"] = pdf(
+    [stream(b"0 0 0 rg 0 0 10 10 re f 10 10 10 10 re f",
+            b" /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>")],
+    resources=b"<< /Pattern << /T 5 0 R >> >>",
+    content=b"/Pattern cs /T scn 0 0 200 200 re f",
+)
+
+# 13. Form XObject with /BBox (must clip) and /Matrix.
+FILES["form-bbox"] = pdf(
+    [stream(b"1 0 0 rg -50 -50 300 300 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [1 0 0 1 50 50]")],
+    resources=b"<< /XObject << /F 5 0 R >> >>",
+    content=b"/F Do",
+)
+
+# 14. Optional content: a layer that is OFF must not paint.
+FILES["optional-content"] = pdf(
+    [b"<< /Type /OCG /Name (Hidden) >>"],
+    resources=b"<< /Properties << /L 5 0 R >> >>",
+    content=b"0 1 0 rg 0 0 200 200 re f /OC /L BDC 1 0 0 rg 50 50 100 100 re f EMC",
+    catalog=b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [5 0 R] /D << /OFF [5 0 R] >> >> >>",
+)
+
+# 15. Blend mode + soft mask through ExtGState.
+FILES["blend-smask"] = pdf(
+    [stream(b"0 0 200 200 re 0 g f 1 g 50 50 100 100 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency /CS /DeviceGray >>")],
+    resources=b"""<< /ExtGState << /M << /BM /Multiply >>
+ /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >> >>""",
+    content=b"""0 1 1 rg 0 0 200 100 re f q /M gs 1 1 0 rg 50 0 100 100 re f Q
+q /S gs 1 0 0 rg 0 100 200 100 re f Q""",
+)
+
+# 16. CMYK fill (no ICC in our port; MuPDF uses lcms2 + its default profile).
+FILES["cmyk-fill"] = pdf([], content=b"1 0 0 0 k 0 0 100 200 re f 0 0.5 1 0 k 100 0 100 200 re f")
+
+# 17. Stroke adjust / hairlines: 0-width lines are one device pixel in MuPDF.
+FILES["hairline"] = pdf([], content=b"0 w " + b" ".join(b"%d 0 m %d 200 l S" % (x, x) for x in range(5, 200, 10)))
+
+
+# 18. A damaged file: every xref offset is off by 7 bytes (a common result of
+# an editor re-saving with CRLF/LF damage). MuPDF repairs it (pdf-repair.c:
+# scan for "N G obj") and renders the red square; a port without repair
+# refuses to open the file at all.
+_good = pdf([], content=b"1 0 0 rg 50 50 100 100 re f")
+_x = _good.index(b"xref\n")
+_tbl = _good[_x:].split(b"trailer")[0]
+_fixed = b"\n".join(
+    (b"%010d 00000 n " % (int(l[:10]) + 7)) if l.endswith(b" n ") else l for l in _tbl.split(b"\n")
+)
+FILES["broken-xref"] = _good[:_x] + _fixed + b"trailer" + _good[_x:].split(b"trailer", 1)[1]
+
+
+def main():
+    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "feature-corpus")
+    out.mkdir(parents=True, exist_ok=True)
+    for name, data in FILES.items():
+        (out / f"feat-{name}.pdf").write_bytes(data)
+    print(f"wrote {len(FILES)} files to {out}")
+
+
+if __name__ == "__main__":
+    main()

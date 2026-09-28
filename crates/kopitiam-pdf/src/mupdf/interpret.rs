@@ -128,6 +128,16 @@ pub(crate) struct GState {
     pub stroke_cs: ColorSpace,
     /// The line width (`w`), in path-space units. Default 1.0.
     pub line_width: f32,
+    /// The rest of the stroke state (`J`/`j`/`M`/`d` and their ExtGState
+    /// keys); `line_width` above stays the source of truth for the width.
+    // MuPDF: pdf_gstate.stroke_state (fz_stroke_state).
+    pub stroke_style: super::draw_path::StrokeStyle,
+    /// The fill alpha (`/ca` via `gs`), 0..=1. Default 1.
+    // MuPDF: pdf_gstate.fill.alpha (pdf_run_gs_ca).
+    pub fill_alpha: f32,
+    /// The stroke alpha (`/CA` via `gs`), 0..=1. Default 1.
+    // MuPDF: pdf_gstate.stroke.alpha (pdf_run_gs_CA).
+    pub stroke_alpha: f32,
     /// The current rectangular clip (`W`/`W*`), in device space *before* the
     /// device's own output transform. `None` = unclipped. Non-rect clips are
     /// bbox-approximated (see [`Processor::end_path`]).
@@ -146,6 +156,9 @@ impl GState {
             fill_cs: ColorSpace::Gray,
             stroke_cs: ColorSpace::Gray,
             line_width: 1.0,
+            stroke_style: super::draw_path::StrokeStyle::default(),
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
             clip: None,
         }
     }
@@ -472,6 +485,22 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
 
             // -- stroke state ----------------------------------------------
             b"w" => self.gstate_mut().line_width = s(0),
+            // MuPDF: pdf_run_J / pdf_run_j / pdf_run_M / pdf_run_d
+            // (pdf-op-run.c:2607-2651). pdf-interpret.c reads J/j as ints.
+            b"J" => self.gstate_mut().stroke_style.cap = line_cap(s(0) as i32),
+            b"j" => self.gstate_mut().stroke_style.join = line_join(s(0) as i32),
+            b"M" => self.gstate_mut().stroke_style.miter_limit = s(0),
+            b"d" => {
+                if let Some(arr) = obj {
+                    self.op_d(arr, s(0));
+                }
+            }
+            // -- ExtGState (pdf_process_extgstate, pdf-interpret.c:875) ----
+            b"gs" => {
+                if let Some(n) = name {
+                    self.op_gs(n)?;
+                }
+            }
 
             // -- colour ----------------------------------------------------
             b"g" => self.op_set_gray(s(0), true),
@@ -543,5 +572,26 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             }
             prev_ws = c <= b' ';
         }
+    }
+}
+
+/// `J` / `/LC` value -> cap. MuPDF: pdf-interpret.c reads the operand as an
+/// int; `/LC` is clamped to 0..=2 (fz_clampi) and so is anything PDF can say.
+pub(crate) fn line_cap(v: i32) -> super::draw_path::LineCap {
+    use super::draw_path::LineCap;
+    match v.clamp(0, 2) {
+        1 => LineCap::Round,
+        2 => LineCap::Square,
+        _ => LineCap::Butt,
+    }
+}
+
+/// `j` / `/LJ` value -> join (clamped to 0..=2 like `/LJ`).
+pub(crate) fn line_join(v: i32) -> super::draw_path::LineJoin {
+    use super::draw_path::LineJoin;
+    match v.clamp(0, 2) {
+        1 => LineJoin::Round,
+        2 => LineJoin::Bevel,
+        _ => LineJoin::Miter,
     }
 }

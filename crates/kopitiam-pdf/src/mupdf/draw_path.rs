@@ -98,7 +98,209 @@ pub struct Path {
     cmds: Vec<Cmd>,
 }
 
+/// A stroke's line style: MuPDF's `fz_stroke_state`, reduced to what PDF can
+/// set (`w`, `J`, `j`, `M`, `d`, and the same keys of an ExtGState). PDF's `J`
+/// sets `start_cap`/`dash_cap`/`end_cap` together, so one `cap` covers them.
+// MuPDF: fz_stroke_state (include/mupdf/fitz/path.h), default fz_default_stroke_state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeStyle {
+    /// Line width in path (user) units (`w`, `/LW`).
+    pub line_width: f32,
+    /// Line cap (`J`, `/LC`).
+    pub cap: LineCap,
+    /// Line join (`j`, `/LJ`).
+    pub join: LineJoin,
+    /// Miter limit (`M`, `/ML`).
+    pub miter_limit: f32,
+    /// Dash array in path units (`d`, `/D`); empty = solid.
+    pub dash: Vec<f32>,
+    /// Dash phase in path units.
+    pub dash_phase: f32,
+}
+
+impl Default for StrokeStyle {
+    // MuPDF: fz_default_stroke_state -- width 1, butt caps, miter joins, limit 10.
+    fn default() -> StrokeStyle {
+        StrokeStyle {
+            line_width: 1.0,
+            cap: LineCap::Butt,
+            join: LineJoin::Miter,
+            miter_limit: DEFAULT_MITER_LIMIT,
+            dash: Vec::new(),
+            dash_phase: 0.0,
+        }
+    }
+}
+
+/// The dash walker's running state (the dash fields of draw-path.c's `sctx`).
+///
+/// Invariant: `toggle == true` exactly when an "on" run is open in `out` and
+/// ends at the walker's current position -- so extending the run is a
+/// `line_to`, and starting one is a `move_to`.
+struct DashState<'a> {
+    list: &'a [f32],
+    phase0: f32,
+    toggle: bool,
+    offset: usize,
+    phase: f32,
+    cur: Point,
+    beg: Point,
+    flatness: f32,
+    out: Path,
+}
+
+impl DashState<'_> {
+    // MuPDF: fz_dash_moveto (draw-path.c:1078)
+    fn moveto(&mut self, p: Point) {
+        self.toggle = true;
+        self.offset = 0;
+        self.phase = self.phase0;
+        while self.phase > 0.0 && self.phase >= self.list[self.offset] {
+            self.toggle = !self.toggle;
+            self.phase -= self.list[self.offset];
+            self.offset += 1;
+            if self.offset == self.list.len() {
+                self.offset = 0;
+            }
+        }
+        self.cur = p;
+        if self.toggle {
+            // fz_stroke_flush + fz_stroke_moveto
+            self.out.move_to(p.x, p.y);
+        }
+    }
+
+    // MuPDF: fz_dash_lineto (draw-path.c:1128), without the off-screen
+    // `s->rect` trimming -- that is a speed optimisation that only skips work
+    // outside the visible area; the dash phase it carries forward is the same.
+    fn lineto(&mut self, b: Point) {
+        let a = self.cur;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let total = (dx * dx + dy * dy).sqrt();
+        let mut used = 0.0f32;
+        while total - used > self.list[self.offset] - self.phase {
+            used += self.list[self.offset] - self.phase;
+            let ratio = used / total;
+            let mx = a.x + ratio * dx;
+            let my = a.y + ratio * dy;
+            if self.toggle {
+                // fz_stroke_lineto_aux: extend the on-run to the boundary.
+                self.out.line_to(mx, my);
+            } else {
+                // fz_stroke_flush(dash_cap) + fz_stroke_moveto: a new run.
+                self.out.move_to(mx, my);
+            }
+            self.toggle = !self.toggle;
+            self.phase = 0.0;
+            self.offset += 1;
+            if self.offset == self.list.len() {
+                self.offset = 0;
+            }
+        }
+        self.phase += total - used;
+        self.cur = b;
+        if self.toggle {
+            self.out.line_to(b.x, b.y);
+        }
+    }
+
+    // MuPDF: fz_dash_bezier (draw-path.c:1380) -- same arithmetic order.
+    fn bezier(&mut self, a: Point, b: Point, c: Point, d: Point, depth: u32) {
+        let mut dmax = (a.x - b.x).abs();
+        dmax = dmax.max((a.y - b.y).abs());
+        dmax = dmax.max((d.x - c.x).abs());
+        dmax = dmax.max((d.y - c.y).abs());
+        if dmax < self.flatness || depth >= MAX_DEPTH {
+            self.lineto(d);
+            return;
+        }
+        let (xab, yab) = (a.x + b.x, a.y + b.y);
+        let (xbc, ybc) = (b.x + c.x, b.y + c.y);
+        let (xcd, ycd) = (c.x + d.x, c.y + d.y);
+        let (xabc, yabc) = (xab + xbc, yab + ybc);
+        let (xbcd, ybcd) = (xbc + xcd, ybc + ycd);
+        let (xabcd, yabcd) = ((xabc + xbcd) * 0.125, (yabc + ybcd) * 0.125);
+        let ab = Point::new(xab * 0.5, yab * 0.5);
+        let cd = Point::new(xcd * 0.5, ycd * 0.5);
+        let abc = Point::new(xabc * 0.25, yabc * 0.25);
+        let bcd = Point::new(xbcd * 0.25, ybcd * 0.25);
+        let abcd = Point::new(xabcd, yabcd);
+        self.bezier(a, ab, abc, abcd, depth + 1);
+        self.bezier(abcd, bcd, cd, d, depth + 1);
+    }
+}
+
 impl Path {
+    // MuPDF: do_flatten_stroke's dash setup (draw-path.c:1566-1597) + the
+    // dash_proc walker (dash_moveto/lineto/curveto/close, draw-path.c:1485).
+    /// Split this path into its dashed "on" runs, in path space, per `dash` /
+    /// `phase` -- exactly the runs MuPDF's dash walker hands its stroker.
+    ///
+    /// Returns `None` when MuPDF would stroke the path undashed (no dash array,
+    /// or a pattern so short it vanishes: `total < 0.01` or under half a device
+    /// pixel), and `Some(empty)` when it would stroke nothing at all (a dash
+    /// array summing to zero, which MuPDF treats as "draw nothing").
+    pub fn dashed(&self, dash: &[f32], phase: f32, ctm: Matrix) -> Option<Path> {
+        if dash.is_empty() {
+            return None;
+        }
+        // Hostile-input guard, not in MuPDF: a negative or non-finite entry
+        // can make MuPDF's `while (total - used > dash[offset] - phase)` walk
+        // backwards forever. Stroke such a pattern solid instead.
+        if dash.iter().any(|d| !d.is_finite() || *d < 0.0) || !phase.is_finite() {
+            return None;
+        }
+        let total: f32 = dash.iter().sum();
+        if total == 0.0 {
+            return Some(Path::new());
+        }
+        if !(total >= 0.01 && total * ctm.max_expansion() >= 0.5) {
+            return None;
+        }
+        let mut expansion = ctm.expansion();
+        if expansion < f32::EPSILON {
+            expansion = 1.0;
+        }
+        let flatness = (0.3 / expansion).max(0.001);
+        let mut st = DashState {
+            list: dash,
+            // fmodf(stroke->dash_phase, s.dash_total)
+            phase0: phase % total,
+            toggle: false,
+            offset: 0,
+            phase: 0.0,
+            cur: Point::new(0.0, 0.0),
+            beg: Point::new(0.0, 0.0),
+            flatness,
+            out: Path::new(),
+        };
+        let mut cur = Point::new(0.0, 0.0);
+        for cmd in &self.cmds {
+            match *cmd {
+                Cmd::MoveTo(p) => {
+                    st.moveto(p);
+                    st.beg = p;
+                    cur = p;
+                }
+                Cmd::LineTo(p) => {
+                    st.lineto(p);
+                    cur = p;
+                }
+                Cmd::CurveTo(c1, c2, to) => {
+                    st.bezier(cur, c1, c2, to, 0);
+                    cur = to;
+                }
+                Cmd::Close => {
+                    let beg = st.beg;
+                    st.lineto(beg);
+                    cur = beg;
+                }
+            }
+        }
+        Some(st.out)
+    }
+
     /// An empty path.
     pub fn new() -> Path {
         Path { cmds: Vec::new() }
@@ -140,6 +342,22 @@ impl Path {
             .line_to(x1, y1)
             .line_to(x0, y1)
             .close()
+    }
+
+    // MuPDF: fz_transform_path (path.c).
+    /// A copy of this path with every point transformed by `m`.
+    pub fn transformed(&self, m: Matrix) -> Path {
+        let cmds = self
+            .cmds
+            .iter()
+            .map(|c| match *c {
+                Cmd::MoveTo(p) => Cmd::MoveTo(p.transform(m)),
+                Cmd::LineTo(p) => Cmd::LineTo(p.transform(m)),
+                Cmd::CurveTo(a, b, d) => Cmd::CurveTo(a.transform(m), b.transform(m), d.transform(m)),
+                Cmd::Close => Cmd::Close,
+            })
+            .collect();
+        Path { cmds }
     }
 
     /// Append another path's commands to the end of this one, preserving its
@@ -253,7 +471,12 @@ impl Path {
         join: LineJoin,
         miter_limit: f32,
     ) -> Vec<Vec<Point>> {
-        let hw = (line_width * 0.5).max(0.35);
+        // MuPDF fz_draw_stroke_path_aux (draw-device.c:774): a stroke thinner
+        // than the graphics AA level (`2 / (aa_bits + 2)` = 0.2 px at the
+        // default 8-bit AA) is widened to it -- so the half-width floor is
+        // 0.1 px. (Before 0.4.2 this floor was an invented 0.35, which drew
+        // every hairline 3.5x too heavy next to MuPDF.)
+        let hw = (line_width * 0.5).max(0.1);
         // A non-finite or sub-1.0 miter limit is meaningless (PDF 32000-1
         // 8.4.3.5 requires `M >= 1`); fall back to the spec default rather
         // than propagate garbage into the miter-limit test below.

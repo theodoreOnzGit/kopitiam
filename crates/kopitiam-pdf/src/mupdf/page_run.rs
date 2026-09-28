@@ -294,7 +294,9 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // fitz image space (0,0 top-left, unit square) -> PDF user space unit square
         // (image top row at y=1): flip y, then apply the page/user CTM.
         let image_ctm = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0).concat(ctm);
-        self.dev.draw_image(&img, image_ctm, 1.0, clip);
+        // MuPDF: fz_fill_image(..., gstate->fill.alpha, ...) (pdf-op-run.c:879).
+        let alpha = self.gstate().fill_alpha;
+        self.dev.draw_image(&img, image_ctm, alpha, clip);
     }
 
     // MuPDF: pdf_lookup_resource (pdf-interpret.c:33), returning the *raw*

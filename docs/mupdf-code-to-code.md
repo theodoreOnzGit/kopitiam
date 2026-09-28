@@ -200,3 +200,44 @@ mutool showed it point-samples that one, because `fz_default_image_scale`
 needs BOTH axes to shrink), `jpx_image_decodes`, `jbig2_image_decodes`
 (fixtures from `tests/fixtures/make-image-codecs.py`, cross-rendered with
 mutool before use).
+
+## The synthetic feature corpus
+
+`scripts/mupdf-feature-corpus.py OUTDIR` writes 18 one-feature PDFs (line
+style, ExtGState, stencil masks, inline images, shadings via `sh` and via a
+pattern, a circular clip path, Type3, text render modes, fill colour spaces,
+CropBox, tiling pattern, Form `/BBox`, optional content, blend + soft mask,
+CMYK fill, hairlines, and one deliberately damaged xref). Each feature covers
+a large area, so a missing feature fails the raster gate loudly. They are
+generated from the script alone -- nothing third-party, nothing committed but
+the generator.
+
+**Metric amendment (2026-09-28, before any feature-corpus number was
+recorded).** The raster "gross" test was `|Δluma| > 128`. The first feature
+run showed that hides hue errors: a red square where MuPDF paints green is
+only 74 apart in luma, so `optional-content` "passed" while plainly wrong.
+From here on a pixel is gross when **any RGB channel** differs by more than
+128; the 1 % page criterion is unchanged. The open-corpus results above were
+measured with the luma rule; the final table at the end of this document
+re-measures everything, both corpora, with the per-channel rule.
+
+### After tranche 3 (graphics state) -- measured 2026-09-28
+
+Fixes: `gs` (ExtGState `LW`/`LC`/`LJ`/`ML`/`D`/`Font`/`CA`/`ca`, per
+`pdf_process_extgstate`), `J`/`j`/`M`/`d`, MuPDF's dash walker
+(`fz_dash_moveto`/`fz_dash_lineto`/`fz_dash_bezier`, draw-path.c), the stroke
+width floor (`0.2 px`, not the invented `0.7 px`), fill/stroke alpha on paths,
+text and images, text render modes 1/2/5/6 stroking the glyph outline
+(`fz_stroke_text`) and mode 1/5 no longer filling, and MuPDF's no-ICC CMYK
+formula `1 - min(1, c + k)`.
+
+| feature file | gross % (tranche 2 -> 3) | mean \|Δluma\| (2 -> 3) | note |
+|---|---|---|---|
+| line-style | 2.08 -> **0.00** | 4.97 -> 0.07 | dashes, butt/round/square caps, miter/round/bevel joins |
+| extgstate | 2.96 -> **0.00** | 32.48 -> 0.01 | `/ca` `/CA`, `/LW`, `/D`, `/LC` through `gs` |
+| hairline | 0.00 -> 0.00 | 13.30 -> 1.50 | `0 w` lines now 0.2 px like MuPDF |
+| text-render-modes | 37.99 -> 32.98 | 67.82 -> 56.70 | stroke + fill/stroke right; mode 7 (clip) is the clip tranche |
+| cmyk-fill | 0.00 -> 0.00 | 31.00 -> 31.00 | residual is ICC: mutool converts through lcms2 + its default CMYK profile; this port has no CMS |
+
+(Tranche-2 figures for these rows are luma-gross, tranche-3 per-channel; for
+these five files the two rules give the same verdict.)

@@ -88,6 +88,8 @@ pub struct DrawDevice {
     /// [`TextDevice::set_text_render_mode`] before each glyph. Modes 3
     /// (invisible) and 7 (clip only) paint nothing -- see `show_glyph`.
     text_render_mode: i32,
+    /// The current fill alpha for text (`/ca`), 0..=1.
+    fill_alpha: f32,
 }
 
 impl DrawDevice {
@@ -104,6 +106,7 @@ impl DrawDevice {
             fill: [0, 0, 0],
             fallback_glyphs: 0,
             text_render_mode: 0,
+            fill_alpha: 1.0,
         }
     }
 
@@ -130,6 +133,7 @@ impl DrawDevice {
             fill: [0, 0, 0],
             fallback_glyphs: 0,
             text_render_mode: 0,
+            fill_alpha: 1.0,
         }
     }
 
@@ -411,7 +415,11 @@ impl TextDevice for DrawDevice {
         // solid advance boxes AND counted those boxes as fallback glyphs, which
         // kicked the whole page over to the hayro fallback for no reason.
         // Clip-text (4..=7) is not modelled by this device; 4..=6 still paint.
-        if matches!(self.text_render_mode, 3 | 7) {
+        //
+        // More generally (0.4.2): only the FILL modes paint here -- 0, 2, 4, 6
+        // (pdf_flush_text_imp's `dofill`). Mode 1 / 5 is stroke-only, drawn by
+        // `stroke_glyph`; mode 2 / 6 gets both calls.
+        if !matches!(self.text_render_mode, 0 | 2 | 4 | 6) {
             return;
         }
 
@@ -434,7 +442,7 @@ impl TextDevice for DrawDevice {
                 &polys,
                 FillRule::NonZero,
                 &self.fill,
-                1.0,
+                self.fill_alpha,
                 self.clip,
             );
             return;
@@ -458,7 +466,7 @@ impl TextDevice for DrawDevice {
             &polys,
             FillRule::NonZero,
             &self.fill,
-            1.0,
+            self.fill_alpha,
             self.clip,
         );
     }
@@ -504,6 +512,73 @@ impl TextDevice for DrawDevice {
     fn set_text_render_mode(&mut self, mode: i32) {
         self.text_render_mode = mode;
     }
+
+    fn set_fill_alpha(&mut self, alpha: f32) {
+        self.fill_alpha = alpha;
+    }
+
+    // MuPDF: fz_draw_stroke_path_aux (draw-device.c:746) with the whole
+    // stroke state.
+    fn stroke_path_styled(
+        &mut self,
+        path: &Path,
+        ctm: Matrix,
+        style: &super::draw_path::StrokeStyle,
+        color: [f32; 3],
+        alpha: f32,
+        clip: Option<Rect>,
+    ) {
+        let ic = self.resolve_clip(clip);
+        let m = ctm.concat(self.base);
+        let polys = stroke_polygons(path, m, style);
+        let c = rgb_to_bytes(color);
+        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, ic);
+    }
+
+    fn stroke_glyph(
+        &mut self,
+        font: &Font,
+        trm: Matrix,
+        ctm: Matrix,
+        cid: u32,
+        style: &super::draw_path::StrokeStyle,
+        color: [f32; 3],
+        alpha: f32,
+    ) {
+        // MuPDF fz_draw_stroke_text -> fz_render_stroked_glyph: the glyph
+        // outline goes through trm, the line width through the user CTM.
+        let Some(outline) = font.glyph_outline(cid) else { return };
+        let user = ctm.concat(self.base);
+        // Bring the em-space outline into user space (trm = text-matrix·ctm,
+        // so em->user is trm·ctm⁻¹), then stroke under the user CTM.
+        let Some(ctm_inv) = ctm.try_invert() else { return };
+        let em_to_user = trm.concat(ctm_inv);
+        let user_path = outline.transformed(em_to_user);
+        let polys = stroke_polygons(&user_path, user, style);
+        let c = rgb_to_bytes(color);
+        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, self.clip);
+    }
+}
+
+// MuPDF: fz_draw_stroke_path_aux's width floor + fz_flatten_stroke_path's
+// dash walk (draw-device.c:772-776, draw-path.c:1566).
+/// Device-space stroke polygons for `path` under device matrix `m`.
+fn stroke_polygons(path: &Path, m: Matrix, style: &super::draw_path::StrokeStyle) -> Vec<Vec<super::geometry::Point>> {
+    let mut expansion = m.expansion();
+    if expansion < f32::EPSILON {
+        expansion = 1.0;
+    }
+    // aa_level = 2 / (8 + 2) at MuPDF's default 8-bit graphics AA.
+    let aa_level = 0.2f32;
+    let mut lw = style.line_width;
+    if lw * expansion < aa_level {
+        lw = aa_level / expansion;
+    }
+    let dev_w = lw * expansion;
+    match path.dashed(&style.dash, style.dash_phase, m) {
+        Some(d) => d.stroke_to_polygons_styled(m, dev_w, style.cap, style.join, style.miter_limit),
+        None => path.stroke_to_polygons_styled(m, dev_w, style.cap, style.join, style.miter_limit),
+    }
 }
 
 /// Clamp a DeviceRGB float triple (0..=1) to bytes.
@@ -521,14 +596,23 @@ pub fn gray_to_rgb(g: f32) -> [f32; 3] {
     [g, g, g]
 }
 
-// MuPDF: DeviceCMYK -> DeviceRGB (the naive conversion fz_cmyk_to_rgb uses when no
-// ICC profile applies).
-/// Convert DeviceCMYK (each 0..=1) to DeviceRGB.
+// MuPDF: cmyk_to_rgb (color-fast.c:117) -- the conversion MuPDF uses when no
+// ICC colour management applies.
+/// Convert DeviceCMYK (each 0..=1) to DeviceRGB: `1 - min(1, c + k)` per
+/// channel.
+///
+/// ~~`(1 - c)(1 - k)`, "the naive conversion fz_cmyk_to_rgb uses"~~ --
+/// **CORRECTED 2026-09-28 (0.4.2)**: that product is not what MuPDF computes;
+/// color-fast.c is additive-and-clamp, as above. The two agree when `k = 0`
+/// and differ for mixed inks (c = m = y = k = 0.5 gives 0.25 before, 0 now).
+/// Note that a default `mutool` build has lcms2 ICC management ON, which
+/// converts through its default CMYK profile instead; this port has no CMS
+/// (see docs/mupdf-port-coverage.md), so fast conversion is the parity target.
 pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> [f32; 3] {
     [
-        (1.0 - c) * (1.0 - k),
-        (1.0 - m) * (1.0 - k),
-        (1.0 - y) * (1.0 - k),
+        1.0 - (c + k).min(1.0),
+        1.0 - (m + k).min(1.0),
+        1.0 - (y + k).min(1.0),
     ]
 }
 

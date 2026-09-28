@@ -11,6 +11,8 @@
 //! * **Tranche 1 -- structured text** (`stext-device.c`, `pdf-op-run.c`).
 //! * **Tranche 2 -- images** (`draw-device.c` / `draw-scale-simple.c` /
 //!   `draw-affine.c` image path; JPX + JBIG2 codecs).
+//! * **Tranche 3 -- graphics state** (`gs`, `d`/`J`/`j`/`M`, stroked text,
+//!   CMYK conversion).
 
 use kopitiam_pdf::mupdf::structured_text::{StextBlock, StextChar, StextOptions};
 use kopitiam_pdf::mupdf::xref::PdfDocument;
@@ -259,4 +261,93 @@ fn jbig2_image_decodes() {
     assert_eq!((im.width, im.height, im.components), (16, 8, 1));
     assert_eq!(im.pixels[0], 0, "left half black");
     assert_eq!(im.pixels[15], 255, "right half white");
+}
+
+// ---------------------------------------------------------------------------
+// Tranche 3 -- graphics state
+// ---------------------------------------------------------------------------
+
+/// A 200x200 pt page with the given resources and content (no fonts etc.
+/// unless the caller puts them in `extra` as objects 5..).
+fn page_with(resources: &str, content: &str, extra: &[&str]) -> PdfDocument {
+    let mut bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+/Resources {resources} /Contents 4 0 R >>"
+        )
+        .into_bytes(),
+        stream("", content),
+    ];
+    bodies.extend(extra.iter().map(|e| e.as_bytes().to_vec()));
+    PdfDocument::open(build_pdf(&bodies)).expect("fixture opens")
+}
+
+/// Red channel of device pixel `(x, y)` of a 72-dpi native render.
+fn red_at(pix: &kopitiam_pdf::mupdf::Pixmap, x: u32, y: u32) -> u8 {
+    pix.samples[((y * pix.w + x) * pix.n as u32) as usize]
+}
+
+/// `d` was parsed-and-ignored, so every dashed line drew solid; and every
+/// stroke got round caps whatever `J` said. MuPDF (draw-path.c dash walker,
+/// butt caps by default) on `12 w [30 15] 0 d 20 100 m 180 100 l S`, measured
+/// with mutool at y = 100: x = 25, 40 ink; 55 (gap 50..65) paper; 70 ink;
+/// 183 (past the butt end at 180) paper.
+#[test]
+fn dash_pattern_and_butt_caps_follow_mupdf() {
+    let doc = page_with("<< >>", "0 0 0 RG 12 w [30 15] 0 d 20 100 m 180 100 l S", &[]);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (x, ink) in [(25, true), (40, true), (55, false), (70, true), (183, false), (10, false)] {
+        let v = red_at(&pix, x, 100);
+        assert_eq!(v < 64, ink, "x = {x}: red {v}, want ink = {ink}");
+    }
+}
+
+/// ExtGState `/ca` was ignored, so translucent fills painted opaque. MuPDF:
+/// blue at ca 0.5 over red = (128, 0, 126) (mutool, 19f1284).
+#[test]
+fn extgstate_fill_alpha_blends() {
+    let doc = page_with(
+        "<< /ExtGState << /A << /ca 0.5 >> >> >>",
+        "1 0 0 rg 0 0 200 200 re f /A gs 0 0 1 rg 0 0 100 200 re f",
+        &[],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    let o = ((50 * pix.w + 50) * pix.n as u32) as usize;
+    let rgb = &pix.samples[o..o + 3];
+    for (got, want) in rgb.iter().zip([128u8, 0, 126]) {
+        assert!((*got as i32 - want as i32).abs() <= 2, "got {rgb:?}, MuPDF (128, 0, 126)");
+    }
+}
+
+/// Text render mode 1 is stroke-only: the glyph interior stays paper. The
+/// port used to FILL every glyph in modes 0..=6 except 3.
+#[test]
+fn text_render_mode_1_strokes_without_filling() {
+    let doc = page_with(
+        "<< /Font << /F 5 0 R >> >>",
+        "0 0 1 RG 1 w 1 0 0 rg BT /F 150 Tf 1 Tr 20 40 Td (I) Tj ET",
+        &["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    // Middle of the I's stem: MuPDF leaves it white (mutool: (255,255,255)).
+    let o = ((100 * pix.w + 45) * pix.n as u32) as usize;
+    assert_eq!(&pix.samples[o..o + 3], &[255, 255, 255], "stem interior must stay unfilled");
+    // ...while the outline itself is inked in the stroke colour somewhere on
+    // the row's left edge.
+    let edge = (20..40).any(|x| {
+        let o = ((100 * pix.w + x) * pix.n as u32) as usize;
+        pix.samples[o + 2] > 200 && pix.samples[o] < 128
+    });
+    assert!(edge, "no blue outline found on the stem's left edge");
+}
+
+/// MuPDF's no-ICC CMYK conversion is `1 - min(1, c + k)` (color-fast.c:117),
+/// not `(1 - c)(1 - k)`.
+#[test]
+fn cmyk_conversion_is_mupdfs_fast_path() {
+    use kopitiam_pdf::mupdf::cmyk_to_rgb;
+    assert_eq!(cmyk_to_rgb(0.5, 0.5, 0.5, 0.5), [0.0, 0.0, 0.0]);
+    assert_eq!(cmyk_to_rgb(0.25, 0.0, 1.0, 0.25), [0.5, 0.75, 0.0]);
 }
