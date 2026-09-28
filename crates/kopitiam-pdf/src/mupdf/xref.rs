@@ -34,31 +34,43 @@
 //!   walk `/Root → /Pages → /Kids` recursively, flattening inherited
 //!   `/Resources`, `/MediaBox`, `/CropBox`, `/Rotate` top-down into each leaf.
 //!
+//! * **Repair** (`pdf-repair.c`, in [`repair`](super::repair)): a broken xref
+//!   at open, or an object that is not where the xref says, triggers MuPDF's
+//!   whole-file `N G obj` scan -- once per document -- exactly where
+//!   `pdf_init_document` and `pdf_cache_object` do.
+//! * **The endstream filter** (`fz_open_endstream_filter`, filter-basic.c): a
+//!   stream body is `/Length` bytes *plus* whatever sits before the next
+//!   `endstream`, so a `/Length` that is too short (or clamped to 0) still
+//!   reads the whole body, same as MuPDF.
+//!
 //! ## What is deferred (a later wave)
 //!
-//! Repair (`pdf-repair.c`: a malformed xref throws here rather than triggering a
-//! rebuild), encryption (`pdf-crypt.c`), linearization / progressive loading,
-//! and incremental-update authoring (the `newobj`/journal path, and `/Prev`
+//! ~~Repair (`pdf-repair.c`: a malformed xref throws here rather than triggering
+//! a rebuild)~~ **CORRECTED 2026-09-28** -- repair is ported now, see above.
+//! Still deferred: encryption beyond the empty user password (`pdf-crypt.c`),
+//! linearization / progressive loading, the `%PDF` bias for garbage before the
+//! header (`pdf_load_version`), and incremental-update authoring (the `newobj`/journal path, and `/Prev`
 //! handling beyond following the chain to merge previous sections). The write
 //! path is out of scope entirely. MuPDF's mutable multi-section xref with
 //! solidification, local/incremental xrefs, and shared refcounted `pdf_obj`s is
 //! collapsed here into a single flat entry table plus an owned-`Object` cache
 //! (`Clone` deep-copies, as in `object.rs`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use super::doc_stream::decode_stream;
-use super::error::{Error, Result};
+use super::error::{Error, ErrorKind, Result};
 use super::lex::{Token, lex};
 use super::object::{MAX_OBJECT_NUMBER, Object};
 use super::parse::{parse_ind_obj, parse_stm_obj};
+use super::repair::parse_ind_obj_at;
 use super::stream::{Stream, Whence};
 
 /// One cross-reference table entry, keyed by object number.
 // MuPDF: pdf_xref_entry.type 'f'/'n'/'o' (xref.h:76).
 #[derive(Clone, Debug)]
-enum XrefEntry {
+pub(super) enum XrefEntry {
     /// `'f'` -- a free object (not in use).
     Free,
     /// `'n'` -- an uncompressed object at `offset` in the file. (The generation
@@ -73,13 +85,13 @@ enum XrefEntry {
 /// A resolved-and-cached object: the parsed [`Object`] plus, for a stream
 /// object, where its raw body begins (`stm_ofs`, from [`parse_ind_obj`]).
 #[derive(Clone)]
-struct Cached {
-    obj: Object,
-    stm_ofs: Option<i64>,
+pub(super) struct Cached {
+    pub(super) obj: Object,
+    pub(super) stm_ofs: Option<i64>,
     /// The object's generation as parsed from its `N G obj` header (0 for an
     /// object from an object stream, or a free/missing one). Needed because
     /// the per-object encryption key mixes in the generation (§7.6.2 alg. 1).
-    generation: i32,
+    pub(super) generation: i32,
 }
 
 /// A loaded PDF document: the raw bytes, the xref table, the trailer, the
@@ -89,17 +101,34 @@ struct Cached {
 /// path (see the module docs for what is deferred).
 pub struct PdfDocument {
     /// The whole file (MuPDF's `doc->file`, here always an in-memory block).
-    bytes: Vec<u8>,
+    pub(super) bytes: Vec<u8>,
     /// The cross-reference table, indexed by object number; `None` = an object
     /// number never populated by any xref section.
-    entries: Vec<Option<XrefEntry>>,
+    ///
+    /// Behind a `RefCell` because repair can rebuild it from inside a plain
+    /// `&self` object lookup -- MuPDF's `pdf_cache_object` repairs in the middle
+    /// of a read, and so must we.
+    pub(super) entries: RefCell<Vec<Option<XrefEntry>>>,
     /// The newest trailer dict (`pdf_trailer`): `/Root`, `/Size`, …
-    trailer: Object,
+    ///
+    /// Read it through [`trailer`](Self::trailer), never directly: after a
+    /// repair triggered mid-read, the live trailer is `repaired_trailer`.
+    pub(super) trailer: Object,
+    /// The trailer synthesised by a repair that ran from inside an object
+    /// lookup (`&self`, so it cannot overwrite `trailer`). Set at most once,
+    /// because MuPDF repairs at most once (`repair_attempted`).
+    pub(super) repaired_trailer: OnceCell<Object>,
+    /// MuPDF's `doc->repair_attempted`: repair runs once per document, ever.
+    /// A second broken object after that is an error, not another rescan.
+    pub(super) repair_attempted: Cell<bool>,
+    /// Set on the plaintext rewrite of an encrypted document whose ORIGINAL
+    /// needed repair, so [`was_repaired`](Self::was_repaired) still says so.
+    repaired_before_rewrite: bool,
     /// The document's decryptor, when it is encrypted and we could open it.
     ///
     /// `None` for the ordinary unencrypted document, in which case every
     /// decryption site below is a no-op branch. See [`crypt`](super::crypt).
-    decryptor: Option<super::crypt::Decryptor>,
+    pub(super) decryptor: Option<super::crypt::Decryptor>,
     /// The object number of the `/Encrypt` dictionary, when there is one.
     ///
     /// Kept so its own strings -- `/O` and `/U`, which are the *inputs* to the
@@ -108,17 +137,17 @@ pub struct PdfDocument {
     /// building the decryptor, so it is cached in the clear before one
     /// exists), but relying on cache-population order for correctness is the
     /// kind of accident that survives until someone clears a cache.
-    encrypt_obj_num: Option<i32>,
+    pub(super) encrypt_obj_num: Option<i32>,
     /// Set when this document arrived encrypted and was rewritten as
     /// plaintext at open -- see [`rewrite_decrypted`](Self::rewrite_decrypted).
     was_decrypted: bool,
     /// The ordered, inheritance-flattened page dicts.
     pages: Vec<Object>,
     /// Resolved-object cache (MuPDF caches the parsed `pdf_obj` on the entry).
-    cache: RefCell<HashMap<i32, Cached>>,
+    pub(super) cache: RefCell<HashMap<i32, Cached>>,
     /// Object numbers currently being resolved -- the recursion/cycle guard
     /// (MuPDF's `pdf_obj_marked` on object streams + the `RESOLVE` again-loop).
-    resolving: RefCell<Vec<i32>>,
+    pub(super) resolving: RefCell<Vec<i32>>,
 }
 
 impl PdfDocument {
@@ -126,23 +155,46 @@ impl PdfDocument {
     // Opening
     // -----------------------------------------------------------------------
 
-    // MuPDF: pdf_open_document_with_stream / pdf_init_document + pdf_load_xref
-    // (pdf-xref.c:1775, document loading).
-    /// Open a PDF from its raw bytes: build the xref table, read the trailer, and
-    /// walk the page tree. Returns `FZ_ERROR_FORMAT`/`FZ_ERROR_SYNTAX` for a
-    /// malformed cross-reference (repair is deferred to a later wave).
-    pub fn open(bytes: Vec<u8>) -> Result<PdfDocument> {
-        let (entries, trailer) = load_xref(&bytes)?;
-        let mut doc = PdfDocument {
+    /// A document over `bytes` with the given xref and trailer, and nothing
+    /// resolved yet.
+    fn from_parts(bytes: Vec<u8>, entries: Vec<Option<XrefEntry>>, trailer: Object) -> PdfDocument {
+        PdfDocument {
             bytes,
-            entries,
+            entries: RefCell::new(entries),
             trailer,
+            repaired_trailer: OnceCell::new(),
+            repair_attempted: Cell::new(false),
+            repaired_before_rewrite: false,
             decryptor: None,
             encrypt_obj_num: None,
             was_decrypted: false,
             pages: Vec::new(),
             cache: RefCell::new(HashMap::new()),
             resolving: RefCell::new(Vec::new()),
+        }
+    }
+
+    // MuPDF: pdf_open_document_with_stream / pdf_init_document + pdf_load_xref
+    // (pdf-xref.c:1916, 1775, document loading).
+    /// Open a PDF from its raw bytes: build the xref table, read the trailer, and
+    /// walk the page tree.
+    ///
+    /// A cross-reference that will not load -- no `startxref`, offsets out of
+    /// range, a `/Size` that disagrees, a corrupt xref stream -- is not an
+    /// error by itself: like MuPDF ("trying to repair broken xref") the file is
+    /// rescanned for its objects and opened from that. Only when the repair
+    /// also fails (no objects at all, say) does this return the error.
+    pub fn open(bytes: Vec<u8>) -> Result<PdfDocument> {
+        let mut doc = match load_xref(&bytes) {
+            Ok((entries, trailer)) => PdfDocument::from_parts(bytes, entries, trailer),
+            // MuPDF: pdf_init_document's fz_catch (pdf-xref.c:1961) rethrows
+            // only TRYLATER and SYSTEM; everything else is repaired.
+            Err(e) if e.kind() == ErrorKind::System => return Err(e),
+            Err(_) => {
+                let mut doc = PdfDocument::from_parts(bytes, Vec::new(), Object::new_dict());
+                doc.repair_at_open()?;
+                doc
+            }
         };
         // Set up decryption BEFORE anything reads through the document.
         //
@@ -158,9 +210,9 @@ impl PdfDocument {
         // opens with no prompt), and nothing in this crate has anywhere to
         // ask a human for a real one yet. A document needing a real password
         // fails with a message that says so.
-        if let Some(enc_ref) = doc.trailer.dict_gets("Encrypt") {
+        if let Some(enc_ref) = doc.trailer().dict_gets("Encrypt").cloned() {
             doc.encrypt_obj_num = match enc_ref {
-                Object::Ref { num, .. } => Some(*num),
+                Object::Ref { num, .. } => Some(num),
                 _ => None,
             };
             doc.decryptor = Some(doc.build_decryptor(b"")?);
@@ -179,17 +231,10 @@ impl PdfDocument {
             // `was_decrypted`.
             let plain = doc.rewrite_decrypted()?;
             let (entries, trailer) = load_xref(&plain)?;
-            doc = PdfDocument {
-                bytes: plain,
-                entries,
-                trailer,
-                decryptor: None,
-                encrypt_obj_num: None,
-                was_decrypted: true,
-                pages: Vec::new(),
-                cache: RefCell::new(HashMap::new()),
-                resolving: RefCell::new(Vec::new()),
-            };
+            let repaired = doc.was_repaired();
+            doc = PdfDocument::from_parts(plain, entries, trailer);
+            doc.was_decrypted = true;
+            doc.repaired_before_rewrite = repaired;
         }
         doc.pages = doc.load_pages()?;
         Ok(doc)
@@ -201,11 +246,11 @@ impl PdfDocument {
     /// The `/Encrypt` dictionary is itself never encrypted (§7.6.2), so this
     /// can run before any key exists -- which is just as well, since it is
     /// what produces the key.
-    fn build_decryptor(&self, password: &[u8]) -> Result<super::crypt::Decryptor> {
+    pub(super) fn build_decryptor(&self, password: &[u8]) -> Result<super::crypt::Decryptor> {
         use super::crypt::{Decryptor, Method, method_for_filter};
 
         let enc = self.resolve(
-            self.trailer
+            self.trailer()
                 .dict_gets("Encrypt")
                 .ok_or_else(|| Error::format("no /Encrypt dictionary"))?,
         )?;
@@ -230,7 +275,7 @@ impl PdfDocument {
         // contributes nothing rather than failing -- MuPDF is equally
         // forgiving, and some producers omit it.
         let first_id = self
-            .resolve(self.trailer.dict_gets("ID").unwrap_or(&Object::Null))
+            .resolve(self.trailer().dict_gets("ID").unwrap_or(&Object::Null))
             .ok()
             .and_then(|arr| arr.array_get(0).cloned())
             .and_then(|o| self.resolve(&o).ok())
@@ -320,11 +365,14 @@ impl PdfDocument {
         out.extend_from_slice(&[b'%', 0xE2, 0xE3, 0xCF, 0xD3, b'\n']);
         let mut offsets: std::collections::BTreeMap<i32, i64> = std::collections::BTreeMap::new();
 
-        let count = self.entries.len();
+        let count = self.entries.borrow().len();
         for num in 1..count as i32 {
-            match self.entries.get(num as usize).and_then(|e| e.as_ref()) {
-                Some(XrefEntry::Uncompressed { .. }) | Some(XrefEntry::Compressed { .. }) => {}
-                _ => continue,
+            let in_use = matches!(
+                self.entries.borrow().get(num as usize).and_then(|e| e.as_ref()),
+                Some(XrefEntry::Uncompressed { .. }) | Some(XrefEntry::Compressed { .. })
+            );
+            if !in_use {
+                continue;
             }
             // An object we cannot read is skipped rather than fatal: a
             // damaged corner of a 300-page form should not cost the other 299
@@ -374,7 +422,7 @@ endobj
         // The trailer keeps /Root, /Info and /ID; it loses /Encrypt (there is
         // nothing left to decrypt) and the stream-xref pointers, which
         // describe a layout this file no longer has.
-        let mut trailer = self.trailer.clone();
+        let mut trailer = self.trailer().clone();
         for key in [&b"Encrypt"[..], b"XRefStm", b"Prev", b"Type", b"W", b"Index", b"Filter", b"Length"] {
             trailer = super::write::dict_without_key_pub(&trailer, key);
         }
@@ -413,6 +461,20 @@ startxref
         self.was_decrypted
     }
 
+    // MuPDF: pdf_was_repaired (pdf-xref.c) -- `doc->repair_attempted`.
+    /// Whether this document's cross-reference had to be rebuilt by scanning
+    /// the file (see [`repair`](super::repair)).
+    ///
+    /// Worth checking before an *incremental* save: MuPDF refuses incremental
+    /// writes on a repaired file (pdf-write.c, "Can't do incremental writes on
+    /// a repaired file"), because the appended section's `/Prev` would chain
+    /// back to the very xref that was broken. The file still reopens here --
+    /// repair again, last definition wins -- but other readers may not be so
+    /// forgiving, so a full rewrite is the honest choice.
+    pub fn was_repaired(&self) -> bool {
+        self.repair_attempted.get() || self.repaired_before_rewrite
+    }
+
     /// Whether this document is encrypted.
     ///
     /// Matters far beyond curiosity: **kopitiam-pdf can decrypt but cannot
@@ -444,7 +506,7 @@ startxref
     /// The `/Encrypt` dictionary is itself never encrypted (§7.6.2), so it can
     /// be resolved before any key exists.
     pub fn encryption_summary(&self) -> Option<String> {
-        let enc = self.resolve(self.trailer.dict_gets("Encrypt")?).ok()?;
+        let enc = self.resolve(self.trailer().dict_gets("Encrypt")?).ok()?;
         if !enc.is_dict() {
             return None;
         }
@@ -491,13 +553,13 @@ startxref
     // MuPDF: pdf_trailer (pdf-xref.c:177).
     /// The document trailer dict (`/Root`, `/Size`, …).
     pub fn trailer(&self) -> &Object {
-        &self.trailer
+        self.repaired_trailer.get().unwrap_or(&self.trailer)
     }
 
     /// The document catalog (`/Root`, resolved).
     pub fn catalog(&self) -> Result<Object> {
         let root = self
-            .trailer
+            .trailer()
             .dict_gets("Root")
             .cloned()
             .unwrap_or(Object::Null);
@@ -531,7 +593,7 @@ startxref
 
     // MuPDF: pdf_load_object / pdf_cache_object return (pdf-xref.c:2681, 2551).
     /// Fetch object `num` from the xref, resolving it (and caching the result).
-    fn get_object(&self, num: i32) -> Result<Object> {
+    pub(super) fn get_object(&self, num: i32) -> Result<Object> {
         if num <= 0 {
             return Ok(Object::Null);
         }
@@ -546,7 +608,7 @@ startxref
 
     // MuPDF: pdf_cache_object (pdf-xref.c:2551) -- populate the entry's obj.
     /// Ensure object `num` is parsed into the cache. Idempotent.
-    fn ensure_cached(&self, num: i32) -> Result<()> {
+    pub(super) fn ensure_cached(&self, num: i32) -> Result<()> {
         if self.cache.borrow().contains_key(&num) {
             return Ok(());
         }
@@ -568,62 +630,146 @@ startxref
         Ok(())
     }
 
+    // MuPDF: pdf_cache_object (pdf-xref.c:2551-2677), the body after the
+    // `x->obj != NULL` early return -- including its repair-and-retry loop.
     /// Parse object `num` from the file/object-stream, without touching the
     /// cache lookup (the caller guards against recursion).
+    ///
+    /// # Repair, once
+    ///
+    /// When the object is not where the xref says -- the bytes at its offset do
+    /// not even start `N G obj`, or they start a *different* object -- MuPDF
+    /// rebuilds the whole xref by scanning the file and tries again
+    /// (`goto object_updated`). Only once per document though: after
+    /// `repair_attempted`, a mismatched header is "cannot parse object" and a
+    /// wrong object number just makes this one a free (null) object. Same
+    /// here, same order.
     fn load_object_uncached(&self, num: i32) -> Result<Cached> {
-        let entry = self.entries.get(num as usize).and_then(|e| e.as_ref());
-        match entry {
-            // Unknown or free object → null (pdf_resolve_indirect returns NULL;
-            // MuPDF's pdf_cache_object throws "cannot find object", but on the
-            // resolve path that surfaces as null).
-            None | Some(XrefEntry::Free) => Ok(Cached {
-                obj: Object::Null,
-                stm_ofs: None,
-                generation: 0,
-            }),
-            Some(XrefEntry::Uncompressed { offset }) => {
-                let offset = *offset;
-                let mut f = Stream::from_slice(&self.bytes);
-                f.seek(offset, Whence::Set)?;
-                let ind = parse_ind_obj(&mut f)?;
-                // MuPDF: "found object (rnum 0 R) instead of (num 0 R)".
-                if ind.num != num {
-                    return Err(Error::format(format!(
-                        "found object ({} 0 R) instead of ({num} 0 R)",
-                        ind.num
-                    )));
-                }
-                // Decrypt this object's strings -- and ONLY on this path.
-                //
-                // An object parsed out of an object stream must NOT be
-                // decrypted: it was encrypted as part of the containing
-                // stream's bytes and is already plaintext by the time it is
-                // parsed. Decrypting it again with its own object number
-                // yields garbage that still parses, which is the worst kind of
-                // wrong -- a document that loads and shows nonsense. Hence the
-                // split: the `Compressed` arm below leaves strings alone.
-                let mut obj = ind.object;
-                if let Some(d) = &self.decryptor
-                    && self.encrypt_obj_num != Some(num)
-                {
-                    decrypt_strings(d, num as u32, ind.generation as u16, &mut obj);
-                }
-                Ok(Cached {
-                    obj,
-                    stm_ofs: ind.stream.map(|s| s.start),
-                    generation: ind.generation,
-                })
+        let null = Cached {
+            obj: Object::Null,
+            stm_ofs: None,
+            generation: 0,
+        };
+        loop {
+            // object_updated: -- after a repair, the entry (and maybe an
+            // already-cached, /Length-corrected copy) is looked up afresh.
+            if let Some(c) = self.cache.borrow().get(&num) {
+                return Ok(c.clone());
             }
-            Some(XrefEntry::Compressed { stm_num, index }) => {
-                self.load_obj_stm(*stm_num, *index, num)
+            let entry = self.entries.borrow().get(num as usize).cloned().flatten();
+            match entry {
+                // Unknown or free object → null (pdf_resolve_indirect returns
+                // NULL; MuPDF's pdf_cache_object throws "cannot find object",
+                // but on the resolve path that surfaces as null).
+                None | Some(XrefEntry::Free) => return Ok(null),
+                Some(XrefEntry::Uncompressed { offset }) => {
+                    let (parsed, mut try_repair) = parse_ind_obj_at(&self.bytes, offset);
+                    let mut rnum = num;
+                    let mut found = None;
+                    match parsed {
+                        Ok(ind) => {
+                            rnum = ind.num;
+                            found = Some(ind);
+                        }
+                        // Only a broken `N G obj` header asks for repair; a
+                        // broken object *body* is the object's own problem.
+                        Err(e) if !try_repair || e.kind() == ErrorKind::System => return Err(e),
+                        Err(_) => {}
+                    }
+                    // MuPDF: "found object (rnum 0 R) instead of (num 0 R)" --
+                    // the entry is freed, and repaired if we still may.
+                    if !try_repair && rnum != num {
+                        self.set_entry(num, XrefEntry::Free);
+                        found = None;
+                        try_repair = !self.repair_attempted.get();
+                    }
+                    if try_repair {
+                        self.perform_repair(num, rnum)?;
+                        continue;
+                    }
+                    let Some(ind) = found else {
+                        // Wrong object and repair already spent: a free object.
+                        return Ok(null);
+                    };
+                    // Decrypt this object's strings -- and ONLY on this path.
+                    //
+                    // An object parsed out of an object stream must NOT be
+                    // decrypted: it was encrypted as part of the containing
+                    // stream's bytes and is already plaintext by the time it
+                    // is parsed. Decrypting it again with its own object
+                    // number yields garbage that still parses, which is the
+                    // worst kind of wrong -- a document that loads and shows
+                    // nonsense. Hence the split: the `Compressed` arm below
+                    // leaves strings alone.
+                    let mut obj = ind.object;
+                    if let Some(d) = &self.decryptor
+                        && self.encrypt_obj_num != Some(num)
+                    {
+                        decrypt_strings(d, num as u32, ind.generation as u16, &mut obj);
+                    }
+                    return Ok(Cached {
+                        obj,
+                        stm_ofs: ind.stream.map(|s| s.start),
+                        generation: ind.generation,
+                    });
+                }
+                Some(XrefEntry::Compressed { stm_num, index }) => {
+                    let attempted_before = self.repair_attempted.get();
+                    if let Some(c) = self.load_obj_stm(stm_num, index, num)? {
+                        return Ok(c);
+                    }
+                    // Divergence, deliberately: if loading the object stream
+                    // itself ran the repair, this entry may have moved, so
+                    // look it up again rather than freeing a good new entry
+                    // (MuPDF re-reads `ox` here for the same reason, Bug
+                    // 706762, but still frees it).
+                    if !attempted_before && self.repair_attempted.get() {
+                        continue;
+                    }
+                    // MuPDF: "object (num 0 R) was not found in its object
+                    // stream" -- free it, then repair unless already spent.
+                    self.set_entry(num, XrefEntry::Free);
+                    if self.repair_attempted.get() {
+                        return Err(Error::format(format!(
+                            "object ({num} 0 R) was not found in its object stream"
+                        )));
+                    }
+                    self.perform_repair(num, num)?;
+                }
             }
+        }
+    }
+
+    /// Overwrite one xref entry (growing the table if it must).
+    pub(super) fn set_entry(&self, num: i32, entry: XrefEntry) {
+        if num < 0 {
+            return;
+        }
+        let mut entries = self.entries.borrow_mut();
+        ensure_len(&mut entries, num as usize + 1);
+        entries[num as usize] = Some(entry);
+    }
+
+    // MuPDF: the `perform_repair:` label in pdf_cache_object (pdf-xref.c:2609).
+    /// Run the one-and-only repair for object `num` (which parsed as `rnum`),
+    /// translating a failed repair into the lookup error MuPDF reports.
+    fn perform_repair(&self, num: i32, rnum: i32) -> Result<()> {
+        match self.repair_xref() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::System => Err(e),
+            Err(_) if rnum == num => Err(Error::format(format!("cannot parse object ({num} 0 R)"))),
+            Err(_) => Err(Error::format(format!(
+                "found object ({rnum} 0 R) instead of ({num} 0 R)"
+            ))),
         }
     }
 
     // MuPDF: pdf_load_obj_stm (pdf-xref.c:2100).
     /// Decompress object stream `stm_num`, index its `/N` objects, cache them
-    /// all, and return the one numbered `target` (at compressed slot `index`).
-    fn load_obj_stm(&self, stm_num: i32, _index: i32, target: i32) -> Result<Cached> {
+    /// all, and return the one numbered `target` (at compressed slot `index`),
+    /// or `None` when the stream does not hold it (MuPDF's `!x->obj`, which
+    /// is what sends `pdf_cache_object` to repair).
+    fn load_obj_stm(&self, stm_num: i32, _index: i32, target: i32) -> Result<Option<Cached>> {
         let objstm = self.get_object(stm_num)?;
         if !objstm.is_dict() {
             return Err(Error::format(format!("corrupt object stream {stm_num}")));
@@ -691,11 +837,7 @@ startxref
             self.cache.borrow_mut().entry(onum).or_insert(cached);
         }
 
-        Ok(target_cached.unwrap_or(Cached {
-            obj: Object::Null,
-            stm_ofs: None,
-            generation: 0,
-        }))
+        Ok(target_cached)
     }
 
     // MuPDF: the `(entry->type == 'o' || entry->type == 'O') && entry->ofs == num`
@@ -735,7 +877,7 @@ startxref
     /// [`load_obj_stm`]: Self::load_obj_stm
     fn claimed_by_objstm(&self, onum: i32, stm_num: i32) -> bool {
         matches!(
-            self.entries.get(onum as usize).and_then(|e| e.as_ref()),
+            self.entries.borrow().get(onum as usize).and_then(|e| e.as_ref()),
             Some(XrefEntry::Compressed { stm_num: claimed, .. }) if *claimed == stm_num
         )
     }
@@ -790,20 +932,13 @@ startxref
         let stm_ofs =
             stm_ofs.ok_or_else(|| Error::format(format!("object is not a stream ({num} 0 R)")))?;
 
-        // MuPDF: pdf_stream_length -- clamp a bad /Length to 0.
+        // MuPDF: pdf_stream_length (pdf-stream.c:72) -- clamp a bad /Length
+        // to 0 -- then pdf_open_raw_filter's endstream filter, which reads
+        // on past /Length to the next `endstream`. So a clamped or too-short
+        // /Length still yields the whole body instead of nothing.
         let len_obj = self.resolve_get(&dict, "Length")?;
-        let mut length = len_obj.to_int();
-        if length < 0 || length > self.bytes.len() as i64 {
-            length = 0;
-        }
-
-        let start = stm_ofs as usize;
-        let end = start.saturating_add(length as usize).min(self.bytes.len());
-        let raw = if start <= end && start <= self.bytes.len() {
-            self.bytes[start..end].to_vec()
-        } else {
-            Vec::new()
-        };
+        let length = stream_length(len_obj.to_int(), self.bytes.len());
+        let raw = endstream_filter(&self.bytes, stm_ofs, length);
 
         // DECRYPT BEFORE FILTERING. The bytes on disk are the *encrypted*
         // form of the filtered stream, so the order is decrypt-then-inflate.
@@ -853,7 +988,7 @@ startxref
     /// walks every object exactly the way `mutool run`'s `countObjects()`
     /// does, so the two sides compare the same object set lah.
     pub fn xref_len(&self) -> usize {
-        self.entries.len()
+        self.entries.borrow().len()
     }
 
     // -----------------------------------------------------------------------
@@ -1052,8 +1187,14 @@ fn decrypt_strings(d: &super::crypt::Decryptor, num: u32, generation: u16, obj: 
     }
 }
 
+// MuPDF: pdf_load_xref + pdf_read_xref_sections + read_xref_section
+// (pdf-xref.c:1775, 1636, 1589).
 /// Build the xref table and pick out the newest trailer, following the
 /// `/Prev` chain (and hybrid `/XRefStm`).
+///
+/// Every sanity check MuPDF makes here is kept, because each one is a
+/// *repair trigger*: an `Err` from this function sends [`PdfDocument::open`]
+/// to the whole-file scan, just like pdf_init_document's fz_catch.
 fn load_xref(bytes: &[u8]) -> Result<(Vec<Option<XrefEntry>>, Object)> {
     let mut entries: Vec<Option<XrefEntry>> = Vec::new();
     let mut top_trailer: Option<Object> = None;
@@ -1072,28 +1213,157 @@ fn load_xref(bytes: &[u8]) -> Result<(Vec<Option<XrefEntry>>, Object)> {
         // Hybrid-reference files: read the cross-reference stream named by
         // /XRefStm, but ignore its trailer and do not follow its /Prev
         // (pdf-xref.c:1605).
-        if let Some(xstm) = trailer.dict_gets("XRefStm").map(|o| o.to_int())
-            && xstm > 0
-            && !seen.contains(&xstm)
-        {
+        let xstm = trailer.dict_gets("XRefStm").map(|o| o.to_int()).unwrap_or(0);
+        if xstm < 0 {
+            return Err(Error::format("negative xref stream offset"));
+        }
+        if xstm > 0 && !seen.contains(&xstm) {
             seen.push(xstm);
             let _ = read_xref_section(bytes, xstm, &mut entries)?;
         }
 
         // The first (newest) trailer wins for /Root, /Size, ….
-        let prev = trailer.dict_gets("Prev").map(|o| o.to_int());
+        // MuPDF: an integer /Prev that is not positive is an error
+        // (pdf-xref.c:1618), not the end of the chain.
+        let prev = match trailer.dict_gets("Prev") {
+            Some(Object::Int(p)) if *p <= 0 => {
+                return Err(Error::format("invalid offset for previous xref section"));
+            }
+            Some(Object::Int(p)) => Some(*p),
+            _ => None,
+        };
         if top_trailer.is_none() {
             top_trailer = Some(trailer);
         }
 
         match prev {
-            Some(p) if p > 0 => ofs = p,
-            _ => break,
+            Some(p) => ofs = p,
+            None => break,
         }
     }
 
-    let trailer = top_trailer.ok_or_else(|| Error::format("no trailer found"))?;
+    let mut trailer = top_trailer.ok_or_else(|| Error::format("no trailer found"))?;
+
+    // MuPDF: pdf_read_xref_sections (pdf-xref.c:1686) -- more entries than
+    // /Size claims means a lying trailer; off by one is let slide (Bug 708456).
+    let size = trailer.dict_gets("Size").map(|o| o.to_int()).unwrap_or(0);
+    let xref_len = entries.len() as i64;
+    if xref_len > size {
+        if xref_len == size + 1 {
+            trailer.dict_put("Size", Object::new_int(size + 1));
+        } else {
+            return Err(Error::format(
+                "incorrect number of xref entries in trailer, repairing",
+            ));
+        }
+    }
+
+    // MuPDF: pdf_load_xref (pdf-xref.c:1784).
+    if entries.is_empty() {
+        return Err(Error::format("found xref was empty"));
+    }
+    // Broken PDFs where the first object is missing: make it the free head.
+    if entries[0].is_none() {
+        entries[0] = Some(XrefEntry::Free);
+    }
+    check_xref_entry_offsets(&mut entries, bytes.len() as i64)?;
     Ok((entries, trailer))
+}
+
+// MuPDF: check_xref_entry_offsets (pdf-xref.c:1744).
+/// Reject an xref whose offsets cannot be right -- an uncompressed object at
+/// or past the end of the file, or a compressed one naming an object stream
+/// that is not an uncompressed object -- so that the caller repairs instead.
+/// `0000000000 nnnnn n` means *free* to some producers (Quartz), so it is.
+fn check_xref_entry_offsets(entries: &mut [Option<XrefEntry>], file_size: i64) -> Result<()> {
+    let xref_len = entries.len() as i64;
+    for i in 0..entries.len() {
+        match entries[i] {
+            Some(XrefEntry::Uncompressed { offset: 0 }) => entries[i] = Some(XrefEntry::Free),
+            Some(XrefEntry::Uncompressed { offset }) if offset <= 0 || offset >= file_size => {
+                return Err(Error::format(format!(
+                    "object offset out of range: {offset} ({i} 0 R)"
+                )));
+            }
+            Some(XrefEntry::Compressed { stm_num, .. }) => {
+                let ofs = stm_num as i64;
+                let is_n = ofs > 0
+                    && ofs < xref_len
+                    && matches!(entries[ofs as usize], Some(XrefEntry::Uncompressed { .. }));
+                if !is_n {
+                    return Err(Error::format(format!(
+                        "invalid reference to an objstm that does not exist: {ofs} ({i} 0 R)"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+// MuPDF: pdf_stream_length (pdf-stream.c:72).
+/// The sanity-checked `/Length`: negative or longer than the whole file
+/// becomes 0 (and the endstream filter then finds the real end).
+pub(super) fn stream_length(length: i64, file_size: usize) -> i64 {
+    if length < 0 || length > file_size as i64 { 0 } else { length }
+}
+
+// MuPDF: fz_open_endstream_filter + next_endstream (filter-basic.c:185-305),
+// read to the end as fz_read_all does.
+/// A stream body the way MuPDF reads it: first `len` bytes from `offset`,
+/// then -- distrusting `/Length` -- everything up to the next `endstream`
+/// keyword, minus the one end-of-line (LF, CR or CRLF) that precedes it.
+///
+/// With a right `/Length` the tail is just `\nendstream` and adds nothing.
+/// With a short (or clamped-to-0) one, the tail is the rest of the body.
+/// With a long one the first `len` bytes already ran past `endstream`, so
+/// the tail reaches for the *next* `endstream` in the file (or EOF) -- odd,
+/// but it is what MuPDF does, and what it then renders.
+///
+/// The chunked search in C (32, 64, … 4096-byte windows with an 11-byte
+/// carry) finds the same first `endstream` a plain scan finds; the one place
+/// the windows show is that an end-of-line lying *inside* the first `len`
+/// bytes is never stripped, hence the `end > 0` guards.
+pub(super) fn endstream_filter(bytes: &[u8], offset: i64, len: i64) -> Vec<u8> {
+    let n = bytes.len();
+    let start = (offset.max(0) as usize).min(n);
+    let mid = start.saturating_add(len.max(0) as usize).min(n);
+    let mut out = bytes[start..mid].to_vec();
+    // `remain` ran into EOF: the filter returns EOF before any scan.
+    let tail = &bytes[mid..];
+    let end = match find_bytes(tail, b"endstream") {
+        Some(p) => {
+            let mut end = p;
+            if end > 0 && tail[end - 1] == b'\n' {
+                end -= 1;
+            }
+            if end > 0 && tail[end - 1] == b'\r' {
+                end -= 1;
+            }
+            end
+        }
+        None => tail.len(),
+    };
+    out.extend_from_slice(&tail[..end]);
+    out
+}
+
+// MuPDF: fz_memmem (string-util.c).
+/// First position of `needle` in `hay`. Linear-ish: it only compares where
+/// the first byte already matches.
+pub(super) fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        let p = hay[i..=hay.len() - needle.len()].iter().position(|&b| b == first)?;
+        i += p;
+        if &hay[i + 1..i + needle.len()] == rest {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 // MuPDF: pdf_read_xref (pdf-xref.c:1569) -- dispatch classic vs. stream.
@@ -1218,12 +1488,10 @@ fn read_new_xref(
 
     // Decode the stream body. /Length, /Filter and /DecodeParms are direct in an
     // xref stream (they must be, as the xref is not yet usable to resolve them).
+    // MuPDF reads it through pdf_open_stream_with_offset → the same
+    // pdf_stream_length clamp + endstream filter as every other stream.
     let length = dict.dict_gets("Length").map(|o| o.to_int()).unwrap_or(0);
-    let start = stm_ofs as usize;
-    let end = start
-        .saturating_add(length.max(0) as usize)
-        .min(bytes.len());
-    let raw = bytes.get(start..end).unwrap_or(&[]).to_vec();
+    let raw = endstream_filter(bytes, stm_ofs, stream_length(length, bytes.len()));
     let filter = dict.dict_gets("Filter").cloned().unwrap_or(Object::Null);
     let parms = dict
         .dict_gets("DecodeParms")
@@ -1921,17 +2189,7 @@ mod tests {
         // Build far enough to have a document, without the /U check.
         let bytes = pdf_declaring_aes_encryption();
         let (entries, trailer) = load_xref(&bytes).expect("xref loads");
-        let doc = PdfDocument {
-            bytes,
-            entries,
-            trailer,
-            decryptor: None,
-            encrypt_obj_num: None,
-            was_decrypted: false,
-            pages: Vec::new(),
-            cache: RefCell::new(HashMap::new()),
-            resolving: RefCell::new(Vec::new()),
-        };
+        let doc = PdfDocument::from_parts(bytes, entries, trailer);
         let summary = doc.encryption_summary().expect("it is encrypted");
         for expected in ["/Standard", "V4", "R4", "AESV2"] {
             assert!(summary.contains(expected), "summary lacks {expected}: {summary}");
@@ -1960,19 +2218,9 @@ mod tests {
     fn a_decrypted_rewrite_drops_encrypt_and_stays_readable() {
         let bytes = pdf_declaring_aes_encryption();
         let (entries, trailer) = load_xref(&bytes).expect("xref loads");
-        let doc = PdfDocument {
-            bytes,
-            entries,
-            trailer,
-            // No decryptor: the fixture's bytes are already plaintext, so the
-            // rewrite is exercised without the cipher in the way.
-            decryptor: None,
-            encrypt_obj_num: None,
-            was_decrypted: false,
-            pages: Vec::new(),
-            cache: RefCell::new(HashMap::new()),
-            resolving: RefCell::new(Vec::new()),
-        };
+        // No decryptor: the fixture's bytes are already plaintext, so the
+        // rewrite is exercised without the cipher in the way.
+        let doc = PdfDocument::from_parts(bytes, entries, trailer);
 
         let plain = doc.rewrite_decrypted().expect("rewrites");
         let reopened = PdfDocument::open(plain).expect("the rewrite must be a valid PDF");
@@ -1999,6 +2247,78 @@ mod tests {
         );
         let again = PdfDocument::open(plain).expect("re-opens");
         assert_eq!(again.page_count(), doc.page_count());
+    }
+
+    /// pdf_cache_object's retry is spent after ONE repair: with
+    /// `repair_attempted` set, a broken `N G obj` header is "cannot parse
+    /// object" and a header naming a different object makes this one free
+    /// (null) -- no second rescan in either case.
+    #[test]
+    fn repair_is_attempted_only_once() {
+        let bytes = minimal_classic_pdf();
+        let (entries, trailer) = load_xref(&bytes).expect("xref loads");
+        let two = match &entries[2] {
+            Some(XrefEntry::Uncompressed { offset }) => *offset,
+            other => panic!("object 2 should be uncompressed, got {other:?}"),
+        };
+
+        // Header garbage (one byte into `N G obj`).
+        let doc = PdfDocument::from_parts(bytes.clone(), entries.clone(), trailer.clone());
+        doc.repair_attempted.set(true);
+        doc.set_entry(2, XrefEntry::Uncompressed { offset: two + 1 });
+        let err = doc.get_object(2).expect_err("no second repair");
+        assert!(err.to_string().contains("cannot parse object (2 0 R)"), "{err}");
+
+        // A well-formed header for the WRONG object: freed, reads as null.
+        let doc = PdfDocument::from_parts(bytes, entries, trailer);
+        doc.repair_attempted.set(true);
+        let one = match doc.entries.borrow()[1].clone() {
+            Some(XrefEntry::Uncompressed { offset }) => offset,
+            other => panic!("object 1 should be uncompressed, got {other:?}"),
+        };
+        doc.set_entry(2, XrefEntry::Uncompressed { offset: one });
+        assert!(doc.get_object(2).expect("null, not an error").is_null());
+        assert!(matches!(doc.entries.borrow()[2], Some(XrefEntry::Free)));
+    }
+
+    /// The same wrong-object slot WITHOUT a spent repair rescans the file and
+    /// finds the real object 2.
+    #[test]
+    fn a_wrong_object_at_an_offset_triggers_one_repair() {
+        let bytes = minimal_classic_pdf();
+        let (entries, trailer) = load_xref(&bytes).expect("xref loads");
+        let doc = PdfDocument::from_parts(bytes, entries, trailer);
+        let one = match doc.entries.borrow()[1].clone() {
+            Some(XrefEntry::Uncompressed { offset }) => offset,
+            other => panic!("object 1 should be uncompressed, got {other:?}"),
+        };
+        let want = doc.get_object(2).unwrap();
+        doc.cache.borrow_mut().clear();
+        doc.set_entry(2, XrefEntry::Uncompressed { offset: one });
+        assert_eq!(doc.get_object(2).unwrap(), want);
+        assert!(doc.was_repaired());
+    }
+
+    /// The endstream filter, byte for byte against filter-basic.c's rules.
+    #[test]
+    fn endstream_filter_reads_to_endstream() {
+        let f = b"stream\nABCDEF\r\nendstream\nendobj";
+        let body = 7i64;
+        // Right length: nothing extra.
+        assert_eq!(endstream_filter(f, body, 6), b"ABCDEF");
+        // Short: read on, dropping the CRLF before `endstream`.
+        assert_eq!(endstream_filter(f, body, 2), b"ABCDEF");
+        // Zero (a clamped /Length): the whole body.
+        assert_eq!(endstream_filter(f, body, 0), b"ABCDEF");
+        // An EOL inside the /Length bytes is not stripped.
+        assert_eq!(endstream_filter(f, body, 8), b"ABCDEF\r\n");
+        // No endstream at all: to EOF.
+        assert_eq!(endstream_filter(b"xxABC", 2, 1), b"ABC");
+        // Offset past EOF: empty, no panic.
+        assert!(endstream_filter(f, 1000, 5).is_empty());
+        assert_eq!(stream_length(-4, 100), 0);
+        assert_eq!(stream_length(101, 100), 0);
+        assert_eq!(stream_length(100, 100), 100);
     }
 
     /// `was_decrypted` is what drives the user-facing warning, so it must be

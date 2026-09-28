@@ -113,6 +113,7 @@ pub mod page_run;
 pub mod parse;
 pub mod pixmap;
 pub mod pool;
+pub mod repair;
 pub mod resources;
 pub mod shade;
 pub mod standard_encodings;
