@@ -13,7 +13,7 @@
 //! Before 0.4.2 the interpreter parsed `sh` and shading patterns and painted
 //! nothing: every gradient -- chart bars, slide backdrops, logo fills -- came out
 //! as whatever was underneath (usually white paper). The feature corpus
-//! (`scripts/mupdf-feature-corpus.py`) measured 50-64 % of the page wrong on
+//! (scripts/mupdf-feature-corpus.py) measured 50-64 % of the page wrong on
 //! the shading files.
 //!
 //! # How MuPDF draws a shading (and so how this does)

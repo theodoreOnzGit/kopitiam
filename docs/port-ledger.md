@@ -16,16 +16,16 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 
 | Status | Count |
 | --- | --- |
-| ported | 161 |
+| ported | 170 |
 | in-progress | 0 |
 | deliberately-diverged | 8 |
 | unported | 0 |
-| **total** | **169** |
+| **total** | **178** |
 
 | Upstream | License | Pinned commit | Entries |
 | --- | --- | --- | --- |
 | Leptonica | BSD-2-Clause | `10bdea2` | 8 |
-| MuPDF | AGPL-3.0 | `19f1284` | 107 |
+| MuPDF | AGPL-3.0 | `19f1284` | 116 |
 | pdf-to-markdown | MIT | `54baa2e` | 3 |
 | Tesseract | Apache-2.0 | `db0ec62` | 51 |
 
@@ -46,7 +46,6 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 
 | Source | Target | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
-| `cmaps/*.h` | `crates/kopitiam-pdf/src/mupdf/cmap.rs` | ported | `19f1284` |  |
 | `fitz/system.h` | `crates/kopitiam-pdf/src/mupdf/geometry.rs` | ported | `19f1284` |  |
 | `include/mupdf/fitz/buffer.h` | `crates/kopitiam-pdf/src/mupdf/buffer.rs` | ported | `19f1284` |  |
 | `include/mupdf/fitz/context.h` | `crates/kopitiam-pdf/src/mupdf/error.rs` | ported | `19f1284` |  |
@@ -68,12 +67,16 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 | `include/mupdf/pdf/xref.h` | `crates/kopitiam-pdf/src/mupdf/xref.rs` | ported | `19f1284` |  |
 | `scripts/glyphdump.py` | `crates/kopitiam-pdf/src/mupdf/agl_data.rs` | ported | `19f1284` |  |
 | `source/fitz/buffer.c` | `crates/kopitiam-pdf/src/mupdf/buffer.rs` | ported | `19f1284` |  |
+| `source/fitz/device.c` | `crates/kopitiam-pdf/src/mupdf/function.rs` | ported | `19f1284` |  |
+| `source/fitz/draw-affine.c` | `crates/kopitiam-pdf/src/mupdf/draw_affine.rs` | ported | `19f1284` |  |
 | `source/fitz/draw-affine.c` | `crates/kopitiam-pdf/src/mupdf/draw_device.rs` | ported | `19f1284` |  |
 | `source/fitz/draw-device.c` | `crates/kopitiam-pdf/src/mupdf/draw_device.rs` | ported | `19f1284` |  |
 | `source/fitz/draw-edge.c` | `crates/kopitiam-pdf/src/mupdf/draw_edge.rs` | ported | `19f1284` |  |
 | `source/fitz/draw-glyph.c` | `crates/kopitiam-pdf/src/mupdf/draw_device.rs` | ported | `19f1284` |  |
+| `source/fitz/draw-mesh.c` | `crates/kopitiam-pdf/src/mupdf/shade.rs` | ported | `19f1284` |  |
 | `source/fitz/draw-paint.c` | `crates/kopitiam-pdf/src/mupdf/draw_edge.rs` | ported | `19f1284` |  |
 | `source/fitz/draw-path.c` | `crates/kopitiam-pdf/src/mupdf/draw_path.rs` | ported | `19f1284` |  |
+| `source/fitz/draw-scale-simple.c` | `crates/kopitiam-pdf/src/mupdf/draw_scale.rs` | ported | `19f1284` |  |
 | `source/fitz/encodings.c` | `crates/kopitiam-pdf/src/mupdf/agl.rs` | ported | `19f1284` |  |
 | `source/fitz/encodings.c` | `crates/kopitiam-pdf/src/mupdf/encodings.rs` | ported | `19f1284` |  |
 | `source/fitz/encodings.h` | `crates/kopitiam-pdf/src/mupdf/encodings.rs` | ported | `19f1284` |  |
@@ -94,8 +97,10 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 | `source/fitz/image.c` | `crates/kopitiam-pdf/src/mupdf/page_image.rs` | ported | `19f1284` |  |
 | `source/fitz/load-jpeg.c` | `crates/kopitiam-pdf/src/mupdf/page_image.rs` | ported | `19f1284` |  |
 | `source/fitz/path.c` | `crates/kopitiam-pdf/src/mupdf/draw_path.rs` | ported | `19f1284` |  |
+| `source/fitz/pixmap.c` | `crates/kopitiam-pdf/src/mupdf/draw_scale.rs` | ported | `19f1284` |  |
 | `source/fitz/pixmap.c` | `crates/kopitiam-pdf/src/mupdf/pixmap.rs` | ported | `19f1284` |  |
 | `source/fitz/pool.c` | `crates/kopitiam-pdf/src/mupdf/pool.rs` | ported | `19f1284` |  |
+| `source/fitz/shade.c` | `crates/kopitiam-pdf/src/mupdf/shade.rs` | ported | `19f1284` |  |
 | `source/fitz/stext-boxer.c` | `crates/kopitiam-pdf/src/mupdf/stext_boxer.rs` | ported | `19f1284` |  |
 | `source/fitz/stext-classify.c` | `crates/kopitiam-pdf/src/mupdf/stext_classify.rs` | ported | `19f1284` |  |
 | `source/fitz/stext-device.c` | `crates/kopitiam-pdf/src/mupdf/stext_device.rs` | ported | `19f1284` |  |
@@ -120,12 +125,14 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 | `source/pdf/pdf-font.c` | `crates/kopitiam-pdf/src/mupdf/font.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-font.c` | `crates/kopitiam-pdf/src/mupdf/glyph_type1.rs` | deliberately-diverged | `19f1284` | clean-room adaptation: idea adapted, target header disclaims a faithful port |
 | `source/pdf/pdf-form.c` | `crates/kopitiam-pdf/src/mupdf/form.rs` | ported | `5fe54ce` |  |
+| `source/pdf/pdf-function.c` | `crates/kopitiam-pdf/src/mupdf/function.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-image.c` | `crates/kopitiam-pdf/src/mupdf/page_image.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-interpret.c` | `crates/kopitiam-pdf/src/mupdf/annot_run.rs` | ported | `5fe54ce` |  |
 | `source/pdf/pdf-interpret.c` | `crates/kopitiam-pdf/src/mupdf/interpret.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-interpret.c` | `crates/kopitiam-pdf/src/mupdf/resources.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-interpret.c` | `crates/kopitiam-pdf/src/mupdf/text_device.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-js.c` | `crates/kopitiam-pdf/src/mupdf/form.rs` | ported | `5fe54ce` |  |
+| `source/pdf/pdf-layer.c` | `crates/kopitiam-pdf/src/mupdf/layer.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-lex.c` | `crates/kopitiam-pdf/src/mupdf/lex.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-link.c` | `crates/kopitiam-pdf/src/mupdf/destination.rs` | ported | `0b8fd1c` |  |
 | `source/pdf/pdf-link.c` | `crates/kopitiam-pdf/src/mupdf/link.rs` | ported | `0b8fd1c` |  |
@@ -141,9 +148,11 @@ per-session re-discovery of "what is wired, what is ported, what is left".
 | `source/pdf/pdf-page.c` | `crates/kopitiam-pdf/src/mupdf/page_run.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-page.c` | `crates/kopitiam-pdf/src/mupdf/xref.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-parse.c` | `crates/kopitiam-pdf/src/mupdf/parse.rs` | ported | `19f1284` |  |
+| `source/pdf/pdf-repair.c` | `crates/kopitiam-pdf/src/mupdf/repair.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-resources.c` | `crates/kopitiam-pdf/src/mupdf/resources.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-run.c` | `crates/kopitiam-pdf/src/mupdf/annot_run.rs` | ported | `5fe54ce` |  |
 | `source/pdf/pdf-run.c` | `crates/kopitiam-pdf/src/mupdf/page_run.rs` | ported | `19f1284` |  |
+| `source/pdf/pdf-shade.c` | `crates/kopitiam-pdf/src/mupdf/shade.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-stream.c` | `crates/kopitiam-pdf/src/mupdf/doc_stream.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-unicode.c` | `crates/kopitiam-pdf/src/mupdf/cmap.rs` | ported | `19f1284` |  |
 | `source/pdf/pdf-unicode.c` | `crates/kopitiam-pdf/src/mupdf/font.rs` | ported | `19f1284` |  |

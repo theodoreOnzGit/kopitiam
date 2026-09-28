@@ -58,11 +58,18 @@
 //!   returning an [`IndirectObject`] that records the stream body's start offset
 //!   ([`StreamRange`]) for the xref layer to resolve.
 //!
-//! Still ahead: the `filter-*` decoders' remaining wiring, the xref / document
+//! ~~Still ahead: the `filter-*` decoders' remaining wiring, the xref / document
 //! layer (indirect resolution, `/ObjStm` object streams, stream decode,
 //! encryption), the content interpreter, fonts/CMaps/ToUnicode, and the `stext`
 //! device + layout analysis (`boxer`/`para`) -- the parts that actually fix the
-//! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.
+//! two-column reading order and the spurious inter-glyph spaces. Not built yet, hor.~~
+//! **CORRECTED 2026-09-28 (0.4.2)**: all of those exist now -- `xref` (+ `repair`,
+//! `crypt`), `interpret` / `op_run` / `page_run`, `font` / `cmap`, `stext_device` +
+//! `stext_boxer` / `stext_para` -- and so does a full draw path (`draw_device`,
+//! `draw_edge`, `draw_path`, `draw_affine`, `draw_scale`, `shade`, `function`,
+//! `layer`). What is ported and what is not, file by file, is in
+//! `docs/mupdf-port-coverage.md`; how close it is to real MuPDF, measured, is in
+//! `docs/mupdf-code-to-code.md`.
 
 pub mod agl;
 pub mod agl_data;

@@ -63,8 +63,10 @@
 //! * **No `/Type`/`/Subtype`-first dict reordering, no signature bypass.**
 //!   `fmt_dict`'s tight path (`pdf-object.c:3510`) sends `/Type`/`/Subtype`
 //!   first (a compression nicety) and skips encrypting `/Contents` under a
-//!   `/Type /Sig` dict (we have no `/Encrypt` support at all, so nothing to
-//!   bypass). Neither changes correctness; neither is ported.
+//!   `/Type /Sig` dict (~~we have no `/Encrypt` support at all~~ **CORRECTED
+//!   2026-09-28**: encrypted files are READ -- `crypt.rs`, rewritten to
+//!   plaintext at open -- but nothing is ever encrypted on write, so nothing
+//!   to bypass). Neither changes correctness; neither is ported.
 //! * **No encryption.** Every `fmt_*` crypt parameter in MuPDF is dropped —
 //!   this port only ever calls the plaintext path.
 

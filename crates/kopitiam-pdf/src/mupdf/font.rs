@@ -27,7 +27,11 @@
 //! cmap, reversing builtin glyph names, or falling back to glyph metrics when
 //! `/Widths` is absent -- this port falls back gracefully to the PDF-declared
 //! default (`/MissingWidth` or `/DW`, and [`super::agl::REPLACEMENT_CHARACTER`]
-//! for Unicode), never panics, and never rasterises a glyph.
+//! for Unicode), never panics~~, and never rasterises a glyph~~.
+//! **CORRECTED 2026-09-28 (0.4.2)**: "no FreeType" still holds, but embedded
+//! programs ARE read for glyph outlines -- `load_font_program` /
+//! [`Font::glyph_outline`] over `glyph_truetype` / `glyph_cff` / `glyph_type1`
+//! (plus `glyph_skrifa`), which the draw device fills.
 //!
 //! ## The fallback chain (the "missing unicode map" bug fix)
 //!
@@ -49,7 +53,9 @@
 //! procedures are loaded ([`Type3Info`]) and run by the interpreter. Still
 //! deferred: vertical writing-mode metrics (`/W2` / `/DW2`
 //! -> `vmtx`; horizontal `hmtx` is always built), the named Adobe CJK CMap
-//! resource set (see `cmap.rs`), and embedded-font glyph reading (FreeType).
+//! resource set (see `cmap.rs`)~~, and embedded-font glyph reading
+//! (FreeType)~~ (**CORRECTED 2026-09-28**: glyph outlines are read, without
+//! FreeType -- see "No FreeType" above).
 
 use super::glyph_cff::CffProgram;
 use super::agl::{REPLACEMENT_CHARACTER, unicode_from_glyph_name};

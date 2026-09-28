@@ -35,8 +35,10 @@
 //! bboxes, vectors, clipping, actualtext, CID/GID-for-unknown) are recognised
 //! but not acted upon -- see the per-constant docs and the device module.
 //!
-//! The [`StextBlock::Image`] variant is kept as a documented stub: the
-//! interpreter is not on the image path yet, so no image blocks are produced,
+//! The [`StextBlock::Image`] variant is kept as a documented stub: ~~the
+//! interpreter is not on the image path yet~~ (**CORRECTED 2026-09-28**: the
+//! interpreter does reach `TextDevice::draw_image`; the stext device keeps the
+//! trait's no-op default), so no image blocks are produced,
 //! but the variant exists so a later image wave can extend the model without a
 //! breaking change. `Struct`/`Vector`/`Grid` block types are omitted entirely
 //! (deferred to the structure/table waves).

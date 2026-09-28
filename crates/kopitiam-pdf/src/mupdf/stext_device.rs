@@ -56,8 +56,10 @@
 //!   (`unicode-general-category` / `unicode-normalization` stand in for ucdn).
 //! * **ActualText, styles, images, structure, tables,
 //!   segmentation**: recognised via [`StextOptions`] flags but not acted upon
-//!   (later waves). Layout analysis (reading order / paragraphs) is the *next*
-//!   wave.
+//!   (later waves). ~~Layout analysis (reading order / paragraphs) is the *next*
+//!   wave.~~ **CORRECTED 2026-09-28**: it exists -- `stext_boxer`, `stext_para`,
+//!   `stext_classify`, entered through `page_to_stext_segmented`. ActualText is
+//!   still not applied.
 
 use super::font::Font;
 use super::geometry::{Matrix, Point, Quad, Rect};

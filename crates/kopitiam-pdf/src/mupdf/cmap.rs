@@ -34,12 +34,16 @@
 //! ## Not ported (deliberately)
 //!
 //! The named Adobe predefined CMap **resource set** (`pdf-cmap-load.c`'s vendored
-//! `cmaps/*.h` tables: GBK/UniGB/UniJIS/…) is *not* vendored -- that is tens of
+//! cmaps header tables: GBK/UniGB/UniJIS/…) is *not* vendored -- that is tens of
 //! thousands of lines of CJK data. [`CMap::new_identity`] implements Identity-H /
 //! Identity-V directly (the overwhelmingly common Type0 encoding), and
 //! [`CMap::load_predefined`] returns `None` for any other name so the caller can
 //! fall back gracefully (see `font.rs`). `wmode` (vertical writing) is parsed and
 //! stored but the vertical-metrics path is handled in `font.rs`.
+//!
+//! (The header-table path is deliberately written without backticks above:
+//! `scripts/port-ledger.sh` counts every backticked source path in this header
+//! as ported, and listed those tables as ported until 2026-09-28.)
 
 use super::error::Result;
 use super::lex::{Token, lex};
