@@ -161,6 +161,21 @@ pub trait TextDevice {
     /// [`clip_text`](TextDevice::clip_text). Default no-op.
     fn pop_clip(&mut self) {}
 
+    // MuPDF: fz_fill_shade (the `sh` operator, pdf_show_shade; and a shading
+    // pattern painted through a clip, pdf_show_path's PDF_MAT_SHADE).
+    /// Paint `shade` under `ctm` at `alpha`, clipped to `clip` (and to any
+    /// clip pushed with [`clip_path`](TextDevice::clip_path)). Default no-op.
+    fn fill_shade(&mut self, _shade: &super::shade::Shade, _ctm: Matrix, _alpha: f32, _clip: Option<Rect>) {}
+
+    /// Whether this device wants Type3 glyph procedures RUN (their paths,
+    /// images and fills sent to it as drawing). A painting device does; an
+    /// extraction device only wants the glyph's char, which it already got
+    /// from [`show_glyph`](TextDevice::show_glyph) -- MuPDF's stext device
+    /// likewise never sees a Type3 procedure's contents. Default false.
+    fn wants_type3_procs(&self) -> bool {
+        false
+    }
+
     // MuPDF: the fill material of pdf_gstate carried into fz_fill_text.
     /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph
     /// boxes pick up the content stream's fill colour; extraction sinks ignore it.

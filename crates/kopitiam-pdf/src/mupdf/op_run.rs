@@ -168,15 +168,49 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // And the `Tr` mode, so a painting device can leave invisible (3) and
         // clip-only (7) text unpainted while extraction still sees the glyph.
         let render_mode = self.gstate().text.render;
-        self.dev.set_text_render_mode(render_mode);
+        // A shading-pattern fill paints the glyph as clip + fz_fill_shade
+        // (pdf_flush_text_imp's PDF_MAT_SHADE), so the device must not ALSO
+        // fill it with the flat colour: hand it the same mode minus the fill
+        // bit (0->3, 2->1, 4->7, 6->5).
+        let pattern_fill = self.gstate().fill_pattern.clone();
+        let fills = matches!(render_mode, 0 | 2 | 4 | 6);
+        let device_mode = if pattern_fill.is_some() && fills {
+            match render_mode {
+                0 => 3,
+                2 => 1,
+                4 => 7,
+                _ => 5,
+            }
+        } else {
+            render_mode
+        };
+        self.dev.set_text_render_mode(device_mode);
 
         // Emit. Split-borrow via direct field access: `font` reads self.gstack,
         // `dev` is a disjoint field, so the borrow checker permits both (going
         // through the `gstate()` method would borrow all of `self`).
-        {
+        //
+        // Hidden optional content emits nothing -- MuPDF zeroes dofill and
+        // dostroke, so neither the page nor stext sees the glyph -- but the
+        // pen still advances and a clip mode still accumulates.
+        if self.hidden > 0 {
+            if render_mode & 4 != 0 {
+                let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
+                self.text_clip.push(super::text_device::ClipGlyph { font: font.clone(), trm: trm_dev, cid });
+            }
+        } else {
             let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
             self.dev
                 .show_glyph(font, trm_dev, adv_em, unicode, cid, wmode as u8);
+            if let (Some((super::interpret::PatternFill::Shade(shade), gnum)), true) = (&pattern_fill, fills) {
+                let g = self.gstack.last().unwrap();
+                let pat_ctm = self.gstack.get(*gnum).map_or(g.ctm, |p| p.ctm);
+                let (alpha, clip) = (g.fill_alpha, g.clip);
+                let glyph = super::text_device::ClipGlyph { font: font.clone(), trm: trm_dev, cid };
+                self.dev.clip_text(std::slice::from_ref(&glyph));
+                self.dev.fill_shade(shade, pat_ctm, alpha, clip);
+                self.dev.pop_clip();
+            }
             // MuPDF pdf_show_char: modes 4..=7 also add the glyph to the clip
             // accumulator (pdf_tos_accumulate_clip), flushed at ET.
             if render_mode & 4 != 0 {
@@ -210,10 +244,73 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             }
         }
 
+        // MuPDF pdf_show_char's Type3 path: the glyph is its procedure, run
+        // straight to the device under `t3matrix · trm` (fz_render_t3_glyph_
+        // direct). Modes 3 and 7 paint nothing ("If Type3 and tr >= 4 ...
+        // ignore the clipping path part"; "if tr != 3, use mode 0").
+        if self.hidden == 0 && !matches!(render_mode, 3 | 7) && self.dev.wants_type3_procs() {
+            let t3 = self.gstate().text.font.as_ref().and_then(Font::type3_arc);
+            if let Some(t3) = t3 {
+                self.run_type3_glyph(&t3, cid, trm_dev);
+            }
+        }
+
         // MuPDF: pdf_tos_move_after_char (pdf-interpret.c:2062) -- advance Tm.
         self.tos.char_tx = char_tx;
         self.tos.char_ty = char_ty;
         self.tos.tm = self.tos.tm.pre_translate(char_tx, char_ty);
+    }
+
+    // MuPDF: fz_render_t3_glyph_direct (font.c:1798) -> pdf_run_glyph
+    // (pdf-run.c:423): a fresh processor over the glyph procedure with the
+    // current graphics state, the font's resources, ctm = t3matrix · trm.
+    fn run_type3_glyph(&mut self, t3: &super::font::Type3Info, cid: u32, trm_dev: Matrix) {
+        let Some(Some(proc_ref)) = t3.procs.get(cid as usize) else { return };
+        if self.t3_depth >= 8 {
+            return; // "recursive type3 font"
+        }
+        let Ok(content) = self.doc.open_stream(proc_ref) else { return };
+        let glyph_ctm = t3.matrix.concat(trm_dev);
+
+        // Own everything the glyph could disturb: the text object state, the
+        // clip accumulator, the mask flag, and (via gbot) the gstate stack.
+        let saved_tos = self.tos;
+        let saved_clip = std::mem::take(&mut self.text_clip);
+        let saved_mask = self.t3_mask;
+        let saved_path = std::mem::take(&mut self.path);
+        let oldtop = self.gstack.len();
+        self.op_q();
+        {
+            let g = self.gstate_mut();
+            g.ctm = glyph_ctm;
+            // "don't inherit the current font" (pdf_show_char).
+            g.text.font = None;
+        }
+        let pushed = t3.resources.is_dict();
+        if pushed {
+            self.resources.push(t3.resources.clone());
+        }
+        let oldbot = self.gbot;
+        self.gbot = self.gstack.len() - 1;
+        self.t3_mask = false;
+        self.t3_depth += 1;
+        let _ = self.run_stream(&content);
+        self.t3_depth -= 1;
+        self.flush_clip_text();
+        while self.gstack.len() - 1 > self.gbot {
+            self.op_q_restore();
+        }
+        self.gbot = oldbot;
+        if pushed {
+            self.resources.pop();
+        }
+        while self.gstack.len() > oldtop {
+            self.op_q_restore();
+        }
+        self.tos = saved_tos;
+        self.text_clip = saved_clip;
+        self.t3_mask = saved_mask;
+        self.path = saved_path;
     }
 
     // MuPDF: pdf_show_space (pdf-op-run.c:1457) -- shift Tm by the adjustment.
@@ -299,6 +396,9 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             self.path.close();
             self.cur = self.subpath_start;
         }
+        // pdf_show_path: "if (pr->super.hidden) dostroke = dofill = 0" -- a
+        // clip still applies below.
+        let (fill, stroke) = if self.hidden > 0 { (false, false) } else { (fill, stroke) };
         if fill {
             self.fill_current(rule);
         }
@@ -308,9 +408,44 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         self.end_path();
     }
 
+    // MuPDF: pdf_show_shade (pdf-op-run.c:505) for `sh`.
+    pub(crate) fn op_sh(&mut self, name: &[u8]) {
+        if self.hidden > 0 {
+            return; // pdf_show_shade: "if (pr->super.hidden) return"
+        }
+        let obj_ref = self.lookup_resource_raw("Shading", name);
+        let Ok(obj) = self.doc.resolve(&obj_ref) else { return };
+        if obj.is_null() {
+            return;
+        }
+        let Ok(shade) = super::shade::Shade::load(self.doc, &obj, &obj_ref) else { return };
+        let (ctm, alpha, clip) = {
+            let g = self.gstate();
+            (g.ctm, g.fill_alpha, g.clip)
+        };
+        self.dev.fill_shade(&shade, ctm, alpha, clip);
+    }
+
     // MuPDF: fz_fill_path via dev->fill_path (the fill material's DeviceRGB
-    // colour at `gstate->fill.alpha`).
+    // colour at `gstate->fill.alpha`) -- or, for a shading pattern, the path
+    // as a clip around fz_fill_shade in the pattern's space (PDF_MAT_SHADE,
+    // pdf-op-run.c:1038).
     fn fill_current(&mut self, rule: FillRule) {
+        if let Some((pat, gnum)) = self.gstate().fill_pattern.clone() {
+            let (ctm, alpha, clip) = {
+                let g = self.gstate();
+                (g.ctm, g.fill_alpha, g.clip)
+            };
+            let pat_ctm = self.gstack.get(gnum).map_or(ctm, |g| g.ctm);
+            match pat {
+                super::interpret::PatternFill::Shade(shade) => {
+                    self.dev.clip_path(&self.path, rule, ctm);
+                    self.dev.fill_shade(&shade, pat_ctm, alpha, clip);
+                    self.dev.pop_clip();
+                }
+            }
+            return;
+        }
         let (ctm, color, alpha, clip) = {
             let g: &GState = self.gstate();
             (g.ctm, g.fill_color, g.fill_alpha, g.clip)
@@ -474,9 +609,22 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
 
     // MuPDF: pdf_run_sc / _scn / _SC / _SCN -- set colour components in the current
     // colourspace. A bare pattern name (no numeric operands) is a TODO(draw) skip.
+    pub(crate) fn op_set_color_named(&mut self, stack: &[f64], name: Option<&[u8]>, fill: bool) {
+        let is_pattern_space = {
+            let g = self.gstate();
+            matches!(if fill { &g.fill_cs } else { &g.stroke_cs }, ColorSpace::Pattern(_))
+        };
+        if let (true, Some(n)) = (is_pattern_space, name) {
+            self.set_pattern(n, fill);
+        }
+        if stack.is_empty() {
+            return;
+        }
+        self.op_set_color(stack, name.is_some(), fill);
+    }
+
     pub(crate) fn op_set_color(&mut self, stack: &[f64], has_name: bool, fill: bool) {
         if stack.is_empty() {
-            // scn/SCN with only a /Pattern name: pattern fills are not painted.
             let _ = has_name;
             return;
         }
@@ -499,15 +647,44 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     }
 
     /// Store a resolved colourspace + its DeviceRGB colour into the fill or stroke
-    /// material of the current graphics state.
+    /// material of the current graphics state (a colour material: any pattern
+    /// is dropped, as pdf_set_colorspace sets `kind = PDF_MAT_COLOR`).
     fn set_material(&mut self, cs: ColorSpace, rgb: [f32; 3], fill: bool) {
         let g = self.gstate_mut();
         if fill {
             g.fill_cs = cs;
             g.fill_color = rgb;
+            g.fill_pattern = None;
         } else {
             g.stroke_cs = cs;
             g.stroke_color = rgb;
+            g.stroke_pattern = None;
+        }
+    }
+
+    // MuPDF: pdf_process_SC's pattern branch (pdf-interpret.c) +
+    // pdf_set_pattern (pdf-op-run.c:1785): load the named pattern and make it
+    // the material, remembering gparent as the pattern space.
+    fn set_pattern(&mut self, name: &[u8], fill: bool) {
+        let obj_ref = self.lookup_resource_raw("Pattern", name);
+        let Ok(obj) = self.doc.resolve(&obj_ref) else { return };
+        let pat = match self.doc.resolve_get(&obj, "PatternType").map(|o| o.to_int()) {
+            Ok(2) => match super::shade::Shade::load(self.doc, &obj, &obj_ref) {
+                Ok(sh) => Some(super::interpret::PatternFill::Shade(std::sync::Arc::new(sh))),
+                Err(_) => None,
+            },
+            // Tiling patterns (PatternType 1) are not ported yet: the
+            // material stays as it was (the pre-0.4.2 behaviour).
+            _ => None,
+        };
+        let gnum = self.gparent;
+        let g = self.gstate_mut();
+        if let Some(p) = pat {
+            if fill {
+                g.fill_pattern = Some((p, gnum));
+            } else {
+                g.stroke_pattern = Some((p, gnum));
+            }
         }
     }
 }

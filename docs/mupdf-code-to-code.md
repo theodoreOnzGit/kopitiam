@@ -340,3 +340,63 @@ pages still inside 1 %.
 
 Tests: 4 new (circle clip, Form /BBox, `7 Tr` clip, stray `Q` in a form),
 all fail on the pre-fix tree.
+
+**Second metric amendment (2026-09-28, before tranche 7's numbers).** A
+default `mutool draw` has two features this port does not have, and they
+change pixels whenever a page has non-Device colour: an ICC colour-management
+workflow (lcms2 with MuPDF's default profiles) and overprint/spot simulation
+(`-M 1`: a page with a Separation/DeviceN space is composited in CMYK+spots
+and converted at the end -- which even turned a plain DeviceRGB green into
+(106,189,69) on the colour-space feature page). Comparing against those
+measures missing features, not the conversions the port translates. So the
+raster oracle now runs `mutool draw -N -M 0`: MuPDF's own no-ICC fast
+conversions (`color-fast.c`, the formulas ported) and no spot simulation. The
+CMS and spot simulation are listed as missing in the coverage map. The final
+table re-measures both corpora with this setting.
+
+### Tranche 7 (functions, colour spaces, shadings, optional content, Type3) -- measured 2026-09-28
+
+1. **PDF functions** (`function.rs`, a full port of `pdf-function.c`: sampled,
+   exponential, stitching, PostScript calculator; written by a sub-agent
+   against a frozen API, 25 unit tests).
+2. **Colour spaces** as `pdf_load_colorspace` builds them and `fz_convert_color`
+   converts them without ICC: Indexed through its lookup table,
+   Separation/DeviceN through their tint transform into the alternate space,
+   Lab through `lab_to_rgb`, the `[0 0 0 1]` / all-ones initial colours of
+   `pdf_set_colorspace`. Images in Separation/DeviceN/Lab (and Indexed over
+   them) decode through the same machinery instead of failing.
+3. **Shadings** (`shade.rs`: `pdf-shade.c` loading, `shade.c` meshing for all
+   seven types, `draw-mesh.c`'s Gouraud triangle painter and colour
+   look-up): the `sh` operator, and shading **patterns** as fill colour for
+   paths and text (clip + `fz_fill_shade` in the pattern space, `gparent`
+   tracking included).
+4. **Optional content** (`layer.rs`, `pdf-layer.c`): the default
+   configuration's ON/OFF/BaseState/Intent, OCMD policies; `BDC /OC` ...
+   `EMC` and XObject `/OC` hide paths, text (from extraction too), images and
+   shadings, as MuPDF's `proc->hidden` does.
+5. **Type3 fonts** (`pdf-type3.c`): widths scaled by the FontMatrix, ascender
+   and descender from the FontBBox, and each glyph's procedure run through
+   the interpreter under `FontMatrix · trm` (`d1` glyphs ignore colour
+   operators and paint in the text colour). No more advance boxes, so no more
+   hayro fallback, for Type3 text.
+
+| feature file | gross % before (tranche 6) | after | mean \|Δluma\| after |
+|---|---|---|---|
+| shading-sh (axial + radial) | 63.93 | **0.00** | 0.00 |
+| shading-pattern | 31.60 | **0.00** | 0.00 |
+| shading-type1-ps (function-based, PS calculator) | (new) | **0.00** | 0.00 |
+| shading-mesh4 (free-form triangles) | (new) | **0.00** | 0.00 |
+| shading-radial-separation | (new) | **0.00** | 0.01 |
+| fill-colorspaces (Indexed, Separation, Lab, CalRGB) | 75.00 | **0.00** | 0.00 |
+| image-devicen-lab | (new) | **0.00** | 0.12 |
+| optional-content | 25.00 | **0.00** | 0.00 |
+| type3 | 8.11 | **0.00** | 0.06 |
+
+(`-N -M 0` oracle throughout this table; the "before" column was measured
+with the default oracle, which for these files differs only in the colour
+pages -- both verdicts are "fail".) Axial, radial, function-based and mesh
+shadings come out **pixel-identical** to MuPDF.
+
+Tests: 7 new in `tests/mupdf_parity.rs` (colour spaces, axial `sh`, shading
+pattern, type 4 mesh, DeviceN image, optional content, Type3), all failing on
+the pre-tranche tree; expected values measured with `mutool -N -M 0`.

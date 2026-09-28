@@ -141,6 +141,12 @@ pub(crate) struct GState {
     /// The stroke alpha (`/CA` via `gs`), 0..=1. Default 1.
     // MuPDF: pdf_gstate.stroke.alpha (pdf_run_gs_CA).
     pub stroke_alpha: f32,
+    /// The fill material when it is a pattern (MuPDF `fill.kind ==
+    /// PDF_MAT_SHADE / PDF_MAT_PATTERN`), with the gstate index whose CTM is
+    /// the pattern space (`fill.gstate_num = pr->gparent`).
+    pub fill_pattern: Option<(PatternFill, usize)>,
+    /// The stroke material when it is a pattern.
+    pub stroke_pattern: Option<(PatternFill, usize)>,
     /// How many device clips are pushed in total at this state -- MuPDF's
     /// cumulative `pdf_gstate.clip_depth`: `q` copies it, `Q` pops the
     /// difference between the popped and the restored state.
@@ -167,9 +173,19 @@ impl GState {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             clip_depth: 0,
+            fill_pattern: None,
+            stroke_pattern: None,
             clip: None,
         }
     }
+}
+
+/// A pattern material (`pdf_material` with a pattern or shade).
+#[derive(Clone, Debug)]
+pub(crate) enum PatternFill {
+    /// A shading pattern (`/PatternType 2`), painted with fz_fill_shade
+    /// through a clip of the shape.
+    Shade(std::sync::Arc<super::shade::Shade>),
 }
 
 /// The text object state (`pdf_text_object_state`), reduced to the text-showing
@@ -300,6 +316,22 @@ pub struct Processor<'a, D: TextDevice + ?Sized> {
     /// Glyphs shown in a clipping render mode (4..=7) since the last `ET`
     /// (MuPDF's `pdf_tos.clip_text`), turned into a clip at `ET`.
     pub(crate) text_clip: Vec<super::text_device::ClipGlyph>,
+    /// MuPDF's `pr->gparent`: the gstate whose CTM is the pattern space for
+    /// patterns selected now (the page's base state, or the state a Form
+    /// XObject was invoked from, its CTM temporarily set to the form's).
+    pub(crate) gparent: usize,
+    /// MuPDF's `proc->hidden`: > 0 while inside optional content that the
+    /// default layer configuration hides (paths, text, images and shadings
+    /// then paint nothing; clips still apply).
+    pub(crate) hidden: u32,
+    /// The document's default layer configuration, read on first use.
+    pub(crate) ocg: Option<std::sync::Arc<super::layer::OcgConfig>>,
+    /// Inside a Type3 glyph procedure that declared `d1` (an uncoloured,
+    /// "mask" glyph): colour operators are ignored and the glyph paints in
+    /// the text's fill colour (MuPDF's FZ_DEVFLAG_MASK, pdf-op-run.c:3068).
+    pub(crate) t3_mask: bool,
+    /// Type3 glyph-procedure nesting depth ("recursive type3 font" guard).
+    pub(crate) t3_depth: u32,
 }
 
 impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
@@ -326,6 +358,11 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             pending_clip: None,
             gbot: 0,
             text_clip: Vec::new(),
+            gparent: 0,
+            hidden: 0,
+            ocg: None,
+            t3_mask: false,
+            t3_depth: 0,
         }
     }
 
@@ -523,6 +560,9 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             }
 
             // -- colour ----------------------------------------------------
+            // (all ignored inside a `d1` Type3 glyph: FZ_DEVFLAG_MASK)
+            b"g" | b"G" | b"rg" | b"RG" | b"k" | b"K" | b"cs" | b"CS" | b"sc" | b"scn" | b"SC" | b"SCN"
+                if self.t3_mask => {}
             b"g" => self.op_set_gray(s(0), true),
             b"G" => self.op_set_gray(s(0), false),
             b"rg" => self.op_set_rgb(s(0), s(1), s(2), true),
@@ -531,8 +571,42 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             b"K" => self.op_set_cmyk(s(0), s(1), s(2), s(3), false),
             b"cs" => self.op_set_colorspace(name.as_deref(), true),
             b"CS" => self.op_set_colorspace(name.as_deref(), false),
-            b"sc" | b"scn" => self.op_set_color(stack, name.is_some(), true),
-            b"SC" | b"SCN" => self.op_set_color(stack, name.is_some(), false),
+            b"sc" | b"scn" => self.op_set_color_named(stack, name.as_deref(), true),
+            b"SC" | b"SCN" => self.op_set_color_named(stack, name.as_deref(), false),
+
+            // -- marked content: optional content (pdf_process_BDC/BMC/EMC,
+            //    pdf-interpret.c:1227-1263) -------------------------------
+            b"BDC" => {
+                if self.hidden > 0 {
+                    self.hidden += 1;
+                } else if name.as_deref() == Some(b"OC".as_slice())
+                    && let Some(props) = obj
+                    && self.ocg_hidden(props)
+                {
+                    self.hidden += 1;
+                }
+            }
+            b"BMC" => {
+                if self.hidden > 0 {
+                    self.hidden += 1;
+                }
+            }
+            b"EMC" => {
+                if self.hidden > 0 {
+                    self.hidden -= 1;
+                }
+            }
+
+            // -- Type3 glyph metrics (pdf_run_d0 / pdf_run_d1) --------------
+            b"d0" => self.t3_mask = false,
+            b"d1" => self.t3_mask = true,
+
+            // -- shadings (pdf_run_sh -> pdf_show_shade) ------------------
+            b"sh" => {
+                if let Some(n) = name {
+                    self.op_sh(n);
+                }
+            }
 
             // -- XObjects (Form recursion + Image painting) ----------------
             b"Do" => self.op_do(name.as_deref())?,
@@ -551,6 +625,18 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
     // MuPDF: pdf_run_BT (pdf-op-run.c:2929) -- reset Tm and Tlm to identity.
     // MuPDF: pdf_flush_clip_text -> pdf_flush_text_imp(flush_clip = 1)'s
     // `doclip` branch (pdf-op-run.c:1266).
+    // MuPDF: pdf_is_ocg_hidden(doc, rstack, "View", obj) (pdf-layer.c:791).
+    /// Whether optional content `obj` (a `/Properties` name, an OCG/OCMD dict
+    /// or a reference to one) is hidden under the default configuration.
+    pub(crate) fn ocg_hidden(&mut self, obj: &Object) -> bool {
+        let cfg = self
+            .ocg
+            .get_or_insert_with(|| std::sync::Arc::new(super::layer::OcgConfig::load(self.doc)))
+            .clone();
+        let lookup = |n: &[u8]| self.lookup_resource_raw("Properties", n);
+        cfg.is_hidden(self.doc, obj, &lookup)
+    }
+
     pub(crate) fn flush_clip_text(&mut self) {
         if self.text_clip.is_empty() {
             return;

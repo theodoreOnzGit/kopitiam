@@ -118,6 +118,12 @@ enum ColorKind {
         base: Box<ColorKind>,
         palette: Vec<u8>,
     },
+    /// Any other space (Separation, DeviceN, Lab, or an Indexed over one of
+    /// those), converted per pixel through the fill-colour machinery
+    /// ([`super::resources::ColorSpace::to_rgb`]) -- tint transforms, Lab
+    /// decode ranges and all. **Since 0.4.2**; before, such images returned
+    /// Unsupported and rendered blank.
+    Via(super::resources::ColorSpace),
 }
 
 impl ColorKind {
@@ -129,6 +135,7 @@ impl ColorKind {
             ColorKind::Rgb => 3,
             ColorKind::Cmyk => 4,
             ColorKind::Indexed { .. } => 1,
+            ColorKind::Via(cs) => cs.n(),
         }
     }
 
@@ -137,7 +144,7 @@ impl ColorKind {
     fn output_components(&self) -> u8 {
         match self {
             ColorKind::Gray => 1,
-            ColorKind::Rgb | ColorKind::Cmyk => 3,
+            ColorKind::Rgb | ColorKind::Cmyk | ColorKind::Via(_) => 3,
             ColorKind::Indexed { base, .. } => base.output_components(),
         }
     }
@@ -857,6 +864,26 @@ fn emit_pixel(
             }
             push_base(cs, &c01[..comps.len()], out);
         }
+        ColorKind::Via(space) => {
+            // MuPDF's image decode defaults (pdf-image.c:127-143): Lab uses
+            // [0 100 -128 127 -128 127]; an Indexed space the raw index
+            // ([0 maxval]); everything else [0 1].
+            let n = comps.len();
+            let mut v = [0f32; 32];
+            for (i, &raw) in comps.iter().enumerate().take(32) {
+                let (dmin, dmax) = match decode {
+                    Some(d) if d.len() >= 2 * (i + 1) => (d[2 * i], d[2 * i + 1]),
+                    _ => match space {
+                        super::resources::ColorSpace::Lab => [(0.0, 100.0), (-128.0, 127.0), (-128.0, 127.0)][i.min(2)],
+                        super::resources::ColorSpace::Indexed { .. } => (0.0, maxval),
+                        _ => (0.0, 1.0),
+                    },
+                };
+                v[i] = dmin + raw as f32 * (dmax - dmin) / maxval;
+            }
+            let rgb = space.to_rgb(&v[..n], [0.0; 3]);
+            out.extend_from_slice(&[to8(rgb[0]), to8(rgb[1]), to8(rgb[2])]);
+        }
         ColorKind::Indexed { base, palette } => {
             // The single sample is a palette index (optionally /Decode-remapped).
             let index = match decode {
@@ -885,8 +912,9 @@ fn push_base(base: &ColorKind, comps: &[f32], out: &mut Vec<u8>) {
             let (r, g, b) = cmyk_to_rgb(comps[0], comps[1], comps[2], comps[3]);
             out.extend_from_slice(&[r, g, b]);
         }
-        // An Indexed palette's base is never itself Indexed (PDF forbids it).
-        ColorKind::Indexed { .. } => out.push(to8(comps[0])),
+        // An Indexed palette's base is never itself Indexed (PDF forbids it),
+        // and a Via base is routed around this function (parse_colorspace).
+        ColorKind::Indexed { .. } | ColorKind::Via(_) => out.push(to8(comps[0])),
     }
 }
 
@@ -934,6 +962,7 @@ fn parse_colorspace(doc: &PdfDocument, obj: &Object) -> Result<ColorKind> {
             b"DeviceGray" | b"G" | b"CalGray" => Ok(ColorKind::Gray),
             b"DeviceRGB" | b"RGB" | b"CalRGB" => Ok(ColorKind::Rgb),
             b"DeviceCMYK" | b"CMYK" => Ok(ColorKind::Cmyk),
+            b"Lab" => Ok(ColorKind::Via(super::resources::ColorSpace::Lab)),
             other => Err(Error::unsupported(format!(
                 "unsupported colorspace: /{}",
                 String::from_utf8_lossy(other)
@@ -958,9 +987,18 @@ fn parse_colorspace(doc: &PdfDocument, obj: &Object) -> Result<ColorKind> {
                         },
                     }
                 }
+                // MuPDF: load_devicen / Lab via pdf_load_colorspace.
+                b"Separation" | b"DeviceN" | b"Lab" => {
+                    Ok(ColorKind::Via(super::resources::load_colorspace(doc, &obj, 0)))
+                }
                 b"Indexed" | b"I" => {
                     let base_obj = items.get(1).cloned().unwrap_or(Object::Null);
                     let base = parse_colorspace(doc, &base_obj)?;
+                    if matches!(base, ColorKind::Via(_)) {
+                        // An Indexed over Separation/DeviceN/Lab: let the
+                        // colour machinery do the lookup AND the tint.
+                        return Ok(ColorKind::Via(super::resources::load_colorspace(doc, &obj, 0)));
+                    }
                     let lookup_obj = items.get(3).cloned().unwrap_or(Object::Null);
                     let resolved = doc.resolve(&lookup_obj)?;
                     let palette = match resolved {

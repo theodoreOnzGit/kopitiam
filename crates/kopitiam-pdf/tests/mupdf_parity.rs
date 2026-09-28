@@ -18,6 +18,13 @@
 //! * **Tranche 5 -- stencils, inline images, encrypted streams**.
 //! * **Tranche 6 -- clipping** (`fz_clip_path` masks, text clip, Form
 //!   `/BBox`, `gbot`).
+//! * **Tranche 7 -- functions, colour spaces, shadings, optional content,
+//!   Type3** (`pdf-function.c`, `pdf-colorspace.c`, `pdf-shade.c` / `shade.c` /
+//!   `draw-mesh.c`, `pdf-layer.c`, `pdf-type3.c`).
+//!
+//! From tranche 7 on the expected values are measured with `mutool draw -N -M
+//! 0` -- MuPDF's no-ICC, no-spot-simulation mode, which is the mode this port
+//! targets (it has no CMS and no overprint simulation; see the coverage map).
 
 use kopitiam_pdf::mupdf::structured_text::{StextBlock, StextChar, StextOptions};
 use kopitiam_pdf::mupdf::xref::PdfDocument;
@@ -640,4 +647,187 @@ fn stray_q_in_a_form_cannot_pop_the_callers_state() {
     );
     let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
     assert_eq!(rgb_at(&pix, 100, 100), [0, 0, 255]);
+}
+
+// ---------------------------------------------------------------------------
+// Tranche 7 -- functions, colour spaces, shadings
+// ---------------------------------------------------------------------------
+
+/// A 200x200 page from raw bodies: resources + content, extra objects 5...
+fn raw_page(resources: &str, content: &[u8], extra: Vec<Vec<u8>>) -> PdfDocument {
+    let mut bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources {resources} /Contents 4 0 R >>")
+            .into_bytes(),
+        raw_stream("", content),
+    ];
+    bodies.extend(extra);
+    PdfDocument::open(build_pdf(&bodies)).expect("fixture opens")
+}
+
+/// Indexed fills look the index up in the palette; Separation fills run the
+/// tint transform into the alternate space; Lab fills use MuPDF's no-ICC
+/// `lab_to_rgb`. 0.4.1: the index as a gray (white), `1 - max(tint)` gray,
+/// Lab-as-RGB. mutool -N: (0,255,0), (255,127,127), (201,45,49).
+#[test]
+fn fill_colour_spaces_convert_like_mupdf() {
+    let doc = page_with(
+        "<< /ColorSpace << /I [/Indexed /DeviceRGB 1 <FF000000FF00>] \
+/S [/Separation /Spot /DeviceCMYK << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 1 1 0] /N 1 >>] \
+/L [/Lab << /WhitePoint [0.9505 1 1.089] /Range [-100 100 -100 100] >>] >> >>",
+        "/I cs 1 sc 0 0 100 100 re f /S cs 0.5 sc 100 0 100 100 re f /L cs 50 60 40 sc 0 100 100 100 re f",
+        &[],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert!(near(rgb_at(&pix, 50, 150), [0, 255, 0]), "indexed {:?}", rgb_at(&pix, 50, 150));
+    assert!(near(rgb_at(&pix, 150, 150), [255, 127, 127]), "separation {:?}", rgb_at(&pix, 150, 150));
+    assert!(near(rgb_at(&pix, 50, 50), [201, 45, 49]), "lab {:?}", rgb_at(&pix, 50, 50));
+}
+
+/// `sh` with an axial shading was parsed and ignored (blank page). MuPDF
+/// samples the function 256 times and Gouraud-fills an extended quad; mutool
+/// -N along y = 100: (255,0,0) (192,0,63) (127,0,127) (63,0,191) (1,0,253).
+#[test]
+fn axial_shading_sh_paints_the_gradient() {
+    let doc = page_with(
+        "<< /Shading << /Ax << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 200 0] /Extend [true true] \
+/Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> >>",
+        "/Ax sh",
+        &[],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (x, want) in [(0u32, [255u8, 0, 0]), (50, [192, 0, 63]), (100, [127, 0, 127]), (150, [63, 0, 191]), (199, [1, 0, 253])] {
+        assert!(near(rgb_at(&pix, x, 100), want), "x = {x}: {:?} want {want:?}", rgb_at(&pix, x, 100));
+    }
+}
+
+/// A shading PATTERN as the fill colour (`/Pattern cs /P scn ... f`): the
+/// path becomes a clip around fz_fill_shade in the pattern space. 0.4.1
+/// kept the previous colour. mutool -N: (100,30) 216 gray, centre 127, (100,170)
+/// 38, outside the rectangle white.
+#[test]
+fn shading_pattern_fills_through_the_path() {
+    let doc = page_with(
+        "<< /Pattern << /P << /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceGray \
+/Coords [0 0 0 200] /Function << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> >> >> >> >>",
+        "/Pattern cs /P scn 20 20 160 160 re f",
+        &[],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (p, want) in [((100u32, 30u32), 216u8), ((100, 100), 127), ((100, 170), 38), ((10, 100), 255)] {
+        let v = rgb_at(&pix, p.0, p.1)[0];
+        assert!((v as i32 - want as i32).abs() <= 2, "{p:?}: {v}, want {want}");
+    }
+}
+
+/// A type 4 free-form triangle mesh read from the bit-packed stream
+/// (fz_process_shade_type4) and Gouraud-filled (draw-mesh.c). mutool -N
+/// samples: (20,20) (0,25,229), (100,100) (0,127,127), (150,50) (127,191,63).
+#[test]
+fn type4_mesh_shading_is_gouraud_filled() {
+    let mesh: Vec<u8> = vec![
+        0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 1, 255, 255, 255, 255, 0,
+    ];
+    let mut sh = format!(
+        "<< /Length {} /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 \
+/BitsPerFlag 8 /Decode [0 200 0 200 0 1 0 1 0 1] >>\nstream\n",
+        mesh.len()
+    )
+    .into_bytes();
+    sh.extend_from_slice(&mesh);
+    sh.extend_from_slice(b"\nendstream");
+    let doc = raw_page("<< /Shading << /M 5 0 R >> >>", b"/M sh", vec![sh]);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (p, want) in [((20u32, 20u32), [0u8, 25, 229]), ((100, 100), [0, 127, 127]), ((150, 50), [127, 191, 63])] {
+        assert!(near(rgb_at(&pix, p.0, p.1), want), "{p:?}: {:?} want {want:?}", rgb_at(&pix, p.0, p.1));
+    }
+}
+
+/// A DeviceN image (two inks, a sampled type 0 tint function into RGB) used
+/// to be "unsupported colorspace" and drew nothing. mutool -N, 2x2 image
+/// stretched over the left half: (25,50) black, (75,50) red, (25,150) green,
+/// (75,150) blue.
+#[test]
+fn devicen_image_goes_through_its_tint_transform() {
+    let img = [0u8, 0, 255, 0, 0, 255, 255, 255];
+    let samp = [0u8, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255];
+    let mut im = format!(
+        "<< /Length {} /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 \
+/ColorSpace [/DeviceN [/A /B] /DeviceRGB 6 0 R] >>\nstream\n",
+        img.len()
+    )
+    .into_bytes();
+    im.extend_from_slice(&img);
+    im.extend_from_slice(b"\nendstream");
+    let mut f = format!(
+        "<< /Length {} /FunctionType 0 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Size [2 2] /BitsPerSample 8 >>\nstream\n",
+        samp.len()
+    )
+    .into_bytes();
+    f.extend_from_slice(&samp);
+    f.extend_from_slice(b"\nendstream");
+    let doc = raw_page("<< /XObject << /D 5 0 R >> >>", b"q 100 0 0 200 0 0 cm /D Do Q", vec![im, f]);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (p, want) in [((25u32, 50u32), [0u8, 0, 0]), ((75, 50), [255, 0, 0]), ((25, 150), [0, 255, 0]), ((75, 150), [0, 0, 255])] {
+        assert!(near(rgb_at(&pix, p.0, p.1), want), "{p:?}: {:?} want {want:?}", rgb_at(&pix, p.0, p.1));
+    }
+}
+
+/// Optional content: `/OC /L BDC ... EMC` where `/L` is OFF in the default
+/// configuration paints nothing and extracts nothing (pdf_process_BDC +
+/// pdf_is_ocg_hidden); an XObject whose /OC is hidden is skipped. 0.4.1 drew
+/// every layer.
+#[test]
+fn optional_content_off_layers_are_hidden() {
+    let bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [5 0 R] /D << /OFF [5 0 R] >> >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Properties << /L 5 0 R >> \
+/Font << /F 6 0 R >> /XObject << /X 7 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream(
+            "",
+            "0 1 0 rg 0 0 200 200 re f /OC /L BDC 1 0 0 rg 50 50 100 100 re f BT /F 20 Tf 20 20 Td (Secret) Tj ET EMC \
+0 g BT /F 20 Tf 20 170 Td (Shown) Tj ET /X Do",
+        ),
+        b"<< /Type /OCG /Name (Hidden) >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Length 22 /Type /XObject /Subtype /Form /BBox [0 0 200 200] /OC 5 0 R >>\nstream\n0 0 1 rg 0 0 30 30 re f\nendstream".to_vec(),
+    ];
+    let doc = PdfDocument::open(build_pdf(&bodies)).expect("opens");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 100, 100), [0, 255, 0], "the OFF layer's red square must not paint");
+    assert_eq!(rgb_at(&pix, 10, 190), [0, 255, 0], "the hidden form's blue square must not paint");
+    let text = page_to_stext(&doc, 0, StextOptions::default()).expect("stext").text();
+    assert!(text.contains("Shown") && !text.contains("Secret"), "{text:?}");
+}
+
+/// Type3 glyphs are content-stream procedures (pdf-type3.c): MuPDF runs them
+/// under `FontMatrix · trm`. 0.4.1 drew each glyph as an advance box (and
+/// counted it as a fallback glyph); widths ignored the FontMatrix. Here the
+/// FontMatrix is 0.002, so /Widths 500 is a 1-em advance: "AB" at 60 pt puts
+/// B at x = 80 (mutool stext agrees), and the square glyph fills (40, 130).
+#[test]
+fn type3_glyph_procedures_run_and_widths_use_the_font_matrix() {
+    let bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /T3 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        stream("", "0 0 1 rg BT /T3 60 Tf 20 40 Td (AB) Tj ET"),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 500] /FontMatrix [0.002 0 0 0.002 0 0] \
+/CharProcs << /sq 6 0 R /tri 7 0 R >> /Encoding << /Type /Encoding /Differences [65 /sq /tri] >> \
+/FirstChar 65 /LastChar 66 /Widths [500 500] /Resources << >> >>"
+            .to_vec(),
+        stream("", "500 0 0 0 500 500 d1 0 0 500 500 re f"),
+        stream("", "500 0 0 0 500 500 d1 0 0 m 500 0 l 250 500 l f"),
+    ];
+    let doc = PdfDocument::open(build_pdf(&bodies)).expect("opens");
+    let (pix, fallback) = kopitiam_pdf::mupdf::rasterize_page_ex(&doc, 0, 72.0).expect("renders");
+    assert_eq!(fallback, 0, "a Type3 glyph is not a fallback box");
+    assert_eq!(rgb_at(&pix, 40, 130), [0, 0, 255], "inside the square glyph (text fill colour, d1 mask)");
+    assert_eq!(rgb_at(&pix, 85, 105), [255, 255, 255], "outside the triangle's left edge");
+    let cs = chars(&doc);
+    assert_eq!(text(&cs), "AB");
+    assert!((cs[1].origin.x - 80.0).abs() < 1e-3, "B at {}", cs[1].origin.x);
 }

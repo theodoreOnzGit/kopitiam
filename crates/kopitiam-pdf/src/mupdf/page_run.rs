@@ -302,6 +302,12 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         } else {
             subtype
         };
+        // pdf_process_Do: an XObject whose /OC is hidden is skipped entirely.
+        if let Some(oc) = xobj.dict_gets("OC").cloned()
+            && self.ocg_hidden(&oc)
+        {
+            return Ok(());
+        }
         if subtype.to_name() == b"Image" {
             self.draw_image_xobject(&xobj, &xobj_ref);
             return Ok(());
@@ -340,11 +346,19 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // gsave again "so the clippath doesn't persist"; clip to /BBox; raise
         // gbot so the form cannot pop its caller's state; run; unwind.
         let oldtop = self.gstack.len();
+        // pr->gparent = pr->gtop: patterns inside the form are in the form's
+        // space -- the caller's state with its CTM temporarily set to the
+        // form CTM ("The gparent is updated with the modified ctm").
+        let gparent_save = self.gparent;
+        self.gparent = self.gstack.len() - 1;
         self.op_q();
         {
             let g = self.gstate_mut();
             g.ctm = matrix.concat(g.ctm);
         }
+        let form_ctm = self.gstate().ctm;
+        let gparent_save_ctm = self.gstack[self.gparent].ctm;
+        self.gstack[self.gparent].ctm = form_ctm;
         self.op_q();
         if let Some(bbox) = bbox_from(self.doc, &xobj) {
             let mut clip = Path::new();
@@ -388,6 +402,11 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         if pushed {
             self.resources.pop();
         }
+        let gp = self.gparent;
+        if let Some(g) = self.gstack.get_mut(gp) {
+            g.ctm = gparent_save_ctm;
+        }
+        self.gparent = gparent_save;
         while self.gstack.len() > oldtop {
             self.op_q_restore();
         }
@@ -414,6 +433,9 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // goes to fz_fill_image_mask in the fill colour and alpha; anything else
     // to fz_fill_image at the fill alpha.
     pub(crate) fn show_image(&mut self, img: &super::page_image::DecodedImage, is_mask: bool) {
+        if self.hidden > 0 {
+            return; // pdf_show_image: "if (pr->super.hidden) return"
+        }
         let (ctm, clip, color, alpha) = {
             let g = self.gstate();
             (g.ctm, g.clip, g.fill_color, g.fill_alpha)
@@ -433,7 +455,7 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // (unresolved) value so the caller can open the XObject stream by reference.
     /// Look up a resource without resolving the final value (for XObjects, whose
     /// indirect reference is needed to open the stream body).
-    fn lookup_resource_raw(&self, typ: &str, name: &[u8]) -> Object {
+    pub(crate) fn lookup_resource_raw(&self, typ: &str, name: &[u8]) -> Object {
         for res in self.resources.iter().rev() {
             if let Ok(sub) = self.doc.resolve_get(res, typ)
                 && sub.is_dict()

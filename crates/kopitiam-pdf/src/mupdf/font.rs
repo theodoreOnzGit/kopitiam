@@ -43,8 +43,11 @@
 //!
 //! ## Deferred
 //!
-//! Type3 `/FontMatrix` width scaling (Type3 fonts are loaded through the simple
-//! path, `/Widths` taken verbatim), vertical writing-mode metrics (`/W2` / `/DW2`
+//! ~~Type3 `/FontMatrix` width scaling (Type3 fonts are loaded through the
+//! simple path, `/Widths` taken verbatim)~~ -- **CORRECTED 2026-09-28
+//! (0.4.2)**: Type3 widths are scaled by `FontMatrix.a * 1000` and the glyph
+//! procedures are loaded ([`Type3Info`]) and run by the interpreter. Still
+//! deferred: vertical writing-mode metrics (`/W2` / `/DW2`
 //! -> `vmtx`; horizontal `hmtx` is always built), the named Adobe CJK CMap
 //! resource set (see `cmap.rs`), and embedded-font glyph reading (FreeType).
 
@@ -54,6 +57,7 @@ use super::cmap::{self, CMap};
 use super::draw_path::Path;
 use super::encodings::BaseEncoding;
 use super::error::Result;
+use super::geometry::Matrix;
 use super::glyph::FontProgram;
 use super::glyph_type1::Type1Program;
 use super::object::Object;
@@ -157,6 +161,23 @@ pub struct Font {
     /// `4` = `a20`, a check mark, and asking for `four` instead draws
     /// nothing at all.
     substitute_face: Option<hayro::hayro_interpret::font::StandardFont>,
+    /// A Type3 font's glyph procedures and matrix (`fz_font.t3procs`,
+    /// `t3matrix`, `t3resources`); `None` for every other font kind. The
+    /// interpreter runs the procedure for each glyph (see `op_run`).
+    type3: Option<Arc<Type3Info>>,
+}
+
+/// What a Type3 font needs at draw time (pdf_load_type3_font, pdf-type3.c:40).
+#[derive(Debug)]
+pub struct Type3Info {
+    /// `/FontMatrix`: glyph space -> text space.
+    pub matrix: Matrix,
+    /// Per code, the (unresolved) `/CharProcs` entry for its glyph name.
+    pub procs: Vec<Option<Object>>,
+    /// `/Resources` of the font, or Null (MuPDF then uses the page's).
+    pub resources: Object,
+    /// `/FontBBox` through `/FontMatrix` (ascender/descender come from it).
+    pub bbox: super::geometry::Rect,
 }
 
 /// Where a loaded font's glyph outlines come from — the single fact that
@@ -297,6 +318,7 @@ impl Font {
             cid_to_gid: CidToGid::Identity,
             substitute: None,
             substitute_face: None,
+            type3: None,
         };
 
         // cid_to_ucs from the glyph names (pdf_load_to_unicode's `strings` path).
@@ -312,11 +334,55 @@ impl Font {
         // name, not GID (see `glyph_outline`).
         font.glyph_names = Some(estrings);
 
+        let is_type3 = doc.resolve_get(dict, "Subtype")?.to_name() == b"Type3";
+        if is_type3 {
+            // MuPDF: pdf_load_type3_font (pdf-type3.c:40).
+            let matrix = {
+                let fm = doc.resolve_get(dict, "FontMatrix").unwrap_or(Object::Null);
+                if fm.array_len() >= 6 {
+                    let v = |i: usize| fm.array_get(i).map_or(0.0, |o| resolve(doc, o).to_real() as f32);
+                    Matrix::new(v(0), v(1), v(2), v(3), v(4), v(5))
+                } else {
+                    Matrix::IDENTITY
+                }
+            };
+            let bb = doc.resolve_get(dict, "FontBBox").unwrap_or(Object::Null);
+            let bbox = if bb.array_len() >= 4 {
+                let v = |i: usize| bb.array_get(i).map_or(0.0, |o| resolve(doc, o).to_real() as f32);
+                let (a, b, c, d) = (v(0), v(1), v(2), v(3));
+                super::geometry::Rect::new(a.min(c), b.min(d), a.max(c), b.max(d)).transform(matrix)
+            } else {
+                super::geometry::Rect::EMPTY
+            };
+            let charprocs = doc.resolve_get(dict, "CharProcs").unwrap_or(Object::Null);
+            let procs = font
+                .glyph_names
+                .as_ref()
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|n| n.as_ref().and_then(|n| charprocs.dict_gets(n).cloned()))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![None; 256]);
+            let resources = doc.resolve_get(dict, "Resources").unwrap_or(Object::Null);
+            font.type3 = Some(Arc::new(Type3Info { matrix, procs, resources, bbox }));
+            // "Use the glyph index as ASCII when we can't figure out a proper
+            // encoding" (pdf-type3.c).
+            if let Some(c2u) = font.cid_to_ucs.as_mut() {
+                for (i, slot) in c2u.iter_mut().enumerate().take(127).skip(32) {
+                    if *slot == REPLACEMENT_CHARACTER as u16 {
+                        *slot = i as u16;
+                    }
+                }
+            }
+        }
+
         // Nothing embedded: stand a bundled standard-14 face in for it, or
         // every glyph would be drawn as a filled advance box. This is the
         // Word/LibreOffice case (`/BaseFont /ArialMT` with no `/FontFile*`);
         // see `super::standard_font` for the selection rules and provenance.
-        if font.program.is_none() && font.type1.is_none() {
+        if font.program.is_none() && font.type1.is_none() && font.type3.is_none() {
             let base = dict
                 .dict_gets("BaseFont")
                 .map(|o| String::from_utf8_lossy(o.to_name()).into_owned())
@@ -338,11 +404,15 @@ impl Font {
                 first = 0;
                 last = 0;
             }
+            // A Type3 width is in glyph space: `t3matrix.a * w * 1000`
+            // (pdf-type3.c), so a FontMatrix other than 0.001 scales it.
+            let t3_scale = font.type3.as_ref().map(|t| t.matrix.a * 1000.0);
             for i in 0..(last - first + 1) {
-                let wid = widths
-                    .array_get(i as usize)
-                    .map(|o| resolve(doc, o).to_int())
-                    .unwrap_or(0) as i32;
+                let item = widths.array_get(i as usize).map(|o| resolve(doc, o));
+                let wid = match t3_scale {
+                    Some(k) => (k * item.map_or(0.0, |o| o.to_real() as f32)) as i32,
+                    None => item.map_or(0, |o| o.to_int()) as i32,
+                };
                 font.add_hmtx((i + first) as u32, (i + first) as u32, wid);
             }
         }
@@ -410,6 +480,7 @@ impl Font {
             cid_to_gid,
             substitute: None,
             substitute_face: None,
+            type3: None,
         };
 
         // /ToUnicode, remapped from code->Unicode to CID->Unicode.
@@ -524,7 +595,29 @@ impl Font {
     /// the PDF `FontDescriptor` is deliberately *not* done here: MuPDF's
     /// `fz_font_ascender` never consults it either.
     pub fn ascender(&self) -> f32 {
+        // A Type3 font takes its ascender from the FontBBox
+        // (FZ_ASCDESC_FROM_BOUNDS, pdf-type3.c).
+        if let Some(t3) = &self.type3
+            && !t3.bbox.is_empty()
+        {
+            return t3.bbox.y1;
+        }
         0.8
+    }
+
+    /// Whether this is a Type3 font (glyphs are content-stream procedures).
+    pub fn is_type3(&self) -> bool {
+        self.type3.is_some()
+    }
+
+    /// The Type3 glyph procedures, matrix and resources (None otherwise).
+    pub fn type3_info(&self) -> Option<&Type3Info> {
+        self.type3.as_deref()
+    }
+
+    /// A shared handle to [`type3_info`](Font::type3_info).
+    pub(crate) fn type3_arc(&self) -> Option<Arc<Type3Info>> {
+        self.type3.clone()
     }
 
     // MuPDF: fz_font_descender (font.c:286) -- FZ_ASCDESC_DEFAULT path.
@@ -532,6 +625,11 @@ impl Font {
     /// MuPDF's default `-0.2` for the same no-FreeType reason as
     /// [`Font::ascender`].
     pub fn descender(&self) -> f32 {
+        if let Some(t3) = &self.type3
+            && !t3.bbox.is_empty()
+        {
+            return t3.bbox.y0;
+        }
         -0.2
     }
 
@@ -1220,6 +1318,7 @@ endcmap\nend\nend";
             cid_to_gid: CidToGid::Identity,
             substitute: None,
             substitute_face: None,
+            type3: None,
         };
         let d = font.decode(0x41);
         assert_eq!(d.unicode, '\u{FFFD}');

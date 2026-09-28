@@ -463,6 +463,13 @@ impl TextDevice for DrawDevice {
             return;
         }
 
+        // A Type3 glyph is a content-stream procedure the interpreter runs
+        // straight through this device (fz_render_t3_glyph_direct), so there
+        // is nothing to paint -- and certainly no advance box -- here.
+        if font.is_type3() {
+            return;
+        }
+
         let m = trm.concat(self.base);
 
         // Preferred path: fill the glyph's real outline from the embedded font
@@ -601,6 +608,73 @@ impl TextDevice for DrawDevice {
         self.fill_alpha = alpha;
     }
 
+    fn wants_type3_procs(&self) -> bool {
+        true
+    }
+
+    // MuPDF: fz_draw_fill_shade (draw-device.c:1510) -- bbox, /Background,
+    // fz_paint_shade, then (for alpha < 1) the layer painted back at alpha.
+    fn fill_shade(&mut self, shade: &super::shade::Shade, ctm: Matrix, alpha: f32, clip: Option<Rect>) {
+        if alpha <= 0.0 {
+            return;
+        }
+        let m = ctm.concat(self.base);
+        let scissor = self.resolve_clip(clip).intersect(self.pix.bbox());
+        let bbox = shade.bound(m).irect_from_rect().intersect(scissor);
+        let bbox = match self.mask.as_deref() {
+            Some(mk) => bbox.intersect(mk.bbox),
+            None => bbox,
+        };
+        if bbox.is_empty() {
+            return;
+        }
+        let a255 = (alpha * 255.0) as i32;
+        let w = (bbox.x1 - bbox.x0) as usize;
+        let mask = self.mask.clone();
+        let eff = |x: i32, y: i32| match mask.as_deref() {
+            Some(mk) => fz_mul255(mk.at(x, y), a255),
+            None => a255,
+        };
+        if let Some(bg) = shade.background_rgb() {
+            // resolve_color: colorbv = colour * 255, truncated.
+            let c = [(bg[0] * 255.0) as i32, (bg[1] * 255.0) as i32, (bg[2] * 255.0) as i32];
+            for y in bbox.y0..bbox.y1 {
+                for x in bbox.x0..bbox.x1 {
+                    let a = eff(x, y);
+                    if let Some(o) = self.pix.offset(x, y) {
+                        for k in 0..3 {
+                            let d = self.pix.samples[o + k] as i32;
+                            self.pix.samples[o + k] = (fz_mul255(c[k], a) + fz_mul255(d, 255 - a)) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        let patch = shade.paint(m, bbox);
+        for y in bbox.y0..bbox.y1 {
+            for x in bbox.x0..bbox.x1 {
+                let i = ((y - bbox.y0) as usize * w + (x - bbox.x0) as usize) * 4;
+                let sa = patch[i + 3] as i32;
+                if sa == 0 {
+                    continue;
+                }
+                let a = eff(x, y);
+                if a == 0 {
+                    continue;
+                }
+                // fz_paint_pixmap (premultiplied src-over) then the layer
+                // blended back at `alpha`: d = s*a + d*(1 - sa*a).
+                let t = 255 - fz_mul255(sa, a);
+                if let Some(o) = self.pix.offset(x, y) {
+                    for k in 0..3 {
+                        let d = self.pix.samples[o + k] as i32;
+                        self.pix.samples[o + k] = (fz_mul255(patch[i + k] as i32, a) + fz_mul255(d, t)) as u8;
+                    }
+                }
+            }
+        }
+    }
+
     // MuPDF: fz_draw_clip_path (draw-device.c:842). A path that flattens to an
     // axis-aligned rectangle only narrows the scissor (MuPDF's "rect
     // rasterizer" early-out); anything else becomes a coverage mask, nested
@@ -661,6 +735,8 @@ impl TextDevice for DrawDevice {
     ) {
         // MuPDF fz_draw_stroke_text -> fz_render_stroked_glyph: the glyph
         // outline goes through trm, the line width through the user CTM.
+        // (A Type3 glyph has no outline: "If Type3 and tr != 3, then use
+        // textrender mode 0" -- its procedure is run instead.)
         let Some(outline) = font.glyph_outline(cid) else { return };
         let user = ctm.concat(self.base);
         // Bring the em-space outline into user space (trm = text-matrix·ctm,
@@ -1327,4 +1403,11 @@ fn axis_aligned_rect(polys: &[Vec<super::geometry::Point>]) -> Option<Rect> {
     let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
     let all = corners.iter().all(|&(cx, cy)| pts.iter().any(|p| p.x == cx && p.y == cy));
     (all && pts.iter().all(on_edge)).then(|| Rect::new(x0, y0, x1, y1))
+}
+
+// MuPDF: fz_mul255 (geometry.h:38)
+fn fz_mul255(a: i32, b: i32) -> i32 {
+    let mut x = a * b + 128;
+    x += x >> 8;
+    x >> 8
 }

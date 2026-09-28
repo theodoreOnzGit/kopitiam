@@ -215,6 +215,58 @@ _fixed = b"\n".join(
 FILES["broken-xref"] = _good[:_x] + _fixed + b"trailer" + _good[_x:].split(b"trailer", 1)[1]
 
 
+# 19. Function-based shading (type 1) driven by a PostScript calculator
+# function (type 4): exercises pdf-function.c's calculator end to end.
+FILES["shading-type1-ps"] = pdf(
+    [stream(b"{ 2 copy mul 3 1 roll }", b" /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]")],
+    resources=b"""<< /Shading << /S << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1]
+ /Matrix [200 0 0 200 0 0] /Function 5 0 R >> >> >>""",
+    content=b"/S sh",
+)
+
+# 20. Free-form triangle mesh (type 4): two triangles, 8-bit flag/coord/comp.
+_mesh = bytes([
+    0, 0, 0, 255, 0, 0,      # flag 0, (0,0) red
+    0, 255, 0, 0, 255, 0,    # (255,0) green
+    0, 0, 255, 0, 0, 255,    # (0,255) blue
+    1, 255, 255, 255, 255, 0,  # flag 1 -> triangle (b, c, d): yellow at (255,255)
+])
+FILES["shading-mesh4"] = pdf(
+    [stream(_mesh, b" /ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8"
+                   b" /BitsPerFlag 8 /Decode [0 200 0 200 0 1 0 1 0 1]")],
+    resources=b"<< /Shading << /M 5 0 R >> >>",
+    content=b"/M sh",
+)
+
+# 21. Radial shading with both extends, in a Separation space whose tint
+# transform (type 2) maps to CMYK.
+FILES["shading-radial-separation"] = pdf(
+    [],
+    resources=b"""<< /Shading << /R << /ShadingType 3
+ /ColorSpace [/Separation /Spot /DeviceCMYK << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0.8 0.9 0] /N 1 >>]
+ /Coords [100 100 10 100 100 80] /Extend [true true]
+ /Function << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> >> >> >>""",
+    content=b"/R sh",
+)
+
+# 22. A DeviceN image (2 inks -> RGB via a sampled type 0 tint function) and
+# a Lab image: both were "unsupported colorspace" and drew nothing.
+_samp = bytes([0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255])  # 2x2 grid of RGB
+_devn_img = bytes([0, 0, 255, 0, 0, 255, 255, 255])  # 2x2 pixels, 2 comps
+_lab_img = bytes([50, 200, 128, 90, 128, 30, 20, 60, 200, 100, 128, 128])  # 2x2 L*a*b*
+FILES["image-devicen-lab"] = pdf(
+    [
+        stream(_devn_img, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                          b" /ColorSpace [/DeviceN [/A /B] /DeviceRGB 7 0 R]"),
+        stream(_lab_img, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                         b" /ColorSpace [/Lab << /WhitePoint [0.9505 1 1.089] /Range [-128 127 -128 127] >>]"),
+        stream(_samp, b" /FunctionType 0 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Size [2 2] /BitsPerSample 8"),
+    ],
+    resources=b"<< /XObject << /D 5 0 R /L 6 0 R >> >>",
+    content=b"q 100 0 0 200 0 0 cm /D Do Q q 100 0 0 200 100 0 cm /L Do Q",
+)
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "feature-corpus")
     out.mkdir(parents=True, exist_ok=True)

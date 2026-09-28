@@ -36,7 +36,8 @@
 //!    lies within [`MATCH_RADIUS_PT`]. PASS per page = zero unmatched on both
 //!    sides AND the non-space text in reading order is identical. The max
 //!    origin error over matched chars is reported, not gated.
-//! 3. **Raster.** `mutool draw -r DPI -c rgb` (PPM) vs our
+//! 3. **Raster.** `mutool draw -N -M 0 -r DPI -c rgb` (PPM: no ICC, no
+//!    spot simulation -- the mode the port targets) vs our
 //!    [`rasterize_page_ex`] -- the *native* kopitiam engine, never the hayro
 //!    fallback, because it is the port under test. A pixel is a *gross*
 //!    mismatch when any RGB channel differs by more than 128 (one side says
@@ -292,7 +293,12 @@ fn run_file(args: &Args, f: &Path, tmp: &Path, name: &str, tsv: &mut String) -> 
         let pat = tmp.join("r%d.ppm");
         let t0 = Instant::now();
         let ok = Command::new(&args.mutool)
-            .args(["draw", "-q", "-c", "rgb", "-r"])
+            // `-N` (no ICC: MuPDF's own fast colour conversions, the ones the
+            // port translates) and `-M 0` (no overprint/spot simulation).
+            // Both are MuPDF features the port does not have -- a CMS and
+            // spot rendering -- so the oracle runs in the mode the port
+            // actually targets; see docs/mupdf-code-to-code.md.
+            .args(["draw", "-q", "-N", "-M", "0", "-c", "rgb", "-r"])
             .arg(format!("{}", args.dpi))
             .arg("-o")
             .arg(&pat)
