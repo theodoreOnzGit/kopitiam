@@ -203,7 +203,7 @@ mutool before use).
 
 ## The synthetic feature corpus
 
-`scripts/mupdf-feature-corpus.py OUTDIR` writes 18 one-feature PDFs (line
+`scripts/mupdf-feature-corpus.py OUTDIR` writes ~~18~~ one-feature PDFs (**34** by the end of 0.4.2 -- the later ones are listed in their tranche sections) (line
 style, ExtGState, stencil masks, inline images, shadings via `sh` and via a
 pattern, a circular clip path, Type3, text render modes, fill colour spaces,
 CropBox, tiling pattern, Form `/BBox`, optional content, blend + soft mask,
@@ -400,3 +400,201 @@ shadings come out **pixel-identical** to MuPDF.
 Tests: 7 new in `tests/mupdf_parity.rs` (colour spaces, axial `sh`, shading
 pattern, type 4 mesh, DeviceN image, optional content, Type3), all failing on
 the pre-tranche tree; expected values measured with `mutool -N -M 0`.
+
+### Tranche 8 (tiling patterns) -- measured 2026-09-28
+
+`/PatternType 1` used to be loaded as "not ported yet, keep the old colour",
+so a hatched or textured fill came out as a solid block in whatever colour
+was set before it. Now both branches of `pdf_show_pattern`
+(pdf-op-run.c:2270) are ported:
+
+1. **The tile branch** (at least one whole repeat needed, no blending, per
+   `pdf_pattern_uses_blending`): `fz_draw_begin_tile` / `fz_draw_end_tile`
+   (draw-device.c:2745, 2864). The cell is drawn once into a transparent
+   RGBA pixmap over its device-space `/BBox`, then pasted at every repeat at
+   MuPDF's **truncated integer** offset (`dest->x = ttm.e`), premultiplied
+   source-over (`fz_paint_pixmap_with_bbox`). My first cut ran the cell once
+   per repeat instead; that left a rotated uncoloured pattern 3.9 % gross off
+   MuPDF, because each repeat landed at its exact sub-pixel phase where MuPDF
+   snaps. That cut was withdrawn, not tuned.
+2. **The loop branch**, with MuPDF's ±0.001 rounding guard and no per-cell
+   `/BBox` clip (MuPDF has none there).
+3. Uncoloured patterns (`/PaintType 2`) paint in the `scn` colour and ignore
+   the cell's own colour operators; text filled with a pattern gets a glyph
+   clip around it; `TextDevice` grew defaulted `begin_tile` / `end_tile`, so
+   the stext device sees the cell's content once, like MuPDF's.
+
+| feature file | gross % on 0.4.1 | first (per-repeat) cut | after | mean \|Δ\| after |
+|---|---|---|---|---|
+| tiling-pattern (checkerboard) | 50.00 | 0.50 | **0.00** | 0.00 (pixel-identical) |
+| tiling-pattern-2 (uncoloured + rotating `/Matrix`, pattern-filled text) | 56.77 | 3.92 | **0.88** | 1.68 |
+
+The tiling-pattern-2 residual is font shape, not tiling: the same text in
+the same non-embedded `Helvetica-Bold`, filled plainly, measures **0.875 %**
+against MuPDF's Nimbus Sans. A pattern whose cell paints with itself makes
+MuPDF itself stop with "exception stack overflow" and draw nothing, so there
+is no oracle for it; the port stops at a nesting cap, and a test pins only
+that it terminates.
+
+Tests: 4 new, three fail on the pre-tranche tree (the fourth is the
+self-reference termination check).
+
+### Repair tranche (`pdf-repair.c`) -- measured 2026-09-28
+
+A damaged file (shifted offsets, no `startxref`, truncated, no trailer)
+failed `PdfDocument::open` outright: `feat-broken-xref.pdf` gave "syntax
+error: expected object number" where mutool opens and draws it. Now MuPDF's
+repair runs in the two places MuPDF runs it: at open (`pdf_init_document`,
+with `load_xref`'s repair triggers) and mid-read (`pdf_cache_object`), once
+per document. The endstream filter (`fz_open_endstream_filter`) came with it,
+so a too-short or clamped `/Length` still reads the whole stream body, which
+MuPDF does on the normal path as well. Written by a sub-agent. Every file
+name and number below was re-run by the coordinator before it went in.
+
+| input | before | after |
+|---|---|---|
+| `feat-broken-xref.pdf` | open fails | opens; objects 0/4 kind mismatches, streams 1/1 identical, text and raster **0.00 %** |
+| 16 synthetic damage cases (offsets +7, no xref, truncated in a stream / in a dict / after `obj`, bad `/Length` both ways and flate, redefined object, objects only in an object stream, no trailer, encrypted with its xref removed or shifted) | all fail to open | the ones mutool opens match it (objects, streams, text, 0.00 % raster); the two truncations mutool refuses are refused with MuPDF's messages |
+
+Tests: `tests/repair.rs` (16), 3 xref.rs unit tests.
+
+### Image `/Mask` (colour keys, stencil mask streams) -- measured 2026-09-28
+
+The coverage audit listed `/Mask` as ignored. Ported: a `/Mask` array is a
+colour key on the raw samples (`fz_mask_color_key`, image.c:166, with its
+clamping rules), and a `/Mask` stream is loaded as a forced image mask with
+inverted 1-bit samples (pdf-image.c:146, image.c:705).
+
+| feature file | 0.4.1 | now |
+|---|---|---|
+| image-mask-keys (8-bit RGB key, 4-bit gray key range, stencil `/Mask` stream) | 43.75 % (three opaque rectangles) | **0.00 %**, pixel-identical |
+
+Test: 1 new, fails on the pre-change tree.
+
+### AES-256 encryption (`/R 5`, `/R 6`) -- checked 2026-09-28
+
+This was not found by the harness, because no open-corpus file is encrypted.
+It was the coverage audit's gap #2: Acrobat X and later write AES-256 by
+default, and the port refused R5/R6 by name, so an owner-restricted form
+with an empty user password did not open. MuPDF opens such a form with no
+prompt.
+
+Ported from pdf-crypt.c:
+- the R5 key (:447) and the R6 hardened hash (:502, :569)
+- the object key for `/AESV3`, which is the file key itself (:1082)
+- `pdf_authenticate_password`: the user password is tried first, then the
+  owner password, and an empty password is never accepted as the owner
+  password (:817)
+
+The oracle is mutool-made fixtures (`tests/fixtures/make-encrypted-aes256.py`):
+
+| fixture | mutool 19f1284 | 0.4.1 | now |
+|---|---|---|---|
+| R6, empty user password | draws the red square | open fails ("R6 not implemented") | opens; red square at (50,50); `/Info /Title` decrypts |
+| R6, user `secret`, empty owner | refuses without `-p` | open fails | refuses |
+
+My first cut accepted the empty password as the owner password on the
+second fixture. mutool refused that file, and the reason was the Acrobat
+rule at :817, which I had not ported. The rule is ported now.
+
+### ActualText -- measured 2026-09-28
+
+This closes the last open-corpus text miss (NUREG/CR-7289 p. 2, 144 extra
+chars). Ported:
+- `begin_metatext` / `end_metatext` (pdf-op-run.c:1808) at `BDC`/`EMC`, with
+  the text taken from the properties dict or, failing that, from the
+  structure element named by the span's `/MCID` (`lookup_mcid`,
+  `pdf_lookup_mcid_in_mcids`, `pdf_lookup_number`, `set_struct_parent`; new
+  `marked_content.rs`)
+- the stext side (stext-device.c): `do_extract_within_actualtext`, with its
+  prefix/postfix matching per span, `flush_actualtext` (the `-2` first-rune
+  sentinel), and `fz_stext_begin/end_metatext`, including placing the text at
+  the content bounds of an image-only ActualText
+
+The first cut read only the BDC properties, and **p. 2 did not move**. On
+that page each span is `/Span <</MCID n>> BDC`, and the `/ActualText ()`
+sits on the structure element. So the harness caught a half-port in one run.
+
+| input | 0.4.1 | now |
+|---|---|---|
+| NUREG/CR-7289 p. 2 (text layer) | 144 extra chars, order differs | **0 / 0, order ok** |
+| whole open corpus (text layer) | 1245 / 1368 | **1368 / 1368**, 0 missing / 0 extra of 2,023,821 |
+| feat-actualtext (inline replacement, empty structure ActualText, image ActualText) | "fib", "Hidden words", no "E=mc2" | all 33 chars match mutool in place |
+
+**Divergence:** a span ends at `ET`, at marked-content boundaries, and at a
+font/matrix change. That is a subset of MuPDF's `pdf_flush_text` triggers,
+and it matters only for prefix/postfix matching across text objects inside
+one ActualText.
+
+Test: `actualtext_replaces_glyphs_including_via_the_structure_tree`, which
+fails on the tree before this change.
+
+### Tranche 9 (transparency) -- measured 2026-09-28
+
+This tranche ported blend modes, soft masks and transparency groups:
+- `begin_softmask`, `pdf_begin_group` and the `pdf_run_xobject` group branch
+  (pdf-op-run.c)
+- `fz_draw_begin/end_mask` and `fz_draw_begin/end_group`, with real
+  `group_alpha` (draw-device.c)
+- all 16 blend modes and `fz_blend_pixmap` (draw-blend.c)
+
+It was written by a sub-agent. The coordinator re-ran the suite and the
+whole feature corpus before committing (`93b3086`).
+
+Two parity fixes came with it, both forced by the harness:
+- `rgb_to_bytes` now truncates like `resolve_color`. The old rounding put
+  0.3 x 255 at 77, where MuPDF has 76.
+- `draw_edge::composite` now uses MuPDF's `FZ_BLEND` integer path. Half
+  alpha had been 128 where MuPDF gives 126.
+
+| feature file | gross % before | after |
+|---|---|---|
+| blend-smask (#15) | 62.50 | **0.00** |
+| blend-separable (#25) | 26.25 | **0.00** |
+| blend-nonseparable (#26) | 30.00 | **0.00** |
+| smask-luminosity-bc (#27) | 88.00 | **0.00** |
+| smask-alpha (#28) | 39.00 | **0.00** |
+| smask-tr (#29) | 50.00 | **0.00** |
+| group-isolation (#30) | 10.00 | **0.00** |
+| image-transparency (#31) | 25.12 | **0.00** |
+| text-transparency (#32) | 10.15 | **0.84** (glyph shape only) |
+| pattern-alpha (#33) | 0.00 (mean 15.0) | 0.00 (mean 0.00) |
+
+Divergences:
+- knockout is drawn as non-knockout
+- text is grouped per text-showing operator
+- luminosity masks are drawn in RGB and converted with MuPDF's fast gray
+  formula (within ±1)
+- only a DeviceGray group `/CS` is honoured
+
+Tests: 11 in tranche 9. All fail on `adddc48`.
+
+## Final measurement -- 0.4.1 vs 0.4.2, same harness, 2026-09-28
+
+Both columns come from the final harness: `mutool` 19f1284 run with
+`-N -M 0`, per-channel gross metric, stext `-O` flags. The 0.4.1 column is
+the library at `9955131` (0.4.1's code) driven by the final
+`mupdf_oracle.rs`. The 0.4.2 column is `e86d969` plus the release commit.
+**These are the numbers to quote.** The per-tranche tables above are
+progress records. Some of them were measured with the earlier luma metric
+or the default (ICC) oracle, as each section says.
+
+| open corpus (1368 pages) | 0.4.1 | 0.4.2 |
+|---|---|---|
+| object kinds (42,771) | 0 mismatches | 0 mismatches |
+| streams byte-identical | 3754 / 4257 | 3754 / 4257 (the rest are image codecs, compared as pixels) |
+| text pages passing | 1245 | **1368** |
+| chars missing / extra (of 2,023,821) | 974 / 412 | **0 / 0** |
+| reading-order mismatch pages | 93 | **0** |
+| raster pages within 1 % | 1099 | **1368** |
+
+Per file, 0.4.2: every file passes every page. The worst page gross is
+0.34 % (NUREG ML13325A086), and ML15334A199 (WASH-1400, 228 CCITT pages)
+is 0.00 % with a mean of 0.00.
+
+| feature corpus | 0.4.1 | 0.4.2 |
+|---|---|---|
+| files | 24 (the first 24; 23 open) | 34 |
+| raster pass | 2 / 23 | **33 / 34** |
+| text pass | 22 / 23 | **34 / 34** |
+| failing | everything except cmyk-fill and hairline | text-render-modes 1.84 % (glyph shape: bundled base-14 face vs MuPDF's Nimbus) |
