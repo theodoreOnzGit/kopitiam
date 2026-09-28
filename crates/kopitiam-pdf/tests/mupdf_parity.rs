@@ -1007,6 +1007,28 @@ fn aes_256_r6_file_opens_with_the_empty_user_password() {
     assert!(refused.is_err(), "an empty owner password must not open the file");
 }
 
+/// gh-98's exact shape, end to end: `/Standard /V 4 /R 4 /AESV2`, empty user
+/// password, owner-restricted (`/P -4`), made by mutool itself
+/// (`tests/fixtures/make-encrypted-aes128.py`). The content stream is
+/// deflated, so it must decrypt BEFORE it inflates (the other order is what
+/// produced gh-98's "corrupt object stream"), and the page tree sits in an
+/// object stream whose members must not be decrypted a second time. mutool
+/// renders the red square at (50, 50); the direct-object /Info title string
+/// decrypts too. The crypt.rs unit tests pin R4's key derivation and /U check;
+/// until this test nothing opened a real AESV2 file.
+#[test]
+fn aes_128_r4_owner_restricted_form_opens_with_the_empty_user_password() {
+    let doc = PdfDocument::open(include_bytes!("fixtures/encrypted-aes128-r4.pdf").to_vec())
+        .expect("V4 R4 AESV2 with an empty user password opens");
+    assert_eq!(doc.page_count(), 1, "the page tree inside the object stream resolves");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 50, 50), [255, 0, 0], "the deflated content stream decrypts");
+    assert_eq!(rgb_at(&pix, 5, 5), [255, 255, 255]);
+    let info = doc.resolve(doc.trailer().dict_gets("Info").expect("/Info")).expect("resolves");
+    let title = doc.resolve_get(&info, "Title").expect("title");
+    assert_eq!(title.to_string_bytes(), b"AES-128 fixture");
+}
+
 // ---------------------------------------------------------------------------
 // Tranche 9 -- transparency (draw-blend.c, fz_draw_begin/end_group and
 // _mask, pdf-op-run.c begin_softmask / pdf_begin_group / pdf_run_xobject)

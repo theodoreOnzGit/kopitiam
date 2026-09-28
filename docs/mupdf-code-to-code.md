@@ -492,6 +492,7 @@ The oracle is mutool-made fixtures (`tests/fixtures/make-encrypted-aes256.py`):
 |---|---|---|---|
 | R6, empty user password | draws the red square | open fails ("R6 not implemented") | opens; red square at (50,50); `/Info /Title` decrypts |
 | R6, user `secret`, empty owner | refuses without `-p` | open fails | refuses |
+| R4 `/AESV2`, empty user password, `-z -Z` (added 2026-09-28 SGT, `make-encrypted-aes128.py`; gh-98's shape) | draws the red square | not run | opens; red square at (50,50); `/Info /Title` decrypts |
 
 My first cut accepted the empty password as the owner password on the
 second fixture. mutool refused that file, and the reason was the Acrobat
