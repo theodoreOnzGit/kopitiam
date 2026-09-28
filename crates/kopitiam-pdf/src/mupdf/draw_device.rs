@@ -50,10 +50,12 @@
 //!   knockout / transparency groups. Image blitting is **nearest-neighbour**
 //!   (no bilinear/mip smoothing) and honours only a rectangular clip.
 
+use super::draw_affine;
 use super::draw_edge::{FillRule, fill_polygons};
+use super::draw_scale::{self, ScalePix};
 use super::draw_path::Path;
 use super::font::Font;
-use super::geometry::{IRect, Matrix, Point, Rect};
+use super::geometry::{IRect, Matrix, Rect};
 use super::object::Object;
 use super::page_image::DecodedImage;
 use super::pixmap::Pixmap;
@@ -233,11 +235,15 @@ impl DrawDevice {
     }
 
     // MuPDF: fz_draw_fill_image (draw-device.c) -> fz_paint_image_imp ->
-    // fz_paint_affine (draw-affine.c): inverse-map each destination pixel into the
-    // image's unit square and sample.
-    /// Blit `img` at `alpha` under `ctm`, which maps the image's unit square
-    /// `[0,1]²` (fitz image space, with `(0,0)` top-left) onto the page. Nearest-
-    /// neighbour sampling; grayscale (`components == 1`) is expanded to RGB.
+    // MuPDF: fz_draw_fill_image (draw-device.c:1836)
+    /// Paint `img` at `alpha` under `ctm`, which maps the image's unit square
+    /// `[0,1]²` (fitz image space, with `(0,0)` top-left) onto the page.
+    ///
+    /// Since 0.4.2 this follows MuPDF's pipeline instead of nearest-neighbour
+    /// sampling every device pixel: grid-fit the matrix, box-subsample by a
+    /// power of two (`l2factor`, [`draw_scale::subsample_pixmap`]), smooth-scale
+    /// to the exact device footprint ([`draw_scale::transform_pixmap`]), then
+    /// paint 1:1 -- bilinear only where MuPDF would ([`draw_affine::paint_image`]).
     pub fn draw_image(&mut self, img: &DecodedImage, ctm: Matrix, alpha: f32) {
         let clip = self.clip;
         self.draw_image_clipped(img, ctm, alpha, clip);
@@ -248,82 +254,133 @@ impl DrawDevice {
         if img.width == 0 || img.height == 0 || alpha <= 0.0 {
             return;
         }
-        let m = ctm.concat(self.base);
-        let Some(inv) = m.try_invert() else { return };
-
-        // Device bounds = unit square transformed by m, clamped to clip ∩ pixmap.
-        let corners = [
-            Point::new(0.0, 0.0).transform(m),
-            Point::new(1.0, 0.0).transform(m),
-            Point::new(1.0, 1.0).transform(m),
-            Point::new(0.0, 1.0).transform(m),
-        ];
-        let mut x0 = f32::INFINITY;
-        let mut y0 = f32::INFINITY;
-        let mut x1 = f32::NEG_INFINITY;
-        let mut y1 = f32::NEG_INFINITY;
-        for p in corners {
-            x0 = x0.min(p.x);
-            y0 = y0.min(p.y);
-            x1 = x1.max(p.x);
-            y1 = y1.max(p.y);
+        let clip = clip.intersect(self.pix.bbox());
+        if clip.is_empty() {
+            return;
         }
-        let bounds = IRect::new(
-            x0.floor() as i32,
-            y0.floor() as i32,
-            x1.ceil() as i32,
-            y1.ceil() as i32,
-        )
-        .intersect(self.pix.bbox())
-        .intersect(clip);
-        if bounds.is_empty() {
+        // `local_ctm = fz_concat(in_ctm, dev->transform)`, then grid-fitted
+        // (not a Type3 glyph device, so always).
+        let local = draw_scale::gridfit_matrix(false, ctm.concat(self.base));
+
+        let base = ScalePix {
+            x: 0,
+            y: 0,
+            w: img.width as i32,
+            h: img.height as i32,
+            n: img.components as i32,
+            alpha: false,
+            samples: img.pixels.clone(),
+        };
+        let Some((pix, pix_ctm)) = prepare_image_pixmap(base, local, alpha, clip) else {
+            return;
+        };
+        let pix = gray_to_rgb_pix(pix);
+
+        // The /SMask goes through the same subsample + scale path as its own
+        // image (MuPDF: fz_clip_image_mask -> fz_get_pixmap_mask_from_image),
+        // then becomes a device-space coverage mask (see draw_affine's docs).
+        let mask = img.smask.as_ref().filter(|m| m.width > 0 && m.height > 0).and_then(|m| {
+            let mpix = ScalePix {
+                x: 0,
+                y: 0,
+                w: m.width as i32,
+                h: m.height as i32,
+                n: 1,
+                alpha: false,
+                samples: m.alpha.clone(),
+            };
+            let (mpix, mctm) = prepare_image_pixmap(mpix, local, alpha, clip)?;
+            let mpix = gray_to_rgb_pix(mpix);
+            let mut layer = Pixmap::new_rgb((clip.x1 - clip.x0) as u32, (clip.y1 - clip.y0) as u32);
+            layer.x = clip.x0;
+            layer.y = clip.y0;
+            draw_affine::paint_image(&mut layer, clip, &mpix, mctm, 255, true, false, None);
+            let data = layer.samples.chunks(3).map(|p| p[0]).collect();
+            Some(draw_affine::DevMask { bbox: clip, data })
+        });
+        if img.smask.is_some() && mask.is_none() {
+            // A mask that scales to nothing covers nothing.
             return;
         }
 
-        let iw = img.width;
-        let ih = img.height;
-        for py in bounds.y0..bounds.y1 {
-            for px in bounds.x0..bounds.x1 {
-                // Pixel centre -> image space.
-                let ip = Point::new(px as f32 + 0.5, py as f32 + 0.5).transform(inv);
-                if ip.x < 0.0 || ip.y < 0.0 || ip.x >= 1.0 || ip.y >= 1.0 {
-                    continue;
-                }
-                let sx = ((ip.x * iw as f32) as usize).min(iw - 1);
-                let sy = ((ip.y * ih as f32) as usize).min(ih - 1);
-                let si = (sy * iw + sx) * img.components as usize;
-                let rgb = match img.components {
-                    1 => {
-                        let v = img.pixels[si];
-                        [v, v, v]
-                    }
-                    _ => [img.pixels[si], img.pixels[si + 1], img.pixels[si + 2]],
-                };
-                // Per-pixel alpha from the /SMask, sampled in the SAME
-                // normalized image space rather than at the base image's
-                // resolution -- the mask may be a different size (§11.6.5.3),
-                // and this way neither is resampled.
-                let a = match &img.smask {
-                    Some(m) if m.width > 0 && m.height > 0 => {
-                        let mx = ((ip.x * m.width as f32) as usize).min(m.width - 1);
-                        let my = ((ip.y * m.height as f32) as usize).min(m.height - 1);
-                        let cover = m.alpha[my * m.width + mx] as f32 / 255.0;
-                        // Fully transparent: skip entirely rather than blend by
-                        // zero, so a masked-out region costs nothing.
-                        if cover <= 0.0 {
-                            continue;
-                        }
-                        alpha * cover
-                    }
-                    _ => alpha,
-                };
-                if let Some(o) = self.pix.offset(px, py) {
-                    // Straight source-over at the combined alpha.
-                    blend_rgb(&mut self.pix.samples[o..o + 3], rgb, a);
-                }
-            }
+        draw_affine::paint_image(
+            &mut self.pix,
+            clip,
+            &pix,
+            pix_ctm,
+            (alpha * 255.0) as i32,
+            true,
+            false,
+            mask.as_ref(),
+        );
+    }
+}
+
+// MuPDF: fz_get_pixmap_from_image (image.c:1019) + the scaling block of
+// fz_draw_fill_image (draw-device.c:1912-1929).
+/// Subsample `pix` by MuPDF's `l2factor` for the device footprint of `local`,
+/// then (when shrinking) smooth-scale it. Returns the pixmap to paint and the
+/// matrix that maps the unit square onto it, or `None` when nothing is left.
+fn prepare_image_pixmap(mut pix: ScalePix, local: Matrix, alpha: f32, clip: IRect) -> Option<(ScalePix, Matrix)> {
+    let (iw, ih) = (pix.w, pix.h);
+    // "Figure out the extent" -- C `int w = sqrtf(...)`, i.e. truncation.
+    let dx = (local.a * local.a + local.b * local.b).sqrt() as i32;
+    let dy = (local.c * local.c + local.d * local.d).sqrt() as i32;
+    // Clamp: we never magnify here.
+    let w = dx.min(iw);
+    let h = dy.min(ih);
+    // The largest power-of-two shrink that stays >= the needed size (+2 for
+    // grid-fit growth). FZ_IMAGE_RENDERING_BALANCE is MuPDF's default tuning.
+    let mut l2factor = 0;
+    if w > 0 && h > 0 {
+        while (iw >> (l2factor + 1)) >= w + 2 && (ih >> (l2factor + 1)) >= h + 2 && l2factor < 6 {
+            l2factor += 1;
         }
     }
+    // MuPDF consumes l2factor inside the decoder for compressed non-indexed
+    // images (subsample_stream -> fz_subsample_pixblock) and falls back to
+    // fz_subsample_pixmap (Bresenham for ragged sizes) for everything else.
+    // Our images arrive fully decoded, so the plain block subsample is the
+    // decoder-path equivalent; see draw_scale's docs.
+    if l2factor > 0 {
+        let (nw, nh) = draw_scale::subsample_pixblock(&mut pix.samples, pix.w, pix.h, pix.n, l2factor);
+        pix.w = nw;
+        pix.h = nh;
+        pix.samples.truncate((nw * nh * pix.n) as usize);
+    }
+
+    let mut m = local;
+    // ctx->tuning->image_scale == fz_default_image_scale: only when shrinking.
+    if dx < pix.w && dy < pix.h {
+        let gridfit = alpha == 1.0;
+        let scaled = match draw_scale::transform_pixmap(&pix, &mut m, dx, dy, gridfit, Some(clip)) {
+            Some(s) => Some(s),
+            None => draw_scale::scale_pixmap(&pix, pix.x as f32, pix.y as f32, dx.max(1) as f32, dy.max(1) as f32, None),
+        };
+        if let Some(s) = scaled {
+            pix = s;
+        }
+    }
+    Some((pix, m))
+}
+
+/// Gray (+alpha) -> RGB (+alpha) by replication, done AFTER scaling exactly
+/// where MuPDF converts "images with fewer components" (and what its `g2rgb`
+/// painter computes).
+fn gray_to_rgb_pix(pix: ScalePix) -> ScalePix {
+    let cn = pix.n - i32::from(pix.alpha);
+    if cn != 1 {
+        return pix;
+    }
+    let step = pix.n as usize;
+    let mut out = Vec::with_capacity(pix.samples.len() / step * (3 + usize::from(pix.alpha)));
+    for px in pix.samples.chunks(step) {
+        out.extend_from_slice(&[px[0], px[0], px[0]]);
+        if pix.alpha {
+            out.push(px[1]);
+        }
+    }
+    ScalePix { n: 3 + i32::from(pix.alpha), samples: out, ..pix }
 }
 
 // MuPDF: fz_draw_fill_text -> fz_draw_glyph (draw-device.c / draw-glyph.c). Here,
@@ -456,17 +513,6 @@ fn rgb_to_bytes(c: [f32; 3]) -> [u8; 3] {
         (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
         (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
     ]
-}
-
-/// Straight (non-premultiplied) source-over of `src` at `a` (0..=1) onto a 3-byte
-/// RGB destination slice.
-fn blend_rgb(dst: &mut [u8], src: [u8; 3], a: f32) {
-    let ia = 1.0 - a;
-    for k in 0..3 {
-        dst[k] = (src[k] as f32 * a + dst[k] as f32 * ia)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-    }
 }
 
 // MuPDF: DeviceGray -> DeviceRGB (fz_convert_color): replicate the single value.

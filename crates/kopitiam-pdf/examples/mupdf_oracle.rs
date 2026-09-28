@@ -114,6 +114,10 @@ struct Args {
     objects: bool,
     /// Print up to this many unmatched chars per page (debugging aid).
     show_unmatched: usize,
+    /// Write `<file>-p<N>-{ours,mupdf}.ppm` here for every raster-failing page.
+    dump: Option<PathBuf>,
+    /// 1-based first page to compare (default 1).
+    first_page: usize,
     files: Vec<PathBuf>,
 }
 
@@ -127,6 +131,8 @@ fn parse_args() -> Args {
         text: true,
         objects: true,
         show_unmatched: 0,
+        dump: None,
+        first_page: 1,
         files: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
@@ -139,6 +145,8 @@ fn parse_args() -> Args {
             "--no-raster" => a.raster = false,
             "--no-text" => a.text = false,
             "--no-objects" => a.objects = false,
+            "--first-page" => a.first_page = it.next().expect("--first-page N").parse().expect("n"),
+            "--dump" => a.dump = Some(it.next().expect("--dump DIR").into()),
             "--show-unmatched" => a.show_unmatched = it.next().expect("--show-unmatched N").parse().expect("n"),
             _ => a.files.push(s.into()),
         }
@@ -241,8 +249,9 @@ fn run_file(args: &Args, f: &Path, tmp: &Path, name: &str, tsv: &mut String) -> 
             return s;
         }
     };
-    let n_pages = doc.page_count().min(args.max_pages);
-    s.pages = n_pages;
+    let first = args.first_page.max(1) - 1;
+    let n_pages = doc.page_count().min(first.saturating_add(args.max_pages));
+    s.pages = n_pages.saturating_sub(first);
 
     if args.objects {
         compare_objects(args, f, tmp, &doc, &mut s);
@@ -250,7 +259,7 @@ fn run_file(args: &Args, f: &Path, tmp: &Path, name: &str, tsv: &mut String) -> 
 
     // Per-page layers. MuPDF is asked for all pages in one process each (text,
     // raster) -- much cheaper than one spawn per page.
-    let page_range = format!("1-{n_pages}");
+    let page_range = format!("{}-{n_pages}", first + 1);
     let mu_text = if args.text && n_pages > 0 {
         let out = tmp.join("t.xml");
         let t0 = Instant::now();
@@ -299,10 +308,10 @@ fn run_file(args: &Args, f: &Path, tmp: &Path, name: &str, tsv: &mut String) -> 
         0.0
     };
 
-    for p in 0..n_pages {
+    for p in first..n_pages {
         let mut row = (0usize, 0usize, 0usize, true, 0.0f32, f64::NAN, f64::NAN, 0usize, 0.0f64);
         if let Some((pages, _)) = &mu_text {
-            let mu = pages.get(p).cloned().unwrap_or_default();
+            let mu = pages.get(p - first).cloned().unwrap_or_default();
             let ours = match page_to_stext(&doc, p, StextOptions { flags: StextOptions::CLIP }) {
                 Ok(pg) => pg
                     .blocks
@@ -354,6 +363,14 @@ fn run_file(args: &Args, f: &Path, tmp: &Path, name: &str, tsv: &mut String) -> 
                     s.mean_abs_sum += mean;
                     if gross <= RASTER_GROSS_PASS {
                         s.raster_pages_pass += 1;
+                    } else if let Some(dir) = &args.dump {
+                        let _ = std::fs::create_dir_all(dir);
+                        let stem = format!("{name}-p{}", p + 1);
+                        let _ = write_ppm(&dir.join(format!("{stem}.ours.ppm")), &pix.samples, pix.w, pix.h, pix.n);
+                        let _ = std::fs::copy(
+                            tmp.join(format!("r{}.ppm", p + 1)),
+                            dir.join(format!("{stem}.mupdf.ppm")),
+                        );
                     }
                     if gross > s.worst_gross {
                         s.worst_gross = gross;
@@ -661,4 +678,16 @@ fn compare_raster(ours: &[u8], ow: u32, oh: u32, on: u8, mu: &[u8], mw: u32, mh:
     }
     let n = (w * h).max(1) as f64;
     (gross as f64 / n, sum as f64 / n)
+}
+
+/// Write our pixmap as a binary PPM (gray / RGB / RGBA all flattened to RGB).
+fn write_ppm(p: &Path, samples: &[u8], w: u32, h: u32, n: u8) -> std::io::Result<()> {
+    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+    for px in samples.chunks(n as usize) {
+        match n {
+            1 | 2 => out.extend_from_slice(&[px[0], px[0], px[0]]),
+            _ => out.extend_from_slice(&px[..3]),
+        }
+    }
+    std::fs::write(p, out)
 }

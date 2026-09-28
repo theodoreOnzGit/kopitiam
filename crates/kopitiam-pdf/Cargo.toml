@@ -134,6 +134,20 @@ skrifa = "0.42"
 unicode-general-category = "1.1"
 unicode-normalization = "0.1.25"
 
+# JPEG 2000 (`JPXDecode`) and JBIG2 (`JBIG2Decode`) image codecs, for
+# `mupdf/page_image.rs`. MuPDF hands these to openjpeg and jbig2dec
+# (load-jpx.c, filter-jbig2.c); per AID-0052 the port substitutes existing
+# pure-Rust crates instead of translating two more C libraries. Both are the
+# decoders hayro itself uses, pinned to EXACTLY the versions `hayro-syntax
+# 0.7.2` (under our pinned `hayro =0.7.1`) already pulls in -- so this adds no
+# new code to the build, and our renderer and the hayro fallback decode the
+# same image with the same codec. Bump these only together with hayro.
+# Apache-2.0 OR MIT, `#![forbid(unsafe_code)]`, no C.
+# default-features = false: the `image`/`moxcms` extras are for PNG export,
+# not decoding; whatever hayro enables (std/simd) unifies in anyway.
+hayro-jpeg2000 = { version = "=0.3.5", default-features = false }
+hayro-jbig2 = { version = "=0.3.0", default-features = false }
+
 # --- kpdf GUI stack (optional, behind the default `kpdf` feature) -------------
 # `src/bin/kpdf.rs` -- a lightweight native PDF reader. These were
 # `[dev-dependencies]` while kpdf was an example; promoting kpdf to a real

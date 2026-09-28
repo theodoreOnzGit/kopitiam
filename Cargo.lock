@@ -4325,6 +4325,8 @@ dependencies = [
  "eframe",
  "egui",
  "hayro",
+ "hayro-jbig2",
+ "hayro-jpeg2000",
  "lopdf",
  "md-5",
  "miniz_oxide",

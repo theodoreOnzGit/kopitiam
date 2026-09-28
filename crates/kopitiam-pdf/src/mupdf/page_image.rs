@@ -36,13 +36,22 @@
 //!   ICCBased (by its `/N`, falling back to `/Alternate`), and Indexed over any
 //!   of those.
 //!
-//! ## What is deferred (a later codec wave)
+//! * **JPXDecode (JPEG 2000)** -- decoded by `hayro-jpeg2000` (substituting
+//!   MuPDF's openjpeg, `load-jpx.c`), with the PDF `/ColorSpace` winning when
+//!   its component count matches, as in `jpx_read_image`. **Since 0.4.2.**
+//! * **JBIG2Decode** -- decoded by `hayro-jbig2` (substituting jbig2dec,
+//!   `filter-jbig2.c`), `/JBIG2Globals` included, then fed through the raw
+//!   1-bit sample path like CCITT. **Since 0.4.2.**
 //!
-//! `JPXDecode` (JPEG 2000) and `JBIG2Decode` return a clear
+//! ## What is deferred
+//!
+//! Separation/DeviceN/Lab image colorspaces return a clear
 //! [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported) error (never a
-//! panic). Separation/DeviceN/Lab colorspaces are likewise unsupported. Soft
-//! masks / `/SMask` / stencil-mask compositing are not applied -- each image is
-//! returned as its own opaque sample buffer.
+//! panic). `/SMask` soft masks ARE applied (see [`DecodedImage::smask`]);
+//! colour-key `/Mask` arrays and stencil `/Mask` images are not.
+//! ~~`JPXDecode` and `JBIG2Decode` return Unsupported~~ -- **CORRECTED
+//! 2026-09-28 (0.4.2)**: both decode now; the code-to-code harness showed 211
+//! JPX figures blank on NUREG/CR-7289 before this.
 
 use super::error::{Error, Result};
 use super::filter_fax::{self, FaxParams};
@@ -134,11 +143,14 @@ impl ColorKind {
     }
 }
 
-/// The image-only compression filters this module does not (yet) decode.
-///
-/// `CCITTFaxDecode` left this set on 2026-09-24, when [`filter_fax`] landed.
-fn is_deferred_codec(name: &[u8]) -> bool {
-    matches!(name, b"JPXDecode" | b"JBIG2Decode")
+/// The JPEG 2000 filter name (`JPXDecode`; it has no inline abbreviation).
+fn is_jpx(name: &[u8]) -> bool {
+    name == b"JPXDecode"
+}
+
+/// The JBIG2 filter name (`JBIG2Decode`).
+fn is_jbig2(name: &[u8]) -> bool {
+    name == b"JBIG2Decode"
 }
 
 /// The CCITT Group 3/4 fax filter names (`CCITTFaxDecode` / inline `CCF`).
@@ -160,8 +172,9 @@ fn is_dct(name: &[u8]) -> bool {
 /// resource-dictionary order.
 ///
 /// Returns an [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported) error if
-/// any image uses a deferred codec (JPX/JBIG2) or colorspace; a page with
-/// no images yields an empty vector.
+/// any image uses a colorspace this module does not decode (Separation /
+/// DeviceN / Lab); a page with no images yields an empty vector. (JPX and
+/// JBIG2 decode since 0.4.2.)
 pub fn page_images(doc: &PdfDocument, page_index: usize) -> Result<Vec<DecodedImage>> {
     let page = doc.page(page_index)?.clone();
     let images = image_xobjects(doc, &page)?;
@@ -185,7 +198,7 @@ pub fn page_images(doc: &PdfDocument, page_index: usize) -> Result<Vec<DecodedIm
 /// scanned-document shape -- one full-bleed image per page -- and it deliberately
 /// avoids interpreting the content stream to recover the image's exact placement
 /// (`cm` matrix): the aspect match is a cheap, robust proxy for "covers the
-/// page". A decode error (e.g. a deferred codec) propagates.
+/// page". A decode error (e.g. an unsupported colorspace) propagates.
 pub fn page_full_image(doc: &PdfDocument, page_index: usize) -> Result<Option<DecodedImage>> {
     let page = doc.page(page_index)?.clone();
     let images = image_xobjects(doc, &page)?;
@@ -247,7 +260,7 @@ fn image_xobjects(doc: &PdfDocument, page: &Object) -> Result<Vec<(Object, Objec
 /// Decode an Image XObject named by a content-stream `Do`, given its resolved
 /// dict and the indirect reference to its stream. The crate-visible entry the
 /// content interpreter ([`Processor::op_do`](super::interpret::Processor)) uses to
-/// paint image XObjects; a deferred codec / colorspace returns an error the caller
+/// paint image XObjects; an unsupported colorspace returns an error the caller
 /// treats as a safe skip.
 pub(crate) fn decode_image_xobject(
     doc: &PdfDocument,
@@ -261,7 +274,11 @@ pub(crate) fn decode_image_xobject(
 /// Decode one Image XObject to a [`DecodedImage`].
 fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result<DecodedImage> {
     let mut img = decode_image_base(doc, dict, stream_ref)?;
-    img.smask = decode_smask(doc, dict);
+    // An explicit /SMask wins; otherwise keep any alpha the codec itself
+    // carried (a JPX alpha channel).
+    if let Some(m) = decode_smask(doc, dict) {
+        img.smask = Some(m);
+    }
     Ok(img)
 }
 
@@ -312,15 +329,31 @@ fn decode_image_base(
     }
     let (width, height) = (width as usize, height as usize);
 
-    // Classify the filter chain: a deferred codec errors early; a DCT filter
-    // routes to the JPEG decoder; anything else is the raw-sample path.
+    // Classify the filter chain: JPX and DCT route to their codecs; CCITT and
+    // JBIG2 expand to packed bits; anything else is the raw-sample path.
     let filters = filter_names(doc, dict);
-    if let Some(name) = filters.iter().find(|n| is_deferred_codec(n)) {
-        return Err(Error::unsupported(format!(
-            "image codec not yet supported: {}",
-            String::from_utf8_lossy(name)
-        )));
+
+    // JPXDecode: MuPDF special-cases it in the image loader, never as a stream
+    // filter (pdf-stream.c build_filter passes JPX through untouched), because
+    // the codestream carries its own size, colour space and alpha.
+    if let Some(pos) = filters.iter().position(|n| is_jpx(n)) {
+        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let data = apply_leading_filters(raw, &filter, &parms, pos)?;
+        return decode_jpx(doc, dict, &data);
     }
+
+    // JBIG2Decode: a stream filter in MuPDF (fz_open_jbig2d), so like CCITT it
+    // expands to packed 1-bit samples and falls through to the common sample
+    // path. jbig2dec paints 1 = black; filter-jbig2.c:119 inverts to PDF's
+    // 0 = black, and so do we.
+    let jbig2 = if let Some(pos) = filters.iter().position(|n| is_jbig2(n)) {
+        let (raw, filter, parms) = doc.stream_raw(stream_ref)?;
+        let coded = apply_leading_filters(raw, &filter, &parms, pos)?;
+        let globals = jbig2_globals(doc, &parms, pos);
+        Some(decode_jbig2(&coded, globals.as_deref())?)
+    } else {
+        None
+    };
 
     // CCITTFaxDecode: expand to packed 1-bit samples and fall through to the
     // raw-sample path below, which is what MuPDF does -- its fax filter is a
@@ -377,9 +410,9 @@ fn decode_image_base(
         parse_colorspace(doc, &cs_obj)?
     };
 
-    let samples = match ccitt {
-        Some(bits) => bits,
-        None => doc.open_stream(stream_ref)?,
+    let samples = match (ccitt, jbig2) {
+        (Some(bits), _) | (None, Some(bits)) => bits,
+        (None, None) => doc.open_stream(stream_ref)?,
     };
     let decode = read_decode(doc, dict);
     Ok(decode_samples(
@@ -390,6 +423,149 @@ fn decode_image_base(
         decode.as_deref(),
         &samples,
     ))
+}
+
+// MuPDF: pdf_load_jpx_as_compressed_image (pdf-image.c:283) + jpx_read_image
+// (load-jpx.c:414), with openjpeg substituted by hayro-jpeg2000 (AID-0052).
+/// Decode a JPEG 2000 codestream / JP2 file into a [`DecodedImage`].
+///
+/// Colour space, MuPDF's way: the codestream says how many colour channels it
+/// has; the PDF `/ColorSpace` is used when its component count matches
+/// ("jpx file and dict colorspace do not match" otherwise), else 1/3/4 channels
+/// mean Gray/RGB/CMYK. An `Indexed` PDF colour space turns off the JP2 palette
+/// (`OPJ_DPARAMETERS_IGNORE_PCLR_CMAP_CDEF_FLAG`) so the samples stay indices
+/// for our palette lookup. A JPX alpha channel becomes the image's soft mask
+/// (an explicit `/SMask` still wins, see [`decode_image`]).
+fn decode_jpx(doc: &PdfDocument, dict: &Object, data: &[u8]) -> Result<DecodedImage> {
+    let cs_obj = geta(doc, dict, "ColorSpace", "CS");
+    let pdf_cs = if cs_obj.is_null() {
+        None
+    } else {
+        parse_colorspace(doc, &cs_obj).ok()
+    };
+    let indexed = matches!(pdf_cs, Some(ColorKind::Indexed { .. }));
+    let settings = hayro_jpeg2000::DecodeSettings {
+        resolve_palette_indices: !indexed,
+        strict: false,
+        target_resolution: None,
+    };
+    let image = hayro_jpeg2000::Image::new(data, &settings)
+        .map_err(|e| Error::syntax(format!("JPXDecode: {e:?}")))?;
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let has_alpha = image.has_alpha();
+    let numcomps = match image.color_space() {
+        hayro_jpeg2000::ColorSpace::Gray => 1,
+        hayro_jpeg2000::ColorSpace::RGB => 3,
+        hayro_jpeg2000::ColorSpace::CMYK => 4,
+        hayro_jpeg2000::ColorSpace::Unknown { num_channels }
+        | hayro_jpeg2000::ColorSpace::Icc { num_channels, .. } => *num_channels as usize,
+    };
+    let bitmap = image
+        .decode()
+        .map_err(|e| Error::syntax(format!("JPXDecode: {e:?}")))?;
+    let total = numcomps + usize::from(has_alpha);
+    if total == 0 || bitmap.len() < w * h * total {
+        return Err(Error::syntax("JPXDecode: short bitmap"));
+    }
+    let mut color = Vec::with_capacity(w * h * numcomps);
+    let mut alpha = has_alpha.then(|| Vec::with_capacity(w * h));
+    for px in bitmap.chunks_exact(total).take(w * h) {
+        color.extend_from_slice(&px[..numcomps]);
+        if let Some(a) = alpha.as_mut() {
+            a.push(px[numcomps]);
+        }
+    }
+    let cs = match pdf_cs {
+        Some(cs) if cs.source_components() == numcomps => cs,
+        _ => match numcomps {
+            1 => ColorKind::Gray,
+            3 => ColorKind::Rgb,
+            4 => ColorKind::Cmyk,
+            n => {
+                return Err(Error::unsupported(format!(
+                    "JPXDecode: {n}-channel colour space"
+                )));
+            }
+        },
+    };
+    let decode = read_decode(doc, dict);
+    let mut img = decode_samples(w, h, 8, &cs, decode.as_deref(), &color);
+    if let Some(a) = alpha {
+        img.smask = Some(SoftMask {
+            width: w,
+            height: h,
+            alpha: a,
+        });
+    }
+    Ok(img)
+}
+
+/// The `/JBIG2Globals` stream of `/DecodeParms[pos]`, decoded, if any.
+fn jbig2_globals(doc: &PdfDocument, parms: &Object, pos: usize) -> Option<Vec<u8>> {
+    let d = match parms {
+        Object::Array(items) => doc.resolve(items.get(pos)?).ok()?,
+        other => doc.resolve(other).ok()?,
+    };
+    let g = d.dict_gets("JBIG2Globals")?;
+    doc.open_stream(g).ok()
+}
+
+// MuPDF: fz_open_jbig2d (filter-jbig2.c), with jbig2dec substituted by
+// hayro-jbig2 (AID-0052).
+/// Decode an embedded JBIG2 stream to packed 1-bit rows in the PDF convention
+/// (bit 0 = black), byte-aligned per row.
+fn decode_jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<Vec<u8>> {
+    let image = hayro_jbig2::Image::new_embedded(data, globals)
+        .map_err(|e| Error::syntax(format!("JBIG2Decode: {e:?}")))?;
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let row_bytes = w.div_ceil(8);
+
+    /// Packs pixels MSB-first, 1 = white (PDF), padding each row to a byte.
+    struct Packer {
+        out: Vec<u8>,
+        row_bytes: usize,
+        row: usize,
+        bit: usize,
+    }
+    impl hayro_jbig2::Decoder for Packer {
+        fn push_pixel(&mut self, black: bool) {
+            if !black {
+                let i = self.row * self.row_bytes + self.bit / 8;
+                if let Some(b) = self.out.get_mut(i) {
+                    *b |= 0x80 >> (self.bit % 8);
+                }
+            }
+            self.bit += 1;
+        }
+        fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+            // Only called byte-aligned (hayro-jbig2's contract).
+            let n = chunk_count as usize;
+            let start = self.row * self.row_bytes + self.bit / 8;
+            if !black {
+                let end = (start + n).min(self.out.len());
+                if start < end {
+                    self.out[start..end].fill(0xff);
+                }
+            }
+            self.bit += n * 8;
+        }
+        fn next_line(&mut self) {
+            self.row += 1;
+            self.bit = 0;
+        }
+    }
+    let mut p = Packer {
+        out: vec![0u8; row_bytes * h],
+        row_bytes,
+        row: 0,
+        bit: 0,
+    };
+    image
+        .decode(&mut p)
+        .map_err(|e| Error::syntax(format!("JBIG2Decode: {e:?}")))?;
+    Ok(p.out)
 }
 
 /// Apply the filters *before* index `image_pos` in the chain (usually none), so
@@ -1031,8 +1207,11 @@ mod tests {
         assert!(page_full_image(&doc, 0).unwrap().is_none());
     }
 
+    // Until 0.4.2 these two asserted `Unsupported` (the codecs were deferred).
+    // The codecs decode now, so what is pinned is the part that still matters:
+    // a corrupt codestream is a clean `Syntax` error, never a panic.
     #[test]
-    fn jpxdecode_is_unsupported_not_panic() {
+    fn corrupt_jpx_is_an_error_not_panic() {
         let img = stream_body(
             "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
              /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /JPXDecode",
@@ -1043,11 +1222,11 @@ mod tests {
         let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
 
         let err = page_images(&doc, 0).unwrap_err();
-        assert_eq!(err.kind(), crate::mupdf::ErrorKind::Unsupported);
+        assert_eq!(err.kind(), crate::mupdf::ErrorKind::Syntax);
     }
 
     #[test]
-    fn jbig2decode_is_unsupported_not_panic() {
+    fn corrupt_jbig2_is_an_error_not_panic() {
         let img = stream_body(
             "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
              /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode",
@@ -1057,7 +1236,7 @@ mod tests {
         let bodies = vec![s[0].clone(), s[1].clone(), s[2].clone(), img];
         let doc = PdfDocument::open(build_pdf(&bodies)).unwrap();
         let err = page_images(&doc, 0).unwrap_err();
-        assert_eq!(err.kind(), crate::mupdf::ErrorKind::Unsupported);
+        assert_eq!(err.kind(), crate::mupdf::ErrorKind::Syntax);
     }
 
     // The embedded 16x8 baseline JPEG fixture (`const JPEG_16X8`).
@@ -1121,12 +1300,12 @@ mod tests {
     }
 
     #[test]
-    fn ccitt_is_no_longer_a_deferred_codec() {
-        assert!(!is_deferred_codec(b"CCITTFaxDecode"));
-        assert!(!is_deferred_codec(b"CCF"));
-        // The wave that has not landed yet.
-        assert!(is_deferred_codec(b"JPXDecode"));
-        assert!(is_deferred_codec(b"JBIG2Decode"));
+    fn no_image_codec_is_deferred_any_more() {
+        // CCITT left the deferred set on 2026-09-24, JPX + JBIG2 on
+        // 2026-09-28 (0.4.2): every PDF image filter has a decoder now.
+        assert!(is_ccitt(b"CCITTFaxDecode") && is_ccitt(b"CCF"));
+        assert!(is_jpx(b"JPXDecode"));
+        assert!(is_jbig2(b"JBIG2Decode"));
     }
 
     #[test]

@@ -151,3 +151,52 @@ sits in a marked-content span `/ActualText ()` (empty), which MuPDF emits
 instead of the glyphs, so its text vanishes from MuPDF's stext. We ignore
 marked content, so we keep the 144 glyph chars. Recorded as a gap in the
 coverage map, not fixed in this tranche.
+
+### After tranche 2 (images) -- measured 2026-09-28
+
+Fixes:
+
+1. **The image drawing pipeline is MuPDF's now** (`fz_draw_fill_image`,
+   draw-device.c:1836): grid-fit the image matrix (`fz_gridfit_matrix`),
+   box-subsample by `l2factor` (`fz_subsample_pixblock`), smooth-scale to the
+   device footprint with the "simple" filter (`fz_scale_pixmap`,
+   draw-scale-simple.c), then paint in 14-bit fixed point with MuPDF's
+   near/bilinear decision (`fz_paint_image_imp`, draw-affine.c). New modules
+   `draw_scale.rs`, `draw_affine.rs`. Before: nearest-neighbour at pixel
+   centres, which shredded 1-bit scans (bd-6lx).
+2. **JPXDecode** via `hayro-jpeg2000` and **JBIG2Decode** via `hayro-jbig2`
+   (AID-0052 substitutions for openjpeg / jbig2dec; the exact versions hayro
+   already links), with MuPDF's colour-space rule for JPX and the
+   1 = black -> 0 = black inversion for JBIG2.
+
+| file | raster pages pass (before -> after) | worst gross % (after) | mean \|Δluma\| (before -> after) |
+|---|---|---|---|
+| ML15334A199 (WASH-1400, CCITT scan) | 34 -> **228/228** | 0.00 | 12.72 -> **0.00** (pixel-identical) |
+| ML22063A060 (NUREG/CR-7289, 211 JPX figures) | 170 -> **209/209** | 0.15 | 5.24 -> 2.88 |
+| ML12338A215 | 274 -> **279/279** | 0.12 | 3.62 -> 2.31 |
+| ML13028A421 | 55 -> **56/56** | 0.23 | 2.98 -> 2.01 |
+| ML13325A086 | 347 -> **349/349** | 0.34 | 2.24 -> 2.16 |
+| ML16245A032 | 99 -> **101/101** | 0.17 | 3.62 -> 3.00 |
+| physor2026-449 | 7 -> **8/8** | 0.25 | 5.48 -> 2.84 |
+| arxiv-2608.17504v1 | 77 -> **78/78** | 0.27 | 3.34 -> 2.99 |
+| ML070740002, physor-206/-306/-343 | all pass before and after | <= 0.12 | small drops |
+| **total** | 1123 -> **1368/1368** | **0.34** | |
+
+WASH-1400 is worth a sentence: 228 pages of 1-bit CCITT scan now come out
+**pixel-identical** to MuPDF (mean |Δluma| 0.00, zero gross pixels), because
+the subsample + simple-filter + gridfit chain is integer arithmetic end to
+end and the CCITT decoder was already byte-identical (AID-0058).
+
+**The open corpus no longer discriminates rasters.** Every page is inside
+1 %; the features still missing from the port (shadings, `gs` alpha, dashes,
+patterns, Type3, stencil masks, inline images, ...) simply do not occur, or
+occur too small, in these 12 files. From here on the harness is fed
+synthetic feature PDFs as well -- see the next section.
+
+Tests (each checked to fail on the pre-fix tree): `downscaled_image_is_filtered_not_point_sampled`
+(expected value **measured with mutool**: 127 in every pixel -- the first
+draft of the test assumed MuPDF would also filter a 64x4 -> 16x4 shrink, and
+mutool showed it point-samples that one, because `fz_default_image_scale`
+needs BOTH axes to shrink), `jpx_image_decodes`, `jbig2_image_decodes`
+(fixtures from `tests/fixtures/make-image-codecs.py`, cross-rendered with
+mutool before use).
