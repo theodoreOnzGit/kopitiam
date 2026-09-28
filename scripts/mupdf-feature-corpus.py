@@ -267,6 +267,28 @@ FILES["image-devicen-lab"] = pdf(
 )
 
 
+# 23. Tiling patterns beyond the plain case: an UNCOLOURED (PaintType 2)
+# pattern under a rotating+scaling /Matrix painted in red through
+# [/Pattern /DeviceRGB], and big text filled with a coloured pattern.
+# (A pattern whose cell paints with itself is NOT here: MuPDF's own run
+# dies with "exception stack overflow" and draws nothing, so there is no
+# oracle -- tests/mupdf_parity.rs checks only that ours terminates.)
+FILES["tiling-pattern-2"] = pdf(
+    [
+        stream(b"0 0 6 6 re f 0 0 0 rg 6 6 6 6 re f",  # the `0 0 0 rg` must be ignored
+               b" /Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 12 12]"
+               b" /XStep 12 /YStep 12 /Matrix [1.2 0.7 -0.7 1.2 3 5] /Resources << >>"),
+        stream(b"0 0 1 rg 0 0 4 8 re f 1 1 0 rg 4 0 4 8 re f",
+               b" /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 8 8]"
+               b" /XStep 8 /YStep 8 /Resources << >>"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+    ],
+    resources=b"<< /Pattern << /U 5 0 R /C 6 0 R >> /Font << /F 7 0 R >>"
+              b" /ColorSpace << /PU [/Pattern /DeviceRGB] >> >>",
+    content=b"""/PU cs 1 0 0 /U scn 0 0 200 100 re f
+/Pattern cs /C scn BT /F 70 Tf 10 120 Td (Wa) Tj ET""",
+)
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "feature-corpus")
     out.mkdir(parents=True, exist_ok=True)

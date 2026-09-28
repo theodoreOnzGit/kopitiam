@@ -176,6 +176,28 @@ pub trait TextDevice {
         false
     }
 
+    // MuPDF: fz_begin_tile_tid (device.c) -- the TILE branch of
+    // pdf_show_pattern (pdf-op-run.c:791).
+    /// Begin a tiled pattern fill. `area` is the region to cover and `view`
+    /// the pattern cell's `/BBox`, both in pattern space; `ctm` maps pattern
+    /// space to the page; `xstep`/`ystep` are the repeat.
+    ///
+    /// Returns whether the device TAKES the tile. When it does, the
+    /// interpreter runs the cell content exactly once (under `ctm`) and then
+    /// calls [`end_tile`](TextDevice::end_tile), and the device repeats what
+    /// it drew. When it does not, the interpreter runs the content once per
+    /// cell instead. The default takes it and does nothing -- MuPDF's
+    /// behaviour for a device with no `begin_tile` (the stext device): the
+    /// cell's content is seen once.
+    fn begin_tile(&mut self, _area: Rect, _view: Rect, _xstep: f32, _ystep: f32, _ctm: Matrix) -> bool {
+        true
+    }
+
+    // MuPDF: fz_end_tile (device.c).
+    /// End the tile begun by a [`begin_tile`](TextDevice::begin_tile) that
+    /// returned true. Default no-op.
+    fn end_tile(&mut self) {}
+
     // MuPDF: the fill material of pdf_gstate carried into fz_fill_text.
     /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph
     /// boxes pick up the content stream's fill colour; extraction sinks ignore it.

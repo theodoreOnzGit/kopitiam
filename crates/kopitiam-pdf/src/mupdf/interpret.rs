@@ -186,6 +186,27 @@ pub(crate) enum PatternFill {
     /// A shading pattern (`/PatternType 2`), painted with fz_fill_shade
     /// through a clip of the shape.
     Shade(std::sync::Arc<super::shade::Shade>),
+    /// A tiling pattern (`/PatternType 1`), its cell run repeatedly through a
+    /// clip of the shape (pdf_show_pattern).
+    Tiling(std::sync::Arc<TilingPattern>),
+}
+
+/// A loaded tiling pattern (`pdf_pattern`, pdf-pattern.c:pdf_load_pattern).
+#[derive(Debug)]
+pub(crate) struct TilingPattern {
+    /// `/PaintType 2`: an uncoloured pattern, painted in the current colour.
+    pub ismask: bool,
+    pub xstep: f32,
+    pub ystep: f32,
+    pub bbox: Rect,
+    pub matrix: Matrix,
+    pub resources: Object,
+    /// The pattern's own (decoded) content stream.
+    pub content: Vec<u8>,
+    /// `pdf_pattern_uses_blending`: a blend mode, transparency group or
+    /// soft-masked image anywhere in the pattern's resources. Such a
+    /// pattern is never drawn through the tile cache.
+    pub uses_blending: bool,
 }
 
 /// The text object state (`pdf_text_object_state`), reduced to the text-showing

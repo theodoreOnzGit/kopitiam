@@ -21,6 +21,8 @@
 //! * **Tranche 7 -- functions, colour spaces, shadings, optional content,
 //!   Type3** (`pdf-function.c`, `pdf-colorspace.c`, `pdf-shade.c` / `shade.c` /
 //!   `draw-mesh.c`, `pdf-layer.c`, `pdf-type3.c`).
+//! * **Tranche 8 -- tiling patterns** (`pdf_show_pattern`,
+//!   `fz_draw_begin_tile` / `fz_draw_end_tile`).
 //!
 //! From tranche 7 on the expected values are measured with `mutool draw -N -M
 //! 0` -- MuPDF's no-ICC, no-spot-simulation mode, which is the mode this port
@@ -830,4 +832,102 @@ fn type3_glyph_procedures_run_and_widths_use_the_font_matrix() {
     let cs = chars(&doc);
     assert_eq!(text(&cs), "AB");
     assert!((cs[1].origin.x - 80.0).abs() < 1e-3, "B at {}", cs[1].origin.x);
+}
+
+// ---------------------------------------------------------------------------
+// Tranche 8 -- tiling patterns (pdf-op-run.c pdf_show_pattern, pdf-pattern.c,
+// draw-device.c fz_draw_begin_tile / fz_draw_end_tile).
+// ---------------------------------------------------------------------------
+
+/// A coloured tiling pattern (checkerboard cell, 20 pt step) filling the
+/// page. 0.4.1 ignored PatternType 1 and kept the previous colour (black
+/// everywhere). mutool -N -M 0: black at cell-local (5,5) and (15,15), white
+/// at (15,5) and (5,15), in every repeat; pixel-identical page.
+#[test]
+fn coloured_tiling_pattern_repeats_its_cell() {
+    let doc = raw_page(
+        "<< /Pattern << /T 5 0 R >> >>",
+        b"/Pattern cs /T scn 0 0 200 200 re f",
+        vec![raw_stream(
+            " /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+            b"0 0 0 rg 0 0 10 10 re f 10 10 10 10 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for (cx, cy) in [(0u32, 0u32), (60, 100), (180, 180)] {
+        // device y = 199 - pdf y
+        let dev = |x: u32, y: u32| rgb_at(&pix, cx + x, 199 - (cy + y));
+        assert_eq!(dev(5, 5), [0, 0, 0], "cell ({cx},{cy}) lower-left");
+        assert_eq!(dev(15, 15), [0, 0, 0], "cell ({cx},{cy}) upper-right");
+        assert_eq!(dev(15, 5), [255, 255, 255], "cell ({cx},{cy}) lower-right");
+        assert_eq!(dev(5, 15), [255, 255, 255], "cell ({cx},{cy}) upper-left");
+    }
+}
+
+/// An UNCOLOURED (PaintType 2) pattern through `[/Pattern /DeviceRGB]`,
+/// under a rotating + scaling /Matrix: painted in the `scn` colour (red),
+/// with the cell's own `0 0 0 rg` ignored (gstate->ismask), each repeat
+/// placed at MuPDF's truncated integer tile offset. 0.4.1: solid black.
+/// Sample points measured with mutool -N -M 0 (3x3-uniform neighbourhoods).
+#[test]
+fn uncoloured_tiling_pattern_uses_the_scn_colour_and_matrix() {
+    let doc = raw_page(
+        "<< /Pattern << /U 5 0 R >> /ColorSpace << /PU [/Pattern /DeviceRGB] >> >>",
+        b"/PU cs 1 0 0 /U scn 0 0 200 200 re f",
+        vec![raw_stream(
+            " /Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 12 12] /XStep 12 /YStep 12 \
+/Matrix [1.2 0.7 -0.7 1.2 3 5] /Resources << >>",
+            b"0 0 6 6 re f 0 0 0 rg 6 6 6 6 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for p in [(49u32, 66u32), (78, 89), (78, 135), (20, 181), (165, 181)] {
+        assert_eq!(rgb_at(&pix, p.0, p.1), [255, 0, 0], "red at {p:?}");
+    }
+    for p in [(78u32, 20u32), (78, 66), (165, 66), (107, 89), (49, 135), (49, 181)] {
+        assert_eq!(rgb_at(&pix, p.0, p.1), [255, 255, 255], "white at {p:?}");
+    }
+}
+
+/// Text whose fill colour is a tiling pattern: each glyph becomes a clip
+/// around the pattern (pdf_flush_text_imp's PDF_MAT_PATTERN). 0.4.1 filled
+/// the glyph black. mutool -N -M 0 on the stem of a 120 pt Helvetica-Bold
+/// "I": 2-pt-wide blue / yellow stripes (x 19..20 blue, 21..24 yellow).
+#[test]
+fn text_filled_with_a_tiling_pattern_shows_the_pattern() {
+    let doc = raw_page(
+        "<< /Pattern << /C 5 0 R >> /Font << /F 6 0 R >> >>",
+        b"/Pattern cs /C scn BT /F 120 Tf 10 50 Td (I) Tj ET",
+        vec![
+            raw_stream(
+                " /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 8 8] /XStep 8 /YStep 8 /Resources << >>",
+                b"0 0 1 rg 0 0 4 8 re f 1 1 0 rg 4 0 4 8 re f",
+            ),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>".to_vec(),
+        ],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    for y in [72u32, 100, 128] {
+        assert_eq!(rgb_at(&pix, 19, y), [0, 0, 255], "blue stripe, y = {y}");
+        assert_eq!(rgb_at(&pix, 22, y), [255, 255, 0], "yellow stripe, y = {y}");
+        assert_eq!(rgb_at(&pix, 10, y), [255, 255, 255], "left of the glyph, y = {y}");
+    }
+}
+
+/// A pattern whose cell fills with ITSELF. MuPDF itself dies with
+/// "exception stack overflow" and draws nothing, so there is no oracle
+/// value; the port must simply terminate (nesting cap) and keep the page.
+#[test]
+fn self_referencing_tiling_pattern_terminates() {
+    let doc = raw_page(
+        "<< /Pattern << /S 5 0 R >> >>",
+        b"0 1 0 rg 0 0 50 50 re f /Pattern cs /S scn 100 100 60 60 re f",
+        vec![raw_stream(
+            " /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 \
+/Resources << /Pattern << /S 5 0 R >> >>",
+            b"0 0 1 rg 0 0 5 5 re f /Pattern cs /S scn 5 5 5 5 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("terminates and renders");
+    assert_eq!(rgb_at(&pix, 25, 175), [0, 255, 0], "content before the pattern survives");
 }

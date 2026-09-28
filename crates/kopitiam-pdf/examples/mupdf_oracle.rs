@@ -370,7 +370,10 @@ fn run_file(args: &Args, f: &Path, tmp: &Path, name: &str, tsv: &mut String) -> 
                     s.mean_abs_sum += mean;
                     if gross <= RASTER_GROSS_PASS {
                         s.raster_pages_pass += 1;
-                    } else if let Some(dir) = &args.dump {
+                    }
+                    // Failing pages are dumped; KOPITIAM_DUMP_ALL=1 dumps the passing ones too.
+                    let dump_this = gross > RASTER_GROSS_PASS || std::env::var_os("KOPITIAM_DUMP_ALL").is_some();
+                    if let Some(dir) = args.dump.as_ref().filter(|_| dump_this) {
                         let _ = std::fs::create_dir_all(dir);
                         let stem = format!("{name}-p{}", p + 1);
                         let _ = write_ppm(&dir.join(format!("{stem}.ours.ppm")), &pix.samples, pix.w, pix.h, pix.n);

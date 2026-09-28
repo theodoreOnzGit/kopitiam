@@ -41,6 +41,7 @@ use super::interpret::{GState, Processor, make_trm};
 use super::object::Object;
 use super::resources::ColorSpace;
 use super::text_device::TextDevice;
+use super::xref::PdfDocument;
 
 impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // -----------------------------------------------------------------------
@@ -211,6 +212,22 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                 self.dev.fill_shade(shade, pat_ctm, alpha, clip);
                 self.dev.pop_clip();
             }
+            // pdf_flush_text_imp's PDF_MAT_PATTERN: the glyph as a clip
+            // around pdf_show_pattern over the glyph's device bounds.
+            if let (Some((super::interpret::PatternFill::Tiling(pat), gnum)), true) = (&pattern_fill, fills) {
+                let area = font.glyph_outline(cid).and_then(|o| path_device_bounds(&o, trm_dev));
+                if let Some(mut area) = area {
+                    if let Some(c) = self.gstack.last().unwrap().clip {
+                        area = area.intersect(c);
+                    }
+                    let glyph = super::text_device::ClipGlyph { font: font.clone(), trm: trm_dev, cid };
+                    self.dev.clip_text(std::slice::from_ref(&glyph));
+                    self.show_tiling_pattern(pat, *gnum, area);
+                    self.dev.pop_clip();
+                }
+            }
+            // Re-borrow: running the cell needed `self` mutably.
+            let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
             // MuPDF pdf_show_char: modes 4..=7 also add the glyph to the clip
             // accumulator (pdf_tos_accumulate_clip), flushed at ET.
             if render_mode & 4 != 0 {
@@ -443,6 +460,22 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                     self.dev.fill_shade(&shade, pat_ctm, alpha, clip);
                     self.dev.pop_clip();
                 }
+                super::interpret::PatternFill::Tiling(pat) => {
+                    // pdf_show_path's PDF_MAT_PATTERN: clip, show, pop.
+                    let Some(mut area) = path_device_bounds(&self.path, ctm) else { return };
+                    if let Some(c) = clip {
+                        area = area.intersect(c);
+                    }
+                    self.dev.clip_path(&self.path, rule, ctm);
+                    // The cell content builds its own paths: the page's path
+                    // must not leak into the first cell (MuPDF runs the cell
+                    // with a fresh path), and is restored for a following
+                    // stroke (`B`) or clip (`W`).
+                    let saved_path = std::mem::take(&mut self.path);
+                    self.show_tiling_pattern(&pat, gnum, area);
+                    self.path = saved_path;
+                    self.dev.pop_clip();
+                }
             }
             return;
         }
@@ -465,6 +498,136 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         };
         self.dev
             .stroke_path_styled(&self.path, ctm, &style, color, alpha, clip);
+    }
+
+    // MuPDF: pdf_show_pattern (pdf-op-run.c:2270), the non-tile-cache branch:
+    // run the pattern cell once per step over the (device-space) `area`,
+    // each under `ptm` pre-translated by the step and clipped to the cell's
+    // /BBox (the tile cache MuPDF's draw device uses renders exactly that
+    // clipped cell and repeats it).
+    fn show_tiling_pattern(&mut self, pat: &super::interpret::TilingPattern, pat_gstate: usize, area: Rect) {
+        if pat.xstep == 0.0 || pat.ystep == 0.0 {
+            return;
+        }
+        // A pattern whose cell paints with itself would recurse forever;
+        // MuPDF stops at its nesting limit (pdf_run_xobject's cycle check),
+        // this shares the Type3 nesting cap.
+        if self.t3_depth >= 8 {
+            return;
+        }
+        // A text fill runs the cell mid-BT: keep the text object and the
+        // clip accumulator the cell could disturb.
+        let saved_tos = self.tos;
+        let saved_text_clip = std::mem::take(&mut self.text_clip);
+        let parent = self.gstack.get(pat_gstate).cloned().unwrap_or_else(|| self.gstate().clone());
+        self.op_q();
+        {
+            // pdf_copy_pattern_gstate: ctm, stroke state, text state, alphas.
+            let g = self.gstate_mut();
+            g.ctm = parent.ctm;
+            g.stroke_style = parent.stroke_style.clone();
+            g.line_width = parent.line_width;
+            g.text = parent.text.clone();
+            g.fill_alpha = parent.fill_alpha;
+            g.stroke_alpha = parent.stroke_alpha;
+            // An uncoloured pattern paints in the current fill colour and
+            // ignores the colour operators inside it (gstate->ismask);
+            // either way the pattern itself stops being the material.
+            g.fill_pattern = None;
+            g.stroke_pattern = None;
+        }
+        let saved_mask = self.t3_mask;
+        if pat.ismask {
+            self.t3_mask = true;
+        }
+        let ptm = pat.matrix.concat(parent.ctm);
+        let Some(invptm) = ptm.try_invert() else {
+            self.op_q_restore();
+            self.t3_mask = saved_mask;
+            return;
+        };
+        let gparent_save = self.gparent;
+        self.gparent = self.gstack.len() - 2;
+        let gparent_save_ctm = self.gstack[self.gparent].ctm;
+        self.gstack[self.gparent].ctm = ptm;
+
+        let local = area.transform(invptm);
+        let (mut fx0, mut fy0) = ((local.x0 - pat.bbox.x0) / pat.xstep, (local.y0 - pat.bbox.y0) / pat.ystep);
+        let (mut fx1, mut fy1) = ((local.x1 - pat.bbox.x0) / pat.xstep, (local.y1 - pat.bbox.y0) / pat.ystep);
+        if fx0 > fx1 {
+            std::mem::swap(&mut fx0, &mut fx1);
+        }
+        if fy0 > fy1 {
+            std::mem::swap(&mut fy0, &mut fy1);
+        }
+        let pushed = pat.resources.is_dict();
+        if pushed {
+            self.resources.push(pat.resources.clone());
+        }
+        self.t3_depth += 1;
+        // MuPDF's TILE branch: "only use it as a tile if a whole repeat is
+        // required in at least one direction", and never with blending.
+        let tiled = (fx1 - fx0 > 1.0 || fy1 - fy0 > 1.0)
+            && !pat.uses_blending
+            && self.dev.begin_tile(local, pat.bbox, pat.xstep, pat.ystep, ptm);
+        if tiled {
+            // (The tile cache never hits here: every tile is drawn fresh.)
+            self.gstate_mut().ctm = ptm;
+            self.run_pattern_cell(&pat.content);
+            self.dev.end_tile();
+        } else {
+            // "When calculating the number of tiles required, we adjust by a
+            // small amount to allow for rounding errors."
+            let x0 = (fx0 + 0.001).floor() as i64;
+            let y0 = (fy0 + 0.001).floor() as i64;
+            let mut x1 = (fx1 - 0.001).ceil() as i64;
+            let mut y1 = (fy1 - 0.001).ceil() as i64;
+            if fx1 > fx0 && x1 == x0 {
+                x1 = x0 + 1;
+            }
+            if fy1 > fy0 && y1 == y0 {
+                y1 = y0 + 1;
+            }
+            // Hostile-input guard (not in MuPDF): the non-tile branch only
+            // runs when at most one whole repeat fits in each direction, so
+            // a sane cell count is tiny; an absurd one is skipped.
+            let cells = (x1 - x0).max(0).saturating_mul((y1 - y0).max(0));
+            if cells <= 10_000 {
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        self.gstate_mut().ctm = ptm.pre_translate(x as f32 * pat.xstep, y as f32 * pat.ystep);
+                        self.run_pattern_cell(&pat.content);
+                    }
+                }
+            }
+        }
+        self.t3_depth -= 1;
+        if pushed {
+            self.resources.pop();
+        }
+        let gp = self.gparent;
+        if let Some(g) = self.gstack.get_mut(gp) {
+            g.ctm = gparent_save_ctm;
+        }
+        self.gparent = gparent_save;
+        self.t3_mask = saved_mask;
+        self.op_q_restore();
+        self.tos = saved_tos;
+        self.text_clip = saved_text_clip;
+    }
+
+    // The body of both pdf_show_pattern branches: raise gbot, gsave, run the
+    // cell's content, grestore, and unwind anything it left on the stack.
+    fn run_pattern_cell(&mut self, content: &[u8]) {
+        let oldbot = self.gbot;
+        self.gbot = self.gstack.len() - 1;
+        self.op_q();
+        let _ = self.run_stream(content);
+        self.flush_clip_text();
+        while self.gstack.len() - 1 > self.gbot {
+            self.op_q_restore();
+        }
+        self.gbot = oldbot;
     }
 
     // MuPDF: pdf_run_d (pdf-op-run.c:2639) -- the dash array + phase.
@@ -673,8 +836,34 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                 Ok(sh) => Some(super::interpret::PatternFill::Shade(std::sync::Arc::new(sh))),
                 Err(_) => None,
             },
-            // Tiling patterns (PatternType 1) are not ported yet: the
-            // material stays as it was (the pre-0.4.2 behaviour).
+            // MuPDF: pdf_load_pattern (pdf-pattern.c:74).
+            Ok(1) => {
+                let get = |k: &str| self.doc.resolve_get(&obj, k).unwrap_or(Object::Null);
+                let rect = |o: &Object| {
+                    let v = |i: usize| o.array_get(i).and_then(|x| self.doc.resolve(x).ok()).map_or(0.0, |x| x.to_real() as f32);
+                    let (a, b, c, d) = (v(0), v(1), v(2), v(3));
+                    Rect::new(a.min(c), b.min(d), a.max(c), b.max(d))
+                };
+                let m = get("Matrix");
+                let matrix = if m.array_len() >= 6 {
+                    let v = |i: usize| m.array_get(i).and_then(|x| self.doc.resolve(x).ok()).map_or(0.0, |x| x.to_real() as f32);
+                    Matrix::new(v(0), v(1), v(2), v(3), v(4), v(5))
+                } else {
+                    Matrix::IDENTITY
+                };
+                self.doc.open_stream(&obj_ref).ok().map(|content| {
+                    super::interpret::PatternFill::Tiling(std::sync::Arc::new(super::interpret::TilingPattern {
+                        ismask: get("PaintType").to_int() == 2,
+                        xstep: get("XStep").to_real() as f32,
+                        ystep: get("YStep").to_real() as f32,
+                        bbox: rect(&get("BBox")),
+                        matrix,
+                        resources: get("Resources"),
+                        content,
+                        uses_blending: pattern_uses_blending(self.doc, &obj, &mut Vec::new()),
+                    }))
+                })
+            }
             _ => None,
         };
         let gnum = self.gparent;
@@ -691,6 +880,67 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
 
 /// The device-space bounding box of `path` flattened by `ctm`, or `None` when the
 /// path has no drawable geometry. Used for the rectangular clip approximation.
+// MuPDF: pdf_pattern_uses_blending / pdf_resources_use_blending /
+// pdf_xobject_uses_blending / pdf_extgstate_uses_blending (pdf-page.c:452).
+// `seen` is the pdf_cycle list: an object already on the path answers 0.
+fn pattern_uses_blending(doc: &PdfDocument, dict: &Object, seen: &mut Vec<(i32, i32)>) -> bool {
+    let Some(()) = enter_cycle(dict, seen) else { return false };
+    let d = doc.resolve(dict).unwrap_or(Object::Null);
+    let r = doc.resolve_get(&d, "Resources").unwrap_or(Object::Null);
+    let found = resources_use_blending(doc, &r, seen)
+        || extgstate_uses_blending(doc, &doc.resolve_get(&d, "ExtGState").unwrap_or(Object::Null));
+    leave_cycle(dict, seen);
+    found
+}
+
+fn extgstate_uses_blending(doc: &PdfDocument, dict: &Object) -> bool {
+    let bm = doc.resolve_get(dict, "BM").unwrap_or(Object::Null);
+    !bm.is_null() && !(bm.is_name() && bm.to_name() == b"Normal")
+}
+
+fn xobject_uses_blending(doc: &PdfDocument, dict: &Object, seen: &mut Vec<(i32, i32)>) -> bool {
+    let Some(()) = enter_cycle(dict, seen) else { return false };
+    let d = doc.resolve(dict).unwrap_or(Object::Null);
+    let group = doc.resolve_get(&d, "Group").unwrap_or(Object::Null);
+    let found = doc.resolve_get(&group, "S").is_ok_and(|s| s.to_name() == b"Transparency")
+        || (doc.resolve_get(&d, "Subtype").is_ok_and(|s| s.to_name() == b"Image")
+            && doc.resolve_get(&d, "SMask").is_ok_and(|s| !s.is_null()))
+        || resources_use_blending(doc, &doc.resolve_get(&d, "Resources").unwrap_or(Object::Null), seen);
+    leave_cycle(dict, seen);
+    found
+}
+
+fn resources_use_blending(doc: &PdfDocument, rdb: &Object, seen: &mut Vec<(i32, i32)>) -> bool {
+    if !rdb.is_dict() {
+        return false;
+    }
+    let vals = |key: &str| {
+        let o = doc.resolve_get(rdb, key).unwrap_or(Object::Null);
+        (0..o.dict_len()).filter_map(|i| o.dict_get_val(i).cloned()).collect::<Vec<_>>()
+    };
+    vals("ExtGState").iter().any(|g| extgstate_uses_blending(doc, &doc.resolve(g).unwrap_or(Object::Null)))
+        || vals("Pattern").iter().any(|p| pattern_uses_blending(doc, p, seen))
+        || vals("XObject").iter().any(|x| xobject_uses_blending(doc, x, seen))
+}
+
+// pdf_cycle: an indirect object already on the walk is a cycle. A direct
+// object cannot recur, but the walk is also capped in depth.
+fn enter_cycle(obj: &Object, seen: &mut Vec<(i32, i32)>) -> Option<()> {
+    if seen.len() >= 64 {
+        return None;
+    }
+    let key = if obj.is_indirect() { (obj.to_num(), obj.to_gen()) } else { (-1, -1) };
+    if key.0 >= 0 && seen.contains(&key) {
+        return None;
+    }
+    seen.push(key);
+    Some(())
+}
+
+fn leave_cycle(_obj: &Object, seen: &mut Vec<(i32, i32)>) {
+    seen.pop();
+}
+
 fn path_device_bounds(path: &Path, ctm: Matrix) -> Option<Rect> {
     let polys = path.flatten(ctm);
     let mut bounds: Option<Rect> = None;

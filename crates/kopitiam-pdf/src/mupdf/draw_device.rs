@@ -102,7 +102,31 @@ pub struct DrawDevice {
     mask: Option<std::sync::Arc<super::draw_affine::DevMask>>,
     /// Saved `(clip, mask)` per pushed clip: MuPDF's draw-device state stack.
     clip_stack: Vec<(IRect, Option<std::sync::Arc<super::draw_affine::DevMask>>)>,
+    /// Open pattern tiles (fz_draw_begin_tile's pushed states), innermost
+    /// last: while one is open, `pix` is the tile's own RGBA pixmap.
+    tiles: Vec<TileState>,
 }
+
+/// One open pattern tile: what `fz_draw_begin_tile` stores in `state[1]`,
+/// plus the device state it replaced.
+struct TileState {
+    /// The destination the tile is painted onto at `end_tile`.
+    saved_pix: Pixmap,
+    saved_clip: IRect,
+    saved_mask: Option<std::sync::Arc<super::draw_affine::DevMask>>,
+    saved_clip_stack: Vec<(IRect, Option<std::sync::Arc<super::draw_affine::DevMask>>)>,
+    /// `fz_irect_from_rect(area)`, in pattern space.
+    area: IRect,
+    xstep: f32,
+    ystep: f32,
+    /// Pattern space -> device pixels (`in_ctm` concat `dev->transform`).
+    ctm: Matrix,
+}
+
+/// The largest tile pixmap drawn (pixels). MuPDF has no cap and allocates
+/// whatever the pattern's /BBox covers; past this the interpreter's
+/// per-cell loop is used instead of a gigabyte tile.
+const MAX_TILE_PIXELS: i64 = 1 << 26;
 
 impl DrawDevice {
     /// Create a device over a fresh white `w×h` DeviceRGB pixmap. `base` is the
@@ -121,6 +145,7 @@ impl DrawDevice {
             fill_alpha: 1.0,
             mask: None,
             clip_stack: Vec::new(),
+            tiles: Vec::new(),
         }
     }
 
@@ -150,6 +175,7 @@ impl DrawDevice {
             fill_alpha: 1.0,
             mask: None,
             clip_stack: Vec::new(),
+            tiles: Vec::new(),
         }
     }
 
@@ -646,6 +672,10 @@ impl TextDevice for DrawDevice {
                             let d = self.pix.samples[o + k] as i32;
                             self.pix.samples[o + k] = (fz_mul255(c[k], a) + fz_mul255(d, 255 - a)) as u8;
                         }
+                        if self.pix.alpha {
+                            let d = self.pix.samples[o + 3] as i32;
+                            self.pix.samples[o + 3] = (a + fz_mul255(d, 255 - a)) as u8;
+                        }
                     }
                 }
             }
@@ -669,6 +699,10 @@ impl TextDevice for DrawDevice {
                     for k in 0..3 {
                         let d = self.pix.samples[o + k] as i32;
                         self.pix.samples[o + k] = (fz_mul255(patch[i + k] as i32, a) + fz_mul255(d, t)) as u8;
+                    }
+                    if self.pix.alpha {
+                        let d = self.pix.samples[o + 3] as i32;
+                        self.pix.samples[o + 3] = (fz_mul255(sa, a) + fz_mul255(d, t)) as u8;
                     }
                 }
             }
@@ -695,6 +729,87 @@ impl TextDevice for DrawDevice {
             }
         }
         self.push_clip_polys(&polys, FillRule::NonZero);
+    }
+
+    // MuPDF: fz_draw_begin_tile (draw-device.c:2745). Render the cell once
+    // into a transparent RGBA pixmap covering its device-space /BBox.
+    fn begin_tile(&mut self, area: Rect, view: Rect, xstep: f32, ystep: f32, ctm: Matrix) -> bool {
+        let ctm = ctm.concat(self.base);
+        let mut bbox = view.transform(ctm).irect_from_rect();
+        // "A BBox of zero height or width should still paint one pixel!"
+        if bbox.x1 == bbox.x0 {
+            bbox.x1 = bbox.x0 + 1;
+        }
+        if bbox.y1 == bbox.y0 {
+            bbox.y1 = bbox.y0 + 1;
+        }
+        let (w, h) = (i64::from(bbox.x1) - i64::from(bbox.x0), i64::from(bbox.y1) - i64::from(bbox.y0));
+        if w <= 0 || h <= 0 || w * h > MAX_TILE_PIXELS {
+            return false;
+        }
+        // "Patterns can be transparent, so we need to have an alpha here."
+        let mut tile = Pixmap::new(w as u32, h as u32, 4, true);
+        tile.x = bbox.x0;
+        tile.y = bbox.y0;
+        let saved_pix = std::mem::replace(&mut self.pix, tile);
+        self.tiles.push(TileState {
+            saved_pix,
+            saved_clip: self.clip,
+            saved_mask: self.mask.take(),
+            saved_clip_stack: std::mem::take(&mut self.clip_stack),
+            area: area.irect_from_rect(),
+            xstep,
+            ystep,
+            ctm,
+        });
+        // state[1].scissor = bbox. The outer clip mask is not applied to
+        // the tile's own drawing (MuPDF applies it when the clip pops).
+        self.clip = bbox;
+        true
+    }
+
+    // MuPDF: fz_draw_end_tile (draw-device.c:2864). Paint the rendered cell
+    // at every repeat that meets the destination's scissor, each at an
+    // integer (truncated) device offset.
+    fn end_tile(&mut self) {
+        let Some(st) = self.tiles.pop() else { return };
+        let tile = std::mem::replace(&mut self.pix, st.saved_pix);
+        self.clip = st.saved_clip;
+        self.mask = st.saved_mask;
+        self.clip_stack = st.saved_clip_stack;
+        let (xstep, ystep) = (st.xstep, st.ystep);
+        let Some(ttm) = st.ctm.try_invert() else { return };
+        // "Fudge the scissor bbox a little to allow for inaccuracies in the
+        // matrix inversion."
+        let scissor = Rect::from_irect(self.clip).expand(1.0).transform(ttm).irect_from_rect();
+        let area = st.area.intersect(scissor);
+        let tile_tmp = Rect::from_irect(tile.bbox()).expand(1.0).transform(ttm);
+        // In PDF files xstep/ystep can be smaller than the tile: bias the
+        // left/bottom edges by the difference (ints, as in MuPDF).
+        let extra_x = ((tile_tmp.x1 - tile_tmp.x0 - xstep) as i32).max(0) as f32;
+        let extra_y = ((tile_tmp.y1 - tile_tmp.y0 - ystep) as i32).max(0) as f32;
+        let x0 = ((area.x0 as f32 - tile_tmp.x0 - extra_x) / xstep).floor() as i64;
+        let y0 = ((area.y0 as f32 - tile_tmp.y0 - extra_y) / ystep).floor() as i64;
+        let x1 = ((area.x1 as f32 - tile_tmp.x0 + extra_x) / xstep).ceil() as i64;
+        let y1 = ((area.y1 as f32 - tile_tmp.y0 + extra_y) / ystep).ceil() as i64;
+        let mut ctm = st.ctm;
+        ctm.e = tile.x as f32;
+        ctm.f = tile.y as f32;
+        // Guard (not MuPDF): a degenerate step can ask for billions of
+        // copies; each copy is clipped to the scissor anyway.
+        if (x1 - x0).max(0).saturating_mul((y1 - y0).max(0)) > 4_000_000 {
+            return;
+        }
+        let scissor = self.clip.intersect(self.pix.bbox());
+        let mask = self.mask.clone();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let ttm = ctm.pre_translate(x as f32 * xstep, y as f32 * ystep);
+                // `dest->x = ttm.e`: a float -> int conversion (truncation).
+                let (dx, dy) = (ttm.e as i32, ttm.f as i32);
+                paint_tile_copy(&mut self.pix, &tile, dx, dy, scissor, mask.as_deref());
+            }
+        }
     }
 
     // MuPDF: fz_draw_pop_clip (draw-device.c).
@@ -1406,6 +1521,45 @@ fn axis_aligned_rect(polys: &[Vec<super::geometry::Point>]) -> Option<Rect> {
 }
 
 // MuPDF: fz_mul255 (geometry.h:38)
+// MuPDF: fz_paint_pixmap_with_bbox (draw-paint.c:2418) with alpha 255 ->
+// template_span_3_general (premultiplied RGBA source over RGB(A)): with
+// t = 256 - FZ_EXPAND(sa), d = s + FZ_COMBINE(d, t). The destination's clip
+// mask, if any, is folded in as fz_paint_pixmap_with_mask would at pop:
+// d = FZ_BLEND(painted, d, FZ_EXPAND(m)).
+fn paint_tile_copy(dst: &mut Pixmap, src: &Pixmap, sx: i32, sy: i32, scissor: IRect, mask: Option<&super::draw_affine::DevMask>) {
+    let sb = IRect::new(sx, sy, sx.saturating_add(src.w as i32), sy.saturating_add(src.h as i32));
+    let b = scissor.intersect(sb);
+    if b.is_empty() {
+        return;
+    }
+    let dn = dst.n as usize;
+    for y in b.y0..b.y1 {
+        for x in b.x0..b.x1 {
+            let so = ((y - sy) as usize) * src.stride + ((x - sx) as usize) * 4;
+            let s = &src.samples[so..so + 4];
+            let sa = s[3] as i32;
+            if sa == 0 {
+                continue;
+            }
+            let Some(o) = dst.offset(x, y) else { continue };
+            let t = 256 - (sa + (sa >> 7));
+            let m = mask.map_or(256, |mk| {
+                let m = mk.at(x, y) as i32;
+                m + (m >> 7)
+            });
+            if m == 0 {
+                continue;
+            }
+            for k in 0..dn {
+                let d = dst.samples[o + k] as i32;
+                let sv = if k < 3 { s[k] as i32 } else { sa };
+                let painted = sv + ((d * t) >> 8);
+                dst.samples[o + k] = if m == 256 { painted } else { ((painted - d) * m + (d << 8)) >> 8 } as u8;
+            }
+        }
+    }
+}
+
 fn fz_mul255(a: i32, b: i32) -> i32 {
     let mut x = a * b + 128;
     x += x >> 8;

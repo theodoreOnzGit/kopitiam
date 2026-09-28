@@ -287,6 +287,9 @@ pub fn paint_image(
                                 for (k, dk) in d.iter_mut().enumerate().take(sn) {
                                     *dk = (comp(k) + mul255(*dk as i32, t)) as u8;
                                 }
+                                if dn > sn {
+                                    d[sn] = (yv + mul255(d[sn] as i32, t)) as u8;
+                                }
                             }
                         } else {
                             let xa = if sa { mul255(yv, a_px) } else { a_px };
@@ -294,6 +297,9 @@ pub fn paint_image(
                                 let t = 255 - xa;
                                 for (k, dk) in d.iter_mut().enumerate().take(sn) {
                                     *dk = (mul255(comp(k), a_px) + mul255(*dk as i32, t)) as u8;
+                                }
+                                if dn > sn {
+                                    d[sn] = (xa + mul255(d[sn] as i32, t)) as u8;
                                 }
                             }
                         }
@@ -316,6 +322,10 @@ pub fn paint_image(
                                         *dk = (sample[k] as i32 + mul255(*dk as i32, t)) as u8;
                                     }
                                 }
+                                // An alpha destination (a pattern tile).
+                                if dn > sn {
+                                    d[sn] = (a + mul255(d[sn] as i32, t)) as u8;
+                                }
                             }
                         } else {
                             let aa = if sa { mul255(a, a_px) } else { a_px };
@@ -323,6 +333,9 @@ pub fn paint_image(
                                 let t = 255 - aa;
                                 for (k, dk) in d.iter_mut().enumerate().take(sn) {
                                     *dk = (mul255(sample[k] as i32, a_px) + mul255(*dk as i32, t)) as u8;
+                                }
+                                if dn > sn {
+                                    d[sn] = (aa + mul255(d[sn] as i32, t)) as u8;
                                 }
                             }
                         }
@@ -415,6 +428,10 @@ pub fn paint_image_color(
                     let o = dst.offset(px, py).expect("bbox is inside dst");
                     for (k, dk) in dst.samples[o..o + dn].iter_mut().enumerate().take(3) {
                         *dk = fz_blend(color[k] as i32, *dk as i32, masa) as u8;
+                    }
+                    // An alpha destination (a pattern tile): da = blend(255, da).
+                    if dn > 3 {
+                        dst.samples[o + 3] = fz_blend(255, dst.samples[o + 3] as i32, masa) as u8;
                     }
                 }
             }
