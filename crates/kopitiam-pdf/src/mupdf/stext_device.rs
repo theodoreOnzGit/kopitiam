@@ -113,6 +113,9 @@ pub struct StextDevice {
     lastchar: i32,
     // MuPDF: fz_stext_device.lastline -- (block index, line index) into `page`.
     lastline: Option<(usize, usize)>,
+    // MuPDF: fz_stext_device.last.clipped -- the last glyph was culled by
+    // FZ_STEXT_CLIP, so its filler chars are dropped with it.
+    last_clipped: bool,
 
     /// Interning: font pointer identity -> index into `page.fonts`. Fonts are
     /// stable within a set-font run, so this dedups per logical font (a `q`/`Q`
@@ -137,6 +140,7 @@ impl StextDevice {
             trm: Matrix::IDENTITY,
             lastchar: -1,
             lastline: None,
+            last_clipped: false,
             font_ptrs: Vec::new(),
         }
     }
@@ -502,6 +506,25 @@ impl TextDevice for StextDevice {
         cid: u32,
         wmode: u8,
     ) {
+        // MuPDF: fz_stext_extract's FZ_STEXT_CLIP test (stext-device.c:1165):
+        // a glyph ENTIRELY outside `scissor ∩ page mediabox` is dropped. This
+        // port has no device scissor yet, so the box is the page mediabox
+        // alone -- which is exactly the case that matters for a cropped page:
+        // text in the part of the MediaBox the CropBox hides. The glyph's box
+        // is its em box (advance x descender..ascender) through `trm`, a
+        // conservative stand-in for fz_bound_glyph's outline bbox.
+        if self.flags & StextOptions::CLIP != 0 {
+            let asc = font.ascender();
+            let desc = font.descender();
+            let em = Rect::new(adv.min(0.0), desc.min(asc), adv.max(1e-3), asc.max(desc));
+            let g = em.transform(trm);
+            let b = self.page.mediabox;
+            if g.x1 <= b.x0 || g.y1 <= b.y0 || g.x0 >= b.x1 || g.y0 >= b.y1 {
+                self.last_clipped = true;
+                return;
+            }
+            self.last_clipped = false;
+        }
         let font_idx = self.intern_font(font);
         // MuPDF forces a new line at each span start under PRESERVE_SPANS. The
         // interpreter emits per string; treat every glyph as mid-span (false),
@@ -525,6 +548,11 @@ impl TextDevice for StextDevice {
     // MuPDF: fz_stext_extract with `span->items[i].gid < 0` -> `adv = 0`
     // (stext-device.c:1191-1194), then fz_add_stext_char as usual.
     fn show_filler_char(&mut self, font: &Font, trm: Matrix, unicode: char, wmode: u8) {
+        // A filler belongs to the glyph just shown; if CLIP dropped that
+        // glyph, drop its fillers too (dev->last.clipped).
+        if self.last_clipped {
+            return;
+        }
         let font_idx = self.intern_font(font);
         self.add_char(font_idx, unicode, -1, trm, 0.0, wmode, false);
     }
@@ -650,41 +678,21 @@ pub fn page_to_stext(
     Ok(dev.into_page())
 }
 
-/// The device-space mediabox for a page: the MediaBox transformed by the page
-/// CTM (so it matches the coordinate space the glyphs land in). Falls back to a
-/// zero-origin US-Letter box if the page or its MediaBox is unavailable.
+// MuPDF: fz_new_stext_page_from_page -> fz_bound_page (pdf_bound_page).
+/// The stext page's `mediabox`: the page rectangle in fitz page space --
+/// the space every glyph lands in -- which is the CropBox (clipped to the
+/// MediaBox) after rotation, with its corner at `(0, 0)`.
+///
+/// ~~"the MediaBox transformed by the page CTM"~~ -- **CORRECTED 2026-09-28
+/// (0.4.2)**: the code actually stored the raw, untransformed MediaBox, so a
+/// page whose MediaBox did not start at `(0, 0)` (or that was rotated or
+/// cropped) got a mediabox in a different space from its glyphs. It is now
+/// [`page_bounds`](super::page_run::page_bounds), i.e. MuPDF's.
 fn page_mediabox(doc: &PdfDocument, page_index: usize) -> Rect {
-    let page = match doc.page(page_index) {
-        Ok(p) => p.clone(),
-        Err(_) => return Rect::new(0.0, 0.0, 612.0, 792.0),
-    };
-    let mediabox = super::geometry::Rect::new(0.0, 0.0, 612.0, 792.0);
-    // The page-run module owns the exact CTM; for the mediabox we only need a
-    // sensible device-space box. Use the raw MediaBox if present.
-    match rect_from(doc, &page, "MediaBox") {
-        Some(r) => Rect::new(
-            r.x0.min(r.x1),
-            r.y0.min(r.y1),
-            r.x0.max(r.x1),
-            r.y0.max(r.y1),
-        ),
-        None => mediabox,
+    match doc.page(page_index) {
+        Ok(p) => super::page_run::page_bounds(doc, p),
+        Err(_) => Rect::new(0.0, 0.0, 612.0, 792.0),
     }
-}
-
-/// Read a 4-number array (`/MediaBox`) into a [`Rect`].
-fn rect_from(doc: &PdfDocument, dict: &super::object::Object, key: &str) -> Option<Rect> {
-    let arr = doc.resolve_get(dict, key).ok()?;
-    if arr.array_len() < 4 {
-        return None;
-    }
-    let v = |i: usize| -> f32 {
-        arr.array_get(i)
-            .and_then(|o| doc.resolve(o).ok())
-            .map(|o| o.to_real() as f32)
-            .unwrap_or(0.0)
-    };
-    Some(Rect::new(v(0), v(1), v(2), v(3)))
 }
 
 // ---------------------------------------------------------------------------

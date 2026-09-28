@@ -241,3 +241,37 @@ formula `1 - min(1, c + k)`.
 
 (Tranche-2 figures for these rows are luma-gross, tranche-3 per-channel; for
 these five files the two rules give the same verdict.)
+
+### Tranche 4 (page boxes) -- the CropBox is the page -- measured 2026-09-28
+
+**Maintainer report, same day:** "my iaea tecdoc document is unusually wide".
+The IAEA TECDOC covers (restricted documents, *not* used as inputs or
+fixtures) have a MediaBox that is a two-page spread, `[0 0 1340.74 898.53]`,
+and a CropBox that is the A4 right half; poppler says page 1 is
+595.25 x 841.84 pt. kopitiam-pdf sized, rendered and positioned text from the
+MediaBox, so kovan laid the page out 1340 pt wide.
+
+Fix, ported from `pdf_page_obj_transform_box` / `pdf_bound_page`
+(pdf-page.c:666, 742) and the CropBox clip in
+`pdf_run_page_contents_with_usage_imp` (pdf-run.c:179): the page is the
+CropBox intersected with the MediaBox (`/CropBox` inheritable, default the
+MediaBox), `/Rotate` snapped to quarter turns, `/UserUnit` applied, the
+CropBox corner moved to the origin; content is clipped to the CropBox when it
+is smaller than the MediaBox. One `page_transform` feeds the raster size, the
+page CTM (so stext coordinates and annotation placement), the stext page
+`mediabox`, and `page_geom::{page_size_points, page_media_box_points}`.
+`FZ_STEXT_CLIP` now culls glyphs entirely outside the page box, as mutool's
+stext output does.
+
+| check | 0.4.1 | now | MuPDF (mutool 19f1284) |
+|---|---|---|---|
+| spread-cover shape: page size | 1340 x 898 | **595 x 842** | 595 x 842 |
+| same, red square inside the crop at user (850,150) | device (850, 748) | **(133, 720)** | (133, 720) |
+| same, first char of "Inside" (stext) | x 800 | **x 83, y 270** | x 83, y 270 |
+| same with `/Rotate 90`: raster + stext vs mutool | -- | **0.00 % gross, text 6/6 chars** | -- |
+| feature corpus `feat-cropbox.pdf` | 66.67 % gross | **0.00 %** (mean 0.00) | -- |
+
+Tests: six `cropbox_*` cases in `tests/mupdf_parity.rs` (size, raster
+offset + clip, stext space, inherited from `/Pages`, larger than MediaBox,
+`/Rotate 90`); five fail on the 0.4.1 tree, the sixth pins the
+intersect-with-MediaBox rule.

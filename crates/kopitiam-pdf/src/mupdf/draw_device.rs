@@ -36,9 +36,12 @@
 //!   falls back to a **filled advance box** only when [`Font::glyph_outline`]
 //!   returns `None` -- a non-embedded font, an undecodable/predefined-Expert
 //!   program, or a genuinely empty glyph (whitespace is skipped outright).
-//! * **Invisible text.** The glyph sink has no render-mode, so `Tr 3/7`
-//!   (invisible, e.g. an OCR text layer over a scan) still paints a box. A future
-//!   render-mode-aware sink should suppress it.
+//! * **Invisible text.** ~~The glyph sink has no render-mode, so `Tr 3/7`
+//!   (invisible, e.g. an OCR text layer over a scan) still paints a box.~~ --
+//!   **CORRECTED 2026-09-28** (checked against `show_glyph`): the sink gets
+//!   the mode through [`TextDevice::set_text_render_mode`] since 0.4.1 and
+//!   paints only the fill modes 0/2/4/6; 1/2/5/6 are stroked through
+//!   `stroke_glyph` (0.4.2). Clip modes 4..=7 do not clip yet.
 //! * **Colour.** The content interpreter now emits colour operators (`g/rg/k`,
 //!   `cs/sc/scn`), tracked in the graphics state and converted to DeviceRGB
 //!   ([`resources`](super::resources)); fills/strokes and glyph boxes pick up the
@@ -47,8 +50,10 @@
 //! * **Not implemented at all** (safe no-ops / skips, never corruption): mesh &
 //!   gradient shadings (`draw-mesh.c`), blend modes beyond Normal
 //!   (`draw-blend.c`), soft masks, clip masks beyond a rectangular clip,
-//!   knockout / transparency groups. Image blitting is **nearest-neighbour**
-//!   (no bilinear/mip smoothing) and honours only a rectangular clip.
+//!   knockout / transparency groups. ~~Image blitting is **nearest-neighbour**
+//!   (no bilinear/mip smoothing)~~ -- **CORRECTED 2026-09-28 (0.4.2)**: images
+//!   go through MuPDF's subsample + smooth-scale + near/lerp paint pipeline
+//!   (`draw_scale`, `draw_affine`); they still honour only a rectangular clip.
 
 use super::draw_affine;
 use super::draw_edge::{FillRule, fill_polygons};
@@ -56,7 +61,6 @@ use super::draw_scale::{self, ScalePix};
 use super::draw_path::Path;
 use super::font::Font;
 use super::geometry::{IRect, Matrix, Rect};
-use super::object::Object;
 use super::page_image::DecodedImage;
 use super::pixmap::Pixmap;
 use super::text_device::TextDevice;
@@ -662,13 +666,12 @@ pub fn rasterize_page_ex(
     let scale = (dpi / 72.0).max(0.01);
     let page = doc.page(page_index)?.clone();
 
-    // Page size in points from the MediaBox, with a US-Letter fallback.
-    let (mut w_pt, mut h_pt) = mediabox_size(doc, &page);
-    // A 90/270 rotation swaps the device-space width/height (page_ctm applies the
-    // rotation; we only need matching pixmap dimensions).
-    if page_is_quarter_turned(doc, &page) {
-        std::mem::swap(&mut w_pt, &mut h_pt);
-    }
+    // MuPDF: fz_bound_page -> pdf_bound_page (pdf-page.c:666) -- the CROP box
+    // (clipped to the MediaBox), rotated and /UserUnit-scaled. Before 0.4.2
+    // this was the MediaBox, so a cover page whose MediaBox is a two-page
+    // spread rendered at the spread's full width (IAEA TECDOC covers).
+    let bounds = super::page_run::page_bounds(doc, &page);
+    let (w_pt, h_pt) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
 
     // The MediaBox is attacker-controlled; `dpi` is caller-controlled. Bound the
     // resulting raster so a pathological page (a huge MediaBox, optionally at a
@@ -710,38 +713,6 @@ pub fn rasterize_page_ex(
 
     let fallback_glyphs = dev.fallback_glyph_count();
     Ok((dev.into_pixmap(), fallback_glyphs))
-}
-
-/// The MediaBox width/height in points (normalised), falling back to US Letter
-/// (612×792) for a missing or degenerate box -- mirrors `page_ctm`'s guard.
-fn mediabox_size(doc: &PdfDocument, page: &Object) -> (f32, f32) {
-    let mb = doc.resolve_get(page, "MediaBox").unwrap_or(Object::Null);
-    let v = |i: usize| -> f32 {
-        mb.array_get(i)
-            .and_then(|o| doc.resolve(o).ok())
-            .map(|o| o.to_real() as f32)
-            .unwrap_or(0.0)
-    };
-    if mb.array_len() >= 4 {
-        let w = (v(0) - v(2)).abs();
-        let h = (v(1) - v(3)).abs();
-        if w >= 1.0 && h >= 1.0 {
-            return (w, h);
-        }
-    }
-    (612.0, 792.0)
-}
-
-/// True if the page's `/Rotate` (snapped to a multiple of 90) is 90° or 270°.
-fn page_is_quarter_turned(doc: &PdfDocument, page: &Object) -> bool {
-    let mut r = doc
-        .resolve_get(page, "Rotate")
-        .map(|o| o.to_int())
-        .unwrap_or(0);
-    r = ((r % 360) + 360) % 360;
-    r = 90 * ((r + 45) / 90);
-    r %= 360;
-    r == 90 || r == 270
 }
 
 #[cfg(test)]

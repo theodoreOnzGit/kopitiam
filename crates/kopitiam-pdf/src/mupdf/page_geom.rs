@@ -19,6 +19,16 @@
 //! resolved. So this is a dictionary lookup: microseconds for the whole
 //! document instead of half a minute.
 //!
+//! # The CropBox is the page (since 0.4.2)
+//!
+//! ~~`/MediaBox` is the page size~~ -- **CORRECTED 2026-09-28 (0.4.2)**:
+//! what a viewer shows is the **CropBox** clipped to the MediaBox (MuPDF
+//! `pdf_bound_page` / `pdf_page_obj_transform_box`, pdf-page.c:742; poppler
+//! agrees). The MediaBox-only answer made the IAEA TECDOC covers -- MediaBox a
+//! 1340 pt two-page spread, CropBox the A4 right half -- lay out "unusually
+//! wide" (maintainer report). Both functions below now answer with the
+//! visible box; the names keep "media" for API stability.
+//!
 //! # `/Rotate` is part of the answer
 //!
 //! A page with `/Rotate 90` or `270` is *displayed* with its width and height
@@ -128,11 +138,21 @@ pub fn page_size_points(doc: &PdfDocument, page_index: usize) -> (f32, f32) {
     }
 }
 
+/// The page's VISIBLE box in PDF user space: the CropBox clipped to the
+/// MediaBox, exactly as [`page_transform`](super::page_run::page_transform)
+/// computes it -- or `None` when the MediaBox itself is unusable (the callers'
+/// documented US-Letter fallback then applies).
+// MuPDF: pdf_page_obj_transform_box's `usedbox` (pdf-page.c:760-777).
+fn media_box(doc: &PdfDocument, page: &Object) -> Option<Rect> {
+    raw_media_box(doc, page)?;
+    Some(super::page_run::page_transform(doc, page).0)
+}
+
 /// The page's `/MediaBox` as a normalised rect, or `None` if unusable.
 ///
 /// Normalised because §7.9.5 allows either diagonal corner order, so a box
 /// written `[612 792 0 0]` is legal and means the same as `[0 0 612 792]`.
-fn media_box(doc: &PdfDocument, page: &Object) -> Option<Rect> {
+fn raw_media_box(doc: &PdfDocument, page: &Object) -> Option<Rect> {
     let arr = doc.resolve(page.dict_gets("MediaBox")?).ok()?;
     if arr.array_len() != 4 {
         return None;

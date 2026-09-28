@@ -13,9 +13,12 @@
 //!   `draw-affine.c` image path; JPX + JBIG2 codecs).
 //! * **Tranche 3 -- graphics state** (`gs`, `d`/`J`/`j`/`M`, stroked text,
 //!   CMYK conversion).
+//! * **Tranche 4 -- page boxes** (`pdf_page_obj_transform_box`: the CropBox
+//!   is the page).
 
 use kopitiam_pdf::mupdf::structured_text::{StextBlock, StextChar, StextOptions};
 use kopitiam_pdf::mupdf::xref::PdfDocument;
+use kopitiam_pdf::mupdf::page_geom::{page_media_box_points, page_size_points};
 use kopitiam_pdf::mupdf::{page_images, page_to_stext, rasterize_page_native};
 
 /// Assemble objects `1..` from `bodies` into a PDF with a classic xref table.
@@ -350,4 +353,122 @@ fn cmyk_conversion_is_mupdfs_fast_path() {
     use kopitiam_pdf::mupdf::cmyk_to_rgb;
     assert_eq!(cmyk_to_rgb(0.5, 0.5, 0.5, 0.5), [0.0, 0.0, 0.0]);
     assert_eq!(cmyk_to_rgb(0.25, 0.0, 1.0, 0.25), [0.5, 0.75, 0.0]);
+}
+
+// ---------------------------------------------------------------------------
+// Tranche 4 -- page boxes: the CropBox is the page
+// ---------------------------------------------------------------------------
+
+/// A one-page document with free-form `/Pages` and `/Page` extras (boxes,
+/// /Rotate) and content, font `/F` = Helvetica (object 5).
+fn boxed_page(pages_extra: &str, page_extra: &str, content: &str) -> PdfDocument {
+    let bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [3 0 R] /Count 1 {pages_extra} >>").into_bytes(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R {page_extra} \
+/Resources << /Font << /F 5 0 R >> >> /Contents 4 0 R >>"
+        )
+        .into_bytes(),
+        stream("", content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    PdfDocument::open(build_pdf(&bodies)).expect("fixture opens")
+}
+
+/// The IAEA-TECDOC cover shape (maintainer report 2026-09-28, "my iaea tecdoc
+/// document is unusually wide"; the real files are restricted and are NOT
+/// fixtures): MediaBox a two-page spread, CropBox the A4 right half. A red
+/// square and a word inside the crop, a blue square and a word outside it.
+const SPREAD: &str = "/MediaBox [0 0 1340 898] /CropBox [717 28 1312 870]";
+const SPREAD_CONTENT: &str = "1 0 0 rg 800 100 100 100 re f 0 0 1 rg 100 100 100 100 re f 0 g \
+BT /F 20 Tf 800 600 Td (Inside) Tj ET BT /F 20 Tf 100 600 Td (Outside) Tj ET";
+
+/// Size: MuPDF's pdf_bound_page is the CropBox (clipped to the MediaBox),
+/// 595 x 842 -- poppler says the same. 0.4.1 said 1340 x 898.
+#[test]
+fn cropbox_is_the_page_size() {
+    let doc = boxed_page("", SPREAD, SPREAD_CONTENT);
+    assert_eq!(page_size_points(&doc, 0), (595.0, 842.0));
+    let mb = page_media_box_points(&doc, 0);
+    assert_eq!((mb.x0, mb.y0, mb.x1, mb.y1), (717.0, 28.0, 1312.0, 870.0));
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!((pix.w, pix.h), (595, 842));
+}
+
+/// Raster: the CropBox corner is the origin (the red square at user x 800
+/// lands at device x 83), and content outside the crop is not drawn at all
+/// (MuPDF clips to the CropBox, pdf-run.c:179).
+#[test]
+fn cropbox_offsets_and_clips_the_raster() {
+    let doc = boxed_page("", SPREAD, SPREAD_CONTENT);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    // user (850, 150) -> device (850 - 717, 870 - 150) = (133, 720).
+    let o = ((720 * pix.w + 133) * pix.n as u32) as usize;
+    assert_eq!(&pix.samples[o..o + 3], &[255, 0, 0], "red square not at the crop-relative spot");
+    let blue = pix
+        .samples
+        .chunks(pix.n as usize)
+        .any(|p| p[2] > 200 && p[0] < 50 && p[1] < 50);
+    assert!(!blue, "the blue square outside the CropBox must not be drawn");
+}
+
+/// Structured text lives in the same cropped space as the raster, so text
+/// selection lines up: "Inside" starts at x = 800 - 717 = 83, baseline y =
+/// 870 - 600 = 270. With FZ_STEXT_CLIP, "Outside" (x < 0) is dropped, as
+/// `mutool draw -F stext` does; without it MuPDF keeps it (at negative x).
+#[test]
+fn cropbox_is_the_stext_coordinate_space() {
+    let doc = boxed_page("", SPREAD, SPREAD_CONTENT);
+    let page = page_to_stext(&doc, 0, StextOptions { flags: StextOptions::CLIP }).expect("stext");
+    assert_eq!(page.text().trim(), "Inside");
+    let first = page
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            StextBlock::Text(t) => t.lines.first().and_then(|l| l.chars.first()).cloned(),
+            _ => None,
+        })
+        .expect("a char");
+    assert!((first.origin.x - 83.0).abs() < 1e-3 && (first.origin.y - 270.0).abs() < 1e-3, "{:?}", first.origin);
+    assert_eq!((page.mediabox.x1 - page.mediabox.x0, page.mediabox.y1 - page.mediabox.y0), (595.0, 842.0));
+
+    let all = page_to_stext(&doc, 0, StextOptions::default()).expect("stext");
+    assert!(all.text().contains("Outside"), "without CLIP the hidden text is still extracted");
+}
+
+/// `/CropBox` is inheritable (§7.7.3.4): set on the /Pages node, it applies.
+#[test]
+fn cropbox_is_inherited_from_the_page_tree() {
+    let doc = boxed_page("/CropBox [717 28 1312 870]", "/MediaBox [0 0 1340 898]", SPREAD_CONTENT);
+    assert_eq!(page_size_points(&doc, 0), (595.0, 842.0));
+}
+
+/// A CropBox bigger than the paper is clipped to the MediaBox ("never use a
+/// box larger than fits the paper", pdf-page.c:766).
+///
+/// Honest note: this one also passed on 0.4.1, which ignored the CropBox
+/// altogether. It is here to pin the INTERSECTION rule of the new code -- a
+/// CropBox-aware change that used the raw CropBox would fail it (1050 x 1050).
+#[test]
+fn cropbox_larger_than_mediabox_is_clipped() {
+    let doc = boxed_page("", "/MediaBox [0 0 300 400] /CropBox [-50 -50 1000 1000]", "");
+    assert_eq!(page_size_points(&doc, 0), (300.0, 400.0));
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!((pix.w, pix.h), (300, 400));
+}
+
+/// /Rotate 90 turns the CROP, not the MediaBox, on its side.
+#[test]
+fn cropbox_with_rotate_90_swaps_the_crop_extents() {
+    let doc = boxed_page("", &format!("{SPREAD} /Rotate 90"), SPREAD_CONTENT);
+    assert_eq!(page_size_points(&doc, 0), (842.0, 595.0));
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!((pix.w, pix.h), (842, 595));
+    // Rotated 90° clockwise: user (850, 150) -> device (870 - ... ); rather
+    // than re-derive the matrix, check the red square is still on the page
+    // and the blue one still is not.
+    let red = pix.samples.chunks(pix.n as usize).any(|p| p[0] > 200 && p[1] < 50 && p[2] < 50);
+    let blue = pix.samples.chunks(pix.n as usize).any(|p| p[2] > 200 && p[0] < 50 && p[1] < 50);
+    assert!(red && !blue);
 }

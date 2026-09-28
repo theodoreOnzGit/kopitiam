@@ -31,7 +31,7 @@
 //! positions. `UserUnit` is treated as 1, and only the MediaBox is used for the
 //! base CTM (CropBox/ArtBox/etc. box selection is deferred).
 
-use super::geometry::{Matrix, Rect};
+use super::geometry::Matrix;
 use super::interpret::Processor;
 use super::object::Object;
 use super::text_device::TextDevice;
@@ -64,7 +64,49 @@ pub fn run_page_dict<D: TextDevice + ?Sized>(
     let contents = gather_contents(doc, page)?;
 
     let mut proc = Processor::new(doc, dev, ctm, resources);
+    // MuPDF pdf-run.c:179: "Clip content to CropBox if it is smaller than the
+    // MediaBox" -- a rectangle clip under the page CTM, compared on the RAW
+    // boxes (pdf_page_cropbox / pdf_page_mediabox, not the intersected one).
+    if let Some(clip) = crop_clip(doc, page, ctm) {
+        proc.gstate_mut().clip = Some(clip);
+    }
     proc.run_stream(&contents)
+}
+
+/// The device-space CropBox clip MuPDF pushes before running a page whose
+/// CropBox is smaller than its MediaBox, or `None` when it pushes none.
+// MuPDF: pdf_run_page_contents_with_usage_imp (pdf-run.c:179-184) with
+// pdf_page_cropbox / pdf_page_mediabox (pdf-run.c:91-102).
+fn crop_clip(doc: &PdfDocument, page: &Object, ctm: Matrix) -> Option<super::geometry::Rect> {
+    let mediabox = pdf_to_rect(doc, page, "MediaBox");
+    let cropbox = match doc.resolve_get(page, "CropBox") {
+        Ok(Object::Null) | Err(_) => mediabox,
+        Ok(_) => pdf_to_rect(doc, page, "CropBox"),
+    };
+    if cropbox.x0 > mediabox.x0 || cropbox.x1 < mediabox.x1 || cropbox.y0 > mediabox.y0 || cropbox.y1 < mediabox.y1 {
+        Some(cropbox.transform(ctm))
+    } else {
+        None
+    }
+}
+
+// MuPDF: pdf_to_rect (pdf-parse.c:36) on a page key -- normalised corners, or
+// fz_empty_rect when the value is not an array.
+fn pdf_to_rect(doc: &PdfDocument, dict: &Object, key: &str) -> super::geometry::Rect {
+    let Ok(arr) = doc.resolve_get(dict, key) else {
+        return super::geometry::Rect::EMPTY;
+    };
+    if !arr.is_array() {
+        return super::geometry::Rect::EMPTY;
+    }
+    let v = |i: usize| -> f32 {
+        arr.array_get(i)
+            .and_then(|o| doc.resolve(o).ok())
+            .map(|o| o.to_real() as f32)
+            .unwrap_or(0.0)
+    };
+    let (a, b, c, d) = (v(0), v(1), v(2), v(3));
+    super::geometry::Rect::new(a.min(c), b.min(d), a.max(c), b.max(d))
 }
 
 // MuPDF: pdf_page_contents (pdf-page.c:730) + pdf_open_contents_stream
@@ -128,29 +170,53 @@ fn gather_contents(doc: &PdfDocument, page: &Object) -> super::error::Result<Vec
     Ok(out)
 }
 
-// MuPDF: pdf_page_obj_transform_box (pdf-page.c:742), MediaBox path, UserUnit=1.
-/// Public because the annotation pass needs *the same* base transform the
-/// content stream was run under: `/Annots` are positioned in the same default
-/// user space as page content, so drawing them under a different CTM would put
-/// every annotation in the wrong place. See [`super::annot_run::run_page_annots`].
+// MuPDF: pdf_page_obj_transform_box (pdf-page.c:742) with FZ_CROP_BOX.
+/// The page's visible box in PDF user space (the CropBox clipped to the
+/// MediaBox) and the base page transform from PDF user space to fitz page
+/// space (origin top-left, y down, 72 dpi, rotation applied, the CropBox's
+/// corner at `(0, 0)`).
 ///
-/// The MediaBox-derived base page transform: flip y, apply the (0/90/180/270)
-/// page rotation, and translate so the box origin lands at `(0, 0)`.
-pub fn page_ctm(doc: &PdfDocument, page: &Object) -> Matrix {
-    let mut mediabox =
-        rect_from(doc, page, "MediaBox").unwrap_or(Rect::new(0.0, 0.0, 612.0, 792.0));
-    // Normalise (x0<=x1, y0<=y1); degenerate boxes fall back to US Letter.
-    if mediabox.x1 - mediabox.x0 < 1.0 || mediabox.y1 - mediabox.y0 < 1.0 {
-        mediabox = Rect::new(0.0, 0.0, 612.0, 792.0);
-    }
-    let mediabox = Rect::new(
-        mediabox.x0.min(mediabox.x1),
-        mediabox.y0.min(mediabox.y1),
-        mediabox.x0.max(mediabox.x1),
-        mediabox.y0.max(mediabox.y1),
-    );
+/// Before 0.4.2 this used the MediaBox only (hence the old name of the
+/// section). A page whose MediaBox is a two-page spread and whose CropBox is
+/// one A4 half -- the cover of IAEA TECDOCs, maintainer report 2026-09-28,
+/// "my iaea tecdoc document is unusually wide" -- was drawn at the full
+/// 1340 pt spread width; MuPDF and poppler show the 595 pt crop.
+///
+/// Steps, as in the C: `/UserUnit`; the used box is the CropBox intersected
+/// with the MediaBox (a CropBox bigger than the paper is clipped to it); an
+/// empty box becomes US Letter, one under 1 pt wide becomes the unit square;
+/// `/Rotate` snaps to 0/90/180/270; `ctm = scale(uu, -uu) · rotate(-r)`, then
+/// translate the CropBox's transformed corner to the origin.
+pub fn page_transform(doc: &PdfDocument, page: &Object) -> (super::geometry::Rect, Matrix) {
+    use super::geometry::Rect;
+    let userunit = match doc.resolve_get(page, "UserUnit") {
+        Ok(o) if o.is_number() => o.to_real() as f32,
+        _ => 1.0,
+    };
+    let mediabox = pdf_to_rect(doc, page, "MediaBox");
+    let crop_obj = doc.resolve_get(page, "CropBox").unwrap_or(Object::Null);
 
-    // Snap /Rotate to a multiple of 90 in [0, 360).
+    let normalise = |mut r: Rect| -> Rect {
+        if r.is_empty() {
+            r = Rect::new(0.0, 0.0, 612.0, 792.0);
+        }
+        let x0 = r.x0.min(r.x1);
+        let y0 = r.y0.min(r.y1);
+        let x1 = x0.max(r.x1);
+        let y1 = y0.max(r.y1);
+        let r = Rect::new(x0, y0, x1, y1);
+        if r.x1 - r.x0 < 1.0 || r.y1 - r.y0 < 1.0 { Rect::UNIT } else { r }
+    };
+
+    // "never use a box larger than fits the paper (mediabox)"
+    let usedbox = if crop_obj.is_null() {
+        mediabox
+    } else {
+        mediabox.intersect(pdf_to_rect(doc, page, "CropBox"))
+    };
+    let usedbox = normalise(usedbox);
+
+    // Snap page rotation to 0, 90, 180 or 270.
     let mut rotate = doc
         .resolve_get(page, "Rotate")
         .map(|o| o.to_int())
@@ -158,36 +224,52 @@ pub fn page_ctm(doc: &PdfDocument, page: &Object) -> Matrix {
     if rotate < 0 {
         rotate = 360 - ((-rotate) % 360);
     }
-    rotate %= 360;
+    if rotate >= 360 {
+        rotate %= 360;
+    }
     rotate = 90 * ((rotate + 45) / 90);
     if rotate >= 360 {
         rotate = 0;
     }
 
-    // fitz page space <- PDF user space: left-handed (flip y), then rotate.
-    let mut ctm = Matrix::scale(1.0, -1.0);
+    // Make left-handed and scale by UserUnit, then rotate.
+    let mut ctm = Matrix::scale(userunit, -userunit);
     ctm = ctm.pre_rotate(-(rotate as f32));
 
-    // Move the (transformed) box origin to (0, 0).
-    let box_t = mediabox.transform(ctm);
-    ctm = ctm.concat(Matrix::translate(-box_t.x0, -box_t.y0));
-    ctm
+    // Always use CropBox to set origin to top left.
+    let crop_src = if crop_obj.is_array() {
+        pdf_to_rect(doc, page, "CropBox")
+    } else {
+        mediabox
+    };
+    let cropbox = normalise(crop_src.intersect(mediabox));
+
+    // Translate page origin of CropBox to 0,0.
+    let cb = cropbox.transform(ctm);
+    ctm = ctm.concat(Matrix::translate(-cb.x0, -cb.y0));
+    (usedbox, ctm)
 }
 
-/// Read a 4-element numeric array (`/MediaBox`, …) into a [`Rect`].
-fn rect_from(doc: &PdfDocument, dict: &Object, key: &str) -> Option<Rect> {
-    let arr = doc.resolve_get(dict, key).ok()?;
-    if arr.array_len() < 4 {
-        return None;
-    }
-    let v = |i: usize| -> f32 {
-        arr.array_get(i)
-            .and_then(|o| doc.resolve(o).ok())
-            .map(|o| o.to_real() as f32)
-            .unwrap_or(0.0)
-    };
-    Some(Rect::new(v(0), v(1), v(2), v(3)))
+/// Public because the annotation pass needs *the same* base transform the
+/// content stream was run under: `/Annots` are positioned in the same default
+/// user space as page content, so drawing them under a different CTM would put
+/// every annotation in the wrong place. See [`super::annot_run::run_page_annots`].
+///
+/// The base page transform of [`page_transform`] (CropBox-aware since 0.4.2).
+pub fn page_ctm(doc: &PdfDocument, page: &Object) -> Matrix {
+    page_transform(doc, page).1
 }
+
+// MuPDF: pdf_bound_page (pdf-page.c:666) with FZ_CROP_BOX.
+/// The page rectangle in fitz page space -- `(0, 0, width, height)` of what
+/// is actually displayed: the CropBox (clipped to the MediaBox), rotated and
+/// scaled by `/UserUnit`. This is the size a viewer should lay the page out
+/// at, and the space every [`super::StextChar`] coordinate is in.
+pub fn page_bounds(doc: &PdfDocument, page: &Object) -> super::geometry::Rect {
+    let (r, ctm) = page_transform(doc, page);
+    r.transform(ctm)
+}
+
 
 impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // MuPDF: pdf_process_Do (pdf-interpret.c:1046) dispatch to op_Do_form ->
