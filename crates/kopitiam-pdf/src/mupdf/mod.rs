@@ -81,6 +81,7 @@ pub mod cmap;
 pub mod crypt;
 pub mod destination;
 pub mod doc_info;
+pub mod marked_content;
 pub mod doc_stream;
 pub mod draw_device;
 pub mod draw_affine;

@@ -1003,3 +1003,43 @@ fn aes_256_r6_file_opens_with_the_empty_user_password() {
     let refused = PdfDocument::open(include_bytes!("fixtures/encrypted-aes256-r6-empty-owner.pdf").to_vec());
     assert!(refused.is_err(), "an empty owner password must not open the file");
 }
+
+/// ActualText (stext-device.c `do_extract_within_actualtext` /
+/// `fz_stext_end_metatext`, pdf-op-run.c `begin_metatext` + `lookup_mcid`):
+/// an inline `/ActualText (lie)` replaces "fib" inside "Politicians fib,
+/// always." (matching prefix and suffix kept); a span whose MCID's
+/// STRUCTURE ELEMENT says `/ActualText ()` vanishes; an ActualText over an
+/// image is placed at the image. 0.4.1 ignored marked content: "fib",
+/// "Hidden words", and no "E=mc2". mutool `-F text` on the same bytes
+/// (scripts/mupdf-feature-corpus.py #25): "Politicians lie, always." /
+/// "Before" / "E=mc2"; the harness matches all 33 chars in place.
+#[test]
+fn actualtext_replaces_glyphs_including_via_the_structure_tree() {
+    let img: &[u8] = &[0, 128, 255, 64];
+    let bodies: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /StructParents 0 \
+/Resources << /Font << /F 5 0 R >> /XObject << /Im 9 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        stream(
+            "",
+            "BT /F 14 Tf 20 170 Td (Politicians ) Tj /Span << /ActualText (lie) >> BDC (fib) Tj EMC (, always.) Tj ET\n\
+/Span << /MCID 0 >> BDC BT /F 14 Tf 20 120 Td (Hidden words) Tj ET EMC\n\
+BT /F 14 Tf 20 80 Td (Before) Tj ET\n\
+/Figure << /ActualText (E=mc2) >> BDC q 60 0 0 20 20 40 cm /Im Do Q EMC",
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /StructTreeRoot /ParentTree 7 0 R /K [8 0 R] >>".to_vec(),
+        b"<< /Nums [0 [8 0 R]] >>".to_vec(),
+        b"<< /Type /StructElem /S /Span /P 6 0 R /Pg 3 0 R /K 0 /ActualText () >>".to_vec(),
+        raw_stream(" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceGray", img),
+    ];
+    let doc = PdfDocument::open(build_pdf(&bodies)).expect("opens");
+    let t = text(&chars(&doc));
+    assert!(t.contains("Politicians lie, always."), "{t:?}");
+    assert!(!t.contains("fib"), "{t:?}");
+    assert!(!t.contains("Hidden"), "the empty structure ActualText swallows the span: {t:?}");
+    assert!(t.contains("Before"), "{t:?}");
+    assert!(t.contains("E=mc2"), "ActualText over an image is placed at it: {t:?}");
+}

@@ -313,6 +313,30 @@ FILES["image-mask-keys"] = pdf(
 )
 
 
+# 25. ActualText (text layer): an inline `/ActualText (lie)` over the glyphs
+# "fib" inside "Politicians fib, always." (MuPDF's own prefix/postfix
+# example); a tagged span whose MCID's structure element says
+# `/ActualText ()` (the glyphs vanish from extraction); and an ActualText
+# over an IMAGE, placed at the image's bounds. 0.4.1 ignored all three.
+FILES["actualtext"] = pdf(
+    [
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /StructTreeRoot /ParentTree 7 0 R /K [8 0 R] >>",
+        b"<< /Nums [0 [8 0 R]] >>",
+        b"<< /Type /StructElem /S /Span /P 6 0 R /Pg 3 0 R /K 0 /ActualText () >>",
+        stream(bytes([0, 128, 255, 64]), b" /Type /XObject /Subtype /Image /Width 2 /Height 2"
+                                          b" /BitsPerComponent 8 /ColorSpace /DeviceGray"),
+    ],
+    resources=b"<< /Font << /F 5 0 R >> /XObject << /Im 9 0 R >> >>",
+    page_dict_extra=b" /StructParents 0",
+    content=b"""BT /F 14 Tf 20 170 Td (Politicians ) Tj /Span << /ActualText (lie) >> BDC (fib) Tj EMC (, always.) Tj ET
+/Span << /MCID 0 >> BDC BT /F 14 Tf 20 120 Td (Hidden words) Tj ET EMC
+BT /F 14 Tf 20 80 Td (Before) Tj ET
+/Figure << /ActualText (E=mc2) >> BDC q 60 0 0 20 20 40 cm /Im Do Q EMC""",
+    catalog=b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R /MarkInfo << /Marked true >> >>",
+)
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "feature-corpus")
     out.mkdir(parents=True, exist_ok=True)

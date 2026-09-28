@@ -66,6 +66,8 @@ pub fn run_page_dict<D: TextDevice + ?Sized>(
     let contents = gather_contents(doc, page)?;
 
     let mut proc = Processor::new(doc, dev, ctm, resources);
+    // pdf-run.c:175: the page's /StructParents feeds MCID lookups.
+    proc.set_struct_parent(doc.resolve_get(page, "StructParents").map_or(-1, |o| if o.is_int() { o.to_int() } else { -1 }));
     // MuPDF pdf-run.c:179: "Clip content to CropBox if it is smaller than the
     // MediaBox" -- a rectangle clip under the page CTM, compared on the RAW
     // boxes (pdf_page_cropbox / pdf_page_mediabox, not the intersected one).

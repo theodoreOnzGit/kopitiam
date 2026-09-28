@@ -345,6 +345,14 @@ pub struct Processor<'a, D: TextDevice + ?Sized> {
     /// default layer configuration hides (paths, text, images and shadings
     /// then paint nothing; clips still apply).
     pub(crate) hidden: u32,
+    /// MuPDF's `proc->marked_content` stack, reduced to what is used: for
+    /// each open `BDC`/`BMC`, whether it began an ActualText (so its `EMC`
+    /// ends one).
+    pub(crate) mc_actualtext: Vec<bool>,
+    /// MuPDF's `proc->mcids`: this page's (or form's) ParentTree entry, for
+    /// resolving a `BDC`'s `/MCID` to its structure element
+    /// ([`super::marked_content`]). Null when the content is untagged.
+    pub(crate) mcids: Object,
     /// The document's default layer configuration, read on first use.
     pub(crate) ocg: Option<std::sync::Arc<super::layer::OcgConfig>>,
     /// Inside a Type3 glyph procedure that declared `d1` (an uncoloured,
@@ -381,6 +389,8 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             text_clip: Vec::new(),
             gparent: 0,
             hidden: 0,
+            mc_actualtext: Vec::new(),
+            mcids: Object::Null,
             ocg: None,
             t3_mask: false,
             t3_depth: 0,
@@ -480,7 +490,11 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             // MuPDF pdf_run_ET: pdf_flush_text + pdf_flush_clip_text -- the
             // glyphs shown in modes 4..=7 become one clip, counted in the
             // gstate's clip_depth so the enclosing Q pops it.
-            b"ET" => self.flush_clip_text(),
+            b"ET" => {
+                self.flush_clip_text();
+                // pdf_run_ET -> pdf_flush_text: the glyphs so far are one fz_text.
+                self.dev.flush_text();
+            }
 
             // -- text state ------------------------------------------------
             b"Tc" => self.gstate_mut().text.char_space = s(0),
@@ -606,15 +620,28 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
                 {
                     self.hidden += 1;
                 }
+                // pdf-op-run.c push_marked_content -> begin_metatext(ActualText).
+                let at = obj.as_ref().and_then(|o| self.marked_content_actualtext(o));
+                if let Some(text) = &at {
+                    self.dev.flush_text();
+                    self.dev.begin_actualtext(text);
+                }
+                self.mc_actualtext.push(at.is_some());
             }
             b"BMC" => {
                 if self.hidden > 0 {
                     self.hidden += 1;
                 }
+                self.mc_actualtext.push(false);
             }
             b"EMC" => {
                 if self.hidden > 0 {
                     self.hidden -= 1;
+                }
+                // pop_marked_content -> pdf_flush_text + end_metatext.
+                if self.mc_actualtext.pop() == Some(true) {
+                    self.dev.flush_text();
+                    self.dev.end_actualtext();
                 }
             }
 
@@ -646,6 +673,39 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
     // MuPDF: pdf_run_BT (pdf-op-run.c:2929) -- reset Tm and Tlm to identity.
     // MuPDF: pdf_flush_clip_text -> pdf_flush_text_imp(flush_clip = 1)'s
     // `doclip` branch (pdf-op-run.c:1266).
+    // MuPDF: begin_metatext (pdf-op-run.c:1808) for ActualText -- the
+    // properties operand is an inline dict or a `/Properties` resource name;
+    // its `/ActualText` text string (or, failing that, the one on the
+    // structure element its `/MCID` names), decoded.
+    fn marked_content_actualtext(&self, props: &Object) -> Option<String> {
+        let dict = if props.is_name() {
+            self.lookup_resource_raw("Properties", props.to_name())
+        } else {
+            props.clone()
+        };
+        let dict = self.doc.resolve(&dict).ok()?;
+        // `pdf_dict_get(val, name)`, else the MCID's structure element.
+        let mut at = self.doc.resolve_get(&dict, "ActualText").unwrap_or(Object::Null);
+        if at.is_null()
+            && let Some(elem) = super::marked_content::lookup_mcid(self.doc, &self.mcids, &dict)
+        {
+            at = self.doc.resolve_get(&elem, "ActualText").unwrap_or(Object::Null);
+        }
+        if at.is_null() {
+            return None;
+        }
+        // pdf_to_text_string: a non-string value reads as "".
+        let bytes = if at.is_string() { at.to_string_bytes() } else { &[] };
+        Some(super::doc_info::decode_text_string(bytes))
+    }
+
+    // MuPDF: set_struct_parent (pdf-op-run.c:2397).
+    /// Point MCID lookups at the ParentTree entry for `struct_parent` (a
+    /// page's `/StructParents`, a form's `/StructParent`; -1 for none).
+    pub(crate) fn set_struct_parent(&mut self, struct_parent: i64) {
+        self.mcids = super::marked_content::mcids_for_struct_parent(self.doc, struct_parent);
+    }
+
     // MuPDF: pdf_is_ocg_hidden(doc, rstack, "View", obj) (pdf-layer.c:791).
     /// Whether optional content `obj` (a `/Properties` name, an OCG/OCMD dict
     /// or a reference to one) is hidden under the default configuration.
@@ -671,6 +731,14 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
     /// content stream (MuPDF's pdf_close_run_processor).
     pub(crate) fn finish(&mut self) {
         self.flush_clip_text();
+        // pdf_close_run_processor: pending text, then any marked content the
+        // stream left open (pop_marked_content).
+        self.dev.flush_text();
+        while let Some(at) = self.mc_actualtext.pop() {
+            if at {
+                self.dev.end_actualtext();
+            }
+        }
         self.gbot = 0;
         while self.gstack.len() > 1 {
             self.op_q_restore();
