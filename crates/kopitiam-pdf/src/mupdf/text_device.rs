@@ -28,11 +28,18 @@
 //! the `stext` device would have applied) and calls [`TextDevice::show_glyph`]
 //! straight away. There is no buffered `fz_text`, no `q`/`Q`-style device stack.
 //!
-//! The next wave's structured-text builder implements this trait; nothing else
+//! ~~The next wave's structured-text builder implements this trait; nothing else
 //! consumes it. Paths, colours, shadings, clips, blends and images are **not**
 //! on the text-extraction path and are parsed-and-ignored by the interpreter, so
 //! this trait exposes only the glyph sink (plus an image hook kept as a
-//! documented no-op default for a later wave).
+//! documented no-op default for a later wave).~~ **CORRECTED 2026-09-28**: the
+//! structured-text device AND the rasterizing
+//! [`DrawDevice`](super::draw_device::DrawDevice) implement this trait, and it
+//! carries the whole drawing surface -- paths, colours, images, shadings,
+//! clips, pattern tiles and (since the transparency tranche) groups and soft
+//! masks. Every method past [`show_glyph`](TextDevice::show_glyph) has a
+//! default that keeps an extraction sink working, mirroring what MuPDF's
+//! stext device does with the same call (usually: nothing).
 
 use super::draw_edge::FillRule;
 use super::draw_path::Path;
@@ -51,6 +58,30 @@ pub struct ClipGlyph {
     pub trm: Matrix,
     /// The glyph's CID (what `Font::glyph_outline` takes).
     pub cid: u32,
+}
+
+/// The arguments of `fz_begin_group`, for
+/// [`TextDevice::begin_group`].
+// MuPDF: fz_begin_group(dev, area, cs, isolated, knockout, blendmode, alpha).
+#[derive(Clone, Copy, Debug)]
+pub struct GroupParams {
+    /// The group's bounds, in device space before the device transform.
+    pub area: Rect,
+    /// An isolated group starts from transparent black instead of a copy
+    /// of what lies beneath (`/I true`, and always for a soft-mask group).
+    pub isolated: bool,
+    /// `/K true`. Passed through; the draw device renders knockout groups
+    /// as non-knockout (see its docs).
+    pub knockout: bool,
+    /// How the finished group composites onto its backdrop.
+    pub blend: super::draw_blend::BlendMode,
+    /// The group's constant alpha (the fill alpha at the `Do`), 0..=1.
+    pub alpha: f32,
+    /// The group's blending colour space (`/CS`, loaded only for an
+    /// isolated group, as MuPDF does) is DeviceGray: the result is knocked
+    /// down to gray before compositing (`fz_convert_pixmap` in
+    /// fz_draw_end_group).
+    pub gray: bool,
 }
 
 /// The sink the content-stream interpreter emits positioned glyphs to.
@@ -197,6 +228,41 @@ pub trait TextDevice {
     /// End the tile begun by a [`begin_tile`](TextDevice::begin_tile) that
     /// returned true. Default no-op.
     fn end_tile(&mut self) {}
+
+    // MuPDF: fz_begin_group (device.c) -- a transparency group: the explicit
+    // one of a `/Group /S /Transparency` Form XObject (pdf_run_xobject,
+    // pdf-op-run.c:2484) or the implicit per-object one pdf_begin_group
+    // wraps round any drawing op under a non-Normal `/BM` (pdf-op-run.c:488).
+    /// Begin a transparency group: everything drawn until the matching
+    /// [`end_group`](TextDevice::end_group) is composited back as one unit
+    /// (see [`GroupParams`]). Default no-op: MuPDF's stext device has no
+    /// `begin_group`, so the group's contents simply reach it as usual.
+    fn begin_group(&mut self, _group: &GroupParams) {}
+
+    // MuPDF: fz_end_group (device.c).
+    /// End the innermost group. Default no-op.
+    fn end_group(&mut self) {}
+
+    // MuPDF: fz_begin_mask (device.c), from begin_softmask (pdf-op-run.c:437).
+    /// Begin rendering a soft mask over `area` (device space before the
+    /// device transform; possibly infinite). `luminosity`: the mask is the
+    /// luminosity of what is drawn over a backdrop of gray `bc` (0..=1,
+    /// `/BC` already converted to gray); otherwise it is the drawn alpha.
+    /// The interpreter then runs the mask's group and calls
+    /// [`end_mask`](TextDevice::end_mask).
+    ///
+    /// Default no-op. MuPDF's stext device has no `begin_mask` either, so
+    /// the mask group's content -- glyphs included -- IS run through it and
+    /// extracted; the extraction sinks match that by keeping the default.
+    fn begin_mask(&mut self, _area: Rect, _luminosity: bool, _bc: f32) {}
+
+    // MuPDF: fz_end_mask_tr (device.c).
+    /// Finish the mask begun by [`begin_mask`](TextDevice::begin_mask),
+    /// mapping each mask value through the transfer-function table `tr`
+    /// (`/TR`, sampled at the 256 byte values), and push it as a clip:
+    /// everything drawn until the matching [`pop_clip`](TextDevice::pop_clip)
+    /// is multiplied by it. Default no-op.
+    fn end_mask(&mut self, _tr: Option<&[u8; 256]>) {}
 
     // MuPDF: the fill material of pdf_gstate carried into fz_fill_text.
     /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph

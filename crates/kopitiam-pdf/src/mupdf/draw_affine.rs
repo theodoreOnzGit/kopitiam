@@ -14,8 +14,13 @@
 //! for upscaled or rotated ones -- the same `dolerp` decision MuPDF makes.
 //!
 //! Only the arms the kopitiam draw device can reach are here: an RGB
-//! destination with no alpha plane, no shape / group-alpha planes, no
-//! overprint, no spot colours. The `g2rgb` special case is covered by
+//! destination ~~with no alpha plane, no shape / group-alpha planes~~, no
+//! overprint, no spot colours. **CORRECTED 2026-09-28**: the destination
+//! may carry an alpha channel (a pattern tile, a transparency group, an
+//! alpha soft mask), and the draw device paints a non-isolated group's
+//! group-alpha plane by calling these painters a second time on an RGBA
+//! pixmap standing in for it (see [`super::draw_blend`]); there is still no
+//! separate shape plane (knockout groups are not ported). The `g2rgb` special case is covered by
 //! expanding gray to RGB *after* scaling, which is exactly what that painter
 //! computes (it writes the same gray value into all three channels).
 //!

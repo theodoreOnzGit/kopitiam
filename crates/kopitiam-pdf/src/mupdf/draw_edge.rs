@@ -152,23 +152,28 @@ fn add_span(cov: &mut [f32], x0: i32, a: f32, b: f32, w: f32) {
     }
 }
 
-// MuPDF: the source-over span painter fz_paint_span_... (draw-paint.c) reduced to
-// a single straight (non-premultiplied) source-over composite.
-/// Composite `color` at coverage `a` (0..=1) onto the pixel at byte offset `o`.
-fn composite(pix: &mut Pixmap, o: usize, color: &[u8], a: f32) {
+// MuPDF: template_span_with_color_N_general_solid / _alpha (draw-paint.c:897,
+// 940) -- per channel `FZ_BLEND(color, d, ma)`, and `FZ_BLEND(255, d, ma)`
+// for a destination alpha.
+/// Composite `color` at the expanded amount `ma` (0..=256) onto the pixel at
+/// byte offset `o`.
+///
+/// ~~a float source-over, `src * a + dst * (1 - a)` rounded~~ --
+/// **CORRECTED 2026-09-28**: MuPDF's span painter is integer, and a
+/// translucent fill differed by up to 3 levels once it went through a soft
+/// mask (0.5 alpha was 128 here, 126 in MuPDF). The coverage itself is
+/// still this module's analytic approximation (see the module docs).
+fn composite(pix: &mut Pixmap, o: usize, color: &[u8], ma: i32) {
     let n = pix.n as usize;
-    let ia = 1.0 - a;
     // Colour components (all but a trailing alpha, if any).
     let ccount = if pix.alpha { n - 1 } else { n };
+    let blend = |s: i32, d: i32| (((s - d) * ma + (d << 8)) >> 8) as u8;
     for k in 0..ccount {
-        let src = *color.get(k).unwrap_or(&0) as f32;
-        let dst = pix.samples[o + k] as f32;
-        pix.samples[o + k] = (src * a + dst * ia).round().clamp(0.0, 255.0) as u8;
+        let src = *color.get(k).unwrap_or(&0) as i32;
+        pix.samples[o + k] = blend(src, pix.samples[o + k] as i32);
     }
     if pix.alpha {
-        let dst = pix.samples[o + n - 1] as f32;
-        // source-over alpha: a + dst*(1-a)
-        pix.samples[o + n - 1] = (a * 255.0 + dst * ia).round().clamp(0.0, 255.0) as u8;
+        pix.samples[o + n - 1] = blend(255, pix.samples[o + n - 1] as i32);
     }
 }
 
@@ -234,6 +239,27 @@ pub fn fill_polygons_masked(
     clip: IRect,
     mask: Option<&super::draw_affine::DevMask>,
 ) {
+    fill_polygons_masked_ga(pix, None, subpaths, rule, color, alpha, clip, mask);
+}
+
+// MuPDF: fz_draw_fill_path's second fz_convert_rasterizer into
+// `state->group_alpha` (draw-device.c:735): inside a non-isolated group the
+// same coverage is painted into the group-alpha plane too. `ga` is that
+// plane as an RGBA pixmap over the same bbox as `pix` (only its alpha
+// channel matters, see draw_blend's module docs); the edges are scan
+// converted once for both.
+/// [`fill_polygons_masked`], also painting the coverage into `ga`.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_polygons_masked_ga(
+    pix: &mut Pixmap,
+    mut ga: Option<&mut Pixmap>,
+    subpaths: &[Vec<Point>],
+    rule: FillRule,
+    color: &[u8],
+    alpha: f32,
+    clip: IRect,
+    mask: Option<&super::draw_affine::DevMask>,
+) {
     if alpha <= 0.0 {
         return;
     }
@@ -247,16 +273,36 @@ pub fn fill_polygons_masked(
     }
     let mut hits: Vec<(i32, i32, f32)> = Vec::new();
     rasterize(subpaths, rule, bounds, |x, y, c| hits.push((x, y, c)));
+    // resolve_color: the colour's alpha byte is `alpha * 255`, truncated.
+    let sa = expand((alpha.min(1.0) * 255.0) as i32);
     for (x, y, c) in hits {
+        // template_span_with_color_N_general_alpha's `ma = FZ_COMBINE(
+        // FZ_EXPAND(coverage), sa)`, with this rasterizer's analytic coverage
+        // kept in float rather than quantised to a byte first (quantising
+        // it made thin glyph features measurably worse against MuPDF,
+        // whose coverage comes from a different, supersampled, scan
+        // converter anyway). A clip mask multiplies it the way
+        // fz_paint_pixmap_with_mask's FZ_BLEND would at the pop.
         let m = mask.map_or(1.0, |m| m.at(x, y) as f32 / 255.0);
-        let a = c.min(1.0) * alpha * m;
-        if a <= 0.0 {
+        let ma = (c.min(1.0) * m * sa as f32).round() as i32;
+        if ma <= 0 {
             continue;
         }
         if let Some(o) = pix.offset(x, y) {
-            composite(pix, o, color, a);
+            composite(pix, o, color, ma);
+        }
+        if let Some(g) = ga.as_deref_mut()
+            && let Some(o) = g.offset(x, y)
+        {
+            composite(g, o, color, ma);
         }
     }
+}
+
+// MuPDF: FZ_EXPAND (geometry.h).
+#[inline]
+fn expand(a: i32) -> i32 {
+    a + (a >> 7)
 }
 
 /// The scan converter proper: calls `emit(x, y, coverage)` for every pixel of

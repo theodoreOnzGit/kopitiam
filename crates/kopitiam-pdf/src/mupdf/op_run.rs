@@ -27,10 +27,17 @@
 //!
 //! ## Deferred
 //!
-//! Text render modes are honoured only for *emission* (modes 3 and 7 stay
+//! ~~Text render modes are honoured only for *emission* (modes 3 and 7 stay
 //! visible to extraction, as the PDF spec's invisible modes still carry text);
 //! actual stroking/filling/clipping, Type3 glyph execution, the glyph cache and
-//! bounding-box accumulation are not ported (no rasterisation on the text path).
+//! bounding-box accumulation are not ported (no rasterisation on the text path).~~
+//! **CORRECTED 2026-09-28**: text is filled, stroked (`stroke_glyph`) and
+//! clipped (`clip_text` at `ET`) by render mode, Type3 glyph procedures are
+//! run (`run_type3_glyph`), and a text-showing operator under a blend mode or
+//! soft mask is drawn in its own transparency group (see
+//! [`super::op_transparency`]). Modes 3 and 7 still reach extraction. Only
+//! the glyph cache and MuPDF's buffered `fz_text` (with its bbox
+//! accumulation) are not ported: glyphs go to the device as they are shown.
 
 use super::draw_device::{cmyk_to_rgb, gray_to_rgb};
 use super::draw_edge::FillRule;
@@ -158,6 +165,19 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         };
         // Device space: post-multiply by the CTM (what the stext device applies).
         let trm_dev = trm_text.concat(self.gstate().ctm);
+
+        // The measuring pass of show_text_grouped: union a generous box of
+        // this glyph, advance, emit nothing.
+        if self.measure.is_some() {
+            let b = self.glyph_measure_box(trm_dev, adv_em);
+            if let Some(r) = self.measure.as_mut() {
+                *r = r.union(b);
+            }
+            self.tos.char_tx = char_tx;
+            self.tos.char_ty = char_ty;
+            self.tos.tm = self.tos.tm.pre_translate(char_tx, char_ty);
+            return;
+        }
 
         // Carry the current fill colour to the device so the placeholder glyph
         // boxes render in the text's colour (the sink ignores this by default).
@@ -302,6 +322,14 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             g.ctm = glyph_ctm;
             // "don't inherit the current font" (pdf_show_char).
             g.text.font = None;
+            // The glyph is one object of the text run, whose group and soft
+            // mask are already open round it (show_text_grouped). MuPDF's
+            // draw device renders a Type3 glyph into its glyph cache and
+            // paints the result inside that group; drawing the procedure's
+            // own ops under the same /BM and /SMask again would apply them
+            // twice, so they are cleared for the procedure.
+            g.blend = super::draw_blend::BlendMode::Normal;
+            g.softmask = None;
         }
         let pushed = t3.resources.is_dict();
         if pushed {
@@ -416,13 +444,38 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // pdf_show_path: "if (pr->super.hidden) dostroke = dofill = 0" -- a
         // clip still applies below.
         let (fill, stroke) = if self.hidden > 0 { (false, false) } else { (fill, stroke) };
+        // pdf_show_path: "if (dofill || dostroke) gstate = pdf_begin_group(
+        // ctx, pr, bbox, &softmask)" over fz_bound_path (stroke-widened).
+        let group = if (fill || stroke) && self.transparency_active() {
+            let bbox = self.paint_bbox(stroke);
+            Some(self.begin_object_group(bbox))
+        } else {
+            None
+        };
         if fill {
             self.fill_current(rule);
         }
         if stroke {
             self.stroke_current();
         }
+        if let Some(save) = group {
+            self.end_object_group(save);
+        }
         self.end_path();
+    }
+
+    // MuPDF: fz_bound_path(path, stroke ? stroke_state : NULL, ctm) -- the
+    // device bbox of the current path, widened for a stroke (generously:
+    // half the width times the miter limit, as fz_adjust_rect_for_stroke
+    // bounds a mitred join).
+    fn paint_bbox(&self, stroke: bool) -> Rect {
+        let g = self.gstate();
+        let Some(r) = path_device_bounds(&self.path, g.ctm) else { return Rect::EMPTY };
+        if !stroke {
+            return r;
+        }
+        let w = g.line_width.abs().max(1.0) * 0.5 * g.stroke_style.miter_limit.max(1.0) * g.ctm.max_expansion();
+        r.expand(w)
     }
 
     // MuPDF: pdf_show_shade (pdf-op-run.c:505) for `sh`.
@@ -436,11 +489,19 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             return;
         }
         let Ok(shade) = super::shade::Shade::load(self.doc, &obj, &obj_ref) else { return };
+        // pdf_begin_group over fz_bound_shade(shd, gstate->ctm).
+        let group = self.transparency_active().then(|| {
+            let bbox = shade.bound(self.gstate().ctm);
+            self.begin_object_group(bbox)
+        });
         let (ctm, alpha, clip) = {
             let g = self.gstate();
             (g.ctm, g.fill_alpha, g.clip)
         };
         self.dev.fill_shade(&shade, ctm, alpha, clip);
+        if let Some(save) = group {
+            self.end_object_group(save);
+        }
     }
 
     // MuPDF: fz_fill_path via dev->fill_path (the fill material's DeviceRGB
@@ -461,10 +522,26 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                     self.dev.pop_clip();
                 }
                 super::interpret::PatternFill::Tiling(pat) => {
-                    // pdf_show_path's PDF_MAT_PATTERN: clip, show, pop.
-                    let Some(mut area) = path_device_bounds(&self.path, ctm) else { return };
+                    // pdf_show_path's PDF_MAT_PATTERN: clip, show, pop --
+                    // inside a Normal group at the fill alpha when that is
+                    // not 1 (pdf-op-run.c:1027-1036); nothing at alpha 0.
+                    if alpha == 0.0 {
+                        return;
+                    }
+                    let Some(bounds) = path_device_bounds(&self.path, ctm) else { return };
+                    let mut area = bounds;
                     if let Some(c) = clip {
                         area = area.intersect(c);
+                    }
+                    if alpha != 1.0 {
+                        self.dev.begin_group(&super::text_device::GroupParams {
+                            area: bounds,
+                            isolated: false,
+                            knockout: false,
+                            blend: super::draw_blend::BlendMode::Normal,
+                            alpha,
+                            gray: false,
+                        });
                     }
                     self.dev.clip_path(&self.path, rule, ctm);
                     // The cell content builds its own paths: the page's path
@@ -475,6 +552,9 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
                     self.show_tiling_pattern(&pat, gnum, area);
                     self.path = saved_path;
                     self.dev.pop_clip();
+                    if alpha != 1.0 {
+                        self.dev.end_group();
+                    }
                 }
             }
             return;
@@ -530,6 +610,10 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             g.text = parent.text.clone();
             g.fill_alpha = parent.fill_alpha;
             g.stroke_alpha = parent.stroke_alpha;
+            // "transparency": the blend mode and the whole soft mask too.
+            g.blend = parent.blend;
+            g.softmask = parent.softmask.clone();
+            g.softmask_tr = parent.softmask_tr.clone();
             // An uncoloured pattern paints in the current fill colour and
             // ignores the colour operators inside it (gstate->ismask);
             // either way the pattern itself stops being the material.
@@ -646,10 +730,10 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     }
 
     // MuPDF: pdf_run_gs -> pdf_process_extgstate (pdf-interpret.c:875), the
-    // keys this port's graphics state models: LW, LC, LJ, ML, D, Font, CA, ca.
+    // keys this port's graphics state models: LW, LC, LJ, ML, D, Font, CA, ca,
+    // and (since the transparency tranche) BM and SMask.
     // RI/FL/OP/op/OPM/UseBlackPtComp/TR/TR2 change nothing we paint (MuPDF
-    // itself only warns about transfer functions); BM and SMask (blend modes,
-    // soft masks) are the transparency tranche and still ignored here.
+    // itself only warns about transfer functions).
     pub(crate) fn op_gs(&mut self, name: &[u8]) -> super::error::Result<()> {
         let dict = self.lookup_resource("ExtGState", name);
         if !dict.is_dict() {
@@ -712,6 +796,8 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         if ca_fill.is_number() {
             self.gstate_mut().fill_alpha = (ca_fill.to_real() as f32).clamp(0.0, 1.0);
         }
+        // BM and SMask: the transparency tranche (op_transparency).
+        self.gs_transparency(&dict);
         Ok(())
     }
 

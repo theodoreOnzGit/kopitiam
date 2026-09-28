@@ -43,14 +43,19 @@
 //!
 //! ## Still deferred (parsed-and-ignored so the stream still runs)
 //!
-//! Type3 glyph metrics (`d0 d1`), shadings (`sh`), marked content (`MP DP BMC
+//! ~~Type3 glyph metrics (`d0 d1`), shadings (`sh`), marked content (`MP DP BMC
 //! BDC EMC`) and the compatibility bracket (`BX EX`) are recognised and
-//! skipped; their operands are consumed so the operator stream stays in sync.
+//! skipped;~~ **CORRECTED 2026-09-28**: `d0`/`d1` set the Type3 mask mode,
+//! `sh` paints ([`Processor::op_sh`]) and `BDC`/`BMC`/`EMC` track optional
+//! content; only `MP DP` and the compatibility bracket (`BX EX`) are still
+//! recognised and skipped. Their operands are consumed so the operator
+//! stream stays in sync.
 //! ~~the ExtGState body (`gs`)~~ and ~~inline images skipped as a raw byte
 //! span~~ -- **CORRECTED 2026-09-28 (0.4.2)**: `gs` applies its line-state,
-//! font and alpha keys ([`Processor::op_gs`]), and `BI … ID … EI` is decoded
-//! and painted ([`Processor::op_inline_image`]). Render modes 3 and 7
-//! ("invisible") still emit glyphs: extraction needs them.
+//! font and alpha keys ([`Processor::op_gs`]) -- and, since the transparency
+//! tranche, `/BM` and `/SMask` ([`super::op_transparency`]) -- and `BI … ID
+//! … EI` is decoded and painted ([`Processor::op_inline_image`]). Render
+//! modes 3 and 7 ("invisible") still emit glyphs: extraction needs them.
 
 use std::collections::HashMap;
 
@@ -108,9 +113,11 @@ impl Default for TextState {
 
 /// The graphics state slice the text path needs: the CTM and the text state.
 ///
-/// MuPDF's `pdf_gstate` also carries stroke state, blend mode and soft masks;
+/// ~~MuPDF's `pdf_gstate` also carries stroke state, blend mode and soft masks;
 /// those beyond the fill/stroke material don't affect this port's output, so they
-/// are dropped (blends/soft-masks deferred). The fill/stroke **colour**, current
+/// are dropped (blends/soft-masks deferred).~~ **CORRECTED 2026-09-28**: the
+/// stroke state, the blend mode and the soft mask are carried too (see the
+/// fields). The fill/stroke **colour**, current
 /// **colourspace**, **line width** and the rectangular **clip** are carried here
 /// (all `q`/`Q` push/pop) now that the draw device paints. This is what `q`/`Q`
 /// push/pop.
@@ -155,6 +162,38 @@ pub(crate) struct GState {
     /// device's own output transform. `None` = unclipped. Non-rect clips are
     /// bbox-approximated (see [`Processor::end_path`]).
     pub clip: Option<Rect>,
+    /// The blend mode (`/BM` via `gs`). Default Normal.
+    // MuPDF: pdf_gstate.blendmode (pdf_run_gs_BM).
+    pub blend: super::draw_blend::BlendMode,
+    /// The soft mask (`/SMask` via `gs`), or `None` (`/SMask /None`).
+    // MuPDF: pdf_gstate.softmask / softmask_cs / softmask_resources /
+    // softmask_ctm / softmask_bc / luminosity (pdf_run_gs_SMask).
+    pub softmask: Option<std::sync::Arc<SoftMaskRef>>,
+    /// The soft mask's `/TR` transfer function. Kept apart from
+    /// [`softmask`](GState::softmask) because MuPDF CLEARS it the first time
+    /// the mask is used (begin_softmask drops `gstate->softmask_tr`), so only
+    /// the first object painted under a `gs` gets it -- replicated.
+    // MuPDF: pdf_gstate.softmask_tr.
+    pub softmask_tr: Option<Object>,
+}
+
+/// A soft mask selected by `gs` (`/SMask << /S /G /BC /TR >>`), as
+/// pdf_run_gs_SMask stores it on the graphics state.
+#[derive(Debug)]
+pub(crate) struct SoftMaskRef {
+    /// The `/G` transparency-group XObject (unresolved, so it can be opened).
+    pub group: Object,
+    /// The resource dict in force at the `gs` (`proc->rstack->resources`),
+    /// used when the group has no `/Resources` of its own.
+    pub resources: Object,
+    /// The CTM at the `gs` (`softmask_ctm`): the mask is drawn in the space
+    /// of the `gs`, not of the object it masks.
+    pub ctm: Matrix,
+    /// `/S /Luminosity` (else `/Alpha`).
+    pub luminosity: bool,
+    /// `/BC` converted to gray through the group's `/CS` (DeviceGray when it
+    /// has none): the backdrop a luminosity mask is drawn over.
+    pub bc_gray: f32,
 }
 
 impl GState {
@@ -176,6 +215,9 @@ impl GState {
             fill_pattern: None,
             stroke_pattern: None,
             clip: None,
+            blend: super::draw_blend::BlendMode::Normal,
+            softmask: None,
+            softmask_tr: None,
         }
     }
 }
@@ -353,6 +395,11 @@ pub struct Processor<'a, D: TextDevice + ?Sized> {
     pub(crate) t3_mask: bool,
     /// Type3 glyph-procedure nesting depth ("recursive type3 font" guard).
     pub(crate) t3_depth: u32,
+    /// While `Some`, the show path only MEASURES: each glyph's (generous)
+    /// device box is unioned in and the pen advances, but nothing reaches
+    /// the device. Used to get a text run's bbox before its transparency
+    /// group opens (MuPDF knows it from the buffered fz_text).
+    pub(crate) measure: Option<Rect>,
 }
 
 impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
@@ -384,6 +431,7 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             ocg: None,
             t3_mask: false,
             t3_depth: 0,
+            measure: None,
         }
     }
 
@@ -505,14 +553,16 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             }
 
             // -- text showing ----------------------------------------------
+            // Each text-showing operator is one transparency group when a
+            // blend mode or soft mask is in force (show_text_grouped).
             b"Tj" => {
                 if let Some(str_bytes) = string {
-                    self.show_string(str_bytes);
+                    self.show_text_grouped(|p| p.show_string(str_bytes));
                 }
             }
             b"TJ" => {
                 if let Some(arr) = obj {
-                    self.show_text_array(arr);
+                    self.show_text_grouped(|p| p.show_text_array(arr));
                 }
             }
             b"'" => {
@@ -520,7 +570,7 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
                 let leading = self.gstate().text.leading;
                 self.tos.newline(leading);
                 if let Some(str_bytes) = string {
-                    self.show_string(str_bytes);
+                    self.show_text_grouped(|p| p.show_string(str_bytes));
                 }
             }
             b"\"" => {
@@ -533,7 +583,7 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
                 let leading = self.gstate().text.leading;
                 self.tos.newline(leading);
                 if let Some(str_bytes) = string {
-                    self.show_string(str_bytes);
+                    self.show_text_grouped(|p| p.show_string(str_bytes));
                 }
             }
 
@@ -635,9 +685,9 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             // -- inline images: BI <dict> ID <data> EI ---------------------
             b"BI" => self.op_inline_image(stm)?,
 
-            // Everything else (paths, colours, clips, shadings, gs, marked
-            // content, Type3 metrics, BX/EX) is parsed-and-ignored: the operands
-            // were already consumed, so the stream stays in sync.
+            // Everything else -- `MP`/`DP` marked-content points, `BX`/`EX`,
+            // `ri`, `i`, and anything unknown -- is parsed-and-ignored: the
+            // operands were already consumed, so the stream stays in sync.
             _ => {}
         }
         Ok(())

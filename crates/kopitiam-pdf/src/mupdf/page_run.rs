@@ -13,9 +13,10 @@
 //! [`run_page`] is the headline WAVE-5 entry point: get a page's `/Contents`
 //! (one stream or an array of streams, concatenated with a separating newline as
 //! MuPDF's `fz_open_contents_stream` does), its `/Resources`, and the
-//! MediaBox-derived base CTM (`pdf_page_obj_transform_box`: flip y, apply page
+//! ~~MediaBox-derived~~ base CTM (`pdf_page_obj_transform_box`: flip y, apply page
 //! rotation, move the crop origin to `(0, 0)`), then run the interpreter over the
-//! bytes.
+//! bytes. **CORRECTED 2026-09-28**: the CTM is derived from the CropBox
+//! (clipped to the MediaBox) and `/UserUnit`, see [`page_transform`].
 //!
 //! A `Do` operator naming a Form XObject ([`Processor::op_do`]) runs that
 //! XObject's own content stream with its `/Matrix` pre-concatenated onto the CTM
@@ -26,10 +27,16 @@
 //!
 //! Form XObjects recurse and `/Image` XObjects are decoded + painted (via
 //! [`Processor::draw_image_xobject`], driving the draw device's fill-image
-//! callback); PostScript / unknown XObjects are skipped. The XObject `/BBox` clip
+//! callback); PostScript / unknown XObjects are skipped. ~~The XObject `/BBox` clip
 //! and transparency-group setup are not modelled -- neither affects glyph
 //! positions. `UserUnit` is treated as 1, and only the MediaBox is used for the
-//! base CTM (CropBox/ArtBox/etc. box selection is deferred).
+//! base CTM (CropBox/ArtBox/etc. box selection is deferred).~~
+//! **CORRECTED 2026-09-28**: the `/BBox` is pushed as a clip, a `/Group /S
+//! /Transparency` form is drawn as a transparency group under the soft mask in
+//! force ([`Processor::run_xobject`]), and the base CTM honours `/UserUnit`
+//! and the CropBox ([`page_transform`]). One divergence stays: a form with
+//! no `/BBox` is not clipped (MuPDF clips it to an empty rect and draws
+//! nothing).
 
 use super::draw_edge::FillRule;
 use super::draw_path::Path;
@@ -41,7 +48,8 @@ use super::xref::PdfDocument;
 
 // MuPDF: pdf_run_page_contents_with_usage_imp (pdf-run.c:105).
 /// Run the content stream of page `page_index` (0-based) in `doc`, emitting
-/// positioned glyphs to `dev`. The base CTM is the MediaBox-derived page
+/// positioned glyphs to `dev`. The base CTM is the ~~MediaBox-derived~~
+/// CropBox-derived (**CORRECTED 2026-09-28**, [`page_transform`]) page
 /// transform (device space: origin top-left, y descending, 72 dpi).
 ///
 /// This is the seam the structured-text (`stext`) wave consumes: implement
@@ -278,10 +286,9 @@ pub fn page_bounds(doc: &PdfDocument, page: &Object) -> super::geometry::Rect {
 
 impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // MuPDF: pdf_process_Do (pdf-interpret.c:1046) dispatch to op_Do_form ->
-    // pdf_run_xobject (pdf-op-run.c:2405). Form XObjects only; images deferred.
-    /// Handle `Do`: if `name` resolves to a Form XObject, run its content stream
-    /// with its `/Matrix` pre-concatenated onto the CTM and its `/Resources`
-    /// pushed, inside a `q`/`Q` pair and guarded against reference cycles.
+    // pdf_run_xobject (pdf-op-run.c:2405), or op_Do_image -> pdf_show_image.
+    /// Handle `Do`: an Image XObject is painted; a Form XObject is run by
+    /// [`run_xobject`](Processor::run_xobject).
     pub(crate) fn op_do(&mut self, name: Option<&[u8]>) -> super::error::Result<()> {
         let Some(name) = name else { return Ok(()) };
 
@@ -315,10 +322,29 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         if subtype.to_name() != b"Form" {
             return Ok(()); // /PS, unknown: skip
         }
+        self.run_xobject(&xobj, &xobj_ref, None, Matrix::IDENTITY, false)
+    }
 
+    // MuPDF: pdf_run_xobject (pdf-op-run.c:2405).
+    /// Run the Form XObject `xobj` (`xobj_ref` unresolved, to open its
+    /// stream) under `transform`: its `/Matrix` pre-concatenated onto the
+    /// CTM, its `/Resources` pushed (or `page_resources` when it has none --
+    /// the soft-mask case; a `Do` leaves them to the resource stack), inside
+    /// a `q`/`Q` pair and guarded against reference cycles. A `/Group /S
+    /// /Transparency` form is drawn as a transparency group, with the soft
+    /// mask in force around it; `is_smask` (the form IS a soft mask's
+    /// group) forces the group isolated.
+    pub(crate) fn run_xobject(
+        &mut self,
+        xobj: &Object,
+        xobj_ref: &Object,
+        page_resources: Option<Object>,
+        transform: Matrix,
+        is_smask: bool,
+    ) -> super::error::Result<()> {
         // Content bytes come from the stream body (always an indirect stream).
-        let content = match &xobj_ref {
-            Object::Ref { .. } => match self.doc.open_stream(&xobj_ref) {
+        let content = match xobj_ref {
+            Object::Ref { .. } => match self.doc.open_stream(xobj_ref) {
                 Ok(b) => b,
                 Err(_) => return Ok(()),
             },
@@ -336,11 +362,18 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
 
         // /Matrix (default identity) and /Resources (fall back to the current
         // resources -- MuPDF uses the page resources when the form omits its own).
-        let matrix = matrix_from(&xobj).unwrap_or(Matrix::IDENTITY);
-        let resources = self
+        let matrix = matrix_from(xobj).unwrap_or(Matrix::IDENTITY);
+        let mut resources = self
             .doc
-            .resolve_get(&xobj, "Resources")
+            .resolve_get(xobj, "Resources")
             .unwrap_or(Object::Null);
+        if !resources.is_dict()
+            && let Some(r) = page_resources
+        {
+            resources = r;
+        }
+        let bbox = bbox_from(self.doc, xobj);
+        let transparency = self.xobject_transparency(xobj);
 
         // MuPDF pdf_run_xobject (pdf-op-run.c:2405): gsave; ctm = matrix·ctm;
         // gsave again "so the clippath doesn't persist"; clip to /BBox; raise
@@ -354,13 +387,39 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         self.op_q();
         {
             let g = self.gstate_mut();
-            g.ctm = matrix.concat(g.ctm);
+            g.ctm = matrix.concat(transform).concat(g.ctm);
         }
         let form_ctm = self.gstate().ctm;
         let gparent_save_ctm = self.gstack[self.gparent].ctm;
         self.gstack[self.gparent].ctm = form_ctm;
+
+        // "apply soft mask, create transparency group and reset state".
+        // (A form with no /BBox is not clipped by this port -- MuPDF clips
+        // it to an empty rect -- so its group spans the clip instead.)
+        let mut softmask = None;
+        if let Some((isolated, knockout, gray)) = transparency {
+            let area = bbox.map_or(super::geometry::Rect::INFINITE, |b| b.transform(form_ctm));
+            softmask = self.begin_softmask(area);
+            let (blend, alpha) = {
+                let g = self.gstate();
+                (g.blend, g.fill_alpha)
+            };
+            self.dev.begin_group(&super::text_device::GroupParams {
+                area,
+                isolated: is_smask || isolated,
+                knockout,
+                blend,
+                alpha,
+                gray,
+            });
+            let g = self.gstate_mut();
+            g.blend = super::draw_blend::BlendMode::Normal;
+            g.stroke_alpha = 1.0;
+            g.fill_alpha = 1.0;
+        }
+
         self.op_q();
-        if let Some(bbox) = bbox_from(self.doc, &xobj) {
+        if let Some(bbox) = bbox {
             let mut clip = Path::new();
             clip.move_to(bbox.x0, bbox.y0)
                 .line_to(bbox.x1, bbox.y0)
@@ -401,6 +460,13 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         }
         if pushed {
             self.resources.pop();
+        }
+        // "Remove the state we pushed for the clippath", then "wrap up
+        // transparency stacks".
+        self.op_q_restore();
+        if transparency.is_some() {
+            self.dev.end_group();
+            self.end_softmask(softmask);
         }
         let gp = self.gparent;
         if let Some(g) = self.gstack.get_mut(gp) {
@@ -443,11 +509,39 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         // fitz image space (0,0 top-left, unit square) -> PDF user space unit square
         // (image top row at y=1): flip y, then apply the page/user CTM.
         let image_ctm = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0).concat(ctm);
+        // MuPDF pdf_show_image (pdf-op-run.c:917): an image with its own
+        // mask (/SMask, stencil /Mask) gets a blend group but IGNORES the
+        // gstate's soft mask; any other image gets pdf_begin_group.
+        let bbox = super::geometry::Rect::UNIT.transform(image_ctm);
+        let blend = self.gstate().blend;
+        let own_mask = img.smask.is_some();
+        let mut softmask = None;
+        let mut group = false;
+        if own_mask && blend != super::draw_blend::BlendMode::Normal {
+            // "apply blend group even though we skip the soft mask"
+            self.dev.begin_group(&super::text_device::GroupParams {
+                area: bbox,
+                isolated: false,
+                knockout: false,
+                blend,
+                alpha: 1.0,
+                gray: false,
+            });
+            group = true;
+        } else if !own_mask && self.transparency_active() {
+            softmask = Some(self.begin_object_group(bbox));
+        }
         if is_mask {
             self.dev.draw_image_mask(img, image_ctm, color, alpha, clip);
         } else {
             // MuPDF: fz_fill_image(..., gstate->fill.alpha, ...) (pdf-op-run.c:879).
             self.dev.draw_image(img, image_ctm, alpha, clip);
+        }
+        if group {
+            self.dev.end_group();
+        }
+        if let Some(save) = softmask {
+            self.end_object_group(save);
         }
     }
 
@@ -471,7 +565,7 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
 // MuPDF: pdf_xobject_matrix (pdf-xobject.c) -- the /Matrix entry, or identity.
 /// Read an XObject's `/Matrix` (6 numbers) into a [`Matrix`], or `None` if absent
 /// or malformed.
-fn matrix_from(xobj: &Object) -> Option<Matrix> {
+pub(crate) fn matrix_from(xobj: &Object) -> Option<Matrix> {
     let arr = xobj.dict_gets("Matrix")?;
     if arr.array_len() < 6 {
         return None;
@@ -745,7 +839,7 @@ mod tests {
 
 // MuPDF: pdf_xobject_bbox (pdf-xobject.c) -> pdf_to_rect of /BBox.
 /// A Form XObject's `/BBox`, normalised, if it has a usable one.
-fn bbox_from(doc: &PdfDocument, xobj: &Object) -> Option<super::geometry::Rect> {
+pub(crate) fn bbox_from(doc: &PdfDocument, xobj: &Object) -> Option<super::geometry::Rect> {
     let arr = doc.resolve_get(xobj, "BBox").ok()?;
     if arr.array_len() < 4 {
         return None;

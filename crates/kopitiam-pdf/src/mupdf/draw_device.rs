@@ -47,10 +47,17 @@
 //!   ([`resources`](super::resources)); fills/strokes and glyph boxes pick up the
 //!   fill colour. Separation/DeviceN and Indexed spaces are approximated (see
 //!   [`ColorSpace`](super::resources)); ICCBased maps by component count.
-//! * **Not implemented at all** (safe no-ops / skips, never corruption): mesh &
-//!   gradient shadings (`draw-mesh.c`), blend modes beyond Normal
-//!   (`draw-blend.c`), soft masks in the graphics state, knockout /
-//!   transparency groups. ~~clip masks beyond a rectangular clip~~ and
+//! * **Not implemented at all** (safe no-ops / skips, never corruption):
+//!   ~~mesh & gradient shadings (`draw-mesh.c`), blend modes beyond Normal
+//!   (`draw-blend.c`), soft masks in the graphics state,~~ knockout
+//!   ~~/ transparency~~ groups. **CORRECTED 2026-09-28**: shadings, meshes
+//!   included, are painted ([`fill_shade`](TextDevice::fill_shade) over
+//!   [`super::shade`]); all 16 blend modes, luminosity / alpha soft masks
+//!   (with `/BC` and `/TR`) and isolated / non-isolated transparency groups
+//!   with a group-alpha plane are ported ([`super::draw_blend`], `begin_group`
+//!   / `end_group` / `begin_mask` / `end_mask` below). Knockout groups are
+//!   drawn as non-knockout -- that part of the claim still holds.
+//!   ~~clip masks beyond a rectangular clip~~ and
 //!   ~~Image blitting is **nearest-neighbour** (no bilinear/mip smoothing)~~
 //!   -- **CORRECTED 2026-09-28 (0.4.2)**: images go through MuPDF's subsample
 //!   + smooth-scale + near/lerp paint pipeline (`draw_scale`, `draw_affine`),
@@ -58,7 +65,8 @@
 //!   (`clip_path`, `clip_text`, `pop_clip`) that every paint honours.
 
 use super::draw_affine;
-use super::draw_edge::{FillRule, coverage_mask, fill_polygons_masked};
+use super::draw_blend;
+use super::draw_edge::{FillRule, coverage_mask, fill_polygons_masked_ga};
 use super::draw_scale::{self, ScalePix};
 use super::draw_path::Path;
 use super::font::Font;
@@ -74,7 +82,9 @@ use super::xref::PdfDocument;
 /// [`run_page`](super::run_page), or by calling the fill/stroke/image methods
 /// directly), then take the result with [`into_pixmap`](DrawDevice::into_pixmap).
 pub struct DrawDevice {
-    /// The render target (DeviceRGB, `n = 3`).
+    /// The render target: DeviceRGB, `n = 3` for the page; `n = 4` (RGB +
+    /// premultiplied alpha) while a tile, an isolated group or an alpha soft
+    /// mask is being drawn (see `layers`).
     pix: Pixmap,
     /// A device-space transform applied *after* every incoming CTM -- used to
     /// scale a 72-dpi page transform up to the requested output resolution
@@ -102,19 +112,53 @@ pub struct DrawDevice {
     mask: Option<std::sync::Arc<super::draw_affine::DevMask>>,
     /// Saved `(clip, mask)` per pushed clip: MuPDF's draw-device state stack.
     clip_stack: Vec<(IRect, Option<std::sync::Arc<super::draw_affine::DevMask>>)>,
-    /// Open pattern tiles (fz_draw_begin_tile's pushed states), innermost
-    /// last: while one is open, `pix` is the tile's own RGBA pixmap.
-    tiles: Vec<TileState>,
+    /// The group-alpha plane of the innermost open NON-isolated group
+    /// (MuPDF's `state->group_alpha`), as an RGBA pixmap over the same bbox
+    /// as `pix` whose alpha channel is the plane. Every painter paints into
+    /// it too while it is `Some`. See [`super::draw_blend`].
+    ga: Option<Pixmap>,
+    /// Open offscreen layers -- pattern tiles, transparency groups, soft
+    /// masks being rendered, and soft masks in force -- innermost last:
+    /// while one is open, `pix` (and `ga`) are the layer's own pixmaps.
+    layers: Vec<Layer>,
 }
 
-/// One open pattern tile: what `fz_draw_begin_tile` stores in `state[1]`,
-/// plus the device state it replaced.
-struct TileState {
-    /// The destination the tile is painted onto at `end_tile`.
+/// One pushed offscreen layer: the device state it replaced (restored when it
+/// ends), plus what kind of layer it is. This is the kopitiam counterpart of
+/// MuPDF's `push_stack` / `pop_stack` on the draw-device state array for
+/// the states that get their own `dest`.
+struct Layer {
+    /// The destination the layer is composited onto when it ends.
     saved_pix: Pixmap,
+    saved_ga: Option<Pixmap>,
     saved_clip: IRect,
     saved_mask: Option<std::sync::Arc<super::draw_affine::DevMask>>,
     saved_clip_stack: Vec<(IRect, Option<std::sync::Arc<super::draw_affine::DevMask>>)>,
+    kind: LayerKind,
+}
+
+/// What an open [`Layer`] is.
+enum LayerKind {
+    /// fz_draw_begin_tile: the pattern cell being rendered once.
+    Tile(TileState),
+    /// fz_draw_begin_group: a transparency group.
+    Group {
+        blend: super::draw_blend::BlendMode,
+        isolated: bool,
+        alpha: f32,
+        gray: bool,
+    },
+    /// fz_draw_begin_mask: a soft mask being rendered (`pix` is its RGB
+    /// backdrop for a luminosity mask, a transparent RGBA one for alpha).
+    Mask { luminosity: bool },
+    /// fz_draw_end_mask's pushed state: a finished soft mask in force as a
+    /// clip. `pix` is the scratch copy of the destination; popping lerps it
+    /// back through the mask (`fz_paint_pixmap_with_mask` at pop_clip).
+    Soft { mask: super::draw_affine::DevMask },
+}
+
+/// One open pattern tile: what `fz_draw_begin_tile` stores in `state[1]`.
+struct TileState {
     /// `fz_irect_from_rect(area)`, in pattern space.
     area: IRect,
     xstep: f32,
@@ -145,7 +189,8 @@ impl DrawDevice {
             fill_alpha: 1.0,
             mask: None,
             clip_stack: Vec::new(),
-            tiles: Vec::new(),
+            ga: None,
+            layers: Vec::new(),
         }
     }
 
@@ -175,7 +220,8 @@ impl DrawDevice {
             fill_alpha: 1.0,
             mask: None,
             clip_stack: Vec::new(),
-            tiles: Vec::new(),
+            ga: None,
+            layers: Vec::new(),
         }
     }
 
@@ -229,7 +275,7 @@ impl DrawDevice {
         let m = ctm.concat(self.base);
         let polys = path.flatten(m);
         let c = rgb_to_bytes(color);
-        fill_polygons_masked(&mut self.pix, &polys, rule, &c, alpha, clip, self.mask.as_deref());
+        fill_polygons_masked_ga(&mut self.pix, self.ga.as_mut(), &polys, rule, &c, alpha, clip, self.mask.as_deref());
     }
 
     // MuPDF: fz_draw_stroke_path (draw-device.c:766).
@@ -263,7 +309,7 @@ impl DrawDevice {
         let dev_w = line_width * m.max_expansion();
         let polys = path.stroke_to_polygons(m, dev_w);
         let c = rgb_to_bytes(color);
-        fill_polygons_masked(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, clip, self.mask.as_deref());
+        fill_polygons_masked_ga(&mut self.pix, self.ga.as_mut(), &polys, FillRule::NonZero, &c, alpha, clip, self.mask.as_deref());
     }
 
     /// Push a clip made of device-space `polys` (MuPDF's push_stack + the
@@ -383,7 +429,88 @@ impl DrawDevice {
             false,
             mask.as_ref(),
         );
+        // Inside a non-isolated group the image's alpha goes into the
+        // group-alpha plane too (fz_draw_fill_image's `state->group_alpha`
+        // paint, draw-device.c:1947).
+        if let Some(ga) = self.ga.as_mut() {
+            draw_affine::paint_image(ga, clip, &pix, pix_ctm, (alpha * 255.0) as i32, true, false, mask.as_ref());
+        }
     }
+}
+
+impl DrawDevice {
+    // MuPDF: push_stack (draw-device.c) for a state with its own `dest`.
+    /// Open a layer: `pix`/`ga` become the drawing targets, `clip` the
+    /// scissor; the outer clip mask and clip stack are saved (they apply
+    /// when the layer is composited back, not to its own drawing).
+    fn push_layer(&mut self, pix: Pixmap, ga: Option<Pixmap>, clip: IRect, kind: LayerKind) {
+        let saved_pix = std::mem::replace(&mut self.pix, pix);
+        let saved_ga = std::mem::replace(&mut self.ga, ga);
+        self.layers.push(Layer {
+            saved_pix,
+            saved_ga,
+            saved_clip: self.clip,
+            saved_mask: self.mask.take(),
+            saved_clip_stack: std::mem::take(&mut self.clip_stack),
+            kind,
+        });
+        self.clip = clip;
+    }
+
+    // MuPDF: pop_stack (draw-device.c).
+    /// Close the innermost layer, restoring the state it saved; returns the
+    /// layer's own pixmap, group-alpha plane and kind. Callers check the
+    /// kind of `self.layers.last()` first.
+    fn pop_layer(&mut self) -> (Pixmap, Option<Pixmap>, LayerKind) {
+        let l = self.layers.pop().expect("caller checked a layer is open");
+        let pix = std::mem::replace(&mut self.pix, l.saved_pix);
+        let ga = std::mem::replace(&mut self.ga, l.saved_ga);
+        self.clip = l.saved_clip;
+        self.mask = l.saved_mask;
+        self.clip_stack = l.saved_clip_stack;
+        (pix, ga, l.kind)
+    }
+
+    /// `fz_intersect_irect(fz_irect_from_rect(fz_transform_rect(area,
+    /// dev->transform)), state->scissor)` -- a group's or mask's pixel bbox.
+    fn area_bbox(&self, area: Rect) -> IRect {
+        area.transform(self.base).irect_from_rect().intersect(self.clip).intersect(self.pix.bbox())
+    }
+
+    // MuPDF: fz_draw_pop_clip's mask branch for the state fz_draw_end_mask
+    // pushed: fz_paint_pixmap_with_mask(dest) and
+    // fz_paint_over_pixmap_with_mask(group_alpha).
+    fn pop_soft(&mut self) {
+        let (src, src_ga, kind) = self.pop_layer();
+        let LayerKind::Soft { mask } = kind else { return };
+        // The clip mask in force outside (kopitiam folds clip masks into the
+        // paint instead of giving each clip its own scratch) multiplies the
+        // soft mask: the same result as MuPDF's two nested pops.
+        let eff = match self.mask.as_deref() {
+            Some(outer) => mask.intersect(outer),
+            None => mask,
+        };
+        draw_blend::paint_pixmap_with_mask(&mut self.pix, &src, &eff);
+        if let (Some(pga), Some(sga)) = (self.ga.as_mut(), src_ga.as_ref()) {
+            draw_blend::paint_over_alpha_with_mask(pga, sga, &eff);
+        }
+    }
+}
+
+/// Run `op` on `dst` as MuPDF would inside a clip whose mask is `mask`: on a
+/// scratch copy of `bbox`, then lerped back through the mask at the clip's
+/// pop (`fz_paint_pixmap_with_mask`). With no mask, `op` runs on `dst`.
+fn through_mask(dst: &mut Pixmap, mask: Option<&super::draw_affine::DevMask>, bbox: IRect, op: impl FnOnce(&mut Pixmap)) {
+    let Some(mask) = mask else {
+        op(dst);
+        return;
+    };
+    let mut tmp = draw_blend::copy_pixmap_rect(dst, bbox.intersect(mask.bbox));
+    if tmp.w == 0 || tmp.h == 0 {
+        return;
+    }
+    op(&mut tmp);
+    draw_blend::paint_pixmap_with_mask(dst, &tmp, mask);
 }
 
 // MuPDF: fz_get_pixmap_from_image (image.c:1019) + the scaling block of
@@ -510,8 +637,9 @@ impl TextDevice for DrawDevice {
             // Nonzero winding: a glyph's counter (the hole in 'o'/'A') is wound
             // opposite its outer contour, so nonzero leaves it unfilled -- the
             // interior white that distinguishes a real letterform from the box.
-            fill_polygons_masked(
+            fill_polygons_masked_ga(
                 &mut self.pix,
+                self.ga.as_mut(),
                 &polys,
                 FillRule::NonZero,
                 &self.fill,
@@ -535,8 +663,9 @@ impl TextDevice for DrawDevice {
         path.rect(x0, 0.0, x1, asc);
 
         let polys = path.flatten(m);
-        fill_polygons_masked(
+        fill_polygons_masked_ga(
             &mut self.pix,
+            self.ga.as_mut(),
             &polys,
             FillRule::NonZero,
             &self.fill,
@@ -624,6 +753,10 @@ impl TextDevice for DrawDevice {
             false,
             self.mask.as_deref(),
         );
+        if let Some(ga) = self.ga.as_mut() {
+            let c = rgb_to_bytes(color);
+            draw_affine::paint_image_color(ga, clip, &mpix, mctm, c, (alpha * 255.0) as i32, true, false, self.mask.as_deref());
+        }
     }
 
     fn set_text_render_mode(&mut self, mode: i32) {
@@ -655,57 +788,13 @@ impl TextDevice for DrawDevice {
             return;
         }
         let a255 = (alpha * 255.0) as i32;
-        let w = (bbox.x1 - bbox.x0) as usize;
-        let mask = self.mask.clone();
-        let eff = |x: i32, y: i32| match mask.as_deref() {
-            Some(mk) => fz_mul255(mk.at(x, y), a255),
-            None => a255,
-        };
-        if let Some(bg) = shade.background_rgb() {
-            // resolve_color: colorbv = colour * 255, truncated.
-            let c = [(bg[0] * 255.0) as i32, (bg[1] * 255.0) as i32, (bg[2] * 255.0) as i32];
-            for y in bbox.y0..bbox.y1 {
-                for x in bbox.x0..bbox.x1 {
-                    let a = eff(x, y);
-                    if let Some(o) = self.pix.offset(x, y) {
-                        for k in 0..3 {
-                            let d = self.pix.samples[o + k] as i32;
-                            self.pix.samples[o + k] = (fz_mul255(c[k], a) + fz_mul255(d, 255 - a)) as u8;
-                        }
-                        if self.pix.alpha {
-                            let d = self.pix.samples[o + 3] as i32;
-                            self.pix.samples[o + 3] = (a + fz_mul255(d, 255 - a)) as u8;
-                        }
-                    }
-                }
-            }
-        }
         let patch = shade.paint(m, bbox);
-        for y in bbox.y0..bbox.y1 {
-            for x in bbox.x0..bbox.x1 {
-                let i = ((y - bbox.y0) as usize * w + (x - bbox.x0) as usize) * 4;
-                let sa = patch[i + 3] as i32;
-                if sa == 0 {
-                    continue;
-                }
-                let a = eff(x, y);
-                if a == 0 {
-                    continue;
-                }
-                // fz_paint_pixmap (premultiplied src-over) then the layer
-                // blended back at `alpha`: d = s*a + d*(1 - sa*a).
-                let t = 255 - fz_mul255(sa, a);
-                if let Some(o) = self.pix.offset(x, y) {
-                    for k in 0..3 {
-                        let d = self.pix.samples[o + k] as i32;
-                        self.pix.samples[o + k] = (fz_mul255(patch[i + k] as i32, a) + fz_mul255(d, t)) as u8;
-                    }
-                    if self.pix.alpha {
-                        let d = self.pix.samples[o + 3] as i32;
-                        self.pix.samples[o + 3] = (fz_mul255(sa, a) + fz_mul255(d, t)) as u8;
-                    }
-                }
-            }
+        let bg = shade.background_rgb();
+        let mask = self.mask.clone();
+        paint_shade_patch(&mut self.pix, bbox, &patch, bg, a255, mask.as_deref());
+        // ... and into the group-alpha plane of a non-isolated group.
+        if let Some(ga) = self.ga.as_mut() {
+            paint_shade_patch(ga, bbox, &patch, bg, a255, mask.as_deref());
         }
     }
 
@@ -751,20 +840,12 @@ impl TextDevice for DrawDevice {
         let mut tile = Pixmap::new(w as u32, h as u32, 4, true);
         tile.x = bbox.x0;
         tile.y = bbox.y0;
-        let saved_pix = std::mem::replace(&mut self.pix, tile);
-        self.tiles.push(TileState {
-            saved_pix,
-            saved_clip: self.clip,
-            saved_mask: self.mask.take(),
-            saved_clip_stack: std::mem::take(&mut self.clip_stack),
-            area: area.irect_from_rect(),
-            xstep,
-            ystep,
-            ctm,
-        });
         // state[1].scissor = bbox. The outer clip mask is not applied to
-        // the tile's own drawing (MuPDF applies it when the clip pops).
-        self.clip = bbox;
+        // the tile's own drawing (MuPDF applies it when the clip pops), and
+        // the tile has no group-alpha plane of its own: its alpha goes into
+        // the parent's at end_tile.
+        let st = TileState { area: area.irect_from_rect(), xstep, ystep, ctm };
+        self.push_layer(tile, None, bbox, LayerKind::Tile(st));
         true
     }
 
@@ -772,11 +853,11 @@ impl TextDevice for DrawDevice {
     // at every repeat that meets the destination's scissor, each at an
     // integer (truncated) device offset.
     fn end_tile(&mut self) {
-        let Some(st) = self.tiles.pop() else { return };
-        let tile = std::mem::replace(&mut self.pix, st.saved_pix);
-        self.clip = st.saved_clip;
-        self.mask = st.saved_mask;
-        self.clip_stack = st.saved_clip_stack;
+        if !matches!(self.layers.last(), Some(Layer { kind: LayerKind::Tile(_), .. })) {
+            return;
+        }
+        let (tile, _, kind) = self.pop_layer();
+        let LayerKind::Tile(st) = kind else { return };
         let (xstep, ystep) = (st.xstep, st.ystep);
         let Some(ttm) = st.ctm.try_invert() else { return };
         // "Fudge the scissor bbox a little to allow for inaccuracies in the
@@ -808,16 +889,124 @@ impl TextDevice for DrawDevice {
                 // `dest->x = ttm.e`: a float -> int conversion (truncation).
                 let (dx, dy) = (ttm.e as i32, ttm.f as i32);
                 paint_tile_copy(&mut self.pix, &tile, dx, dy, scissor, mask.as_deref());
+                if let Some(ga) = self.ga.as_mut() {
+                    paint_tile_copy(ga, &tile, dx, dy, scissor, mask.as_deref());
+                }
             }
         }
     }
 
-    // MuPDF: fz_draw_pop_clip (draw-device.c).
+    // MuPDF: fz_draw_pop_clip (draw-device.c:2177). A plain clip restores
+    // the scissor + mask. With no plain clip left in this layer, the pop
+    // belongs to a soft mask pushed by end_mask (end_softmask's fz_pop_clip):
+    // the scratch it drew into is lerped back through the mask.
     fn pop_clip(&mut self) {
         if let Some((clip, mask)) = self.clip_stack.pop() {
             self.clip = clip;
             self.mask = mask;
+            return;
         }
+        if matches!(self.layers.last(), Some(Layer { kind: LayerKind::Soft { .. }, .. })) {
+            self.pop_soft();
+        }
+    }
+
+    // MuPDF: fz_draw_begin_group (draw-device.c:2440), with
+    // ATTEMPT_KNOCKOUT_AND_ISOLATED defined (as it is at the top of the C):
+    // an isolated group starts transparent; a non-isolated one starts as a
+    // copy of the backdrop and gets a group-alpha plane.
+    //
+    // Divergence: knockout groups are drawn as non-knockout
+    // (fz_knockout_begin / fz_knockout_end are not ported) -- no knockout
+    // fixture exists yet to measure against.
+    fn begin_group(&mut self, group: &super::text_device::GroupParams) {
+        let bbox = self.area_bbox(group.area);
+        let (pix, ga) = if group.isolated {
+            (draw_blend::new_pixmap_with_bbox(bbox, 4, true), None)
+        } else {
+            (draw_blend::copy_pixmap_rect(&self.pix, bbox), Some(draw_blend::new_pixmap_with_bbox(bbox, 4, true)))
+        };
+        let kind = LayerKind::Group { blend: group.blend, isolated: group.isolated, alpha: group.alpha, gray: group.gray };
+        self.push_layer(pix, ga, bbox, kind);
+    }
+
+    // MuPDF: fz_draw_end_group (draw-device.c:2515).
+    fn end_group(&mut self) {
+        if !matches!(self.layers.last(), Some(Layer { kind: LayerKind::Group { .. }, .. })) {
+            return;
+        }
+        let (mut src, src_ga, kind) = self.pop_layer();
+        let LayerKind::Group { blend, isolated, alpha, gray } = kind else { return };
+        if gray {
+            draw_blend::rgb_to_gray_in_place(&mut src);
+        }
+        // `alpha * 255` passed to an int parameter: truncation.
+        let a255 = (alpha * 255.0) as i32;
+        let simple = blend == draw_blend::BlendMode::Normal && src_ga.is_none() && self.ga.is_none();
+        let mask = self.mask.clone();
+        let bbox = src.bbox();
+        through_mask(&mut self.pix, mask.as_deref(), bbox, |dst| {
+            if simple {
+                draw_blend::paint_pixmap(dst, &src, a255);
+            } else {
+                draw_blend::blend_pixmap(dst, &mut src, a255, blend, isolated, src_ga.as_ref());
+            }
+        });
+        if let Some(pga) = self.ga.as_mut() {
+            through_mask(pga, mask.as_deref(), bbox, |dst| match &src_ga {
+                Some(sga) => draw_blend::paint_alpha_plane(dst, sga, a255),
+                None => draw_blend::paint_alpha_plane(dst, &src, if isolated { 255 } else { a255 }),
+            });
+        }
+    }
+
+    // MuPDF: fz_draw_begin_mask (draw-device.c:2242). The mask content is
+    // drawn in DeviceRGB (this device's only working space) over a backdrop
+    // of the /BC gray, and converted to gray at end_mask -- where MuPDF draws
+    // it straight into a DeviceGray pixmap. The two agree up to the
+    // rounding of the fast RGB -> gray formula (see the tests).
+    fn begin_mask(&mut self, area: Rect, luminosity: bool, bc: f32) {
+        let bbox = self.area_bbox(area);
+        let pix = if luminosity {
+            let mut p = draw_blend::new_pixmap_with_bbox(bbox, 3, false);
+            // fz_clear_pixmap_with_value(dest, bc * 255): int truncation.
+            p.clear_with_value((bc * 255.0).clamp(0.0, 255.0) as u8);
+            p
+        } else {
+            draw_blend::new_pixmap_with_bbox(bbox, 4, true)
+        };
+        // "Reset the blendmode for the mask rendering"; no group alpha.
+        self.push_layer(pix, None, bbox, LayerKind::Mask { luminosity });
+    }
+
+    // MuPDF: fz_draw_end_mask (draw-device.c:2368) with
+    // apply_transfer_function_to_pixmap (draw-device.c:2322): the rendered
+    // mask becomes an alpha mask (fz_alpha_from_gray), the transfer
+    // function maps it, and it is pushed as a clip over a scratch copy of
+    // the destination.
+    fn end_mask(&mut self, tr: Option<&[u8; 256]>) {
+        if !matches!(self.layers.last(), Some(Layer { kind: LayerKind::Mask { .. }, .. })) {
+            return;
+        }
+        let (src, _, kind) = self.pop_layer();
+        let LayerKind::Mask { luminosity } = kind else { return };
+        let n = src.n as usize;
+        let mut data: Vec<u8> = if luminosity {
+            src.samples.chunks(n).map(|p| draw_blend::rgb_to_gray_byte(p[0], p[1], p[2])).collect()
+        } else {
+            src.samples.chunks(n).map(|p| p[n - 1]).collect()
+        };
+        if let Some(tr) = tr {
+            data.iter_mut().for_each(|v| *v = tr[*v as usize]);
+        }
+        let bbox = src.bbox();
+        let softmask = super::draw_affine::DevMask { bbox, data };
+        // "create new dest scratch buffer" -- a copy of the destination, and
+        // a fresh group-alpha plane when the destination has one.
+        let scratch = draw_blend::copy_pixmap_rect(&self.pix, bbox);
+        let ga = self.ga.as_ref().map(|_| draw_blend::new_pixmap_with_bbox(scratch.bbox(), 4, true));
+        let clip = scratch.bbox();
+        self.push_layer(scratch, ga, clip, LayerKind::Soft { mask: softmask });
     }
 
     // MuPDF: fz_draw_stroke_path_aux (draw-device.c:746) with the whole
@@ -835,7 +1024,7 @@ impl TextDevice for DrawDevice {
         let m = ctm.concat(self.base);
         let polys = stroke_polygons(path, m, style);
         let c = rgb_to_bytes(color);
-        fill_polygons_masked(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, ic, self.mask.as_deref());
+        fill_polygons_masked_ga(&mut self.pix, self.ga.as_mut(), &polys, FillRule::NonZero, &c, alpha, ic, self.mask.as_deref());
     }
 
     fn stroke_glyph(
@@ -861,7 +1050,7 @@ impl TextDevice for DrawDevice {
         let user_path = outline.transformed(em_to_user);
         let polys = stroke_polygons(&user_path, user, style);
         let c = rgb_to_bytes(color);
-        fill_polygons_masked(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, self.clip, self.mask.as_deref());
+        fill_polygons_masked_ga(&mut self.pix, self.ga.as_mut(), &polys, FillRule::NonZero, &c, alpha, self.clip, self.mask.as_deref());
     }
 }
 
@@ -886,12 +1075,20 @@ fn stroke_polygons(path: &Path, m: Matrix, style: &super::draw_path::StrokeStyle
     }
 }
 
+// MuPDF: resolve_color (draw-device.c:551): `colorbv[i] = colorfv[i] * 255`,
+// a float -> unsigned char conversion, i.e. TRUNCATION.
 /// Clamp a DeviceRGB float triple (0..=1) to bytes.
+///
+/// ~~rounded to nearest~~ -- **CORRECTED 2026-09-28**: MuPDF truncates, and
+/// the difference is not cosmetic under a blend mode: `0.3 * 255` is 76 in
+/// MuPDF and was 77 here, which ColorBurn's division turned into a 4-level
+/// miss on the transparency feature file. Truncating also took the mean
+/// |Δ| of the CMYK, inline-image and non-separable blend feature files to 0.
 fn rgb_to_bytes(c: [f32; 3]) -> [u8; 3] {
     [
-        (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
-        (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c[0] * 255.0).clamp(0.0, 255.0) as u8,
+        (c[1] * 255.0).clamp(0.0, 255.0) as u8,
+        (c[2] * 255.0).clamp(0.0, 255.0) as u8,
     ]
 }
 
@@ -1555,6 +1752,64 @@ fn paint_tile_copy(dst: &mut Pixmap, src: &Pixmap, sx: i32, sy: i32, scissor: IR
                 let sv = if k < 3 { s[k] as i32 } else { sa };
                 let painted = sv + ((d * t) >> 8);
                 dst.samples[o + k] = if m == 256 { painted } else { ((painted - d) * m + (d << 8)) >> 8 } as u8;
+            }
+        }
+    }
+}
+
+// MuPDF: the tail of fz_draw_fill_shade (draw-device.c:1510-1620): the
+// /Background fill, then the shading painted as a layer blended back at
+// `alpha` -- folded here into one pass per pixel, the clip mask (if any)
+// multiplying the alpha.
+fn paint_shade_patch(pix: &mut Pixmap, bbox: IRect, patch: &[u8], bg: Option<[f32; 3]>, a255: i32, mask: Option<&super::draw_affine::DevMask>) {
+    let w = (bbox.x1 - bbox.x0) as usize;
+    let eff = |x: i32, y: i32| match mask {
+        Some(mk) => fz_mul255(mk.at(x, y), a255),
+        None => a255,
+    };
+    let nc = if pix.alpha { pix.n as usize - 1 } else { pix.n as usize };
+    if let Some(bg) = bg {
+        // resolve_color: colorbv = colour * 255, truncated.
+        let c = [(bg[0] * 255.0) as i32, (bg[1] * 255.0) as i32, (bg[2] * 255.0) as i32];
+        for y in bbox.y0..bbox.y1 {
+            for x in bbox.x0..bbox.x1 {
+                let a = eff(x, y);
+                if let Some(o) = pix.offset(x, y) {
+                    for k in 0..nc.min(3) {
+                        let d = pix.samples[o + k] as i32;
+                        pix.samples[o + k] = (fz_mul255(c[k], a) + fz_mul255(d, 255 - a)) as u8;
+                    }
+                    if pix.alpha {
+                        let d = pix.samples[o + nc] as i32;
+                        pix.samples[o + nc] = (a + fz_mul255(d, 255 - a)) as u8;
+                    }
+                }
+            }
+        }
+    }
+    for y in bbox.y0..bbox.y1 {
+        for x in bbox.x0..bbox.x1 {
+            let i = ((y - bbox.y0) as usize * w + (x - bbox.x0) as usize) * 4;
+            let sa = patch[i + 3] as i32;
+            if sa == 0 {
+                continue;
+            }
+            let a = eff(x, y);
+            if a == 0 {
+                continue;
+            }
+            // fz_paint_pixmap (premultiplied src-over) then the layer
+            // blended back at `alpha`: d = s*a + d*(1 - sa*a).
+            let t = 255 - fz_mul255(sa, a);
+            if let Some(o) = pix.offset(x, y) {
+                for k in 0..nc.min(3) {
+                    let d = pix.samples[o + k] as i32;
+                    pix.samples[o + k] = (fz_mul255(patch[i + k] as i32, a) + fz_mul255(d, t)) as u8;
+                }
+                if pix.alpha {
+                    let d = pix.samples[o + nc] as i32;
+                    pix.samples[o + nc] = (fz_mul255(sa, a) + fz_mul255(d, t)) as u8;
+                }
             }
         }
     }

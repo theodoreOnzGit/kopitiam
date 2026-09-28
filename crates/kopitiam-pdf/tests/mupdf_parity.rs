@@ -1003,3 +1003,296 @@ fn aes_256_r6_file_opens_with_the_empty_user_password() {
     let refused = PdfDocument::open(include_bytes!("fixtures/encrypted-aes256-r6-empty-owner.pdf").to_vec());
     assert!(refused.is_err(), "an empty owner password must not open the file");
 }
+
+// ---------------------------------------------------------------------------
+// Tranche 9 -- transparency (draw-blend.c, fz_draw_begin/end_group and
+// _mask, pdf-op-run.c begin_softmask / pdf_begin_group / pdf_run_xobject)
+// ---------------------------------------------------------------------------
+//
+// Every value below is `mutool draw -N -M 0 -r 72 -c rgb` on the same page
+// (the fixtures are the transparency entries of
+// scripts/mupdf-feature-corpus.py). The port matches most of these pages
+// pixel for pixel; `near` allows MuPDF's +-2 rounding slack anyway.
+
+/// The four mid-tone stripes the transparency fixtures draw everything over.
+const STRIPES: &[u8] = b"1 0.2 0.2 rg 0 0 50 200 re f 0.2 0.8 0.3 rg 50 0 50 200 re f \
+0.3 0.4 0.9 rg 100 0 50 200 re f 0.9 0.9 0.5 rg 150 0 50 200 re f\n";
+
+fn with_stripes(ops: &[u8]) -> Vec<u8> {
+    let mut v = STRIPES.to_vec();
+    v.extend_from_slice(ops);
+    v
+}
+
+fn assert_probes(pix: &kopitiam_pdf::mupdf::Pixmap, probes: &[((u32, u32), [u8; 3])]) {
+    for &((x, y), want) in probes {
+        let got = rgb_at(pix, x, y);
+        assert!(near(got, want), "at ({x}, {y}): got {got:?}, mutool {want:?}");
+    }
+}
+
+/// The original feature file (#15): a Multiply rect and a luminosity soft
+/// mask from ExtGState. 0.4.1 ignored `/BM` and `/SMask`: the yellow rect
+/// was painted plain and the red one unmasked (62.5 % of the page grossly
+/// off). mutool: (25,150) cyan x yellow multiplied = (0,255,0) only where
+/// they overlap -- (25,150) is plain cyan (0,255,255), (100,150) the
+/// multiply (0,255,0); the mask lets red through only in its white square:
+/// (100,50) (255,0,0), (25,50) white (255,255,255).
+#[test]
+fn blend_mode_and_luminosity_smask_from_extgstate() {
+    let doc = raw_page(
+        "<< /ExtGState << /M << /BM /Multiply >> /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> >> >>",
+        b"0 1 1 rg 0 0 200 100 re f q /M gs 1 1 0 rg 50 0 100 100 re f Q \
+q /S gs 1 0 0 rg 0 100 200 100 re f Q",
+        vec![raw_stream(
+            " /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency /CS /DeviceGray >>",
+            b"0 0 200 200 re 0 g f 1 g 50 50 100 100 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((25, 150), [0, 255, 255]), ((100, 150), [0, 255, 0]), ((100, 50), [255, 0, 0]), ((25, 50), [255, 255, 255])]);
+}
+
+/// Separable blend modes (fz_blend_separable, draw-blend.c:350), source
+/// (0.6, 0.3, 0.8) over the stripes. 0.4.1 painted every band as the plain
+/// source (153, 76, 204). mutool: Multiply over red (153,15,41), Screen over
+/// green (173,219,219), Darken over blue (76,76,204), ColorBurn over yellow
+/// (212,168,95), Difference over green (102,128,128), Exclusion over blue
+/// (137,118,67), Normal at ca 0.5 over red (204,63,126).
+#[test]
+fn separable_blend_modes_follow_mupdf() {
+    let modes = ["Multiply", "Screen", "Overlay", "Darken", "Lighten", "ColorDodge", "ColorBurn", "HardLight", "SoftLight", "Difference", "Exclusion", "Normal"];
+    let mut res = String::from("<< /ExtGState << ");
+    let mut ops = Vec::new();
+    for (i, m) in modes.iter().enumerate() {
+        let ca = if *m == "Normal" { " /ca 0.5" } else { "" };
+        res.push_str(&format!("/B{i} << /BM /{m}{ca} >> "));
+        ops.extend_from_slice(format!("q /B{i} gs 0.6 0.3 0.8 rg 0 {} 200 14 re f Q\n", 200 - 16 * (i + 1)).as_bytes());
+    }
+    res.push_str(">> >>");
+    let doc = raw_page(&res, &with_stripes(&ops), vec![]);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(
+        &pix,
+        &[
+            ((25, 9), [153, 15, 41]),
+            ((75, 25), [173, 219, 219]),
+            ((125, 57), [76, 76, 204]),
+            ((175, 105), [212, 168, 95]),
+            ((75, 153), [102, 128, 128]),
+            ((125, 169), [137, 118, 67]),
+            ((25, 185), [204, 63, 126]),
+        ],
+    );
+}
+
+/// Non-separable blend modes (fz_hue_rgb / fz_saturation_rgb /
+/// fz_color_rgb / fz_luminosity_rgb). 0.4.1: plain source colour --
+/// (230,51,127) left, (51,153,229) right. mutool: Hue over red
+/// (246,42,129), Saturation over yellow (237,237,59), Color over blue
+/// (28,130,206), Luminosity over yellow (142,142,40).
+#[test]
+fn nonseparable_blend_modes_follow_mupdf() {
+    let modes = ["Hue", "Saturation", "Color", "Luminosity"];
+    let mut res = String::from("<< /ExtGState << ");
+    let mut ops = Vec::new();
+    for (i, m) in modes.iter().enumerate() {
+        res.push_str(&format!("/B{i} << /BM /{m} >> "));
+        let y = 200 - 50 * (i + 1) + 5;
+        ops.extend_from_slice(format!("q /B{i} gs 0.9 0.2 0.5 rg 0 {y} 100 40 re f 0.2 0.6 0.9 rg 100 {y} 100 40 re f Q\n").as_bytes());
+    }
+    res.push_str(">> >>");
+    let doc = raw_page(&res, &with_stripes(&ops), vec![]);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((25, 25), [246, 42, 129]), ((175, 75), [237, 237, 59]), ((125, 125), [28, 130, 206]), ((175, 175), [142, 142, 40])]);
+}
+
+/// A luminosity soft mask with `/BC`: the mask group only paints inside its
+/// `/BBox`; outside, the mask is the backdrop colour's gray (fz_draw_begin_mask
+/// clears to it). `/BC [0.2 0.5 0.8]` in the group's `/CS /DeviceRGB` is
+/// gray 0.443. 0.4.1: the red fill unmasked, (255,0,0) everywhere. mutool
+/// (red over blue): outside the BBox (111,0,143); under the 0.2 gray rect
+/// (50,0,204); under the red rect, luminosity 0.3, (75,0,179); under the
+/// 0.8 gray rect (204,0,50); under the blue rect (27,0,227).
+#[test]
+fn luminosity_smask_uses_the_backdrop_colour_outside_its_group() {
+    let doc = raw_page(
+        "<< /ExtGState << /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R /BC [0.2 0.5 0.8] >> >> >> >>",
+        b"0 0 1 rg 0 0 200 200 re f q /S gs 1 0 0 rg 0 0 200 200 re f Q",
+        vec![raw_stream(
+            " /Type /XObject /Subtype /Form /BBox [20 20 180 180] /Group << /S /Transparency /CS /DeviceRGB >>",
+            b"0.2 g 20 20 50 160 re f 1 0 0 rg 70 20 50 160 re f 0 0 1 rg 120 20 60 80 re f 0.8 g 120 100 60 80 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(
+        &pix,
+        &[((10, 10), [111, 0, 143]), ((45, 100), [50, 0, 204]), ((95, 100), [75, 0, 179]), ((150, 50), [204, 0, 50]), ((150, 150), [27, 0, 227])],
+    );
+}
+
+/// An `/S /Alpha` soft mask is the ALPHA its group paints: an opaque rect
+/// (full), a `ca 0.5` rect (half), nothing (none). 0.4.1: the green fill
+/// covered the whole page. mutool: (50,100) green (0,127,0); (150,100)
+/// half green over the yellow stripe (116,178,64); (150,30) the stripe
+/// (229,229,127).
+#[test]
+fn alpha_smask_is_the_groups_alpha() {
+    let doc = raw_page(
+        "<< /ExtGState << /S << /SMask << /Type /Mask /S /Alpha /G 5 0 R >> >> >> >>",
+        &with_stripes(b"q /S gs 0 0.5 0 rg 0 0 200 200 re f Q"),
+        vec![raw_stream(
+            " /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >> \
+/Resources << /ExtGState << /H << /ca 0.5 >> >> >>",
+            b"0 0 1 rg 10 10 90 180 re f /H gs 1 1 0 rg 60 60 130 80 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((50, 100), [0, 127, 0]), ((150, 100), [116, 178, 64]), ((150, 30), [229, 229, 127])]);
+}
+
+/// A soft mask's `/TR` (here `1 - x`) maps the mask -- but MuPDF's
+/// begin_softmask DROPS the transfer function from the graphics state the
+/// first time it is used, so only the FIRST object painted after the `gs`
+/// gets it; the port replicates that. 0.4.1: no mask at all, the page
+/// black. mutool: top (first object, inverted mask) (62,62,62) left /
+/// (192,192,192) right; bottom (second object, plain mask) (192,192,192) /
+/// (63,63,63).
+#[test]
+fn smask_transfer_function_applies_to_the_first_object_only() {
+    let doc = raw_page(
+        "<< /ExtGState << /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R \
+/TR << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >> >> >> >> >>",
+        b"1 1 1 rg 0 0 200 200 re f q /S gs 0 0 0 rg 0 100 200 100 re f 0 0 0 rg 0 0 200 100 re f Q",
+        vec![raw_stream(
+            " /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >>",
+            b"0.25 g 0 0 100 200 re f 0.75 g 100 0 100 200 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((50, 50), [62, 62, 62]), ((150, 50), [192, 192, 192]), ((50, 150), [192, 192, 192]), ((150, 150), [63, 63, 63])]);
+}
+
+/// Transparency groups (fz_draw_begin_group with ATTEMPT_KNOCKOUT_AND_ISOLATED):
+/// a white `/Difference` rect inside a NON-isolated group inverts the page
+/// under it; inside an ISOLATED group it differences against nothing and
+/// stays white. Both groups are drawn at `ca 0.6` (the group alpha of the
+/// `Do`). 0.4.1 ignored `/Group` and `/BM`: plain white at 0.6. mutool:
+/// non-isolated over red (102,142,142), over green (142,113,137);
+/// isolated over blue (183,193,244), over yellow (244,244,203); a Normal
+/// group at ca 0.5 over green (153,102,165).
+#[test]
+fn nonisolated_and_isolated_groups_with_group_alpha() {
+    let grp: &[u8] = b"/M gs 1 1 1 rg 10 10 80 80 re f 0 0 0 rg 30 30 40 40 re f";
+    let res = " /Resources << /ExtGState << /M << /BM /Difference >> >> >>";
+    let doc = raw_page(
+        "<< /XObject << /N 5 0 R /I 6 0 R /P 7 0 R >> /ExtGState << /GA << /ca 0.6 >> /HA << /ca 0.5 >> >> >>",
+        &with_stripes(b"q /GA gs 1 0 0 1 0 100 cm /N Do Q q /GA gs 1 0 0 1 100 100 cm /I Do Q q /HA gs 1 0 0 1 50 0 cm /P Do Q"),
+        vec![
+            raw_stream(&format!(" /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency >>{res}"), grp),
+            raw_stream(&format!(" /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency /I true >>{res}"), grp),
+            raw_stream(
+                " /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency >>",
+                b"1 0 1 rg 0 0 100 100 re f 0 0 0 rg 25 25 50 50 re f",
+            ),
+        ],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(
+        &pix,
+        &[((20, 50), [102, 142, 142]), ((50, 50), [142, 113, 137]), ((120, 50), [183, 193, 244]), ((150, 50), [244, 244, 203]), ((60, 190), [153, 102, 165])],
+    );
+}
+
+/// Images and transparency (pdf_show_image): an image under a gstate soft
+/// mask is masked; an image with its OWN `/SMask` under `/BM /Multiply`
+/// gets a blend group but no gstate mask. 0.4.1: the top image opaque, the
+/// bottom one merely alpha-blended. mutool: top, mask 0.2, over green
+/// (91,163,60); mask 0.9 over blue... (150,25) (23,252,12); bottom,
+/// multiply at smask 255 over green (51,0,0), at smask 128 over yellow
+/// (113,228,63).
+#[test]
+fn image_under_gstate_smask_and_image_smask_under_blend() {
+    let img: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+    let doc = raw_page(
+        "<< /XObject << /A 6 0 R /B 7 0 R >> /ExtGState << /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R >> >> \
+/M << /BM /Multiply /SMask /None >> >> >>",
+        &with_stripes(b"q /S gs 200 0 0 100 0 100 cm /A Do Q q /M gs 200 0 0 100 0 0 cm /B Do Q"),
+        vec![
+            raw_stream(
+                " /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >>",
+                b"0.2 g 0 0 100 200 re f 0.9 g 100 0 100 200 re f",
+            ),
+            raw_stream(" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceRGB", img),
+            raw_stream(" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceRGB /SMask 8 0 R", img),
+            raw_stream(" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceGray", &[255, 128, 64, 0]),
+        ],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((50, 25), [91, 163, 60]), ((150, 25), [23, 252, 12]), ((50, 125), [51, 0, 0]), ((150, 125), [113, 228, 63])]);
+}
+
+/// Text under a blend mode and under a soft mask (pdf_flush_text_imp's
+/// pdf_begin_group). 0.4.1: white text on the stripes, and the masked word
+/// drawn whole in black. mutool: the white `/Difference` "D" stem over the
+/// red stripe is cyan (0,204,204); the "M" of the masked word is black at
+/// (12,150); the "k", right of the mask's edge at x = 100, is not drawn:
+/// the blue stripe (76,102,229) at (139,150).
+#[test]
+fn text_under_blend_mode_and_soft_mask() {
+    let doc = raw_page(
+        "<< /Font << /F 5 0 R >> /ExtGState << /D << /BM /Difference >> /S << /SMask << /Type /Mask /S /Alpha /G 6 0 R >> >> >> >>",
+        &with_stripes(b"q /D gs 1 1 1 rg BT /F 64 Tf 5 120 Td (Diff) Tj ET Q q /S gs 0 0 0 rg BT /F 64 Tf 5 30 Td (Mask) Tj ET Q"),
+        vec![
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>".to_vec(),
+            raw_stream(" /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >>", b"0 0 0 rg 0 0 100 200 re f"),
+        ],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((12, 60), [0, 204, 204]), ((12, 150), [0, 0, 0]), ((139, 150), [76, 102, 229])]);
+}
+
+/// A tiling-pattern fill at `ca 0.5`: pdf_show_path wraps the pattern in a
+/// Normal group at the fill alpha (the cell itself runs at the PARENT
+/// state's alpha, 1). 0.4.1 drew the checkerboard opaque: (0,0,255) and
+/// (255,255,0). mutool: blue half over red (128,26,153), yellow half over
+/// red (255,153,26), the empty cells the stripe (51,204,76).
+#[test]
+fn tiling_pattern_fill_at_fill_alpha() {
+    let doc = raw_page(
+        "<< /Pattern << /P 5 0 R >> /ExtGState << /H << /ca 0.5 >> >> >>",
+        &with_stripes(b"q /H gs /Pattern cs /P scn 20 20 160 160 re f Q"),
+        vec![raw_stream(
+            " /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 20 20] /XStep 20 /YStep 20 /Resources << >>",
+            b"0 0 1 rg 0 0 10 10 re f 1 1 0 rg 10 10 10 10 re f",
+        )],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_probes(&pix, &[((25, 175), [128, 26, 153]), ((35, 165), [255, 153, 26]), ((75, 175), [51, 204, 76])]);
+}
+
+/// MuPDF's stext device has no begin_mask: a soft mask's group is run
+/// through it like any content, so glyphs INSIDE the mask are extracted.
+/// 0.4.1 never ran the mask, so the mask's word was missing from the text.
+/// `mutool draw -F text` on this page prints "Hidden" (from the mask group)
+/// and then "Shown". (MuPDF also drops a mask glyph that falls outside the
+/// device scissor -- the masked object's bbox -- via FZ_STEXT_CLIP; this
+/// port's stext device has no scissor yet, so here the mask word sits on
+/// top of the shown one, where both agree.)
+#[test]
+fn soft_mask_group_text_reaches_stext_like_mupdf() {
+    let doc = raw_page(
+        "<< /Font << /F 5 0 R >> /ExtGState << /S << /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >> >>",
+        b"q /S gs 0 0 0 rg BT /F 24 Tf 10 100 Td (Shown) Tj ET Q",
+        vec![
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            raw_stream(
+                " /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >> /Resources << /Font << /F 5 0 R >> >>",
+                b"1 g BT /F 24 Tf 10 100 Td (Hidden) Tj ET",
+            ),
+        ],
+    );
+    let t = text(&chars(&doc));
+    assert!(t.contains("Shown"), "page text: {t:?}");
+    assert!(t.contains("Hidden"), "mask-group text reaches stext: {t:?}");
+}

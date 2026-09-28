@@ -313,6 +313,134 @@ FILES["image-mask-keys"] = pdf(
 )
 
 
+# --- Transparency tranche (blend modes, soft masks, groups). A backdrop of
+# four mid-tone stripes so every blend function sees non-trivial input.
+_stripes = (b"1 0.2 0.2 rg 0 0 50 200 re f 0.2 0.8 0.3 rg 50 0 50 200 re f"
+            b" 0.3 0.4 0.9 rg 100 0 50 200 re f 0.9 0.9 0.5 rg 150 0 50 200 re f\n")
+
+# 25. The 11 separable blend modes (+ Normal at ca 0.5) as horizontal bands
+# across the stripes, via ExtGState /BM. 0.4.1 ignored /BM: every band was
+# plain paint.
+_sep = [b"Multiply", b"Screen", b"Overlay", b"Darken", b"Lighten", b"ColorDodge",
+        b"ColorBurn", b"HardLight", b"SoftLight", b"Difference", b"Exclusion", b"Normal"]
+FILES["blend-separable"] = pdf(
+    [],
+    resources=b"<< /ExtGState << " + b" ".join(
+        b"/B%d << /BM /%s%s >>" % (i, m, b" /ca 0.5" if m == b"Normal" else b"")
+        for i, m in enumerate(_sep)) + b" >> >>",
+    content=_stripes + b"".join(
+        b"q /B%d gs 0.6 0.3 0.8 rg 0 %d 200 14 re f Q\n" % (i, 200 - 16 * (i + 1))
+        for i in range(len(_sep))),
+)
+
+# 26. The 4 non-separable modes, each band with two source colours.
+_nonsep = [b"Hue", b"Saturation", b"Color", b"Luminosity"]
+FILES["blend-nonseparable"] = pdf(
+    [],
+    resources=b"<< /ExtGState << " + b" ".join(
+        b"/B%d << /BM /%s >>" % (i, m) for i, m in enumerate(_nonsep)) + b" >> >>",
+    content=_stripes + b"".join(
+        b"q /B%d gs 0.9 0.2 0.5 rg 0 %d 100 40 re f 0.2 0.6 0.9 rg 100 %d 100 40 re f Q\n"
+        % (i, 200 - 50 * (i + 1) + 5, 200 - 50 * (i + 1) + 5) for i in range(len(_nonsep))),
+)
+
+# 27. Luminosity soft mask with a /BC backdrop: the mask group only paints
+# inside its /BBox [20 20 180 180]; outside it the mask is the /BC colour's
+# gray (RGB 0.2 0.5 0.8 -> 0.443), inside, gray and coloured rects.
+FILES["smask-luminosity-bc"] = pdf(
+    [stream(b"0.2 g 20 20 50 160 re f 1 0 0 rg 70 20 50 160 re f 0 0 1 rg 120 20 60 80 re f"
+            b" 0.8 g 120 100 60 80 re f",
+            b" /Type /XObject /Subtype /Form /BBox [20 20 180 180]"
+            b" /Group << /S /Transparency /CS /DeviceRGB >>")],
+    resources=b"<< /ExtGState << /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R"
+              b" /BC [0.2 0.5 0.8] >> >> >> >>",
+    content=b"0 0 1 rg 0 0 200 200 re f q /S gs 1 0 0 rg 0 0 200 200 re f Q",
+)
+
+# 28. Alpha soft mask: the mask is the ALPHA of what its group draws (an
+# opaque rect, a ca 0.5 rect, overlapping), not its colour.
+FILES["smask-alpha"] = pdf(
+    [stream(b"0 0 1 rg 10 10 90 180 re f /H gs 1 1 0 rg 60 60 130 80 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 200 200]"
+            b" /Group << /S /Transparency >> /Resources << /ExtGState << /H << /ca 0.5 >> >> >>")],
+    resources=b"<< /ExtGState << /S << /SMask << /Type /Mask /S /Alpha /G 5 0 R >> >> >> >>",
+    content=_stripes + b"q /S gs 0 0.5 0 rg 0 0 200 200 re f Q",
+)
+
+# 29. A soft-mask /TR transfer function (1 - x, type 2): the top half is
+# painted by the first object after the gs, the bottom half by a second
+# one. MuPDF drops the /TR from the gstate once it has been used, so only
+# the top half is inverted -- the port replicates that quirk.
+FILES["smask-tr"] = pdf(
+    [stream(b"0.25 g 0 0 100 200 re f 0.75 g 100 0 100 200 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >>")],
+    resources=b"<< /ExtGState << /S << /SMask << /Type /Mask /S /Luminosity /G 5 0 R"
+              b" /TR << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >> >> >> >> >>",
+    content=b"1 1 1 rg 0 0 200 200 re f q /S gs 0 0 0 rg 0 100 200 100 re f 0 0 0 rg 0 0 200 100 re f Q",
+)
+
+# 30. Transparency groups: the same Form, whose content paints a white
+# /Difference rect, drawn NON-isolated (top left: inverts the page stripes
+# under it), isolated (/I true, top right: differences against nothing, so
+# stays white), both at group alpha ca 0.6 on the Do; plus a plain Normal
+# group at ca 0.5 (bottom).
+_grp = b"/M gs 1 1 1 rg 10 10 80 80 re f 0 0 0 rg 30 30 40 40 re f"
+_grp_res = b" /Resources << /ExtGState << /M << /BM /Difference >> >> >>"
+FILES["group-isolation"] = pdf(
+    [stream(_grp, b" /Type /XObject /Subtype /Form /BBox [0 0 100 100]"
+                  b" /Group << /S /Transparency >>" + _grp_res),
+     stream(_grp, b" /Type /XObject /Subtype /Form /BBox [0 0 100 100]"
+                  b" /Group << /S /Transparency /I true >>" + _grp_res),
+     stream(b"1 0 1 rg 0 0 100 100 re f 0 0 0 rg 25 25 50 50 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Group << /S /Transparency >>")],
+    resources=b"<< /XObject << /N 5 0 R /I 6 0 R /P 7 0 R >>"
+              b" /ExtGState << /GA << /ca 0.6 >> /HA << /ca 0.5 >> >> >>",
+    content=_stripes + b"q /GA gs 1 0 0 1 0 100 cm /N Do Q q /GA gs 1 0 0 1 100 100 cm /I Do Q"
+            b" q /HA gs 1 0 0 1 50 0 cm /P Do Q",
+)
+
+# 31. Images and transparency: an image under a luminosity soft mask from
+# the gstate (top), and an image carrying its own /SMask under /BM
+# /Multiply (bottom) -- which MuPDF gives a blend group but no gstate mask.
+_img = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0])  # 2x2 RGB
+_img_sm = bytes([255, 128, 64, 0])  # 2x2 gray alpha
+FILES["image-transparency"] = pdf(
+    [stream(b"0.2 g 0 0 100 200 re f 0.9 g 100 0 100 200 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >>"),
+     stream(_img, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                  b" /ColorSpace /DeviceRGB"),
+     stream(_img, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                  b" /ColorSpace /DeviceRGB /SMask 8 0 R"),
+     stream(_img_sm, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                     b" /ColorSpace /DeviceGray")],
+    resources=b"<< /XObject << /A 6 0 R /B 7 0 R >> /ExtGState << /S << /SMask << /Type /Mask"
+              b" /S /Luminosity /G 5 0 R >> >> /M << /BM /Multiply /SMask /None >> >> >>",
+    content=_stripes + b"q /S gs 200 0 0 100 0 100 cm /A Do Q q /M gs 200 0 0 100 0 0 cm /B Do Q",
+)
+
+# 32. Text under a blend mode (/Difference, top) and under an alpha soft
+# mask that covers only the left half of the page (bottom).
+FILES["text-transparency"] = pdf(
+    [b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+     stream(b"0 0 0 rg 0 0 100 200 re f",
+            b" /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Group << /S /Transparency >>")],
+    resources=b"<< /Font << /F 5 0 R >> /ExtGState << /D << /BM /Difference >>"
+              b" /S << /SMask << /Type /Mask /S /Alpha /G 6 0 R >> >> >> >>",
+    content=_stripes + b"q /D gs 1 1 1 rg BT /F 64 Tf 5 120 Td (Diff) Tj ET Q"
+            b" q /S gs 0 0 0 rg BT /F 64 Tf 5 30 Td (Mask) Tj ET Q",
+)
+
+# 33. A tiling-pattern fill at ca 0.5: pdf_show_path draws the pattern
+# inside a Normal transparency group at the fill alpha. 0.4.1 drew it
+# opaque (the cell copies the PARENT state's alpha, which is 1).
+FILES["pattern-alpha"] = pdf(
+    [stream(b"0 0 1 rg 0 0 10 10 re f 1 1 0 rg 10 10 10 10 re f",
+            b" /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 20 20]"
+            b" /XStep 20 /YStep 20 /Resources << >>")],
+    resources=b"<< /Pattern << /P 5 0 R >> /ExtGState << /H << /ca 0.5 >> >> >>",
+    content=_stripes + b"q /H gs /Pattern cs /P scn 20 20 160 160 re f Q",
+)
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "feature-corpus")
     out.mkdir(parents=True, exist_ok=True)
