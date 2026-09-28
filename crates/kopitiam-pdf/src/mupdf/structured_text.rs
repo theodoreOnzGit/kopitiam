@@ -97,7 +97,8 @@ impl StextOptions {
     pub const ACCURATE_BBOXES: u32 = 512;
     /// Collect vector-graphics bboxes. **Deferred**. (`FZ_STEXT_COLLECT_VECTORS`)
     pub const COLLECT_VECTORS: u32 = 1024;
-    /// Do not apply `/ActualText` replacements. **Deferred** (no actualtext).
+    /// Do not apply `/ActualText` replacements. ~~**Deferred** (no actualtext).~~
+    /// **CORRECTED 2026-09-28 (0.4.2)**: ActualText is applied, so this flag works.
     /// (`FZ_STEXT_IGNORE_ACTUALTEXT`)
     pub const IGNORE_ACTUALTEXT: u32 = 2048;
     /// Segment the page into regions. **Deferred** (layout/`boxer` wave).

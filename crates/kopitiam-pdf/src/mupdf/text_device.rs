@@ -207,6 +207,22 @@ pub trait TextDevice {
         false
     }
 
+    // MuPDF: fz_begin_metatext (device.c) with FZ_METATEXT_ACTUALTEXT, from
+    // pdf-op-run.c's begin_metatext (a `BDC` whose properties carry
+    // `/ActualText`). `text` is the decoded text string. Default no-op: only
+    // an extraction device cares.
+    fn begin_actualtext(&mut self, _text: &str) {}
+
+    // MuPDF: fz_end_metatext (device.c), from pdf-op-run.c's end_metatext at
+    // the matching `EMC`. Default no-op.
+    fn end_actualtext(&mut self) {}
+
+    // MuPDF: the fz_fill_text call pdf_flush_text makes -- the point where a
+    // run of shown glyphs becomes one `fz_text` (at `ET`, and around marked
+    // content). A device that works per span (the stext device inside
+    // ActualText) processes its buffered glyphs here. Default no-op.
+    fn flush_text(&mut self) {}
+
     // MuPDF: fz_begin_tile_tid (device.c) -- the TILE branch of
     // pdf_show_pattern (pdf-op-run.c:791).
     /// Begin a tiled pattern fill. `area` is the region to cover and `view`

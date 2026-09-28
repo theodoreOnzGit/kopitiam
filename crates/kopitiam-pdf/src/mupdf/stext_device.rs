@@ -54,14 +54,23 @@
 //!   **DONE 2026-09-28 (0.4.2)**: `Mn` chars and no-glyph fillers ride on the
 //!   pen (the `glyph == -1 || MN` arm), and presentation forms decompose
 //!   (`unicode-general-category` / `unicode-normalization` stand in for ucdn).
-//! * **ActualText, styles, images, structure, tables,
+//! * **~~ActualText,~~ styles, images, structure, tables,
 //!   segmentation**: recognised via [`StextOptions`] flags but not acted upon
 //!   (later waves). ~~Layout analysis (reading order / paragraphs) is the *next*
 //!   wave.~~ **CORRECTED 2026-09-28**: it exists -- `stext_boxer`, `stext_para`,
-//!   `stext_classify`, entered through `page_to_stext_segmented`. ActualText is
-//!   still not applied.
+//!   `stext_classify`, entered through `page_to_stext_segmented`. **ActualText
+//!   DONE 2026-09-28 (0.4.2)**: `do_extract_within_actualtext` (prefix/postfix
+//!   matching per span), `flush_actualtext`, `fz_stext_begin/end_metatext`
+//!   (content-bounds placement included), with the text found on the BDC
+//!   properties or on the MCID's structure element (`marked_content.rs`).
+//!   Divergence: a span ends at `ET`/marked-content boundaries and at a
+//!   font/matrix change, a subset of MuPDF's `pdf_flush_text` triggers.
 
+use super::draw_edge::FillRule;
+use super::draw_path::Path;
 use super::font::Font;
+use super::object::Object;
+use super::page_image::DecodedImage;
 use super::geometry::{Matrix, Point, Quad, Rect};
 use super::page_run::run_page;
 use super::structured_text::{
@@ -119,10 +128,50 @@ pub struct StextDevice {
     // FZ_STEXT_CLIP, so its filler chars are dropped with it.
     last_clipped: bool,
 
+    // MuPDF: fz_stext_device.metatext -- the stack of open ActualTexts
+    // (other metatext kinds do not reach this device; they change nothing
+    // in the extracted text).
+    actualtext: Vec<ActualText>,
+    /// Glyphs shown inside an ActualText since the last `flush_text`: the
+    /// `fz_text` MuPDF hands to `fz_stext_extract` as a whole.
+    pending: Vec<PendingGlyph>,
+    // MuPDF: fz_stext_device.last -- where the last extracted char sat
+    // (`valid` is `last.is_some()`), used to place ActualText runes.
+    last: Option<LastChar>,
+    /// `last.font` outlives `last.valid` in MuPDF (only valid is reset).
+    last_font: Option<usize>,
+
     /// Interning: font pointer identity -> index into `page.fonts`. Fonts are
     /// stable within a set-font run, so this dedups per logical font (a `q`/`Q`
     /// gstate clone may add a duplicate entry, which is harmless).
     font_ptrs: Vec<usize>,
+}
+
+// MuPDF: metatext_t (stext-device.c:106), ActualText only.
+struct ActualText {
+    /// The replacement text still to be placed.
+    text: Vec<char>,
+    /// Device-space bounds of the non-text content inside it.
+    bounds: Option<Rect>,
+}
+
+// MuPDF: one fz_text_item of a span, plus the span's font.
+#[derive(Clone, Copy)]
+struct PendingGlyph {
+    font_idx: usize,
+    ucs: char,
+    /// `>= 0` a real glyph, `-1` a no-glyph filler (MuPDF's gid sign).
+    glyph: i32,
+    trm: Matrix,
+    adv: f32,
+    wmode: u8,
+}
+
+#[derive(Clone, Copy)]
+struct LastChar {
+    font_idx: usize,
+    trm: Matrix,
+    wmode: u8,
 }
 
 impl StextDevice {
@@ -143,6 +192,10 @@ impl StextDevice {
             lastchar: -1,
             lastline: None,
             last_clipped: false,
+            actualtext: Vec::new(),
+            pending: Vec::new(),
+            last: None,
+            last_font: None,
             font_ptrs: Vec::new(),
         }
     }
@@ -153,8 +206,147 @@ impl StextDevice {
         self.page
     }
 
+    // MuPDF: do_extract (stext-device.c:1153) for already-buffered glyphs.
+    fn extract_items(&mut self, items: &[PendingGlyph]) {
+        for it in items {
+            self.last = Some(LastChar { font_idx: it.font_idx, trm: it.trm, wmode: it.wmode });
+            self.last_font = Some(it.font_idx);
+            let adv = if it.glyph >= 0 { it.adv } else { 0.0 };
+            self.add_char(it.font_idx, it.ucs, it.glyph, it.trm, adv, it.wmode, false);
+        }
+    }
+
+    // MuPDF: flush_actualtext (stext-device.c:1242). Places `text[i..end)`
+    // (all of it for `end == None`) at the last char's position: the first
+    // rune as glyph -2 (advances the pen, never fake-bold), the rest as -1.
+    fn flush_actualtext(&mut self, text: &[char], mut i: usize, end: Option<usize>) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(last) = self.last else { return };
+        if self.flags & StextOptions::CLIP != 0 && self.last_clipped {
+            return;
+        }
+        let mut glyph = -2;
+        let mut k = 0;
+        while end.is_none_or(|e| i < e) {
+            let Some(&rune) = text.get(k) else { break };
+            k += 1;
+            self.add_char(last.font_idx, rune, glyph, last.trm, 0.0, last.wmode, false);
+            i += 1;
+            glyph = -1;
+        }
+    }
+
+    // MuPDF: do_extract_within_actualtext (stext-device.c:1280) for one span.
+    // The prefix of the span that matches the ActualText is extracted as is,
+    // a matching suffix too; the glyphs in between carry the ActualText's
+    // runes in order. An EMPTY ActualText swallows the span.
+    fn extract_within_actualtext(&mut self, span: &[PendingGlyph]) {
+        let Some(mt) = self.actualtext.last() else { return };
+        let text = mt.text.clone();
+        if text.is_empty() {
+            return;
+        }
+        let len = span.len();
+        let mut k = 0;
+        let mut start = 0;
+        while start < len && k < text.len() && span[start].ucs == text[k] {
+            start += 1;
+            k += 1;
+        }
+        if start != 0 {
+            self.extract_items(&span[..start]);
+        }
+        if start == len {
+            if let Some(mt) = self.actualtext.last_mut() {
+                mt.text.drain(..k);
+            }
+            return;
+        }
+        // Remaining runes, then a matching postfix (sent at the end).
+        let mut z = text.len() - k;
+        let mut end = len;
+        while end > start && z > 0 && span[end - 1].ucs == text[k + z - 1] {
+            z -= 1;
+            end -= 1;
+        }
+        let mut p = k;
+        let mut i = start;
+        while i < end {
+            let it = span[i];
+            // `if ((size_t)i < z)` -- compared against the ABSOLUTE index,
+            // exactly as the C does.
+            let rune = if i < z {
+                let r = text.get(p).copied();
+                p += 1;
+                r
+            } else {
+                None
+            };
+            self.last = Some(LastChar { font_idx: it.font_idx, trm: it.trm, wmode: it.wmode });
+            self.last_font = Some(it.font_idx);
+            let adv = if it.glyph >= 0 { it.adv } else { 0.0 };
+            // A rune of -1 ("ignore") adds nothing.
+            if let Some(r) = rune {
+                self.add_char(it.font_idx, r, it.glyph, it.trm, adv, it.wmode, false);
+            }
+            i += 1;
+        }
+        if end == len {
+            if let Some(mt) = self.actualtext.last_mut() {
+                mt.text.drain(..p.min(mt.text.len()));
+            }
+            return;
+        }
+        // A postfix matched: send the rest of the ActualText now, then the
+        // postfix, and the ActualText is used up. (MuPDF bounds the flush with
+        // strlen, a BYTE count of UTF-8; this counts runes -- the same for
+        // ASCII, and never runs past the string either way.)
+        let rest: Vec<char> = text[p.min(text.len())..].to_vec();
+        let bound = (i + rest.len()).saturating_sub(len - end);
+        self.flush_actualtext(&rest, i, Some(bound));
+        self.extract_items(&span[end..]);
+        if let Some(mt) = self.actualtext.last_mut() {
+            mt.text.clear();
+        }
+    }
+
+    /// Add `r` (device space) to the innermost ActualText's bounds.
+    fn actualtext_bounds(&mut self, r: Rect) {
+        if let Some(mt) = self.actualtext.last_mut() {
+            if r.is_empty() {
+                return;
+            }
+            mt.bounds = Some(match mt.bounds {
+                Some(b) => b.union(r),
+                None => r,
+            });
+        }
+    }
+
+    // MuPDF: pop_metatext (stext-device.c:1559): the bounds carry outwards.
+    fn pop_actualtext(&mut self) {
+        if let Some(mt) = self.actualtext.pop() {
+            if let Some(b) = mt.bounds {
+                self.actualtext_bounds(b);
+            }
+        }
+    }
+
     // MuPDF: the font pointer stored in fz_stext_char.font. Interns `font` into
     // `page.fonts` by pointer identity, returning its index.
+    /// Intern a font this device owns (not one borrowed from a gstate).
+    fn intern_font_owned(&mut self, font: Font) -> usize {
+        // Keyed by a sentinel no real `&Font` address can have.
+        if let Some(idx) = self.font_ptrs.iter().position(|&p| p == usize::MAX) {
+            return idx;
+        }
+        self.font_ptrs.push(usize::MAX);
+        self.page.fonts.push(font);
+        self.page.fonts.len() - 1
+    }
+
     fn intern_font(&mut self, font: &Font) -> usize {
         let key = font as *const Font as usize;
         if let Some(idx) = self.font_ptrs.iter().position(|&p| p == key) {
@@ -245,8 +437,9 @@ impl StextDevice {
 
     // MuPDF: fz_add_stext_char_imp (stext-device.c:758). THE line/block/space
     // decision. `glyph` is `>= 0` for a real glyph, `-1` for a no-glyph char
-    // (see [`add_char`](Self::add_char)); the ACCURATE_BBOXES per-glyph quads
-    // and the actualtext `-2` sentinel are still out of scope for this port.
+    // (see [`add_char`](Self::add_char)), or `-2` for the first rune of a
+    // flushed ActualText (advances like a glyph, never fake-bold, as in the
+    // C); the ACCURATE_BBOXES per-glyph quads are still out of scope.
     #[allow(clippy::too_many_arguments)]
     fn add_char_imp(
         &mut self,
@@ -544,6 +737,14 @@ impl TextDevice for StextDevice {
         // every glyph, which silently disabled fake-bold suppression: text a
         // producer printed twice for a bold effect came out doubled.
         let glyph = i32::try_from(cid).unwrap_or(i32::MAX);
+        // Inside an ActualText the glyph waits for the span to be flushed
+        // (fz_stext_extract -> do_extract_within_actualtext).
+        if !self.actualtext.is_empty() && self.flags & StextOptions::IGNORE_ACTUALTEXT == 0 {
+            self.pending.push(PendingGlyph { font_idx, ucs: unicode, glyph, trm, adv, wmode });
+            return;
+        }
+        self.last = Some(LastChar { font_idx, trm, wmode });
+        self.last_font = Some(font_idx);
         self.add_char(font_idx, unicode, glyph, trm, adv, wmode, force_new_line);
     }
 
@@ -556,8 +757,161 @@ impl TextDevice for StextDevice {
             return;
         }
         let font_idx = self.intern_font(font);
+        if !self.actualtext.is_empty() && self.flags & StextOptions::IGNORE_ACTUALTEXT == 0 {
+            self.pending.push(PendingGlyph { font_idx, ucs: unicode, glyph: -1, trm, adv: 0.0, wmode });
+            return;
+        }
         self.add_char(font_idx, unicode, -1, trm, 0.0, wmode, false);
     }
+
+    // MuPDF: pdf_flush_text -> fz_fill_text -> fz_stext_fill_text: each
+    // span of the buffered text through do_extract_within_actualtext. A new
+    // span starts where fz_show_glyph starts one: a different font, writing
+    // mode, or glyph matrix (translation aside).
+    fn flush_text(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let mut s = 0;
+        for e in 1..=pending.len() {
+            let brk = e == pending.len() || {
+                let (a, b) = (pending[e - 1], pending[e]);
+                a.font_idx != b.font_idx
+                    || a.wmode != b.wmode
+                    || a.trm.a != b.trm.a
+                    || a.trm.b != b.trm.b
+                    || a.trm.c != b.trm.c
+                    || a.trm.d != b.trm.d
+            };
+            if brk {
+                self.extract_within_actualtext(&pending[s..e]);
+                s = e;
+            }
+        }
+    }
+
+    // MuPDF: fz_stext_begin_metatext (stext-device.c:1527), ActualText.
+    fn begin_actualtext(&mut self, text: &str) {
+        if let Some(mt) = self.actualtext.last() {
+            let outer = mt.text.clone();
+            self.flush_actualtext(&outer, 0, None);
+        }
+        self.last = None;
+        self.actualtext.push(ActualText { text: text.chars().collect(), bounds: None });
+    }
+
+    // MuPDF: fz_stext_end_metatext (stext-device.c:1577), ActualText.
+    fn end_actualtext(&mut self) {
+        if self.actualtext.is_empty() {
+            return; // "Mismatched pop. Live with it."
+        }
+        if self.flags & StextOptions::IGNORE_ACTUALTEXT != 0 {
+            self.pop_actualtext();
+            return;
+        }
+        let text = self.actualtext.last().map(|m| m.text.clone()).unwrap_or_default();
+        // "If we have a 'last' text position, send the content after that."
+        if let Some(mut last) = self.last {
+            last.trm.e = self.pen.x;
+            last.trm.f = self.pen.y;
+            self.last = Some(last);
+            self.flush_actualtext(&text, 0, None);
+            self.pop_actualtext();
+            self.last = None;
+            return;
+        }
+        // Otherwise only content bounds can place it.
+        let Some(b) = self.actualtext.last().and_then(|m| m.bounds) else {
+            self.pop_actualtext();
+            return;
+        };
+        let font_idx = match self.last_font {
+            Some(f) => Some(f),
+            // MuPDF falls back to base-14 Helvetica.
+            None => helvetica().map(|f| self.intern_font_owned(f)),
+        };
+        if let Some(font_idx) = font_idx {
+            self.last = Some(LastChar {
+                font_idx,
+                trm: Matrix::new(b.x1 - b.x0, 0.0, 0.0, b.y0 - b.y1, b.x0, b.y1),
+                wmode: 0,
+            });
+            self.flush_actualtext(&text, 0, None);
+        }
+        self.pop_actualtext();
+        self.last = None;
+    }
+
+    // Content inside an ActualText widens its bounds
+    // (fz_stext_fill_path / stroke_path / fill_image / fill_image_mask /
+    // fill_shade); outside one these paint nothing into stext.
+    fn fill_path(&mut self, path: &Path, _rule: FillRule, ctm: Matrix, _c: [f32; 3], _a: f32, _clip: Option<Rect>) {
+        if !self.actualtext.is_empty() {
+            if let Some(r) = path_bounds(path, ctm, 0.0) {
+                self.actualtext_bounds(r);
+            }
+        }
+    }
+
+    fn stroke_path(&mut self, path: &Path, ctm: Matrix, line_width: f32, _c: [f32; 3], _a: f32, _clip: Option<Rect>) {
+        if !self.actualtext.is_empty() {
+            if let Some(r) = path_bounds(path, ctm, line_width * 0.5 * ctm.max_expansion()) {
+                self.actualtext_bounds(r);
+            }
+        }
+    }
+
+    fn draw_image(&mut self, _img: &DecodedImage, ctm: Matrix, _alpha: f32, _clip: Option<Rect>) {
+        if !self.actualtext.is_empty() {
+            self.actualtext_bounds(Rect::new(0.0, 0.0, 1.0, 1.0).transform(ctm));
+        }
+    }
+
+    fn draw_image_mask(&mut self, _img: &DecodedImage, ctm: Matrix, _c: [f32; 3], _a: f32, _clip: Option<Rect>) {
+        if !self.actualtext.is_empty() {
+            self.actualtext_bounds(Rect::new(0.0, 0.0, 1.0, 1.0).transform(ctm));
+        }
+    }
+
+    fn fill_shade(&mut self, shade: &super::shade::Shade, ctm: Matrix, _alpha: f32, _clip: Option<Rect>) {
+        if !self.actualtext.is_empty() {
+            self.actualtext_bounds(shade.bound(ctm));
+        }
+    }
+}
+
+// MuPDF: fz_bound_path (path.c), expanded by `pad` for a stroke.
+fn path_bounds(path: &Path, ctm: Matrix, pad: f32) -> Option<Rect> {
+    let mut r: Option<Rect> = None;
+    for poly in path.flatten(ctm) {
+        for p in poly {
+            r = Some(match r {
+                None => Rect::new(p.x, p.y, p.x, p.y),
+                Some(b) => Rect::new(b.x0.min(p.x), b.y0.min(p.y), b.x1.max(p.x), b.y1.max(p.y)),
+            });
+        }
+    }
+    r.map(|b| Rect::new(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad))
+}
+
+// fz_new_base14_font("Helvetica"), for an ActualText placed by content bounds
+// on a page that showed no text before it. Built once from a one-object
+// document, since `Font::load` resolves through one.
+fn helvetica() -> Option<Font> {
+    static FONT: std::sync::OnceLock<Option<Font>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        let body = b"%PDF-1.4\n1 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n";
+        let mut pdf = body.to_vec();
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        let doc = PdfDocument::open(pdf).ok()?;
+        let dict = doc.resolve(&Object::new_indirect(1, 0)).ok()?;
+        Font::load(&doc, &dict).ok()
+    })
+    .clone()
 }
 
 // MuPDF: vec_dot (stext-device.c:554).
