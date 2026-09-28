@@ -826,6 +826,19 @@ startxref
         }
     }
 
+    // MuPDF: pdf_xref_len (pdf-xref.c)
+    /// How many object-number slots the cross-reference table has
+    /// (`pdf_xref_len`) -- one past the highest object number any xref
+    /// section populated. Object `0` is always the free-list head, so the
+    /// live objects are somewhere in `1..xref_len()`.
+    ///
+    /// Added for the code-to-code harness (`examples/mupdf_oracle.rs`), which
+    /// walks every object exactly the way `mutool run`'s `countObjects()`
+    /// does, so the two sides compare the same object set lah.
+    pub fn xref_len(&self) -> usize {
+        self.entries.len()
+    }
+
     // -----------------------------------------------------------------------
     // Page tree
     // -----------------------------------------------------------------------
