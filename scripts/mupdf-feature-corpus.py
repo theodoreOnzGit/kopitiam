@@ -289,6 +289,30 @@ FILES["tiling-pattern-2"] = pdf(
 /Pattern cs /C scn BT /F 70 Tf 10 120 Td (Wa) Tj ET""",
 )
 
+# 24. Image /Mask: a colour-key ARRAY on an 8-bit RGB image (white keyed
+# out) and on a 4-bit gray one (range 5..9), and an explicit stencil /Mask
+# STREAM -- all over a blue background that must show through. 0.4.1 drew
+# all three opaque.
+_ck_rgb = bytes([255, 255, 255, 255, 0, 0, 0, 255, 0, 255, 255, 255])  # 2x2
+_ck_g4 = bytes([0x05, 0x9F, 0xF7, 0x31])  # 4x2 at 4 bpc: 0,5,9,15 / 15,7,3,1
+_st_img = bytes([200, 30, 30] * 4)  # 2x2 red-ish
+_st_mask = bytes([0x40, 0x80])  # 2x2 at 1 bpc: row0 = 0 1, row1 = 1 0
+FILES["image-mask-keys"] = pdf(
+    [
+        stream(_ck_rgb, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                        b" /ColorSpace /DeviceRGB /Mask [250 255 250 255 250 255]"),
+        stream(_ck_g4, b" /Type /XObject /Subtype /Image /Width 4 /Height 2 /BitsPerComponent 4"
+                       b" /ColorSpace /DeviceGray /Mask [5 9]"),
+        stream(_st_img, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8"
+                        b" /ColorSpace /DeviceRGB /Mask 8 0 R"),
+        stream(_st_mask, b" /Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true"),
+    ],
+    resources=b"<< /XObject << /A 5 0 R /B 6 0 R /C 7 0 R >> >>",
+    content=b"0 0 1 rg 0 0 200 200 re f q 100 0 0 100 0 100 cm /A Do Q"
+            b" q 200 0 0 100 0 0 cm /B Do Q q 100 0 0 100 100 100 cm /C Do Q",
+)
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "feature-corpus")
     out.mkdir(parents=True, exist_ok=True)

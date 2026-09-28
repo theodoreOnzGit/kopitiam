@@ -931,3 +931,53 @@ fn self_referencing_tiling_pattern_terminates() {
     let pix = rasterize_page_native(&doc, 0, 72.0).expect("terminates and renders");
     assert_eq!(rgb_at(&pix, 25, 175), [0, 255, 0], "content before the pattern survives");
 }
+
+/// Image `/Mask`: a colour-key ARRAY (fz_mask_color_key, image.c:166 -- on
+/// the raw samples, so a 4-bit key range compares 4-bit values) and an
+/// explicit stencil `/Mask` STREAM (pdf-image.c:146, inverted 1-bit
+/// samples). 0.4.1 drew all three images opaque over the blue background.
+/// mutool -N -M 0: pixel-identical page; the probes below are its values.
+#[test]
+fn image_mask_colour_key_and_stencil_stream_let_the_background_through() {
+    let ck_rgb: &[u8] = &[255, 255, 255, 255, 0, 0, 0, 255, 0, 255, 255, 255];
+    let ck_g4: &[u8] = &[0x05, 0x9F, 0xF7, 0x31];
+    let st_img: Vec<u8> = [200u8, 30, 30].repeat(4);
+    let st_mask: &[u8] = &[0x40, 0x80];
+    let doc = raw_page(
+        "<< /XObject << /A 5 0 R /B 6 0 R /C 7 0 R >> >>",
+        b"0 0 1 rg 0 0 200 200 re f q 100 0 0 100 0 100 cm /A Do Q \
+q 200 0 0 100 0 0 cm /B Do Q q 100 0 0 100 100 100 cm /C Do Q",
+        vec![
+            raw_stream(
+                " /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceRGB \
+/Mask [250 255 250 255 250 255]",
+                ck_rgb,
+            ),
+            raw_stream(
+                " /Type /XObject /Subtype /Image /Width 4 /Height 2 /BitsPerComponent 4 /ColorSpace /DeviceGray /Mask [5 9]",
+                ck_g4,
+            ),
+            raw_stream(
+                " /Type /XObject /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Mask 8 0 R",
+                &st_img,
+            ),
+            raw_stream(" /Type /XObject /Subtype /Image /Width 2 /Height 2 /ImageMask true", st_mask),
+        ],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    let blue = [0u8, 0, 255];
+    for (p, want) in [
+        ((25u32, 25u32), blue),          // RGB white keyed out
+        ((75, 25), [255, 0, 0]),         // RGB red kept
+        ((75, 75), blue),                // RGB white keyed out
+        ((25, 150), [255, 255, 255]),    // gray 15 kept
+        ((75, 150), blue),               // gray 7 in [5, 9]: keyed
+        ((125, 150), [51, 51, 51]),      // gray 3 kept
+        ((125, 25), [200, 30, 30]),      // stencil bit 0: painted
+        ((175, 25), blue),               // stencil bit 1: masked out
+        ((125, 75), blue),
+        ((175, 75), [200, 30, 30]),
+    ] {
+        assert_eq!(rgb_at(&pix, p.0, p.1), want, "at {p:?}");
+    }
+}

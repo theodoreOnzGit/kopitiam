@@ -45,10 +45,16 @@
 //!
 //! ## What is deferred
 //!
-//! Separation/DeviceN/Lab image colorspaces return a clear
+//! ~~Separation/DeviceN/Lab image colorspaces return a clear
 //! [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported) error (never a
-//! panic). `/SMask` soft masks ARE applied (see [`DecodedImage::smask`]);
-//! colour-key `/Mask` arrays and stencil `/Mask` images are not.
+//! panic).~~ **CORRECTED 2026-09-28 (0.4.2)**: they go through their tint
+//! transform / Lab decode (`ColorKind::Via`). `/SMask` soft masks ARE applied
+//! (see [`DecodedImage::smask`]); ~~colour-key `/Mask` arrays and stencil
+//! `/Mask` images are not~~ **CORRECTED 2026-09-28 (0.4.2)**: both are
+//! applied too, as the same per-pixel alpha (`mask_color_key`,
+//! `decode_stencil_mask`). Still not handled: `/Matte` (pre-blended
+//! soft-mask colour), and colour keys on DCT/JPX images (MuPDF keys those
+//! after the codec; here only the raw-sample path is keyed).
 //! ~~`JPXDecode` and `JBIG2Decode` return Unsupported~~ -- **CORRECTED
 //! 2026-09-28 (0.4.2)**: both decode now; the code-to-code harness showed 211
 //! JPX figures blank on NUREG/CR-7289 before this.
@@ -291,8 +297,40 @@ fn decode_image(doc: &PdfDocument, dict: &Object, stream_ref: &Object) -> Result
     // carried (a JPX alpha channel).
     if let Some(m) = decode_smask(doc, dict) {
         img.smask = Some(m);
+    } else if let Some(m) = decode_stencil_mask(doc, dict) {
+        img.smask = Some(m);
     }
     Ok(img)
+}
+
+// MuPDF: pdf_load_image_imp (pdf-image.c:146-166) -- when /SMask is not a
+// dictionary, a `/Mask` STREAM is loaded the same way (forcemask: an image
+// mask, so bpc 1) and becomes image->mask, drawn through
+// fz_clip_image_mask. Its 1-bit samples are inverted on decode ("0=opaque
+// and 1=transparent", image.c:705) before /Decode applies, so the alpha is
+// the complement of the decoded stencil value.
+fn decode_stencil_mask(doc: &PdfDocument, dict: &Object) -> Option<SoftMask> {
+    if doc.resolve_get(dict, "SMask").is_ok_and(|o| o.is_dict()) {
+        return None;
+    }
+    let mask_ref = dict.dict_gets("Mask")?;
+    let mask_dict = doc.resolve(mask_ref).ok()?;
+    if !mask_dict.is_dict() {
+        return None;
+    }
+    let mut md = mask_dict.clone();
+    // forcemask: loaded as an image mask whatever its dict says.
+    md.dict_put("ImageMask", Object::Bool(true));
+    let decoded = decode_image_base(doc, &md, mask_ref).ok()?;
+    if decoded.width == 0 || decoded.height == 0 {
+        return None;
+    }
+    let n = decoded.components.max(1) as usize;
+    let alpha: Vec<u8> = decoded.pixels.iter().step_by(n).map(|v| 255 - v).collect();
+    if alpha.len() < decoded.width * decoded.height {
+        return None;
+    }
+    Some(SoftMask { width: decoded.width, height: decoded.height, alpha })
 }
 
 /// Decode an image's `/SMask` (§11.6.5.3) to per-pixel alpha.
@@ -488,14 +526,103 @@ fn decode_image_base_from(
         }
     }
     let decode = read_decode(doc, dict);
-    Ok(decode_samples(
-        width,
-        height,
-        bpc,
-        &cs,
-        decode.as_deref(),
-        &samples,
-    ))
+    let mut img = decode_samples(width, height, bpc, &cs, decode.as_deref(), &samples);
+    // Colour-key masking (`/Mask [min0 max0 ...]`) works on the RAW samples,
+    // before /Decode and palette lookup -- fz_mask_color_key runs on the
+    // unpacked tile in fz_decomp_image_from_stream (image.c:716). An image
+    // mask cannot carry one.
+    if !image_mask {
+        let indexed = matches!(
+            cs,
+            ColorKind::Indexed { .. } | ColorKind::Via(super::resources::ColorSpace::Indexed { .. })
+        );
+        if let Some(key) = color_key(doc, dict, cs.source_components()) {
+            if let Some(alpha) = mask_color_key(&samples, width, height, cs.source_components(), bpc, &key, indexed) {
+                img.smask = Some(SoftMask { width, height, alpha });
+            }
+        }
+    }
+    Ok(img)
+}
+
+// MuPDF: pdf_load_image_imp (pdf-image.c:168-180) -- a `/Mask` ARRAY is a
+// colour key: 2*n integers, or no key at all ("invalid value in color key
+// mask") if any entry is not an integer. Only consulted when /SMask is not a
+// dictionary.
+fn color_key(doc: &PdfDocument, dict: &Object, n: usize) -> Option<Vec<i64>> {
+    let smask = doc.resolve_get(dict, "SMask").unwrap_or(Object::Null);
+    if smask.is_dict() {
+        return None;
+    }
+    let mask = doc.resolve_get(dict, "Mask").unwrap_or(Object::Null);
+    if !mask.is_array() {
+        return None;
+    }
+    let mut key = Vec::with_capacity(2 * n);
+    for i in 0..2 * n {
+        let v = mask.array_get(i).and_then(|o| doc.resolve(o).ok()).unwrap_or(Object::Null);
+        if !v.is_int() {
+            return None;
+        }
+        key.push(v.to_int());
+    }
+    Some(key)
+}
+
+// MuPDF: fz_mask_color_key (image.c:166). Returns per-pixel alpha: 0 where
+// every component lies inside its [min, max] key range, 255 elsewhere.
+// The comparison is on MuPDF's 8-bit unpacked samples: sub-byte depths are
+// scaled up (both sides alike, so the raw values compare), 16-bit ones keep
+// the high byte, indexed images compare raw indices.
+fn mask_color_key(samples: &[u8], w: usize, h: usize, n: usize, bpc: u32, key_in: &[i64], indexed: bool) -> Option<Vec<u8>> {
+    let max: i64 = (1i64 << bpc) - 1;
+    let shift = if !indexed && bpc == 16 { 8 } else { 0 };
+    let mut key = key_in.to_vec();
+    for (k, v) in key.iter_mut().enumerate() {
+        if *v > max {
+            if indexed && bpc == 1 {
+                // "first color key masking value out of range in 1bpc indexed
+                // image, ignoring color key masking" / "later ... assumed 1"
+                if k == 0 {
+                    return None;
+                }
+                *v = 1;
+            } else if bpc != 1 {
+                *v &= max; // "masking to valid range"
+            }
+        }
+        *v = (*v).clamp(0, max) >> shift;
+    }
+    let stride = (w * n * bpc as usize).div_ceil(8);
+    let sample = |row: usize, idx: usize| -> i64 {
+        let bit = idx * bpc as usize;
+        let base = row * stride;
+        let v = match bpc {
+            8 => *samples.get(base + idx).unwrap_or(&0) as i64,
+            16 => {
+                let o = base + idx * 2;
+                ((*samples.get(o).unwrap_or(&0) as i64) << 8) | *samples.get(o + 1).unwrap_or(&0) as i64
+            }
+            _ => {
+                let byte = *samples.get(base + bit / 8).unwrap_or(&0) as i64;
+                (byte >> (8 - bpc as usize - bit % 8)) & max
+            }
+        };
+        v >> shift
+    };
+    let mut alpha = vec![255u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let inside = (0..n).all(|k| {
+                let v = sample(y, x * n + k);
+                v >= key[2 * k] && v <= key[2 * k + 1]
+            });
+            if inside {
+                alpha[y * w + x] = 0;
+            }
+        }
+    }
+    Some(alpha)
 }
 
 // MuPDF: pdf_load_jpx_as_compressed_image (pdf-image.c:283) + jpx_read_image
