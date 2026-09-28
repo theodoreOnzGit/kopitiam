@@ -141,6 +141,10 @@ pub(crate) struct GState {
     /// The stroke alpha (`/CA` via `gs`), 0..=1. Default 1.
     // MuPDF: pdf_gstate.stroke.alpha (pdf_run_gs_CA).
     pub stroke_alpha: f32,
+    /// How many device clips are pushed in total at this state -- MuPDF's
+    /// cumulative `pdf_gstate.clip_depth`: `q` copies it, `Q` pops the
+    /// difference between the popped and the restored state.
+    pub clip_depth: u32,
     /// The current rectangular clip (`W`/`W*`), in device space *before* the
     /// device's own output transform. `None` = unclipped. Non-rect clips are
     /// bbox-approximated (see [`Processor::end_path`]).
@@ -162,6 +166,7 @@ impl GState {
             stroke_style: super::draw_path::StrokeStyle::default(),
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
+            clip_depth: 0,
             clip: None,
         }
     }
@@ -288,6 +293,13 @@ pub struct Processor<'a, D: TextDevice + ?Sized> {
     /// A pending clip requested by `W`/`W*`; applied (with its winding rule) by the
     /// next path-painting operator (MuPDF's `csi->clip` / `clip_even_odd`).
     pub(crate) pending_clip: Option<FillRule>,
+    /// The lowest `gstack` index `Q` may pop to (MuPDF's `pr->gbot`): a Form
+    /// XObject raises it so a stray `Q` inside the form cannot pop the
+    /// caller's state.
+    pub(crate) gbot: usize,
+    /// Glyphs shown in a clipping render mode (4..=7) since the last `ET`
+    /// (MuPDF's `pdf_tos.clip_text`), turned into a clip at `ET`.
+    pub(crate) text_clip: Vec<super::text_device::ClipGlyph>,
 }
 
 impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
@@ -312,6 +324,8 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
             cur: Point::new(0.0, 0.0),
             subpath_start: Point::new(0.0, 0.0),
             pending_clip: None,
+            gbot: 0,
+            text_clip: Vec::new(),
         }
     }
 
@@ -405,7 +419,10 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
 
             // -- text objects ----------------------------------------------
             b"BT" => self.op_bt(),
-            b"ET" => { /* pdf_flush_text: nothing buffered in this port */ }
+            // MuPDF pdf_run_ET: pdf_flush_text + pdf_flush_clip_text -- the
+            // glyphs shown in modes 4..=7 become one clip, counted in the
+            // gstate's clip_depth so the enclosing Q pops it.
+            b"ET" => self.flush_clip_text(),
 
             // -- text state ------------------------------------------------
             b"Tc" => self.gstate_mut().text.char_space = s(0),
@@ -532,6 +549,32 @@ impl<'a, D: TextDevice + ?Sized> Processor<'a, D> {
     }
 
     // MuPDF: pdf_run_BT (pdf-op-run.c:2929) -- reset Tm and Tlm to identity.
+    // MuPDF: pdf_flush_clip_text -> pdf_flush_text_imp(flush_clip = 1)'s
+    // `doclip` branch (pdf-op-run.c:1266).
+    pub(crate) fn flush_clip_text(&mut self) {
+        if self.text_clip.is_empty() {
+            return;
+        }
+        let glyphs = std::mem::take(&mut self.text_clip);
+        self.dev.clip_text(&glyphs);
+        self.gstate_mut().clip_depth += 1;
+    }
+
+    /// Pop every graphics state and every clip still open at the end of a
+    /// content stream (MuPDF's pdf_close_run_processor).
+    pub(crate) fn finish(&mut self) {
+        self.flush_clip_text();
+        self.gbot = 0;
+        while self.gstack.len() > 1 {
+            self.op_q_restore();
+        }
+        let depth = self.gstate().clip_depth;
+        for _ in 0..depth {
+            self.dev.pop_clip();
+        }
+        self.gstate_mut().clip_depth = 0;
+    }
+
     fn op_bt(&mut self) {
         self.tos.tm = Matrix::IDENTITY;
         self.tos.tlm = Matrix::IDENTITY;

@@ -304,3 +304,39 @@ intersect-with-MediaBox rule.
 | `encrypted-rc4-gen1.pdf` (MuPDF-encrypted fixture) | blank page | red square, as mutool |
 
 Tests: 4 new, all fail on the pre-fix tree.
+
+### Tranche 6 (clipping) -- measured 2026-09-28
+
+The interpreter used to reduce every `W`/`W*` clip to its bounding box
+(`TODO(draw)`) and knew no other kind of clip. Now, as MuPDF:
+
+1. **Clip paths** go to the device as the exact outline + winding rule
+   (`fz_clip_path`); the draw device keeps MuPDF's scissor-for-rectangles
+   early-out and otherwise rasterizes a coverage mask
+   (`fz_convert_rasterizer` into `state[1].mask`), nested clips multiplying.
+   Every paint -- fills, strokes, glyphs, images, stencils -- honours it.
+2. **Text clip** (render modes 4..=7): glyphs accumulate
+   (`pdf_tos_accumulate_clip`) and become one clip at `ET`
+   (`pdf_flush_clip_text`).
+3. **`clip_depth`**: `Q` pops exactly the clips pushed since its `q`
+   (MuPDF's cumulative `pdf_gstate.clip_depth`); the end of a content stream
+   unwinds everything (`pdf_close_run_processor`).
+4. **Form XObjects** are clipped to their `/BBox` and run with `gbot` raised,
+   so a stray `Q` in a form can no longer pop its caller's graphics state
+   (`pdf_run_xobject`, "gstate underflow in content stream").
+
+| feature file | gross % before -> after | mean \|Δluma\| after |
+|---|---|---|
+| clip-path (circle) | 13.67 -> **0.00** | 0.04 |
+| form-bbox | 75.00 -> **0.00** | 0.00 |
+| text-render-modes (stroke, fill+stroke, clip) | 32.98 -> **1.83** | 5.62 |
+
+The text-render-modes residual is glyph *shape*: the non-embedded
+`Helvetica-Bold` is drawn from our bundled standard-14 substitute and MuPDF
+draws its own Nimbus Sans, so a few outline pixels differ at 48 pt (see the
+diff image recipe with `--dump`). That is font substitution
+(substituted-by-design), not clipping. The open corpus is unchanged: all 1368
+pages still inside 1 %.
+
+Tests: 4 new (circle clip, Form /BBox, `7 Tr` clip, stray `Q` in a form),
+all fail on the pre-fix tree.

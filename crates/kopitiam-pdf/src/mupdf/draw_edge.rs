@@ -188,10 +188,80 @@ pub fn fill_polygons(
     alpha: f32,
     clip: IRect,
 ) {
+    fill_polygons_masked(pix, subpaths, rule, color, alpha, clip, None);
+}
+
+// MuPDF: fz_draw_clip_path (draw-device.c:842) -- the non-rectangular case,
+// fz_convert_rasterizer into a one-channel `state[1].mask`.
+/// Rasterize `subpaths` into a device-space coverage mask (0..=255 per
+/// pixel) over `clip ∩ bounds`, for a clip path. Pixels outside the mask's
+/// bbox are 0 (fully clipped), as outside MuPDF's mask pixmap.
+pub fn coverage_mask(
+    subpaths: &[Vec<Point>],
+    rule: FillRule,
+    clip: IRect,
+    page: IRect,
+) -> super::draw_affine::DevMask {
+    let mut tmp = Pixmap::new(1, 1, 1, false);
+    tmp.x = page.x0;
+    tmp.y = page.y0;
+    tmp.w = (page.x1 - page.x0).max(0) as u32;
+    tmp.h = (page.y1 - page.y0).max(0) as u32;
+    let bounds = fill_bounds(subpaths, &tmp, clip);
+    let w = bounds.width().max(0) as usize;
+    let h = (bounds.y1 - bounds.y0).max(0) as usize;
+    let mut data = vec![0u8; w * h];
+    if w > 0 && h > 0 {
+        rasterize(subpaths, rule, bounds, |x, y, c| {
+            data[(y - bounds.y0) as usize * w + (x - bounds.x0) as usize] =
+                (c.min(1.0) * 255.0 + 0.5) as u8;
+        });
+    }
+    super::draw_affine::DevMask { bbox: bounds, data }
+}
+
+/// Like [`fill_polygons`], with every pixel's coverage further multiplied by
+/// a device clip `mask` (MuPDF paints into a clip layer and blends it back
+/// through the mask at `fz_pop_clip`; per-paint masking is the same result
+/// wherever the mask is 0 or 255, and differs only in rounding on its
+/// anti-aliased edge).
+pub fn fill_polygons_masked(
+    pix: &mut Pixmap,
+    subpaths: &[Vec<Point>],
+    rule: FillRule,
+    color: &[u8],
+    alpha: f32,
+    clip: IRect,
+    mask: Option<&super::draw_affine::DevMask>,
+) {
     if alpha <= 0.0 {
         return;
     }
+    let clip = match mask {
+        Some(m) => clip.intersect(m.bbox),
+        None => clip,
+    };
     let bounds = fill_bounds(subpaths, pix, clip);
+    if bounds.is_empty() {
+        return;
+    }
+    let mut hits: Vec<(i32, i32, f32)> = Vec::new();
+    rasterize(subpaths, rule, bounds, |x, y, c| hits.push((x, y, c)));
+    for (x, y, c) in hits {
+        let m = mask.map_or(1.0, |m| m.at(x, y) as f32 / 255.0);
+        let a = c.min(1.0) * alpha * m;
+        if a <= 0.0 {
+            continue;
+        }
+        if let Some(o) = pix.offset(x, y) {
+            composite(pix, o, color, a);
+        }
+    }
+}
+
+/// The scan converter proper: calls `emit(x, y, coverage)` for every pixel of
+/// `bounds` with non-zero coverage.
+fn rasterize(subpaths: &[Vec<Point>], rule: FillRule, bounds: IRect, mut emit: impl FnMut(i32, i32, f32)) {
     if bounds.is_empty() {
         return;
     }
@@ -199,21 +269,15 @@ pub fn fill_polygons(
     if edges.is_empty() {
         return;
     }
-
     let x0 = bounds.x0;
     let width = bounds.width() as usize;
     let inv_ss = 1.0 / SUBSAMPLES as f32;
-
     let mut cov = vec![0.0f32; width];
     let mut xs: Vec<(f32, i32)> = Vec::new();
-
     for py in bounds.y0..bounds.y1 {
         cov.iter_mut().for_each(|c| *c = 0.0);
-
         for s in 0..SUBSAMPLES {
             let sy = py as f32 + (s as f32 + 0.5) * inv_ss;
-
-            // Collect this sub-scanline's crossings with the active edges.
             xs.clear();
             for e in &edges {
                 if sy >= e.ytop && sy < e.ybot {
@@ -225,17 +289,11 @@ pub fn fill_polygons(
                 continue;
             }
             xs.sort_by(|p, q| p.0.total_cmp(&q.0));
-
-            // Walk the sorted crossings, applying the winding rule to mark the
-            // inside spans, and accumulate their coverage.
             let mut winding = 0i32;
             for i in 0..xs.len() - 1 {
                 winding += xs[i].1;
                 let inside = match rule {
                     FillRule::NonZero => winding != 0,
-                    // even-odd: the i-th gap is inside when an odd number of
-                    // edges lie to its left (i.e. i is even after 0-indexing the
-                    // gap that opens at crossing i).
                     FillRule::EvenOdd => (i & 1) == 0,
                 };
                 if inside {
@@ -243,18 +301,9 @@ pub fn fill_polygons(
                 }
             }
         }
-
-        // Composite the accumulated coverage row.
         for (i, &c) in cov.iter().enumerate() {
-            if c <= 0.0 {
-                continue;
-            }
-            let a = (c.min(1.0)) * alpha;
-            if a <= 0.0 {
-                continue;
-            }
-            if let Some(o) = pix.offset(x0 + i as i32, py) {
-                composite(pix, o, color, a);
+            if c > 0.0 {
+                emit(x0 + i as i32, py, c);
             }
         }
     }

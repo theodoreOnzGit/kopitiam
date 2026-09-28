@@ -41,7 +41,7 @@
 //!   **CORRECTED 2026-09-28** (checked against `show_glyph`): the sink gets
 //!   the mode through [`TextDevice::set_text_render_mode`] since 0.4.1 and
 //!   paints only the fill modes 0/2/4/6; 1/2/5/6 are stroked through
-//!   `stroke_glyph` (0.4.2). Clip modes 4..=7 do not clip yet.
+//!   `stroke_glyph` (0.4.2). Clip modes 4..=7 clip at `ET` (0.4.2).
 //! * **Colour.** The content interpreter now emits colour operators (`g/rg/k`,
 //!   `cs/sc/scn`), tracked in the graphics state and converted to DeviceRGB
 //!   ([`resources`](super::resources)); fills/strokes and glyph boxes pick up the
@@ -49,14 +49,16 @@
 //!   [`ColorSpace`](super::resources)); ICCBased maps by component count.
 //! * **Not implemented at all** (safe no-ops / skips, never corruption): mesh &
 //!   gradient shadings (`draw-mesh.c`), blend modes beyond Normal
-//!   (`draw-blend.c`), soft masks, clip masks beyond a rectangular clip,
-//!   knockout / transparency groups. ~~Image blitting is **nearest-neighbour**
-//!   (no bilinear/mip smoothing)~~ -- **CORRECTED 2026-09-28 (0.4.2)**: images
-//!   go through MuPDF's subsample + smooth-scale + near/lerp paint pipeline
-//!   (`draw_scale`, `draw_affine`); they still honour only a rectangular clip.
+//!   (`draw-blend.c`), soft masks in the graphics state, knockout /
+//!   transparency groups. ~~clip masks beyond a rectangular clip~~ and
+//!   ~~Image blitting is **nearest-neighbour** (no bilinear/mip smoothing)~~
+//!   -- **CORRECTED 2026-09-28 (0.4.2)**: images go through MuPDF's subsample
+//!   + smooth-scale + near/lerp paint pipeline (`draw_scale`, `draw_affine`),
+//!   and clip paths / text clips / Form `/BBox` push real coverage masks
+//!   (`clip_path`, `clip_text`, `pop_clip`) that every paint honours.
 
 use super::draw_affine;
-use super::draw_edge::{FillRule, fill_polygons};
+use super::draw_edge::{FillRule, coverage_mask, fill_polygons_masked};
 use super::draw_scale::{self, ScalePix};
 use super::draw_path::Path;
 use super::font::Font;
@@ -94,6 +96,12 @@ pub struct DrawDevice {
     text_render_mode: i32,
     /// The current fill alpha for text (`/ca`), 0..=1.
     fill_alpha: f32,
+    /// The current non-rectangular clip, when one is active: MuPDF's
+    /// `state->mask` (draw-device.c `fz_draw_clip_path`). `clip` above is the
+    /// matching scissor (`state->scissor`).
+    mask: Option<std::sync::Arc<super::draw_affine::DevMask>>,
+    /// Saved `(clip, mask)` per pushed clip: MuPDF's draw-device state stack.
+    clip_stack: Vec<(IRect, Option<std::sync::Arc<super::draw_affine::DevMask>>)>,
 }
 
 impl DrawDevice {
@@ -111,6 +119,8 @@ impl DrawDevice {
             fallback_glyphs: 0,
             text_render_mode: 0,
             fill_alpha: 1.0,
+            mask: None,
+            clip_stack: Vec::new(),
         }
     }
 
@@ -138,6 +148,8 @@ impl DrawDevice {
             fallback_glyphs: 0,
             text_render_mode: 0,
             fill_alpha: 1.0,
+            mask: None,
+            clip_stack: Vec::new(),
         }
     }
 
@@ -191,7 +203,7 @@ impl DrawDevice {
         let m = ctm.concat(self.base);
         let polys = path.flatten(m);
         let c = rgb_to_bytes(color);
-        fill_polygons(&mut self.pix, &polys, rule, &c, alpha, clip);
+        fill_polygons_masked(&mut self.pix, &polys, rule, &c, alpha, clip, self.mask.as_deref());
     }
 
     // MuPDF: fz_draw_stroke_path (draw-device.c:766).
@@ -225,7 +237,23 @@ impl DrawDevice {
         let dev_w = line_width * m.max_expansion();
         let polys = path.stroke_to_polygons(m, dev_w);
         let c = rgb_to_bytes(color);
-        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, clip);
+        fill_polygons_masked(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, clip, self.mask.as_deref());
+    }
+
+    /// Push a clip made of device-space `polys` (MuPDF's push_stack + the
+    /// scissor/mask computation of fz_draw_clip_path).
+    fn push_clip_polys(&mut self, polys: &[Vec<super::geometry::Point>], rule: FillRule) {
+        self.clip_stack.push((self.clip, self.mask.clone()));
+        if let Some(r) = axis_aligned_rect(polys) {
+            self.clip = self.clip.intersect(r.irect_from_rect());
+            return;
+        }
+        let mut m = coverage_mask(polys, rule, self.clip, self.pix.bbox());
+        if let Some(outer) = self.mask.as_deref() {
+            m = m.intersect(outer);
+        }
+        self.clip = self.clip.intersect(m.bbox);
+        self.mask = Some(std::sync::Arc::new(m));
     }
 
     /// Resolve an optional content-space (pre-`base`) rectangular clip against the
@@ -310,6 +338,14 @@ impl DrawDevice {
             // A mask that scales to nothing covers nothing.
             return;
         }
+        // Fold in the active clip mask, if any (the smask and the clip both
+        // multiply the paint; see draw_affine's module docs).
+        let mask = match (mask, self.mask.as_deref()) {
+            (Some(m), Some(c)) => Some(m.intersect(c)),
+            (Some(m), None) => Some(m),
+            (None, Some(c)) => Some(c.clone()),
+            (None, None) => None,
+        };
 
         draw_affine::paint_image(
             &mut self.pix,
@@ -441,13 +477,14 @@ impl TextDevice for DrawDevice {
             // Nonzero winding: a glyph's counter (the hole in 'o'/'A') is wound
             // opposite its outer contour, so nonzero leaves it unfilled -- the
             // interior white that distinguishes a real letterform from the box.
-            fill_polygons(
+            fill_polygons_masked(
                 &mut self.pix,
                 &polys,
                 FillRule::NonZero,
                 &self.fill,
                 self.fill_alpha,
                 self.clip,
+                self.mask.as_deref(),
             );
             return;
         }
@@ -465,13 +502,14 @@ impl TextDevice for DrawDevice {
         path.rect(x0, 0.0, x1, asc);
 
         let polys = path.flatten(m);
-        fill_polygons(
+        fill_polygons_masked(
             &mut self.pix,
             &polys,
             FillRule::NonZero,
             &self.fill,
             self.fill_alpha,
             self.clip,
+            self.mask.as_deref(),
         );
     }
 
@@ -551,6 +589,7 @@ impl TextDevice for DrawDevice {
             (alpha * 255.0) as i32,
             true,
             false,
+            self.mask.as_deref(),
         );
     }
 
@@ -560,6 +599,36 @@ impl TextDevice for DrawDevice {
 
     fn set_fill_alpha(&mut self, alpha: f32) {
         self.fill_alpha = alpha;
+    }
+
+    // MuPDF: fz_draw_clip_path (draw-device.c:842). A path that flattens to an
+    // axis-aligned rectangle only narrows the scissor (MuPDF's "rect
+    // rasterizer" early-out); anything else becomes a coverage mask, nested
+    // clips multiplying.
+    fn clip_path(&mut self, path: &Path, rule: FillRule, ctm: Matrix) {
+        let m = ctm.concat(self.base);
+        let polys = path.flatten(m);
+        self.push_clip_polys(&polys, rule);
+    }
+
+    // MuPDF: fz_draw_clip_text (draw-device.c) -- the union of the glyph
+    // outlines becomes the clip.
+    fn clip_text(&mut self, glyphs: &[super::text_device::ClipGlyph]) {
+        let mut polys = Vec::new();
+        for g in glyphs {
+            if let Some(outline) = g.font.glyph_outline(g.cid) {
+                polys.extend(outline.flatten(g.trm.concat(self.base)));
+            }
+        }
+        self.push_clip_polys(&polys, FillRule::NonZero);
+    }
+
+    // MuPDF: fz_draw_pop_clip (draw-device.c).
+    fn pop_clip(&mut self) {
+        if let Some((clip, mask)) = self.clip_stack.pop() {
+            self.clip = clip;
+            self.mask = mask;
+        }
     }
 
     // MuPDF: fz_draw_stroke_path_aux (draw-device.c:746) with the whole
@@ -577,7 +646,7 @@ impl TextDevice for DrawDevice {
         let m = ctm.concat(self.base);
         let polys = stroke_polygons(path, m, style);
         let c = rgb_to_bytes(color);
-        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, ic);
+        fill_polygons_masked(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, ic, self.mask.as_deref());
     }
 
     fn stroke_glyph(
@@ -601,7 +670,7 @@ impl TextDevice for DrawDevice {
         let user_path = outline.transformed(em_to_user);
         let polys = stroke_polygons(&user_path, user, style);
         let c = rgb_to_bytes(color);
-        fill_polygons(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, self.clip);
+        fill_polygons_masked(&mut self.pix, &polys, FillRule::NonZero, &c, alpha, self.clip, self.mask.as_deref());
     }
 }
 
@@ -1237,4 +1306,25 @@ mod tests {
             (0..pix.h as i32).any(|y| (0..pix.w as i32).any(|x| pix.luma(x, y).unwrap() < 100));
         assert!(any_dark, "advance-box fallback should still paint text");
     }
+}
+
+/// If `polys` is exactly one axis-aligned rectangle, its bounds.
+fn axis_aligned_rect(polys: &[Vec<super::geometry::Point>]) -> Option<Rect> {
+    let [poly] = polys else { return None };
+    let mut pts: Vec<_> = poly.clone();
+    if pts.len() == 5 && pts[0].x == pts[4].x && pts[0].y == pts[4].y {
+        pts.pop();
+    }
+    if pts.len() != 4 {
+        return None;
+    }
+    let xs: Vec<f32> = pts.iter().map(|p| p.x).collect();
+    let ys: Vec<f32> = pts.iter().map(|p| p.y).collect();
+    let (x0, x1) = (xs.iter().cloned().fold(f32::INFINITY, f32::min), xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    let (y0, y1) = (ys.iter().cloned().fold(f32::INFINITY, f32::min), ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    let on_edge = |p: &super::geometry::Point| (p.x == x0 || p.x == x1) && (p.y == y0 || p.y == y1);
+    // Every corner of the box present, every vertex a corner.
+    let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+    let all = corners.iter().all(|&(cx, cy)| pts.iter().any(|p| p.x == cx && p.y == cy));
+    (all && pts.iter().all(on_edge)).then(|| Rect::new(x0, y0, x1, y1))
 }

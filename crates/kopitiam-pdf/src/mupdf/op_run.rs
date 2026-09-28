@@ -53,11 +53,17 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         self.gstack.push(top);
     }
 
-    // MuPDF: pdf_run_Q + pdf_grestore (pdf-op-run.c:2772) -- pop, never below the
-    // base gstate (MuPDF's pdf_grestore clamps gtop at gbot / 0).
+    // MuPDF: pdf_run_Q + pdf_grestore (pdf-op-run.c:667) -- pop, never below
+    // `gbot` ("gstate underflow in content stream"), and pop every device clip
+    // pushed since the matching `q` (the clip_depth difference).
     pub(crate) fn op_q_restore(&mut self) {
-        if self.gstack.len() > 1 {
-            self.gstack.pop();
+        if self.gstack.len() <= self.gbot + 1 {
+            return;
+        }
+        let popped = self.gstack.pop().expect("len > gbot + 1 >= 1");
+        let restored = self.gstate().clip_depth;
+        for _ in restored..popped.clip_depth {
+            self.dev.pop_clip();
         }
     }
 
@@ -171,6 +177,15 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             let font: &Font = self.gstack.last().unwrap().text.font.as_ref().unwrap();
             self.dev
                 .show_glyph(font, trm_dev, adv_em, unicode, cid, wmode as u8);
+            // MuPDF pdf_show_char: modes 4..=7 also add the glyph to the clip
+            // accumulator (pdf_tos_accumulate_clip), flushed at ET.
+            if render_mode & 4 != 0 {
+                self.text_clip.push(super::text_device::ClipGlyph {
+                    font: font.clone(),
+                    trm: trm_dev,
+                    cid,
+                });
+            }
             // MuPDF pdf_flush_text_imp: modes 1, 2, 5, 6 also `dostroke` --
             // the glyph outline stroked with the stroke colour, alpha and
             // line state (fz_stroke_text).
@@ -405,12 +420,15 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
     // MuPDF: the tail of every path-painting operator -- apply a pending clip then
     // reset the current path (pdf_process_end_path / pdf_clear_path).
     fn end_path(&mut self) {
-        if self.pending_clip.take().is_some() {
-            // TODO(draw): honour the true (non-rectangular) clip outline. Here the
-            // running clip is intersected with the clip path's device-space bounding
-            // box -- exact for the common `... re W n` rectangular clip, a
-            // conservative over-approximation otherwise (never clips too much).
+        if let Some(rule) = self.pending_clip.take() {
+            // MuPDF pdf_show_path's clip branch: fz_clip_path with the exact
+            // outline + winding rule, clip_depth++ (pdf-op-run.c:1093). The
+            // device honours the true shape since 0.4.2 (was a TODO(draw)).
             let ctm = self.gstate().ctm;
+            self.dev.clip_path(&self.path, rule, ctm);
+            self.gstate_mut().clip_depth += 1;
+            // The bbox is also kept on the gstate for sinks that only want a
+            // rectangle: exact for `re W n`, conservative otherwise.
             if let Some(bbox) = path_device_bounds(&self.path, ctm) {
                 let g = self.gstate_mut();
                 g.clip = Some(match g.clip {

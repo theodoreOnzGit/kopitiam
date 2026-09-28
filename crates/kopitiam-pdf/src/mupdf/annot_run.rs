@@ -281,7 +281,11 @@ fn paint_one_annot<D: TextDevice + ?Sized>(
     };
 
     let mut proc = super::interpret::Processor::new(doc, dev, final_ctm, resources);
-    proc.run_stream(&appearance.content)
+    let result = proc.run_stream(&appearance.content);
+    // Pop whatever clips/gstates the appearance left open, so they cannot
+    // leak into the next annotation (pdf_close_run_processor).
+    proc.finish();
+    result
 }
 
 // ---------------------------------------------------------------------------

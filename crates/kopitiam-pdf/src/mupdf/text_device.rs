@@ -40,6 +40,19 @@ use super::font::Font;
 use super::geometry::{Matrix, Rect};
 use super::page_image::DecodedImage;
 
+/// One glyph of a text clip (render modes 4-7): its font, device-space
+/// text-rendering matrix and CID -- enough to fetch and place its outline.
+// MuPDF: an fz_text item accumulated in pdf_tos.clip_text.
+#[derive(Clone, Debug)]
+pub struct ClipGlyph {
+    /// The glyph's font.
+    pub font: Font,
+    /// Glyph space -> device space (as passed to `show_glyph`).
+    pub trm: Matrix,
+    /// The glyph's CID (what `Font::glyph_outline` takes).
+    pub cid: u32,
+}
+
 /// The sink the content-stream interpreter emits positioned glyphs to.
 ///
 /// This is the WAVE-5 seam the structured-text (`stext`) device will implement.
@@ -128,6 +141,25 @@ pub trait TextDevice {
         _clip: Option<Rect>,
     ) {
     }
+
+    // MuPDF: fz_clip_path (the `W`/`W*` + paint operator, a Form XObject's
+    // /BBox, the page CropBox).
+    /// Intersect the clip with `path` (path space, under `ctm`) filled with
+    /// `rule`, until the matching [`pop_clip`](TextDevice::pop_clip). The
+    /// interpreter keeps the `clip: Option<Rect>` bbox argument of the other
+    /// calls for sinks that only want a rectangle; a painting device should
+    /// honour this exact shape. Default no-op.
+    fn clip_path(&mut self, _path: &Path, _rule: FillRule, _ctm: Matrix) {}
+
+    // MuPDF: fz_clip_text (render modes 4-7, flushed at ET).
+    /// Intersect the clip with the union of these glyph outlines, until the
+    /// matching [`pop_clip`](TextDevice::pop_clip). Default no-op.
+    fn clip_text(&mut self, _glyphs: &[ClipGlyph]) {}
+
+    // MuPDF: fz_pop_clip.
+    /// Undo the most recent [`clip_path`](TextDevice::clip_path) /
+    /// [`clip_text`](TextDevice::clip_text). Default no-op.
+    fn pop_clip(&mut self) {}
 
     // MuPDF: the fill material of pdf_gstate carried into fz_fill_text.
     /// Set the current fill colour (DeviceRGB 0..=1). Used so the placeholder glyph

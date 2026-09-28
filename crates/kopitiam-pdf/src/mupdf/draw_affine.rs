@@ -59,13 +59,37 @@ fn bilerp(a: i32, b: i32, c: i32, d: i32, uf: i32, vf: i32) -> i32 {
 
 /// A device-space coverage mask (one byte per device pixel), the kopitiam
 /// stand-in for MuPDF's image-mask clip layer. Pixels outside it are 0.
+#[derive(Clone, Debug)]
 pub struct DevMask {
     pub bbox: IRect,
     pub data: Vec<u8>,
 }
 
 impl DevMask {
-    fn at(&self, x: i32, y: i32) -> i32 {
+    /// A mask covering `bbox` fully (every pixel 255).
+    pub fn full(bbox: IRect) -> DevMask {
+        let n = ((bbox.x1 - bbox.x0).max(0) * (bbox.y1 - bbox.y0).max(0)) as usize;
+        DevMask { bbox, data: vec![255; n] }
+    }
+
+    // MuPDF: nested clip masks multiply (each clip layer is painted through
+    // its own mask into the layer below, fz_paint_pixmap_with_mask).
+    /// The pixel-wise product of two masks, over their common bbox.
+    pub fn intersect(&self, other: &DevMask) -> DevMask {
+        let bbox = self.bbox.intersect(other.bbox);
+        let w = (bbox.x1 - bbox.x0).max(0);
+        let h = (bbox.y1 - bbox.y0).max(0);
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for y in bbox.y0..bbox.y0 + h {
+            for x in bbox.x0..bbox.x0 + w {
+                data.push(mul255(self.at(x, y), other.at(x, y)) as u8);
+            }
+        }
+        DevMask { bbox, data }
+    }
+
+    /// Coverage 0..=255 at device pixel `(x, y)`; 0 outside the bbox.
+    pub(crate) fn at(&self, x: i32, y: i32) -> i32 {
         if x < self.bbox.x0 || y < self.bbox.y0 || x >= self.bbox.x1 || y >= self.bbox.y1 {
             return 0;
         }
@@ -342,6 +366,7 @@ pub fn paint_image_color(
     alpha: i32,
     lerp_allowed: bool,
     interpolate: bool,
+    clip_mask: Option<&DevMask>,
 ) {
     if alpha == 0 || mask.w <= 0 || mask.h <= 0 {
         return;
@@ -381,6 +406,10 @@ pub fn paint_image_color(
                 (ui >= 0 && ui < sw && vi >= 0 && vi < sh).then(|| sp[vi as usize * ss + ui as usize] as i32)
             };
             if let Some(ma) = ma {
+                let alpha = match clip_mask {
+                    Some(cm) => mul255(cm.at(px, py), alpha),
+                    None => alpha,
+                };
                 let masa = fz_combine(fz_expand(ma), alpha);
                 if masa != 0 {
                     let o = dst.offset(px, py).expect("bbox is inside dst");

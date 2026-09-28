@@ -31,6 +31,8 @@
 //! positions. `UserUnit` is treated as 1, and only the MediaBox is used for the
 //! base CTM (CropBox/ArtBox/etc. box selection is deferred).
 
+use super::draw_edge::FillRule;
+use super::draw_path::Path;
 use super::geometry::Matrix;
 use super::interpret::Processor;
 use super::object::Object;
@@ -70,7 +72,10 @@ pub fn run_page_dict<D: TextDevice + ?Sized>(
     if let Some(clip) = crop_clip(doc, page, ctm) {
         proc.gstate_mut().clip = Some(clip);
     }
-    proc.run_stream(&contents)
+    let result = proc.run_stream(&contents);
+    // MuPDF pdf_close_run_processor: unwind every q and clip left open.
+    proc.finish();
+    result
 }
 
 /// The device-space CropBox clip MuPDF pushes before running a page whose
@@ -331,11 +336,32 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
             .resolve_get(&xobj, "Resources")
             .unwrap_or(Object::Null);
 
-        // gsave; ctm = matrix . ctm; push resources; run; restore.
+        // MuPDF pdf_run_xobject (pdf-op-run.c:2405): gsave; ctm = matrix·ctm;
+        // gsave again "so the clippath doesn't persist"; clip to /BBox; raise
+        // gbot so the form cannot pop its caller's state; run; unwind.
+        let oldtop = self.gstack.len();
         self.op_q();
         {
             let g = self.gstate_mut();
             g.ctm = matrix.concat(g.ctm);
+        }
+        self.op_q();
+        if let Some(bbox) = bbox_from(self.doc, &xobj) {
+            let mut clip = Path::new();
+            clip.move_to(bbox.x0, bbox.y0)
+                .line_to(bbox.x1, bbox.y0)
+                .line_to(bbox.x1, bbox.y1)
+                .line_to(bbox.x0, bbox.y1)
+                .close();
+            let ctm = self.gstate().ctm;
+            self.dev.clip_path(&clip, FillRule::NonZero, ctm);
+            let dev_box = bbox.transform(ctm);
+            let g = self.gstate_mut();
+            g.clip_depth += 1;
+            g.clip = Some(match g.clip {
+                Some(c) => c.intersect(dev_box),
+                None => dev_box,
+            });
         }
         let pushed = resources.is_dict();
         if pushed {
@@ -344,16 +370,27 @@ impl<D: TextDevice + ?Sized> Processor<'_, D> {
         if num != 0 {
             self.cycle.push(num);
         }
+        let oldbot = self.gbot;
+        self.gbot = self.gstack.len() - 1;
 
         let result = self.run_stream(&content);
 
+        // "Undo any gstate mismatches due to the pdf_process_contents call",
+        // including a text clip the form left pending at a missing ET.
+        self.flush_clip_text();
+        while self.gstack.len() - 1 > self.gbot {
+            self.op_q_restore();
+        }
+        self.gbot = oldbot;
         if num != 0 {
             self.cycle.pop();
         }
         if pushed {
             self.resources.pop();
         }
-        self.op_q_restore();
+        while self.gstack.len() > oldtop {
+            self.op_q_restore();
+        }
 
         result
     }
@@ -682,4 +719,21 @@ mod tests {
         assert!(approx(dev.glyphs[0].1, 10.0), "H.x = {}", dev.glyphs[0].1);
         assert!(approx(dev.glyphs[0].2, 180.0), "H.y = {}", dev.glyphs[0].2);
     }
+}
+
+// MuPDF: pdf_xobject_bbox (pdf-xobject.c) -> pdf_to_rect of /BBox.
+/// A Form XObject's `/BBox`, normalised, if it has a usable one.
+fn bbox_from(doc: &PdfDocument, xobj: &Object) -> Option<super::geometry::Rect> {
+    let arr = doc.resolve_get(xobj, "BBox").ok()?;
+    if arr.array_len() < 4 {
+        return None;
+    }
+    let v = |i: usize| -> f32 {
+        arr.array_get(i)
+            .and_then(|o| doc.resolve(o).ok())
+            .map(|o| o.to_real() as f32)
+            .unwrap_or(0.0)
+    };
+    let (a, b, c, d) = (v(0), v(1), v(2), v(3));
+    Some(super::geometry::Rect::new(a.min(c), b.min(d), a.max(c), b.max(d)))
 }

@@ -16,6 +16,8 @@
 //! * **Tranche 4 -- page boxes** (`pdf_page_obj_transform_box`: the CropBox
 //!   is the page).
 //! * **Tranche 5 -- stencils, inline images, encrypted streams**.
+//! * **Tranche 6 -- clipping** (`fz_clip_path` masks, text clip, Form
+//!   `/BBox`, `gbot`).
 
 use kopitiam_pdf::mupdf::structured_text::{StextBlock, StextChar, StextOptions};
 use kopitiam_pdf::mupdf::xref::PdfDocument;
@@ -564,4 +566,78 @@ fn encrypted_stream_uses_its_objects_generation() {
     let doc = PdfDocument::open(bytes).expect("opens");
     let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
     assert_eq!(rgb_at(&pix, 50, 50), [255, 0, 0]);
+}
+
+// ---------------------------------------------------------------------------
+// Tranche 6 -- clipping
+// ---------------------------------------------------------------------------
+
+/// A circular clip (four beziers) then a full-page fill: MuPDF masks the fill
+/// to the circle (fz_draw_clip_path's non-rectangular branch). 0.4.1 clipped
+/// to the circle's BOUNDING BOX, so the corners of that box came out red.
+/// mutool: (30,30) and (170,170) -- inside the box, outside the circle --
+/// white; centre red; (25,100) -- inside the circle's left edge -- red.
+#[test]
+fn non_rectangular_clip_masks_to_the_path() {
+    let k = 0.5523 * 80.0;
+    let circ = format!(
+        "100 180 m {a} 180 180 {a} 180 100 c 180 {b} {a} 20 100 20 c {b} 20 20 {b} 20 100 c 20 {a} {b} 180 100 180 c h",
+        a = 100.0 + k,
+        b = 100.0 - k
+    );
+    let doc = page_with("<< >>", &format!("q {circ} W n 1 0 0 rg 0 0 200 200 re f Q"), &[]);
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 30, 30), [255, 255, 255], "box corner outside the circle");
+    assert_eq!(rgb_at(&pix, 170, 170), [255, 255, 255], "box corner outside the circle");
+    assert_eq!(rgb_at(&pix, 100, 100), [255, 0, 0]);
+    assert_eq!(rgb_at(&pix, 25, 100), [255, 0, 0]);
+}
+
+/// A Form XObject is clipped to its /BBox (pdf_run_xobject). The form here
+/// paints red far outside its 100x100 box; mutool shows red only inside it.
+#[test]
+fn form_xobject_is_clipped_to_its_bbox() {
+    let doc = page_with(
+        "<< /XObject << /F 5 0 R >> >>",
+        "/F Do",
+        &["<< /Length 30 /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [1 0 0 1 50 50] >>\nstream\n1 0 0 rg -50 -50 300 300 re f\nendstream"],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 20, 20), [255, 255, 255]);
+    assert_eq!(rgb_at(&pix, 100, 100), [255, 0, 0]);
+    assert_eq!(rgb_at(&pix, 160, 160), [255, 255, 255]);
+}
+
+/// Text render mode 7 adds the glyphs to the clip (flushed at ET). The green
+/// fill that follows shows only through "II"; between and after the letters
+/// it is paper. 0.4.1 ignored the text clip and flooded the page green.
+#[test]
+fn text_render_mode_7_clips_to_the_glyphs() {
+    let doc = page_with(
+        "<< /Font << /F 5 0 R >> >>",
+        "q BT /F 100 Tf 7 Tr 10 50 Td (II) Tj ET 0 0.6 0 rg 0 0 200 200 re f Q",
+        &["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    // mutool row y = 120: green at x = 24 and 56 (the stems), white at 40
+    // (between them) and 120 (past the text).
+    assert_eq!(rgb_at(&pix, 24, 120)[1] > 100 && rgb_at(&pix, 24, 120)[0] < 100, true, "{:?}", rgb_at(&pix, 24, 120));
+    assert_eq!(rgb_at(&pix, 120, 120), [255, 255, 255]);
+    assert_eq!(rgb_at(&pix, 40, 120), [255, 255, 255]);
+}
+
+/// A stray `Q` inside a Form XObject must not pop the CALLER's graphics
+/// state (MuPDF raises gbot around the form: "gstate underflow"). The page
+/// sets a blue fill, runs a form whose content is just `Q Q Q`, then fills:
+/// mutool paints blue. 0.4.1 let the form pop the caller's `q` and painted
+/// in the default black.
+#[test]
+fn stray_q_in_a_form_cannot_pop_the_callers_state() {
+    let doc = page_with(
+        "<< /XObject << /F 5 0 R >> >>",
+        "q 0 0 1 rg /F Do 50 50 100 100 re f Q",
+        &["<< /Length 5 /Type /XObject /Subtype /Form /BBox [0 0 200 200] >>\nstream\nQ Q Q\nendstream"],
+    );
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!(rgb_at(&pix, 100, 100), [0, 0, 255]);
 }
