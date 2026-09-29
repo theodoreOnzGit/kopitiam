@@ -26,7 +26,12 @@
 //!
 //! * **DCTDecode (JPEG)** -- decoded by the pure-Rust `zune-jpeg` crate
 //!   (substituting MuPDF's `<jpeglib.h>`), which handles baseline and progressive
-//!   JPEG. Grayscale -> gray, YCbCr -> RGB, CMYK/YCCK -> RGB.
+//!   JPEG. Grayscale -> gray, YCbCr -> RGB, CMYK/YCCK -> RGB. ~~zune-jpeg's own
+//!   colour conversion~~ **CORRECTED 2026-09-29 (0.4.3, gh-116)**: zune-jpeg
+//!   now returns raw components only; the colour-space choice, YCbCr/YCCK
+//!   conversion and `/Decode` are ported from filter-dct.c / libjpeg /
+//!   `fz_decode_tile` in [`super::filter_dct`]. Before, zune-jpeg assumed
+//!   Adobe-inverted CMYK and a plain-CMYK figure rendered solid black.
 //! * **Non-image filters** (Flate/LZW/ASCIIHex/ASCII85/RunLength, with
 //!   predictors) -- decoded through the WAVE-2 filter layer
 //!   ([`PdfDocument::open_stream`]) to raw samples, then interpreted per
@@ -64,9 +69,6 @@ use super::filter_fax::{self, FaxParams};
 use super::object::Object;
 use super::xref::PdfDocument;
 
-use zune_jpeg::zune_core::bytestream::ZCursor;
-use zune_jpeg::zune_core::colorspace::ColorSpace;
-use zune_jpeg::JpegDecoder;
 
 /// A decoded raster image: 8-bit samples, row-major, either 1 component
 /// (grayscale) or 3 (RGB). This is the normalized form the OCR pipeline
@@ -485,7 +487,8 @@ fn decode_image_base_from(
         // DCTDecode: apply any *leading* non-image filters, then JPEG-decode.
         let (raw, filter, parms) = src.raw(doc, dict)?;
         let jpeg = apply_leading_filters(raw, &filter, &parms, pos)?;
-        return decode_jpeg(&jpeg, width, height, read_decode(doc, dict).as_deref());
+        let ct = dct_color_transform(doc, &parms, pos);
+        return decode_jpeg(&jpeg, width, height, ct, read_decode(doc, dict).as_deref());
     }
 
     // Raw-sample path: BitsPerComponent, ColorSpace, Decode, then unpack.
@@ -849,71 +852,60 @@ fn apply_leading_filters(
 // JPEG (DCTDecode) path
 // ---------------------------------------------------------------------------
 
-// MuPDF: fz_load_jpeg (load-jpeg.c) -- here delegated to the pure-Rust zune-jpeg.
+// MuPDF: the DCTDecode image path -- fz_open_dctd (filter-dct.c) under
+// fz_decomp_image_from_stream (image.c), then MuPDF's no-ICC CMYK->RGB.
+// The colour handling is ported in [`super::filter_dct`] (gh-116); only the
+// entropy decode + IDCT is zune-jpeg's (AID-0052).
 /// Decode baseline/progressive JPEG bytes to a [`DecodedImage`]. `pdf_w`/`pdf_h`
 /// are the dict's declared dimensions, used only as a fallback if the codec does
-/// not report them. `decode` is the image's `/Decode` array (used to invert
-/// Adobe CMYK JPEGs when present).
+/// not report them. `color_transform` is `/DecodeParms /ColorTransform` (`-1`
+/// when absent) and `decode` the image's `/Decode` array, applied to the
+/// decoded gray/RGB/CMYK samples exactly like MuPDF's `fz_decode_tile`. CMYK
+/// is never implicitly inverted: inside a PDF an Adobe-inverted JPEG carries
+/// `/Decode [1 0 1 0 1 0 1 0]`, and MuPDF honours only that
+/// (pdf-stream.c:164).
 fn decode_jpeg(
     bytes: &[u8],
     pdf_w: usize,
     pdf_h: usize,
+    color_transform: i64,
     decode: Option<&[f32]>,
 ) -> Result<DecodedImage> {
-    let mut decoder = JpegDecoder::new(ZCursor::new(bytes));
-    let pixels = decoder
-        .decode()
-        .map_err(|e| Error::library(format!("JPEG decode failed: {e:?}")))?;
-    let (w, h) = decoder
-        .info()
-        .map(|i| (i.width as usize, i.height as usize))
-        .unwrap_or((pdf_w, pdf_h));
-    let cs = decoder.output_colorspace().unwrap_or(ColorSpace::Unknown);
-
-    match cs {
-        ColorSpace::Luma => Ok(DecodedImage {
-            smask: None,
-            width: w,
-            height: h,
-            components: 1,
-            pixels,
-        }),
-        ColorSpace::RGB => Ok(DecodedImage {
-            smask: None,
-            width: w,
-            height: h,
-            components: 3,
-            pixels,
-        }),
-        ColorSpace::CMYK | ColorSpace::YCCK => {
-            // Adobe CMYK JPEGs commonly store inverted samples, flagged by a
-            // /Decode of [1 0 1 0 1 0 1 0]; honour it when present.
-            let invert = decode
-                .map(|d| d.first().copied().unwrap_or(0.0) > 0.5)
-                .unwrap_or(false);
-            let mut out = Vec::with_capacity(w * h * 3);
-            for px in pixels.chunks_exact(4) {
-                let f = |b: u8| {
-                    if invert {
-                        1.0 - b as f32 / 255.0
-                    } else {
-                        b as f32 / 255.0
-                    }
-                };
-                let (r, g, b) = cmyk_to_rgb(f(px[0]), f(px[1]), f(px[2]), f(px[3]));
-                out.extend_from_slice(&[r, g, b]);
-            }
-            Ok(DecodedImage {
-                smask: None,
-                width: w,
-                height: h,
-                components: 3,
-                pixels: out,
-            })
+    let s = super::filter_dct::decode_dct(bytes, pdf_w, pdf_h, color_transform, decode)?;
+    let pixels = if s.n == 4 {
+        let mut out = Vec::with_capacity(s.width * s.height * 3);
+        for px in s.pixels.chunks_exact(4) {
+            let f = |b: u8| b as f32 / 255.0;
+            let (r, g, b) = cmyk_to_rgb(f(px[0]), f(px[1]), f(px[2]), f(px[3]));
+            out.extend_from_slice(&[r, g, b]);
         }
-        other => Err(Error::unsupported(format!(
-            "unsupported JPEG output colorspace: {other:?}"
-        ))),
+        out
+    } else {
+        s.pixels
+    };
+    Ok(DecodedImage {
+        smask: None,
+        width: s.width,
+        height: s.height,
+        components: if s.n == 1 { 1 } else { 3 },
+        pixels,
+    })
+}
+
+/// `/DecodeParms /ColorTransform` for the DCT filter at `pos` in the chain,
+/// `-1` when absent (pdf-stream.c:163, `pdf_dict_get_int_default(..., -1)`).
+fn dct_color_transform(doc: &PdfDocument, parms: &Object, pos: usize) -> i64 {
+    let d = match parms {
+        Object::Array(items) => match items.get(pos) {
+            Some(o) => doc.resolve(o).unwrap_or(Object::Null),
+            None => return -1,
+        },
+        other => doc.resolve(other).unwrap_or(Object::Null),
+    };
+    match doc.resolve_get(&d, "ColorTransform") {
+        Ok(Object::Int(v)) => v,
+        Ok(Object::Real(v)) => v as i64,
+        _ => -1,
     }
 }
 

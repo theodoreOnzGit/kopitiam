@@ -45,7 +45,13 @@ name = "kopitiam-pdf"
 # additions are additive (defaulted TextDevice methods, new modules,
 # `PdfDocument::{xref_len, was_repaired}`). The one breaking change is to a
 # struct literal: `crypt::EncryptDict` gained `oe`/`ue`.
-version = "0.4.2"
+#
+# 0.4.3 (2026-09-29 SGT) is a PATCH: a plain-CMYK DCTDecode image (Adobe
+# APP14 transform 0, no /Decode) rendered solid black, because zune-jpeg did
+# its own CMYK->RGB assuming Adobe-inverted storage (gh-116). The DCT colour
+# path is now ported from filter-dct.c + libjpeg + fz_decode_tile
+# (src/mupdf/filter_dct.rs). No public API change.
+version = "0.4.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

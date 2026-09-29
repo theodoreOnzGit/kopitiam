@@ -60,3 +60,7 @@ vendor/
 *.pbm
 *.pgm
 *.ppm
+# ...except MuPDF's own renders of SYNTHETIC test fixtures (tests/fixtures/
+# make-*.py writes both the PDF and `mutool draw`'s output); these are tiny
+# and are the oracle the parity tests compare against (gh-116).
+!crates/kopitiam-pdf/tests/fixtures/*.mutool.ppm

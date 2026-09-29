@@ -599,3 +599,32 @@ is 0.00 % with a mean of 0.00.
 | raster pass | 2 / 23 | **33 / 34** |
 | text pass | 22 / 23 | **34 / 34** |
 | failing | everything except cmyk-fill and hairline | text-render-modes 1.84 % (glyph shape: bundled base-14 face vs MuPDF's Nimbus) |
+
+## 0.4.3 -- DCTDecode colour (gh-116), measured 2026-09-29
+
+Not found by the harness, because no open-corpus file carries a plain-CMYK
+JPEG. The maintainer saw it in kovan: a figure in a proprietary paper came out
+solid black. That paper was used locally for diagnosis only, and nothing
+derived from its bytes is committed. The image is `/DeviceCMYK` DCTDecode
+with no `/Decode`, and its JPEG has an Adobe APP14 marker (transform 0) with
+component ids `C M Y K`. The samples are stored plain.
+
+**Root cause.** zune-jpeg was left on its default RGB output, so it did the
+CMYK->RGB itself as `c*k/255`, which assumes Photoshop-inverted storage. Plain
+white `(0,0,0,0)` therefore came out black. MuPDF never inverts inside a PDF
+(`pdf-stream.c:164`, `invert_cmyk = 0`). It takes libjpeg's raw CMYK, applies
+`/Decode` (`image.c:726`), and only then converts. The coverage row claiming
+"Adobe inverted CMYK is handled via `/Decode`" was false; it is corrected in
+place. Fix: `filter_dct.rs` asks zune-jpeg for raw components and ports the
+colour-space choice, the YCbCr/YCCK tables and `fz_decode_tile`.
+
+| check | 0.4.2 | 0.4.3 |
+|---|---|---|
+| the paper's page, 72 dpi, gross / mean \|Δluma\| | 8.80 % / 23.71 | **0.000 % / 1.81** |
+| the figure's box: our mean luma vs mutool's 244.7 | 1.3 | **245.4** (mean \|Δ\| 0.72) |
+| same page at 150 dpi | -- | 0.016 % / 1.43 |
+| `tests/fixtures/dct-colour.pdf` (plain CMYK, inverted CMYK + `/Decode`, YCCK, partial `/Decode`, `/ColorTransform 0` RGB, gray `/Decode`) vs committed mutool PPM | images 0, 3, 4, 5 wrong, max \|Δ\| 255 | **max \|Δ\| 0, every pixel** |
+| open corpus, raster only (1368 pages), 0.4.2 binary vs 0.4.3 binary | 1368/1368 | 1368/1368; **no page's gross or mean \|Δluma\| moved by 0.001** |
+
+The last row matters because YCbCr->RGB now uses libjpeg's own tables instead
+of zune-jpeg's. On this corpus that moved nothing measurable.

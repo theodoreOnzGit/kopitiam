@@ -281,6 +281,69 @@ fn jbig2_image_decodes() {
     assert_eq!(im.pixels[15], 255, "right half white");
 }
 
+/// DCTDecode colour handling, against MuPDF's own pixels (gh-116). The bug
+/// shape: a 4-component CMYK JPEG with an Adobe APP14 marker (transform 0),
+/// samples stored plain, no `/Decode` -- a real paper's figure. 0.4.2 painted
+/// it solid BLACK: zune-jpeg converted CMYK to RGB itself assuming
+/// Adobe-inverted storage (`r = c * k / 255`), so plain white came out 0.
+/// MuPDF takes libjpeg's raw CMYK (never inverted inside a PDF,
+/// pdf-stream.c:164), applies `/Decode` (image.c:726) and converts after.
+///
+/// The fixture (tests/fixtures/make-dct-colour.py; six 16x16 JPEGs drawn 1:1)
+/// also covers Adobe-inverted CMYK + `/Decode [1 0 ...]`, YCCK (transform 2),
+/// a partial CMYK `/Decode`, a 3-component JPEG stored as RGB with
+/// `/ColorTransform 0`, and a gray JPEG with `/Decode [1 0]`. The expected
+/// image is `mutool draw -N -M 0 -r 72` at 19f1284, committed beside it.
+///
+/// Tolerance: every channel of every pixel within 3 levels. zune-jpeg's IDCT
+/// and colour rounding are not libjpeg's (AID-0052); the quadrants are single
+/// flat 8x8 blocks at quality 100, so a real divergence (a missing inversion,
+/// a missing `/Decode`, a wrong colour transform) is >= 64 levels.
+#[test]
+fn dct_colour_transforms_and_decode_follow_mupdf() {
+    let pdf = include_bytes!("fixtures/dct-colour.pdf").to_vec();
+    let ppm = include_bytes!("fixtures/dct-colour.mutool.ppm");
+    // Binary PPM: "P6\n96 16\n255\n" + RGB rows.
+    let mut parts = ppm.splitn(4, |b| *b == b'\n');
+    assert_eq!(parts.next(), Some(&b"P6"[..]));
+    let dims = std::str::from_utf8(parts.next().unwrap()).unwrap();
+    let mut dims = dims.split_whitespace().map(|v| v.parse::<u32>().unwrap());
+    let (w, h) = (dims.next().unwrap(), dims.next().unwrap());
+    parts.next(); // maxval
+    let want = parts.next().unwrap();
+    assert_eq!(want.len(), (w * h * 3) as usize);
+
+    let doc = PdfDocument::open(pdf).expect("fixture opens");
+    let pix = rasterize_page_native(&doc, 0, 72.0).expect("renders");
+    assert_eq!((pix.w, pix.h), (w, h));
+    let mut worst = (0i32, 0u32, 0u32);
+    let mut bad_images = std::collections::BTreeSet::new();
+    for y in 0..h {
+        for x in 0..w {
+            let got = rgb_at(&pix, x, y);
+            let o = ((y * w + x) * 3) as usize;
+            for (c, g) in got.iter().enumerate() {
+                let d = (*g as i32 - want[o + c] as i32).abs();
+                if d > 3 {
+                    bad_images.insert(x / 16);
+                }
+                if d > worst.0 {
+                    worst = (d, x, y);
+                }
+            }
+        }
+    }
+    let (d, x, y) = worst;
+    let o = ((y * w + x) * 3) as usize;
+    eprintln!("dct-colour: max |d| = {d} vs mutool");
+    assert!(
+        bad_images.is_empty(),
+        "images {bad_images:?} differ from mutool; max |d| = {d} at ({x}, {y}): got {:?}, mutool {:?}",
+        rgb_at(&pix, x, y),
+        &want[o..o + 3]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tranche 3 -- graphics state
 // ---------------------------------------------------------------------------

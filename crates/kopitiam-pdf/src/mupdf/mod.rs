@@ -92,6 +92,7 @@ pub mod draw_scale;
 pub mod encodings;
 pub mod error;
 pub mod filter_basic;
+pub(crate) mod filter_dct;
 pub mod filter_flate;
 pub mod filter_fax;
 pub mod filter_fax_tables;
