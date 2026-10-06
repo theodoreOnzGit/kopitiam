@@ -1,10 +1,11 @@
 [package]
 name = "kopitiam-neovim"
 # Pinned, not `version.workspace`: per CLAUDE.md "no new commits, no version bump",
-# only crates whose code moved get bumped. 0.3.0, not 0.2.6: gh-117 adds a variant
-# to the public, exhaustive `config::Action` enum (`LspCodeAction`), which is a
-# breaking change under Cargo's SemVer rules. See AID-0059.
-version = "0.3.0"
+# only crates whose code moved get bumped. 0.4.0, not 0.3.1: gh-118 removes the
+# public `luaconfig` module, `Config::lua_files`, and the `Action::LuaKeymap` /
+# `Action::FeedKeys` variants — all breaking under Cargo's SemVer rules. See
+# AID-0060. (0.3.0 was gh-117's new `Action::LspCodeAction` variant, AID-0059.)
+version = "0.4.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -45,12 +46,11 @@ kopitiam-snippet.workspace = true
 # KOPITIAM app.
 kopitiam-config.workspace = true
 
-# The pure-Rust Lua 5.1 interpreter. This is what lets kvim EXECUTE the
-# init.lua it already discovers, through the `vim.*` shim in `luaconfig`,
-# instead of only reporting the files. See AID-0003 (why a pure-Rust VM) and
-# AID-0007 (why it is a bytecode VM). No C, no bindings — the Pure Rust Core
-# promise survive.
-kopitiam-lua.workspace = true
+# NO `kopitiam-lua` here, on purpose. kvim used to run init.lua through a
+# `vim.*` shim on that VM (AID-0034); the maintainer reversed that on
+# 2026-10-06 ("kopitiam-neovim shouldn't need to read lua, i want my
+# preferences hardcoded in"), so kvim now carry their preferences compiled in
+# as data and never read or run Lua. See AID-0060 / gh-118.
 
 # Text engine. `ropey` is pure Rust, is the rope behind Helix, and is O(log n)
 # for the index/edit operations an editor performs constantly.

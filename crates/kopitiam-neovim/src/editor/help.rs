@@ -85,6 +85,7 @@ pub const TOPICS: &[HelpTopic] = &[
             "  tmux         hop out into tmux panes",
             "  quit         saving and quitting, all the :q flavours",
             "  shell        run shell commands, filter text through them",
+            "  config       where your settings come from (hint: no Lua one)",
             "",
             "Cannot remember a keymap? Press <leader> (Space) and wait — the",
             "which-key popup will show you what's available. Steady lah.",
@@ -463,6 +464,33 @@ pub const TOPICS: &[HelpTopic] = &[
             "stays safe.",
         ],
     },
+    HelpTopic {
+        id: "config",
+        aliases: &["settings", "options", "init.lua", "lua", "vimrc", "config-path"],
+        title: "Config — where your settings come from",
+        body: &[
+            "kvim's settings and keymaps are COMPILED IN — the maintainer's own",
+            "Neovim preferences, carried as data inside the binary: hybrid line",
+            "numbers, tabstop/shiftwidth 4, no wrap, scrolloff 5, spell en_gb,",
+            "colorcolumn 75, gruvbox dark, leader = Space, and the full keymap.",
+            "Nothing to install, nothing to configure, can use straight away.",
+            "",
+            "kvim does NOT read or run Lua, full stop. No init.lua, no lua/*.lua,",
+            "not in ~/.config/nvim and not in kvim's own folder. Put one there",
+            "also kvim won't bother — that's on purpose, not a bug.",
+            "",
+            "The only override is a JSON file:",
+            "",
+            "  ~/.kopitiam/kopitiam-neovim/config.json",
+            "",
+            "Run `kvim --config-path` in your shell to see exactly where kvim is",
+            "looking and whether it found one. A malformed config.json stops kvim",
+            "at startup with an error — better than silently ignoring your typo.",
+            "",
+            "kvim never reads or writes ~/.config/nvim — your real Neovim's",
+            "config stays yours, untouched.",
+        ],
+    },
 ];
 
 /// The manual as a buffer's worth of text, plus the line each section starts on.
@@ -565,6 +593,7 @@ mod tests {
         assert_eq!(resolve("splits"), Some("windows"));
         assert_eq!(resolve("neotree"), Some("filetree"));
         assert_eq!(resolve("mapleader"), Some("leader"));
+        assert_eq!(resolve("init.lua"), Some("config"));
         // unknown / empty fall through
         assert_eq!(resolve("nonsense-topic"), None);
         assert_eq!(resolve(""), None);

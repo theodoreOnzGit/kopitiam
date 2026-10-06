@@ -315,7 +315,7 @@ scanning, a tag stack, a spell engine, a `completefunc` hook).
 | `<C-x><C-d>` | definitions from includes | **Missing** — no include scanning |
 | `<C-x><C-v>` | vim command line | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`df2a56d`): kvim's `:` vocabulary via `editor::command::complete_names`. Command *names* only; arguments stay the `:` prompt's own `<Tab>` completion |
 | `<C-x><C-o>` | omni completion | ~~Partial (not bound to `<C-x><C-o>`)~~ **CORRECTED 2026-09-24** — **Have** (cj0.37): bound, and LSP is the *only* source in this submode |
-| `<C-x><C-u>` | user `completefunc` | **Missing** — needs a Lua hook |
+| `<C-x><C-u>` | user `completefunc` | **Missing** — ~~needs a Lua hook~~ no Lua in kvim since 0.4.0 (AID-0060); would need a native Rust completion source |
 | `<C-x><C-s>` | spelling suggestions | **Missing** — no spell engine |
 | `<C-x><C-e>` / `<C-x><C-y>` | scroll while in insert | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`df2a56d`). Note this was worse than missing: the unrecognised sub-key used to fall out of CTRL-X mode, so `<C-x><C-e>` reached the editor as a plain insert-mode `<C-e>` and **copied a character out of the line below into the buffer** |
 
@@ -525,7 +525,7 @@ rows that read Missing on 31 August, eleven are now Have.**
 | `:grep :vimgrep :copen :cnext` | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`18d9d66`), plus the location-list twins (`:lgrep :lopen :lnext` …) |
 | `:reg :marks :jumps` | **Missing** — re-checked 2026-09-24, still absent from `editor/command.rs` |
 | `:tabnew :tabclose :tabnext` | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`4eda3c1`), plus `:tabonly :tabprevious :tabfirst :tablast :tabs` |
-| `:map :nnoremap ...` (mappings) | **Missing** (needs Lua/config — cj0.4/.11) — re-checked 2026-09-24, still absent |
+| `:map :nnoremap ...` (mappings) | **Missing** (~~needs Lua/config — cj0.4/.11~~ **CORRECTED 2026-10-06**: kvim dropped Lua in 0.4.0, AID-0060; keymaps are hardcoded data + `config.json`, so a runtime `:map` would be a native ex command if ever wanted) — re-checked 2026-09-24, still absent |
 
 ---
 
@@ -604,10 +604,13 @@ Ranked, as before, by how often a working nvim user's fingers would hit a wall.
 7. **The long tail of `g` and the tag stack (§1, §8).** *P3.* `ga g8 go gr gR
    g+ g-`; `<C-t>` (pop tag stack) and with it `<C-x><C-]>`; `<C-l>` (redraw),
    `Q`, `K`, `is`/`as` sentence text objects, the cmdline window (`q:`,
-   `<C-f>`), `:reg`/`:marks`/`:jumps`, and `:map` (which waits on Lua config,
-   cj0.4/.11).
+   `<C-f>`), `:reg`/`:marks`/`:jumps`, and `:map` (~~which waits on Lua config,
+   cj0.4/.11~~ — no Lua config any more since kvim 0.4.0, AID-0060; a `:map`
+   would be a native ex command).
 
-Still-open beads referenced above: cj0.4/.11 (Lua config + mappings), cj0.22
+Still-open beads referenced above: cj0.4/.11 (Lua config + mappings — **note
+2026-10-06:** the Lua half is now superseded by AID-0060 / gh-118, kvim drops
+Lua entirely), cj0.22
 (`gq`/`gw`), cj0.10.5 (`<C-w>H/J/K/L`). The beads closed by the work this
 re-audit recorded: cj0.10.4, cj0.10.6, cj0.13, cj0.15, cj0.18, cj0.19, cj0.21,
 cj0.35, cj0.36 (partly), cj0.37, cj0.38 (mostly), cj0.39, cj0.40 (mostly),

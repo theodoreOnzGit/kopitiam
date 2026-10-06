@@ -149,8 +149,10 @@ phase is independently useful:
   text objects, ex commands. *At this point it is a usable vi.*
 * **Phase 3** — `kopitiam-lsp` + Android-capable server acquisition. *Now it's
   a usable IDE, and it runs on your phone.*
-* **Phase 4** — `kopitiam-lua` VM + the `vim.*` API surface. *Now Lua configs
-  and third-party plugins load.*
+* ~~**Phase 4** — `kopitiam-lua` VM + the `vim.*` API surface. *Now Lua configs
+  and third-party plugins load.*~~ **CORRECTED 2026-10-06:** built (AID-0034),
+  then removed by the maintainer in kopitiam-neovim 0.4.0 — kvim never reads or
+  runs Lua; preferences are hardcoded as data (AID-0060, gh-118).
 * **Phase 5** — the native plugin suite from decision 3.
 * **Phase 6** — `apps/kvim` with your config baked in.
 

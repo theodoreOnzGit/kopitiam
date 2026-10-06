@@ -78,8 +78,12 @@ nucleo-matcher = "0.3"
 # The kvim editor, launched in-process from the TUI's "kvim (Editor)" menu
 # entry via `kopitiam_neovim::ui::run`. A direct path dep (kopitiam-neovim is
 # not in [workspace.dependencies]); the crate itself targets aarch64-linux-android,
-# so it does not compromise the Android build. Pinned to the workspace version.
-kopitiam-neovim = { path = "../../crates/kopitiam-neovim", version = "0.3.0" }
+# so it does not compromise the Android build. ~~Pinned to the workspace version.~~
+# CORRECTED 2026-10-06: tracks kopitiam-neovim's OWN pinned version (it no longer
+# follows the workspace one, per CLAUDE.md's "no new commits, no version bump").
+# 0.4.0 = gh-118 (Lua config layer removed); the CLI only calls `Config::load` and
+# `ui::run`, neither of which changed.
+kopitiam-neovim = { path = "../../crates/kopitiam-neovim", version = "0.4.0" }
 # The PDF **viewer** View's image mode. `ratatui-image` auto-detects the
 # terminal's graphics protocol (kitty / sixel / iTerm2) and falls back to
 # Unicode half-blocks on terminals that support none of them -- which is what

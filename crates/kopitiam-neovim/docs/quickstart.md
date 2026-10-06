@@ -144,5 +144,8 @@ nerd|unicode|ascii` or the `KVIM_ICONS` environment variable.
   account of what's implemented today versus in progress.
 - `kvim --help` — the authoritative, always-current flag list.
 - The main KOPITIAM repository's `docs/ai-decisions/AID-0003` and
-  `AID-0004` for the architecture decisions behind kvim's design (Lua VM
-  plans, the Mason replacement, and the devicons/font story).
+  `AID-0004` for the architecture decisions behind kvim's design (~~Lua VM
+  plans,~~ the Mason replacement, and the devicons/font story). **CORRECTED
+  2026-10-06:** the Lua VM plan was built (AID-0034) and then removed in
+  0.4.0 — kvim never reads or runs Lua; preferences are compiled in
+  (`AID-0060`).

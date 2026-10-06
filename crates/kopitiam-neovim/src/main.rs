@@ -41,7 +41,8 @@ application and is not part of the KDE Plasma workspace.
 
 Configuration is optional. With no config file at all, kvim starts with the
 maintainer's Neovim setup baked in. Overrides go in the file printed by
---config-path; kvim never reads or writes ~/.config/nvim.
+--config-path; kvim never reads or writes ~/.config/nvim, and never reads or
+runs Lua (no init.lua anywhere). See `:help config` inside kvim.
 ";
 
 fn main() -> anyhow::Result<()> {
@@ -109,29 +110,14 @@ fn show_config_paths() -> anyhow::Result<()> {
         println!("config.json:     {} (absent — using defaults)", config.display());
     }
 
-    let lua = Config::lua_files();
-    if lua.is_empty() {
-        println!("Lua config:      none found (looked for init.lua and lua/*.lua)");
-    } else {
-        println!("Lua config:      {} file(s) found, in load order:", lua.len());
-        for path in &lua {
-            println!("                   {}", path.display());
-        }
-        println!();
-        println!("These are EXECUTED at startup through kvim's pure-Rust Lua VM");
-        println!("(kopitiam-lua) against a vim.* shim: vim.opt/vim.g/vim.keymap.set/");
-        println!("vim.cmd and friends map onto kvim's real options, keymaps, leader and");
-        println!("theme. Plugin-manager boilerplate (lazy.nvim, require of a built-in");
-        println!("plugin) degrades to a no-op, and anything unsupported becomes a warning");
-        println!("shown at startup rather than a crash. See docs/ai-decisions/AID-0034.");
-    }
-
     println!();
     println!("With no config at all, kvim's defaults ARE the maintainer's Neovim setup:");
     println!("hybrid line numbers, tabstop/shiftwidth 4, no wrap, scrolloff 5, spell en_gb,");
     println!("colorcolumn 75, gruvbox dark, leader = Space, and their full keymap.");
     println!();
     println!("kvim never reads or writes ~/.config/nvim — that stays yours.");
+    println!("kvim never reads or runs Lua either: no init.lua, no lua/*.lua, anywhere.");
+    println!("Preferences are compiled in; config.json is the only override.");
 
     Ok(())
 }

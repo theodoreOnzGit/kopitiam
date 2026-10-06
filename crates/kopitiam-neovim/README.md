@@ -97,11 +97,28 @@ defaults are made of. A malformed config is a hard error at startup (not a
 silent fallback), so a typo doesn't cost you an hour wondering why a setting
 "isn't working."
 
-kvim also looks for `init.lua` and `lua/*.lua` in that same directory and
+~~kvim also looks for `init.lua` and `lua/*.lua` in that same directory and
 will tell you if it finds them — but it does not run them yet. Lua config
 execution needs a Lua interpreter, and KOPITIAM is committed to a pure-Rust
 one (`kopitiam-lua`) that has not landed. Until it does, kvim reports the
-files it found rather than silently ignoring them.
+files it found rather than silently ignoring them.~~
+**CORRECTED 2026-10-06 (0.4.0).** That paragraph was already wrong before
+this release: from AID-0034 until 0.3.0, kvim *did* run
+`~/.kopitiam/kopitiam-neovim/init.lua` (and `lua/*.lua` via `require`)
+through the pure-Rust `kopitiam-lua` VM and a `vim.*` shim. As of **0.4.0**
+that whole layer is gone, by the maintainer's call — *"kopitiam-neovim
+shouldn't need to read lua, i want my preferences hardcoded in"*:
+
+- **kvim never reads or runs Lua.** No `init.lua`, no `lua/*.lua`, not in
+  `~/.config/nvim` and not in kvim's own directory. A Lua file sitting there
+  is ignored on purpose, and `kvim --config-path` no longer looks for one.
+- **The maintainer's preferences are hardcoded** in `Config::default` as
+  data — every option and keymap from their `~/.config/nvim` (listed below).
+- **`config.json` is the only override.** The `kopitiam-lua` crate still
+  exists in the KOPITIAM workspace; kvim just no longer depends on it.
+
+See `docs/ai-decisions/AID-0060-kvim-drops-lua-config.md` and gh-118 in the
+main repository. Inside kvim, `:help config` says the same thing.
 
 kvim **never reads or writes `~/.config/nvim/`.** That directory stays your
 real Neovim's; kvim has its own directory under `~/.kopitiam/` so it can
@@ -227,7 +244,8 @@ Roughly, as of this writing:
 
 - **Working:** the Vim editing grammar (modes, motions, operators, text
   objects, registers, macros, ex commands), the file-tree sidebar
-  (`<leader>e`), devicons and font installation, config loading/validation.
+  (`<leader>e`), devicons and font installation, config loading/validation
+  (compiled-in defaults + `config.json`; no Lua, by design — see above).
 - **LSP client (working, tested against a live rust-analyzer):**
   go-to-definition, references, hover, rename, completion, diagnostics, and
   **code actions** (`<leader>ca`). Code actions honestly, lah:

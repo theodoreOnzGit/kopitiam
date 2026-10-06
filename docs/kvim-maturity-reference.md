@@ -107,8 +107,19 @@ clipboard, command history, quickfix), it does.
 
 * **Snippet engine** (LuaSnip replacement) — Phase 5 native-plugin work; needs
   the completion popup (`cj0.17`) first.
-* **Autocommands / event hooks** — arrive with the Lua `vim.*` surface
-  (Phase 4, `kopitiam-cj0.4`/`.11`).
+* **Autocommands / event hooks** — ~~arrive with the Lua `vim.*` surface
+  (Phase 4, `kopitiam-cj0.4`/`.11`).~~ **CORRECTED 2026-10-06:** there is no
+  Lua `vim.*` surface any more — kvim 0.4.0 removed it (AID-0060, gh-118;
+  kvim never reads or runs Lua, preferences are compiled in). The one
+  autocommand behaviour the maintainer's config relies on is already native:
+  `*.tex` → `tex` filetype is extension-based detection in `ui/app.rs`, and
+  `TermOpen → mouse=""` is moot because kvim never captures the mouse
+  (`ui/terminal.rs`). A general event-hook API, if ever wanted, would be
+  Rust-side and needs its own scoping.
+* **User configuration language** — **Deferred by design, 2026-10-06.** kvim
+  has no scripting config (no Lua, no Vimscript). The full config surface is
+  `Config::default` (the maintainer's preferences, hardcoded as data) plus a
+  `config.json` override. See AID-0060.
 * **Incremental syntax highlighting** — the lexers are tracked by
   `kopitiam-v66`/`kopitiam-2qi` (AID-0009: hand-written pure-Rust lexers, no
   tree-sitter). The *incremental re-lex on edit* is the infra piece to build

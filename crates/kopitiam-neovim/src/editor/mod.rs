@@ -403,7 +403,7 @@ impl Editor {
     }
 
     /// Like [`Self::new`], but with a caller-supplied configuration (a
-    /// loaded `~/.config/kvim/config.json`, or a fixture in tests).
+    /// loaded `~/.kopitiam/kopitiam-neovim/config.json`, or a fixture in tests).
     pub fn with_config(config: crate::config::Config) -> Self {
         let mut buffers = BTreeMap::new();
         let id = BufferId(0);

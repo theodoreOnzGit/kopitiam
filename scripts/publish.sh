@@ -81,7 +81,8 @@ CRATES=(
     kopitiam-gpu         # leaf, STANDALONE (wgpu/pollster/bytemuck only), pinned 0.0.1
     kopitiam-resource    # leaf: no internal deps; apps/cli's §6 budget gate
     kopitiam-config      # leaf (editor/kvim)
-    kopitiam-lua         # leaf (editor/kvim: pure-Rust Lua interpreter)
+    kopitiam-lua         # leaf (pure-Rust Lua interpreter; since kvim 0.4.0 / AID-0060 nothing in
+                         # the workspace depends on it -- published standalone, held unless it moves)
     kopitiam-syntax      # leaf (editor/kvim)
     kopitiam-snippet     # leaf (editor/kvim)
     kopitiam-tensor      # depends on: kopitiam-core
