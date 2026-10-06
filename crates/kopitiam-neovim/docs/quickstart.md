@@ -148,4 +148,5 @@ nerd|unicode|ascii` or the `KVIM_ICONS` environment variable.
   plans,~~ the Mason replacement, and the devicons/font story). **CORRECTED
   2026-10-06:** the Lua VM plan was built (AID-0034) and then removed in
   0.4.0 — kvim never reads or runs Lua; preferences are compiled in
-  (`AID-0060`).
+  (`AID-0060`). Since 0.4.1 the Lua layer is back only as an opt-in build,
+  `cargo install kopitiam-neovim --features lua`, off by default (`AID-0061`).

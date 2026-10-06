@@ -45,6 +45,19 @@ maintainer's Neovim setup baked in. Overrides go in the file printed by
 runs Lua (no init.lua anywhere). See `:help config` inside kvim.
 ";
 
+/// Extra line appended to [`USAGE`] only in a `--features lua` build
+/// (AID-0061), because there the "never reads or runs Lua" sentence above is
+/// no longer the whole truth. Empty in the default build, so `kvim --help` is
+/// byte-for-byte 0.4.0's.
+#[cfg(feature = "lua")]
+const USAGE_LUA: &str = "\
+This build was compiled WITH the opt-in `lua` feature, so it DOES run
+init.lua / lua/*.lua from kvim's own directory (never ~/.config/nvim) through
+a vim.* shim. --config-path lists what it found.
+";
+#[cfg(not(feature = "lua"))]
+const USAGE_LUA: &str = "";
+
 fn main() -> anyhow::Result<()> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut icon_override: Option<String> = None;
@@ -53,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{USAGE}{USAGE_LUA}");
                 return Ok(());
             }
             "--version" => {
@@ -72,7 +85,7 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             other if other.starts_with('-') && other.len() > 1 => {
-                anyhow::bail!("unknown option {other:?}\n\n{USAGE}");
+                anyhow::bail!("unknown option {other:?}\n\n{USAGE}{USAGE_LUA}");
             }
             other => files.push(PathBuf::from(other)),
         }
@@ -110,14 +123,42 @@ fn show_config_paths() -> anyhow::Result<()> {
         println!("config.json:     {} (absent — using defaults)", config.display());
     }
 
+    // Only a `--features lua` build looks for Lua at all (AID-0061). The
+    // default build skips this whole block, so its output is 0.4.0's.
+    #[cfg(feature = "lua")]
+    {
+        let lua = Config::lua_files();
+        if lua.is_empty() {
+            println!("Lua config:      none found (looked for init.lua and lua/*.lua)");
+        } else {
+            println!("Lua config:      {} file(s) found, in load order:", lua.len());
+            for path in &lua {
+                println!("                   {}", path.display());
+            }
+            println!();
+            println!("These are EXECUTED at startup through kvim's pure-Rust Lua VM");
+            println!("(kopitiam-lua) against a vim.* shim: vim.opt/vim.g/vim.keymap.set/");
+            println!("vim.cmd and friends map onto kvim's real options, keymaps, leader and");
+            println!("theme. Plugin-manager boilerplate (lazy.nvim, require of a built-in");
+            println!("plugin) degrades to a no-op, and anything unsupported becomes a warning");
+            println!("shown at startup rather than a crash. See docs/ai-decisions/AID-0034.");
+        }
+    }
+
     println!();
     println!("With no config at all, kvim's defaults ARE the maintainer's Neovim setup:");
     println!("hybrid line numbers, tabstop/shiftwidth 4, no wrap, scrolloff 5, spell en_gb,");
     println!("colorcolumn 75, gruvbox dark, leader = Space, and their full keymap.");
     println!();
     println!("kvim never reads or writes ~/.config/nvim — that stays yours.");
-    println!("kvim never reads or runs Lua either: no init.lua, no lua/*.lua, anywhere.");
-    println!("Preferences are compiled in; config.json is the only override.");
+    #[cfg(not(feature = "lua"))]
+    {
+        println!("kvim never reads or runs Lua either: no init.lua, no lua/*.lua, anywhere.");
+        println!("Preferences are compiled in; config.json is the only override.");
+        println!("(Lua is an opt-in build: `cargo install kopitiam-neovim --features lua`.)");
+    }
+    #[cfg(feature = "lua")]
+    println!("This build has the opt-in `lua` feature ON (AID-0061); a default build never runs Lua.");
 
     Ok(())
 }

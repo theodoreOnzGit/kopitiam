@@ -60,6 +60,11 @@ pub mod core;
 pub mod editor;
 pub mod icons;
 pub mod lsp;
+/// The opt-in Lua config layer: runs `init.lua` through a `vim.*` shim on the
+/// pure-Rust `kopitiam-lua` VM. Exists ONLY with `--features lua` (off by
+/// default, AID-0061); a default build never read or run Lua one (AID-0060).
+#[cfg(feature = "lua")]
+pub mod luaconfig;
 pub mod plugins;
 pub mod termemu;
 pub mod text;

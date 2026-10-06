@@ -4,6 +4,11 @@
   *"kopitiam-neovim shouldn't need to read lua, i want my preferences hardcoded
   in"*. The shim described below was removed in kopitiam-neovim 0.4.0; see
   [AID-0060](AID-0060-kvim-drops-lua-config.md) and gh-118. Kept as history.
+  **Partly restored 2026-10-06 (0.4.1):** the shim is back unchanged, but only
+  behind the opt-in, off-by-default `lua` cargo feature
+  (`cargo install kopitiam-neovim --features lua`) — see
+  [AID-0061](AID-0061-kvim-lua-as-opt-in-feature.md). Everything below
+  describes that opt-in build.
 * **Bead:** `kopitiam-cj0.11`
 * **Date:** 2026-07-16
 * **Decided by:** AI (Claude), maintainer absent

@@ -120,6 +120,36 @@ shouldn't need to read lua, i want my preferences hardcoded in"*:
 See `docs/ai-decisions/AID-0060-kvim-drops-lua-config.md` and gh-118 in the
 main repository. Inside kvim, `:help config` says the same thing.
 
+### Lua is opt-in (0.4.1+): `--features lua`, OFF by default
+
+Same day, the maintainer refined it: *"keep kopitiam-lua as a feature gated
+dependency"*, *"off by default"*. So since **0.4.1**:
+
+- **Default build — exactly 0.4.0.** `cargo install kopitiam-neovim` gives a
+  kvim with no Lua in it at all: `kopitiam-lua` is not even compiled, the
+  preferences are hardcoded, and `config.json` is the only override.
+  Everything in the list above holds.
+- **Opt-in build — the old Lua layer, unchanged.**
+
+  ```bash
+  cargo install kopitiam-neovim --features lua
+  ```
+
+  That kvim runs `~/.kopitiam/kopitiam-neovim/init.lua` (and `lua/*.lua` via
+  `require`) at startup through the `vim.*` shim on the pure-Rust
+  `kopitiam-lua` VM — `vim.opt`, `vim.g`, `vim.keymap.set` (including a Lua
+  *function* as the right-hand side), `vim.cmd` and friends, exactly as
+  before 0.4.0 (AID-0034). Still never `~/.config/nvim`. Anything unsupported
+  becomes a startup warning, never a crash. `kvim --config-path` lists the Lua
+  files it found, and says which kind of build you have.
+
+For library users: the `luaconfig` module, `Config::lua_files`,
+`Action::FeedKeys` / `Action::LuaKeymap` and `App::set_lua_runtime` /
+`App::set_startup_message` exist **only** with the `lua` feature. One caveat
+hor: turning the feature on adds two variants to the exhaustive `Action`
+enum, so an exhaustive `match` on `Action` elsewhere in your build would need
+a `_` arm. See `docs/ai-decisions/AID-0061-kvim-lua-as-opt-in-feature.md`.
+
 kvim **never reads or writes `~/.config/nvim/`.** That directory stays your
 real Neovim's; kvim has its own directory under `~/.kopitiam/` so it can
 never interfere with an editor you still depend on.
@@ -245,7 +275,8 @@ Roughly, as of this writing:
 - **Working:** the Vim editing grammar (modes, motions, operators, text
   objects, registers, macros, ex commands), the file-tree sidebar
   (`<leader>e`), devicons and font installation, config loading/validation
-  (compiled-in defaults + `config.json`; no Lua, by design — see above).
+  (compiled-in defaults + `config.json`; no Lua in the default build, by
+  design — Lua config only with the opt-in `--features lua`, see above).
 - **LSP client (working, tested against a live rust-analyzer):**
   go-to-definition, references, hover, rename, completion, diagnostics, and
   **code actions** (`<leader>ca`). Code actions honestly, lah:

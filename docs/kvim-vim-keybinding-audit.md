@@ -315,7 +315,7 @@ scanning, a tag stack, a spell engine, a `completefunc` hook).
 | `<C-x><C-d>` | definitions from includes | **Missing** — no include scanning |
 | `<C-x><C-v>` | vim command line | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`df2a56d`): kvim's `:` vocabulary via `editor::command::complete_names`. Command *names* only; arguments stay the `:` prompt's own `<Tab>` completion |
 | `<C-x><C-o>` | omni completion | ~~Partial (not bound to `<C-x><C-o>`)~~ **CORRECTED 2026-09-24** — **Have** (cj0.37): bound, and LSP is the *only* source in this submode |
-| `<C-x><C-u>` | user `completefunc` | **Missing** — ~~needs a Lua hook~~ no Lua in kvim since 0.4.0 (AID-0060); would need a native Rust completion source |
+| `<C-x><C-u>` | user `completefunc` | **Missing** — ~~needs a Lua hook~~ no Lua in kvim since 0.4.0 (AID-0060; Lua is only the opt-in `lua` feature since 0.4.1, AID-0061, and its shim has no `completefunc`); would need a native Rust completion source |
 | `<C-x><C-s>` | spelling suggestions | **Missing** — no spell engine |
 | `<C-x><C-e>` / `<C-x><C-y>` | scroll while in insert | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`df2a56d`). Note this was worse than missing: the unrecognised sub-key used to fall out of CTRL-X mode, so `<C-x><C-e>` reached the editor as a plain insert-mode `<C-e>` and **copied a character out of the line below into the buffer** |
 
@@ -525,7 +525,7 @@ rows that read Missing on 31 August, eleven are now Have.**
 | `:grep :vimgrep :copen :cnext` | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`18d9d66`), plus the location-list twins (`:lgrep :lopen :lnext` …) |
 | `:reg :marks :jumps` | **Missing** — re-checked 2026-09-24, still absent from `editor/command.rs` |
 | `:tabnew :tabclose :tabnext` | ~~Missing~~ **CORRECTED 2026-09-24** — **Have** (`4eda3c1`), plus `:tabonly :tabprevious :tabfirst :tablast :tabs` |
-| `:map :nnoremap ...` (mappings) | **Missing** (~~needs Lua/config — cj0.4/.11~~ **CORRECTED 2026-10-06**: kvim dropped Lua in 0.4.0, AID-0060; keymaps are hardcoded data + `config.json`, so a runtime `:map` would be a native ex command if ever wanted) — re-checked 2026-09-24, still absent |
+| `:map :nnoremap ...` (mappings) | **Missing** (~~needs Lua/config — cj0.4/.11~~ **CORRECTED 2026-10-06**: kvim dropped Lua in 0.4.0, AID-0060 (back only as the opt-in `lua` feature in 0.4.1, AID-0061 — `vim.keymap.set` from init.lua, not a runtime `:map`); keymaps are hardcoded data + `config.json`, so a runtime `:map` would be a native ex command if ever wanted) — re-checked 2026-09-24, still absent |
 
 ---
 

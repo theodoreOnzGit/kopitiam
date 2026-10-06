@@ -289,6 +289,16 @@ pub struct App<H: EditorHost> {
     /// when `$TMUX` is set. The real binary always spawns tmux.
     #[cfg(test)]
     tmux_calls: Vec<Direction>,
+    /// The live Lua runtime, when the user's `init.lua` bound one or more
+    /// keymaps to a Lua *function* (`vim.keymap.set("n", "x", function() ...
+    /// end)`). Those closures live here — [`Action::LuaKeymap`] carries only an
+    /// index into the runtime's callback registry, because a Lua closure is not
+    /// serialisable and cannot ride inside [`Config`]. `None` when there is no
+    /// Lua config or it bound no function keymaps. Set by
+    /// [`crate::ui::run`] after the config has executed; a unit test that builds
+    /// an `App` directly leaves it `None`. Only with `--features lua` (AID-0061).
+    #[cfg(feature = "lua")]
+    lua: Option<crate::luaconfig::LuaRuntime>,
     /// This project's harpoon marks (`<leader>b` marks, `<leader><Esc>` menu,
     /// `<leader>q` find).
     ///
@@ -568,6 +578,8 @@ impl<H: EditorHost> App<H> {
             tmux_prompt: None,
             #[cfg(test)]
             tmux_calls: Vec::new(),
+            #[cfg(feature = "lua")]
+            lua: None,
             harpoon: Harpoon::empty(&cwd),
             // Computed lazily — not here, so building an `App` in a unit test
             // never touches the filesystem (same rule as `tmux_prompt`). The
@@ -581,6 +593,15 @@ impl<H: EditorHost> App<H> {
             terminals_reaped: std::collections::HashSet::new(),
             term_pending_ctrl_backslash: false,
         }
+    }
+
+    /// Hands the App the live Lua runtime, so a keymap whose right-hand side was
+    /// a Lua *function* can be fired when its key is pressed. Called by
+    /// [`crate::ui::run`] once the config has executed. See the `lua` field and
+    /// [`Action::LuaKeymap`]. Only with `--features lua` (AID-0061).
+    #[cfg(feature = "lua")]
+    pub fn set_lua_runtime(&mut self, runtime: crate::luaconfig::LuaRuntime) {
+        self.lua = Some(runtime);
     }
 
     /// Real-launch only: swap the session-scoped [`Harpoon::empty`] the
@@ -598,11 +619,22 @@ impl<H: EditorHost> App<H> {
 
     /// Hands the App the resolved LSP-guard config (constants + on/off), pulled
     /// from [`crate::config::Config::lsp_guard`] at start-up. Kept out of
-    /// [`Self::new`] for the same reason as the harpoon store: `new` stays pure
+    /// [`Self::new`] for the same reason as the harpoon store (and, with `--features
+    /// lua`, the Lua runtime): `new` stays pure
     /// enough to build in a unit test without a full `Config`. See
     /// [`crate::lsp::resource_guard`].
     pub fn set_lsp_guard_config(&mut self, cfg: crate::config::LspGuardConfig) {
         self.lsp_guard_cfg = cfg;
+    }
+
+    /// Shows a one-line informational message on the statusline at startup —
+    /// used by [`crate::ui::run`] to surface a summary of what a Lua config
+    /// asked for and did not fully get. Coexists with the tmux consent popup,
+    /// which lives in a separate field. Only with `--features lua` (AID-0061):
+    /// the Lua note is its only caller.
+    #[cfg(feature = "lua")]
+    pub fn set_startup_message(&mut self, message: String) {
+        self.message = StatusMessage::Info(message);
     }
 
     /// Shuts down every running language server. Called once the event loop
@@ -1106,7 +1138,35 @@ impl<H: EditorHost> App<H> {
             Action::LspHover => self.lsp_hover(),
             Action::LspStart => self.lsp_force_start(),
             Action::LspInfo => self.lsp_info(),
+            #[cfg(feature = "lua")]
+            Action::LuaKeymap(id) => self.fire_lua_keymap(id),
             other => self.info(format!("{other:?} is not wired into the UI yet")),
+        }
+    }
+
+    /// Fires the Lua closure a `vim.keymap.set(mode, lhs, function() ... end)`
+    /// bound to this key. A config bug in the closure surfaces on the statusline
+    /// rather than crashing the editor — a keymap must never be able to take kvim
+    /// down. Any `vim.notify` the closure raised is drained onto the statusline
+    /// too, so a config that reports through a keymap is heard. Only with
+    /// `--features lua` (AID-0061).
+    #[cfg(feature = "lua")]
+    fn fire_lua_keymap(&mut self, id: usize) -> LoopAction {
+        let Some(runtime) = self.lua.as_mut() else {
+            return self.info("this key is bound to a Lua function, but no Lua runtime is loaded".to_string());
+        };
+        let before = runtime.notifications().len();
+        let result = runtime.fire_keymap(id);
+        let fresh: Vec<String> = runtime.notifications().into_iter().skip(before).collect();
+        match result {
+            Ok(()) => {
+                if let Some(msg) = fresh.into_iter().next_back() {
+                    self.info(msg)
+                } else {
+                    LoopAction::Redraw
+                }
+            }
+            Err(e) => self.error(format!("keymap error: {e}")),
         }
     }
 

@@ -1,11 +1,14 @@
 [package]
 name = "kopitiam-neovim"
 # Pinned, not `version.workspace`: per CLAUDE.md "no new commits, no version bump",
-# only crates whose code moved get bumped. 0.4.0, not 0.3.1: gh-118 removes the
+# only crates whose code moved get bumped. 0.4.1 = gh-118 follow-up: the Lua
+# config layer comes back, but ONLY behind the off-by-default `lua` feature, so
+# the default build is 0.4.0 exactly plus nothing -- additive, a patch. See
+# AID-0061. 0.4.0, not 0.3.1, was: gh-118 removes the
 # public `luaconfig` module, `Config::lua_files`, and the `Action::LuaKeymap` /
 # `Action::FeedKeys` variants — all breaking under Cargo's SemVer rules. See
 # AID-0060. (0.3.0 was gh-117's new `Action::LspCodeAction` variant, AID-0059.)
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -46,11 +49,15 @@ kopitiam-snippet.workspace = true
 # KOPITIAM app.
 kopitiam-config.workspace = true
 
-# NO `kopitiam-lua` here, on purpose. kvim used to run init.lua through a
-# `vim.*` shim on that VM (AID-0034); the maintainer reversed that on
-# 2026-10-06 ("kopitiam-neovim shouldn't need to read lua, i want my
-# preferences hardcoded in"), so kvim now carry their preferences compiled in
-# as data and never read or run Lua. See AID-0060 / gh-118.
+# `kopitiam-lua` is OPTIONAL -- pulled in only by the `lua` feature below, which
+# is OFF by default. kvim used to run init.lua through a `vim.*` shim on that VM
+# unconditionally (AID-0034); the maintainer reversed that on 2026-10-06
+# ("kopitiam-neovim shouldn't need to read lua, i want my preferences hardcoded
+# in", AID-0060), then asked the same day to "keep kopitiam-lua as a feature
+# gated dependency ... off by default" (AID-0061). So a default build carry the
+# preferences compiled in as data and never read or run Lua -- the VM is not
+# even compiled. `--features lua` brings back the shim exactly as it was.
+kopitiam-lua = { workspace = true, optional = true }
 
 # Text engine. `ropey` is pure Rust, is the rope behind Helix, and is O(log n)
 # for the index/edit operations an editor performs constantly.
@@ -86,6 +93,17 @@ sysinfo.workspace = true
 # discipline). See `src/termemu.rs` and AID-0049.
 portable-pty.workspace = true
 vt100.workspace = true
+
+[features]
+# Default build is Lua-free (0.4.0 behaviour). Hor, don't add `lua` here -- the
+# maintainer wants it OFF by default (AID-0061, gh-118).
+default = []
+# Opt-in: execute ~/.kopitiam/kopitiam-neovim/init.lua (+ lua/*.lua) at startup
+# through the `vim.*` shim on the pure-Rust `kopitiam-lua` VM (AID-0034). Adds
+# the `luaconfig` module, `Config::lua_files`, `Action::{FeedKeys, LuaKeymap}`
+# and `App::{set_lua_runtime, set_startup_message}`.
+#   cargo install kopitiam-neovim --features lua
+lua = ["dep:kopitiam-lua"]
 
 [dev-dependencies]
 tempfile.workspace = true

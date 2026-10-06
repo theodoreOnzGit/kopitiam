@@ -152,7 +152,9 @@ phase is independently useful:
 * ~~**Phase 4** — `kopitiam-lua` VM + the `vim.*` API surface. *Now Lua configs
   and third-party plugins load.*~~ **CORRECTED 2026-10-06:** built (AID-0034),
   then removed by the maintainer in kopitiam-neovim 0.4.0 — kvim never reads or
-  runs Lua; preferences are hardcoded as data (AID-0060, gh-118).
+  runs Lua; preferences are hardcoded as data (AID-0060, gh-118). **Amended same day (0.4.1):**
+  the Lua layer is back only as the opt-in, off-by-default `lua` cargo feature
+  (AID-0061); the default build still never reads or runs Lua.
 * **Phase 5** — the native plugin suite from decision 3.
 * **Phase 6** — `apps/kvim` with your config baked in.
 

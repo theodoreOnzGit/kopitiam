@@ -110,16 +110,25 @@ clipboard, command history, quickfix), it does.
 * **Autocommands / event hooks** — ~~arrive with the Lua `vim.*` surface
   (Phase 4, `kopitiam-cj0.4`/`.11`).~~ **CORRECTED 2026-10-06:** there is no
   Lua `vim.*` surface any more — kvim 0.4.0 removed it (AID-0060, gh-118;
-  kvim never reads or runs Lua, preferences are compiled in). The one
+  kvim never reads or runs Lua, preferences are compiled in). (0.4.1 brings
+  the shim back only behind the opt-in `lua` feature, AID-0061; its
+  `vim.api.nvim_create_autocmd` is recorded, not fired, so this item stands.) The one
   autocommand behaviour the maintainer's config relies on is already native:
   `*.tex` → `tex` filetype is extension-based detection in `ui/app.rs`, and
   `TermOpen → mouse=""` is moot because kvim never captures the mouse
   (`ui/terminal.rs`). A general event-hook API, if ever wanted, would be
   Rust-side and needs its own scoping.
-* **User configuration language** — **Deferred by design, 2026-10-06.** kvim
-  has no scripting config (no Lua, no Vimscript). The full config surface is
-  `Config::default` (the maintainer's preferences, hardcoded as data) plus a
-  `config.json` override. See AID-0060.
+* **User configuration language** — **Deferred by design, 2026-10-06.** ~~kvim
+  has no scripting config (no Lua, no Vimscript).~~ **AMENDED 2026-10-06
+  (0.4.1, AID-0061):** the *default build* has no scripting config (no Lua, no
+  Vimscript); the full config surface there is `Config::default` (the
+  maintainer's preferences, hardcoded as data) plus a `config.json` override
+  (AID-0060). The pre-0.4.0 Lua layer (`init.lua` through the `vim.*` shim,
+  AID-0034) is back **only** as the opt-in, off-by-default cargo feature
+  `lua` (`cargo install kopitiam-neovim --features lua`), with its tests
+  (`luaconfig::tests`) run under `--features lua`. Maturity unchanged from
+  AID-0034: a shim, not a Neovim API; unsupported `vim.*` calls degrade to
+  startup warnings.
 * **Incremental syntax highlighting** — the lexers are tracked by
   `kopitiam-v66`/`kopitiam-2qi` (AID-0009: hand-written pure-Rust lexers, no
   tree-sitter). The *incremental re-lex on edit* is the infra piece to build

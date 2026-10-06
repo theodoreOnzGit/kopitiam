@@ -46,16 +46,21 @@ CRATES=(
     kopitiam-config      # no internal deps
     kopitiam-syntax      # no internal deps
     kopitiam-snippet     # no internal deps
+    kopitiam-lua         # no internal deps (pure-Rust Lua 5.1 VM). OPTIONAL dep of
+                         # kvim since 0.4.1 (`lua` feature, off by default --
+                         # AID-0061), but crates.io still needs every optional dep
+                         # on the registry at a matching version, so it stays in the
+                         # tree. Held at 0.2.5 (unchanged since), so this is a skip.
     kopitiam-semantic    # depends on: kopitiam-ontology
-    kopitiam-neovim      # depends on: config, semantic, snippet, syntax
-    # (NOT kopitiam-lua: kvim dropped its Lua config layer in 0.4.0 -- AID-0060,
-    # gh-118 -- so the Lua VM is no longer part of the kvim publish tree.)
+    kopitiam-neovim      # depends on: config, semantic, snippet, syntax (+ lua, optional)
+    # (0.4.0 had dropped kopitiam-lua from this list -- AID-0060; 0.4.1 put it
+    # back as an optional dep -- AID-0061, gh-118.)
 )
 
 # Versions are PER CRATE, not one workspace number: CLAUDE.md's "no new commits,
 # no version bump" rule means a crate that moved pins its own `version =` (e.g.
 # kopitiam-neovim 0.3.0, kopitiam-semantic 0.2.6 for gh-117; kopitiam-neovim
-# 0.4.0 for gh-118) while untouched ones
+# 0.4.0 for gh-118, 0.4.1 for its opt-in `lua` feature) while untouched ones
 # hold at the workspace version. So, exactly like publish.sh, each crate's own
 # version is resolved from Cargo's own view of its manifest. (The old single
 # WORKSPACE_VERSION read here would have checked `kopitiam-neovim@0.2.5`, found

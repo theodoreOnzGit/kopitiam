@@ -19,12 +19,17 @@
 //! ([`Config::config_path`]); the code never read `~/.config/kvim/`. (See
 //! `docs/ai-decisions/AID-0003-kopitiam-neovim-architecture.md`, decision 5.)
 //!
-//! It also **never reads or runs Lua** — not `~/.config/nvim/*.lua`, not an
-//! `init.lua` in its own directory, nothing. The maintainer's preferences are
-//! hardcoded here as data, and that is the whole config surface besides
-//! `config.json`. (From 0.2.x until 0.4.0 kvim did execute
-//! `~/.kopitiam/kopitiam-neovim/init.lua` through a `vim.*` shim — AID-0034;
-//! the maintainer reversed that on 2026-10-06, AID-0060 / gh-118.)
+//! In a **default build** it also **never reads or runs Lua** — not
+//! `~/.config/nvim/*.lua`, not an `init.lua` in its own directory, nothing. The
+//! maintainer's preferences are hardcoded here as data, and that is the whole
+//! config surface besides `config.json`. (From 0.2.x until 0.4.0 kvim did
+//! execute `~/.kopitiam/kopitiam-neovim/init.lua` through a `vim.*` shim —
+//! AID-0034; the maintainer reversed that on 2026-10-06, AID-0060 / gh-118.)
+//!
+//! Since 0.4.1 that shim is back as an **opt-in** cargo feature, `lua`, OFF by
+//! default (AID-0061). Only `--features lua` compiles in [`Config::lua_files`],
+//! the `luaconfig` module and the two Lua-only [`Action`] variants; without it,
+//! none of that exists and `kopitiam-lua` is not even a dependency.
 
 use std::collections::BTreeMap;
 
@@ -255,11 +260,31 @@ pub enum Action {
     EasyAlign,
     /// Run an ex command verbatim.
     Command(String),
-    // `FeedKeys(String)` and `LuaKeymap(usize)` used to live here. Both were
-    // produced ONLY by the Lua `vim.*` shim (AID-0034), and neither was ever
-    // dispatched by anything else — `FeedKeys` fell through to "not wired into
-    // the UI yet". The shim is gone (AID-0060, gh-118: kvim never read or run
-    // Lua any more), so the two variants went with it in 0.4.0.
+    /// Feed a raw key sequence, exactly as if the user typed it — vim's
+    /// `nnoremap lhs rhs` where `rhs` is keys, not an ex command. The string is
+    /// in vim notation (`ciw`, `<Esc>`, `dd`). Produced by the `vim.*` shim when
+    /// `vim.keymap.set(mode, lhs, rhs)` is handed a plain string that is not an
+    /// `<cmd>...<cr>` / `:...` ex invocation.
+    ///
+    /// **Only with `--features lua`** (AID-0061). Removed outright in 0.4.0
+    /// (AID-0060) and brought back gated in 0.4.1, so a default build's `Action`
+    /// is exactly 0.4.0's. Note: enabling the feature ADDS this variant to an
+    /// exhaustive enum — a downstream exhaustive `match` on `Action` would stop
+    /// compiling if anything in its graph switches `lua` on. AID-0061 records
+    /// why that trade-off was accepted.
+    #[cfg(feature = "lua")]
+    FeedKeys(String),
+    /// Call a Lua function bound as a keymap's right-hand side. The `usize` is an
+    /// index into the live [`crate::luaconfig::LuaRuntime`]'s callback registry —
+    /// the function value itself cannot live in `Config` because a Lua closure is
+    /// neither `Serialize` nor `PartialEq`, so the config stores only the handle
+    /// and the runtime owns the closure. Produced by the `vim.*` shim when
+    /// `vim.keymap.set(mode, lhs, function() ... end)` is given a function `rhs`.
+    ///
+    /// **Only with `--features lua`** — same gating and same caveat as
+    /// [`Action::FeedKeys`] (AID-0061).
+    #[cfg(feature = "lua")]
+    LuaKeymap(usize),
 }
 
 /// Tuning knobs for the resource-aware LSP guard (see
@@ -474,6 +499,52 @@ impl Config {
     pub fn config_path() -> Option<std::path::PathBuf> {
         Some(Self::dir()?.join("config.json"))
     }
+
+    /// Lua configuration files found in kvim's directory, in load order:
+    /// `init.lua` first, then `lua/*.lua` sorted by name.
+    ///
+    /// **Only with `--features lua`** (off by default, AID-0061). A default
+    /// build has no such method, because it never read Lua.
+    ///
+    /// # These are discovered here, and executed by [`crate::luaconfig`]
+    ///
+    /// This method only *lists* the files (it is what `kvim --config-path`
+    /// prints). Actually running them is [`crate::luaconfig::LuaRuntime::load`]'s
+    /// job: it feeds `init.lua` — with `lua/*.lua` reachable through `require` —
+    /// to the pure-Rust `kopitiam-lua` VM behind a `vim.*` shim, so the config
+    /// mutates a real [`Config`]. See `docs/ai-decisions/AID-0003` (why a
+    /// pure-Rust VM) and `AID-0034` (how the shim maps Lua onto the editor).
+    ///
+    /// Returns an empty vector when the directory does not exist, which is the
+    /// normal case — kvim's defaults *are* a full configuration, so a user need
+    /// never write one.
+    #[cfg(feature = "lua")]
+    pub fn lua_files() -> Vec<std::path::PathBuf> {
+        let Some(dir) = Self::dir() else { return Vec::new() };
+
+        let mut files = Vec::new();
+
+        // `init.lua` is the entry point, and loads first — the same convention
+        // Neovim uses, so a user's muscle memory transfers.
+        let init = dir.join("init.lua");
+        if init.is_file() {
+            files.push(init);
+        }
+
+        // Then `lua/*.lua`, sorted, so load order is deterministic rather than
+        // whatever order the filesystem happens to hand back.
+        if let Ok(entries) = std::fs::read_dir(dir.join("lua")) {
+            let mut modules: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "lua"))
+                .collect();
+            modules.sort();
+            files.extend(modules);
+        }
+
+        files
+    }
 }
 
 /// kvim's subdirectory under `~/.kopitiam`. The crate name, not the binary
@@ -583,6 +654,40 @@ mod tests {
         // still depends on.
         let s = dir.to_string_lossy();
         assert!(!s.contains(".config/nvim"), "kvim must never live inside ~/.config/nvim");
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn lua_files_are_discovered_in_a_deterministic_load_order() {
+        // init.lua first, then lua/*.lua sorted — so behaviour does not depend
+        // on whatever order the filesystem happens to return entries in.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("init.lua"), "-- entry").unwrap();
+        std::fs::create_dir(dir.path().join("lua")).unwrap();
+        for name in ["zebra.lua", "alpha.lua", "notes.txt"] {
+            std::fs::write(dir.path().join("lua").join(name), "-- x").unwrap();
+        }
+
+        // Mirror `lua_files()`'s logic against this tempdir (it reads a real
+        // home directory, which a test must not depend on).
+        let mut found = Vec::new();
+        let init = dir.path().join("init.lua");
+        if init.is_file() {
+            found.push(init);
+        }
+        let mut modules: Vec<_> = std::fs::read_dir(dir.path().join("lua"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "lua"))
+            .collect();
+        modules.sort();
+        found.extend(modules);
+
+        let names: Vec<_> = found.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["init.lua", "alpha.lua", "zebra.lua"]);
+        // The .txt is not a Lua file and must not be picked up.
+        assert!(!names.iter().any(|n| n.ends_with(".txt")));
     }
 
     #[test]

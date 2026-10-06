@@ -1,6 +1,9 @@
 # AID-0060 — kvim drops its Lua config layer: preferences hardcoded only, released as 0.4.0
 
-**Status:** Pending review
+**Status:** Pending review — **amended 2026-10-06 by
+[AID-0061](AID-0061-kvim-lua-as-opt-in-feature.md)**: the Lua layer is back in
+0.4.1, but only behind the opt-in, off-by-default `lua` cargo feature. The
+default build is still exactly what this AID describes.
 **Date:** 2026-10-06 (SGT)
 **Issue:** gh-118 / `bd-8p3`
 **Reverses:** [AID-0034](AID-0034-kvim-lua-vim-shim.md) (kvim executes `init.lua` through a `vim.*` shim)

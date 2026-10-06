@@ -237,9 +237,10 @@ pub const LUA_LANGUAGE_SERVER: LanguageServer = LanguageServer {
     // a fabricated URL.
     //
     // Worth noting this is also the least painful of the three to lose: kvim
-    // exists precisely so that no Lua config is needed (and since 0.4.0 kvim
-    // never reads or runs Lua at all — AID-0060). KOPITIAM still has a
-    // pure-Rust Lua 5.1 VM (`kopitiam-lua`, no longer a kvim dependency) — a
+    // exists precisely so that no Lua config is needed (and since 0.4.0 a
+    // default kvim never reads or runs Lua at all — AID-0060; Lua config is
+    // only the opt-in `lua` feature since 0.4.1, AID-0061). KOPITIAM still has a
+    // pure-Rust Lua 5.1 VM (`kopitiam-lua`, an optional kvim dependency) — a
     // Rust-native Lua language server built on that would close this properly,
     // and would be ours.
     termux_package: Some("lua-language-server"),
