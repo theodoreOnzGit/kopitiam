@@ -58,7 +58,7 @@ pub mod position;
 pub mod registry;
 pub mod resource_guard;
 
-pub use client::{Diagnostic, Location, LspClient, LspError, Severity};
+pub use client::{AppliedCodeAction, CodeAction, Diagnostic, Location, LspClient, LspError, Severity};
 pub use completion::{CompletionItem, CompletionSource};
 pub use install::Plan as InstallPlan;
 pub use position::{LspPosition, PositionEncoding};

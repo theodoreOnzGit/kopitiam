@@ -71,7 +71,8 @@ use anyhow::Result;
 use crate::edit::FileEdit;
 use crate::lsp_client::{ProgressKind, ProgressUpdate};
 use crate::lsp_types::{CompletionItem, Diagnostic, Hover, Location};
-use crate::session::{CodeAction, RustAnalyzerSession};
+use crate::code_action::{AppliedCodeAction, CodeAction};
+use crate::session::RustAnalyzerSession;
 
 /// The default upper bound on the background connect, matching
 /// [`RustAnalyzerSession::connect`]'s synchronous behaviour. Reaching it flips
@@ -534,6 +535,29 @@ impl AsyncRustAnalyzerSession {
     /// action by value because it must be moved onto the worker thread.
     pub fn apply_code_action(&self, action: CodeAction) -> Result<Vec<FileEdit>, RequestError> {
         self.run(move |session| session.apply_code_action(&action))
+    }
+
+    /// Async counterpart of [`RustAnalyzerSession::apply_code_action_detailed`].
+    pub fn apply_code_action_detailed(&self, action: CodeAction) -> Result<AppliedCodeAction, RequestError> {
+        self.run(move |session| session.apply_code_action_detailed(&action))
+    }
+
+    /// Async counterpart of [`RustAnalyzerSession::code_actions_in_range`].
+    pub fn code_actions_in_range(&self, file: &Path, start: (u32, u32), end: (u32, u32)) -> Result<Vec<CodeAction>, RequestError> {
+        let file = file.to_path_buf();
+        self.run(move |session| session.code_actions_in_range(&file, start, end))
+    }
+
+    /// Async counterpart of [`RustAnalyzerSession::resolve_code_action`].
+    pub fn resolve_code_action(&self, action: CodeAction) -> Result<CodeAction, RequestError> {
+        self.run(move |session| session.resolve_code_action(&action))
+    }
+
+    /// Async counterpart of [`RustAnalyzerSession::execute_command`] — for the
+    /// trailing command of an action whose edit the caller has just written.
+    pub fn execute_command(&self, command: &str, arguments: serde_json::Value) -> Result<serde_json::Value, RequestError> {
+        let command = command.to_string();
+        self.run(move |session| session.execute_command(&command, arguments))
     }
 
     /// Async counterpart of [`RustAnalyzerSession::did_open`].

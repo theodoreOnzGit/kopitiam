@@ -53,7 +53,7 @@ use crate::plugins::grep;
 use crate::plugins::harpoon::Harpoon;
 use crate::plugins::picker::walk_files;
 use crate::lsp::completion::{self, CompletionItem as CItem, CompletionSource};
-use crate::lsp::{Location as LspLocation, LspClient};
+use crate::lsp::{CodeAction, Location as LspLocation, LspClient};
 use crate::ui::completion_menu::{anchored_rect, menu_rect, Anchor, CompletionMenu as CompletionMenuWidget};
 use crate::ui::lsp_ui::{centered_rect, InfoBox};
 use crate::ui::snippet::SnippetSession;
@@ -180,6 +180,9 @@ pub struct App<H: EditorHost> {
     /// An in-progress rename (`<leader>rn`): the captured symbol context plus
     /// the new name being typed. While `Some`, keys go to the prompt.
     lsp_rename: Option<RenameState>,
+    /// An open code-action menu (`<leader>ca`). While `Some`, `j`/`k` move,
+    /// Enter (or a digit `1`–`9`) applies, `q`/`<Esc>` closes.
+    lsp_code_actions: Option<CodeActionMenu>,
     /// The most recent diagnostics per file, polled from the running servers
     /// (diagnostics are *pushed* asynchronously, so they are refreshed on the
     /// event loop's idle tick — see [`App::refresh_diagnostics`]). Rendered as
@@ -369,6 +372,40 @@ struct RenameState {
     line_text: String,
 }
 
+/// An open code-action menu (`<leader>ca`): the actions the server offered,
+/// plus the `(filetype, file)` they were asked for — captured at request time
+/// so applying one goes to the same server and file even if focus moved.
+struct CodeActionMenu {
+    filetype: String,
+    file: PathBuf,
+    actions: Vec<CodeAction>,
+    selected: usize,
+}
+
+/// The rows of the code-action menu, one per action, numbered from 1 so a
+/// digit picks one directly (Neovim's `vim.ui.select` numbers its list the same
+/// way). A preferred fix is starred; a disabled one carries the server's
+/// reason, so the user sees *why* it will not apply instead of a silent no-op.
+fn code_action_menu_lines(actions: &[CodeAction]) -> Vec<String> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let mut line = format!("{}. {}", i + 1, a.title.replace('\n', " "));
+            if a.is_preferred() {
+                line.push_str(" *");
+            }
+            if let Some(kind) = a.kind().filter(|k| !k.is_empty()) {
+                line.push_str(&format!("  [{kind}]"));
+            }
+            if let Some(reason) = a.disabled_reason() {
+                line.push_str(&format!("  (disabled: {reason})"));
+            }
+            line
+        })
+        .collect()
+}
+
 /// The most rows the completion popup shows at once before it starts to scroll
 /// to keep the selection visible — a blink.cmp-ish height.
 const MAX_COMPLETION_ROWS: usize = 8;
@@ -517,6 +554,7 @@ impl<H: EditorHost> App<H> {
             lsp_hover: None,
             lsp_refs: None,
             lsp_rename: None,
+            lsp_code_actions: None,
             diagnostics: std::collections::HashMap::new(),
             lsp_opened: std::collections::HashSet::new(),
             lsp_no_server: std::collections::HashSet::new(),
@@ -815,6 +853,9 @@ impl<H: EditorHost> App<H> {
                         if self.lsp_refs.is_some() {
                             return self.handle_refs_key(kp);
                         }
+                        if self.lsp_code_actions.is_some() {
+                            return self.handle_code_action_key(kp);
+                        }
                         if self.lsp_hover.is_some() {
                             // Any key dismisses a hover popup (Neovim: the popup
                             // closes on the next action), and is then swallowed.
@@ -1087,6 +1128,7 @@ impl<H: EditorHost> App<H> {
             Action::LspDefinition => self.lsp_definition(),
             Action::LspReferences => self.lsp_references(),
             Action::LspRename => self.lsp_start_rename(),
+            Action::LspCodeAction => self.lsp_code_action(),
             Action::LspHover => self.lsp_hover(),
             Action::LspStart => self.lsp_force_start(),
             Action::LspInfo => self.lsp_info(),
@@ -1320,24 +1362,135 @@ impl<H: EditorHost> App<H> {
             Err(e) if e.is_not_ready() => self.info(format!("{} LSP is still starting — try again in a moment", r.filetype)),
             Ok(edits) => {
                 let count = edits.len();
-                for edit in &edits {
-                    if let Err(e) = std::fs::write(&edit.path, &edit.updated) {
-                        return self.error(format!("writing {}: {e}", edit.path.display()));
-                    }
-                }
-                // Reload the active buffer from disk so the rename shows on
-                // screen. (`Editor::open` reopens the path; the window's buffer
-                // id follows via `sync_active_window`.)
-                if let Some(path) = self.host.buffer().path().map(Path::to_path_buf) {
-                    let cursor = self.host.cursor();
-                    if self.host.open(&path).is_ok() {
-                        self.host.set_active(self.host.active_buffer_id(), cursor);
-                        self.sync_active_window();
-                    }
+                if let Err(e) = self.write_lsp_edits(&edits) {
+                    return self.error(e);
                 }
                 self.info(format!("renamed to '{}' across {count} file(s)", r.input))
             }
             Err(e) => self.error(format!("LSP rename: {e}")),
+        }
+    }
+
+    /// The one place LSP edits land — rename's and code actions' shared path:
+    /// write every computed [`FileEdit`](kopitiam_semantic::edit::FileEdit) to
+    /// disk, then reload the active buffer so the change shows on screen.
+    /// (`Editor::open` reopens the path; the window's buffer id follows via
+    /// `sync_active_window`.) Other open buffers touched by the edit are not
+    /// reloaded yet — the same limit rename has always had.
+    fn write_lsp_edits(&mut self, edits: &[kopitiam_semantic::edit::FileEdit]) -> Result<(), String> {
+        kopitiam_semantic::edit::write_file_edits(edits).map_err(|e| format!("{e:#}"))?;
+        self.reload_active_from_disk();
+        Ok(())
+    }
+
+    /// Re-reads the active buffer from disk, keeping the cursor — after an LSP
+    /// edit was written (by us, or by the server's `workspace/applyEdit`).
+    fn reload_active_from_disk(&mut self) {
+        if let Some(path) = self.host.buffer().path().map(Path::to_path_buf) {
+            let cursor = self.host.cursor();
+            if self.host.open(&path).is_ok() {
+                self.host.set_active(self.host.active_buffer_id(), cursor);
+                self.sync_active_window();
+            }
+        }
+    }
+
+    /// `<leader>ca`: ask the server for code actions at the cursor (or over the
+    /// visual selection, when the host reports one) and open a menu of them.
+    ///
+    /// Refuses on a **modified** buffer: the semantic layer computes actions —
+    /// and their edits — against the file on *disk*, and applying them reloads
+    /// the buffer from disk, so offering them over unsaved text would either
+    /// mis-place the edit or throw the unsaved text away. Save first lah.
+    fn lsp_code_action(&mut self) -> LoopAction {
+        let Some((ft, file, cursor, cursor_line)) = self.lsp_context() else {
+            return self.info("no language server configured for this buffer".to_string());
+        };
+        if self.host.buffer().is_modified() {
+            return self.info("save first (:w) lah — code actions work on the file on disk".to_string());
+        }
+        if !LspClient::server_available(&ft) {
+            return self.info(format!("{ft} language server is not installed"));
+        }
+        let (range, start_text, end_text) = match self.host.selection() {
+            Some((start, end)) => {
+                let buf = self.host.buffer();
+                let (st, et) = (buf.line(start.line).unwrap_or_default(), buf.line(end.line).unwrap_or_default());
+                (Range::new(start, end), st, et)
+            }
+            None => (Range::point(cursor), cursor_line.clone(), cursor_line),
+        };
+        match self.lsp.code_actions(&ft, &file, range, &start_text, &end_text) {
+            Ok(actions) if actions.is_empty() => self.info("no code actions here".to_string()),
+            Ok(actions) => {
+                self.lsp_code_actions = Some(CodeActionMenu { filetype: ft, file, actions, selected: 0 });
+                LoopAction::Redraw
+            }
+            Err(e) if e.is_not_ready() => self.info(format!("{ft} LSP is still starting — try again in a moment")),
+            Err(e) => self.error(format!("LSP code actions: {e}")),
+        }
+    }
+
+    /// Feeds a key to the code-action menu: `j`/`k` (or arrows) move, Enter
+    /// applies the selected action, a digit `1`–`9` applies that row directly,
+    /// `q`/`<Esc>` closes.
+    fn handle_code_action_key(&mut self, kp: KeyPress) -> LoopAction {
+        let Some(menu) = self.lsp_code_actions.as_mut() else { return LoopAction::Continue };
+        match kp.key {
+            Key::Escape | Key::Char('q') => {
+                self.lsp_code_actions = None;
+                LoopAction::Redraw
+            }
+            Key::Char('j') | Key::Down => {
+                if menu.selected + 1 < menu.actions.len() {
+                    menu.selected += 1;
+                }
+                LoopAction::Redraw
+            }
+            Key::Char('k') | Key::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+                LoopAction::Redraw
+            }
+            Key::Enter => {
+                let idx = menu.selected;
+                self.apply_code_action(idx)
+            }
+            Key::Char(c @ '1'..='9') => {
+                let idx = c as usize - '1' as usize;
+                if idx < menu.actions.len() { self.apply_code_action(idx) } else { LoopAction::Continue }
+            }
+            _ => LoopAction::Continue,
+        }
+    }
+
+    /// Applies action `idx` of the open menu and closes it: resolve (inside the
+    /// client), then write the edit through [`Self::write_lsp_edits`] — the
+    /// same path rename uses — and run any follow-up command after; or, for a
+    /// command-only action the server already ran (its edits already on disk
+    /// via `workspace/applyEdit`), just reload.
+    fn apply_code_action(&mut self, idx: usize) -> LoopAction {
+        let Some(menu) = self.lsp_code_actions.take() else { return LoopAction::Continue };
+        let Some(action) = menu.actions.get(idx) else { return LoopAction::Continue };
+        let title = action.title.clone();
+        match self.lsp.apply_code_action(&menu.filetype, &menu.file, action) {
+            Ok(applied) => {
+                if let Some(command) = applied.ran_command {
+                    self.reload_active_from_disk();
+                    return self.info(format!("ran '{command}' for '{title}'"));
+                }
+                let count = applied.edits.len();
+                if let Err(e) = self.write_lsp_edits(&applied.edits) {
+                    return self.error(e);
+                }
+                if let Some((command, arguments)) = applied.follow_up_command
+                    && let Err(e) = self.lsp.execute_command(&menu.filetype, &menu.file, &command, arguments)
+                {
+                    return self.info(format!("applied '{title}' ({count} file(s)); follow-up command skipped: {e}"));
+                }
+                self.info(format!("applied '{title}' ({count} file(s))"))
+            }
+            Err(e) if e.is_not_ready() => self.info(format!("{} LSP is still starting — try again in a moment", menu.filetype)),
+            Err(e) => self.error(format!("LSP code action: {e}")),
         }
     }
 
@@ -3540,6 +3693,16 @@ impl<H: EditorHost> App<H> {
                 InfoBox { title: "references", lines: &lines, selected: Some(refs.selected), theme: &self.theme, scroll },
                 rect,
             );
+        } else if let Some(menu) = &self.lsp_code_actions {
+            let lines = code_action_menu_lines(&menu.actions);
+            let title = "code actions (Enter/1-9 apply, Esc close)";
+            let rect = popup_rect_for(area, &lines, 80, title);
+            let inner_h = rect.height.saturating_sub(2) as usize;
+            let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
+            frame.render_widget(
+                InfoBox { title, lines: &lines, selected: Some(menu.selected), theme: &self.theme, scroll },
+                rect,
+            );
         } else if let Some(r) = &self.lsp_rename {
             let lines = vec![r.input.clone()];
             let rect = centered_rect(area, 40, 3);
@@ -3766,6 +3929,7 @@ impl<H: EditorHost> App<H> {
                 && self.hop.is_none()
                 && self.lsp_rename.is_none()
                 && self.lsp_refs.is_none()
+                && self.lsp_code_actions.is_none()
                 && self.host.command_line().is_none()
                 && let Some((x, y)) = text_area.cursor_screen_position(rect)
             {
@@ -4507,6 +4671,118 @@ mod tests {
         // A 5-dep project must not be gated on any sane machine (fail-open if the
         // probe is unavailable also yields START).
         assert!(msg.contains("decision: START") || msg.contains("n/a"), "{msg}");
+    }
+
+    /// The edit-application path rename and code actions share: every computed
+    /// `FileEdit` lands on disk, and the active buffer is reloaded from disk so
+    /// the change is on screen — the cursor kept where it was.
+    #[test]
+    fn write_lsp_edits_writes_to_disk_and_reloads_the_active_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        let original = "use std::fmt;\nfn main() {}\n";
+        std::fs::write(&file, original).unwrap();
+        let buffer = FakeBuffer::new(original.lines().map(str::to_string).collect()).with_path(file.clone());
+        let mut app = App::new(FakeHost::new(buffer), Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        app.host.cursor = Position::new(1, 3);
+
+        let edit = kopitiam_semantic::edit::FileEdit {
+            path: file.clone(),
+            original: original.to_string(),
+            updated: "fn main() {}\n".to_string(),
+        };
+        app.write_lsp_edits(&[edit]).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {}\n");
+        assert_eq!(app.host.buffer().line(0).as_deref(), Some("fn main() {}"), "buffer reloaded from disk");
+        assert_eq!(app.host.opened, vec![file], "reloaded through EditorHost::open");
+    }
+
+    /// A failed write surfaces as an error string, never a panic.
+    #[test]
+    fn write_lsp_edits_reports_an_unwritable_path() {
+        let mut app = app_with(vec!["x"]);
+        let edit = kopitiam_semantic::edit::FileEdit {
+            path: PathBuf::from("/nonexistent-kvim-dir/never/here.rs"),
+            original: String::new(),
+            updated: "x".to_string(),
+        };
+        assert!(app.write_lsp_edits(&[edit]).is_err());
+    }
+
+    /// `<leader>ca` on a modified buffer refuses up front (the actions would be
+    /// computed against the stale on-disk file) — and says why, without
+    /// touching any server.
+    #[test]
+    fn code_action_refuses_on_a_modified_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        let buffer = FakeBuffer::new(vec!["fn a() { }".to_string()]).with_path(file).with_modified(true);
+        let mut app = App::new(FakeHost::new(buffer), Options::default(), Theme::gruvbox_dark(), IconSet::Ascii, ' ');
+        app.lsp_code_action();
+        match &app.message {
+            StatusMessage::Info(m) => assert!(m.contains("save first"), "{m}"),
+            other => panic!("expected Info, got {other:?}"),
+        }
+        assert!(app.lsp_code_actions.is_none());
+    }
+
+    fn menu_with(titles: &[&str]) -> CodeActionMenu {
+        CodeActionMenu {
+            filetype: "rust".to_string(),
+            file: PathBuf::from("/tmp/kvim-ca/lib.rs"),
+            actions: titles.iter().map(|t| CodeAction::from_raw(serde_json::json!({ "title": t }))).collect(),
+            selected: 0,
+        }
+    }
+
+    /// The menu owns the keyboard: `j`/`k` move within bounds, an out-of-range
+    /// digit is ignored, `q`/`<Esc>` close without applying anything.
+    #[test]
+    fn code_action_menu_navigates_and_closes() {
+        let mut app = app_with(vec!["x"]);
+        app.lsp_code_actions = Some(menu_with(&["one", "two"]));
+        let key = |c| KeyPress { key: Key::Char(c), mods: Modifiers::default() };
+        app.handle_code_action_key(key('j'));
+        app.handle_code_action_key(key('j'));
+        assert_eq!(app.lsp_code_actions.as_ref().unwrap().selected, 1, "j stops at the last row");
+        app.handle_code_action_key(key('k'));
+        assert_eq!(app.lsp_code_actions.as_ref().unwrap().selected, 0);
+        app.handle_code_action_key(key('9'));
+        assert!(app.lsp_code_actions.is_some(), "a digit past the list applies nothing");
+        app.handle_code_action_key(KeyPress { key: Key::Escape, mods: Modifiers::default() });
+        assert!(app.lsp_code_actions.is_none());
+    }
+
+    /// The menu rows are numbered (digits pick), star the preferred fix, show
+    /// the kind, and carry a disabled action's reason.
+    #[test]
+    fn code_action_menu_lines_number_star_and_explain() {
+        let actions = vec![
+            CodeAction::from_raw(serde_json::json!({ "title": "Remove unused import", "kind": "quickfix", "isPreferred": true })),
+            CodeAction::from_raw(serde_json::json!({ "title": "Extract into variable", "disabled": { "reason": "no expression" } })),
+        ];
+        let lines = code_action_menu_lines(&actions);
+        assert_eq!(lines[0], "1. Remove unused import *  [quickfix]");
+        assert_eq!(lines[1], "2. Extract into variable  (disabled: no expression)");
+    }
+
+    /// The menu paints on screen (asserted on the cells, the only assertion
+    /// that catches a popup that is wired but never drawn).
+    #[test]
+    fn code_action_menu_is_painted() {
+        let mut app = app_with(vec!["fn main() {}"]);
+        app.lsp_code_actions = Some(menu_with(&["Fill match arms"]));
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..20)
+            .map(|y| (0..80).map(|x| buf.cell((x, y)).unwrap().symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1. Fill match arms"), "{text}");
+        assert!(text.contains("code actions"), "{text}");
     }
 
     /// With the constants cranked so the estimate dwarfs any budget, `:LspInfo`

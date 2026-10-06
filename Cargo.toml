@@ -196,7 +196,7 @@ kopitiam-plot = { path = "crates/kopitiam-plot", version = "0.2.5" }
 kopitiam-document = { path = "crates/kopitiam-document", version = "0.2.5" }
 kopitiam-markdown = { path = "crates/kopitiam-markdown", version = "0.2.5" }
 kopitiam-ontology = { path = "crates/kopitiam-ontology", version = "0.2.5" }
-kopitiam-semantic = { path = "crates/kopitiam-semantic", version = "0.2.5" }
+kopitiam-semantic = { path = "crates/kopitiam-semantic", version = "0.2.6" }
 kopitiam-knowledge = { path = "crates/kopitiam-knowledge", version = "0.2.5" }
 kopitiam-index = { path = "crates/kopitiam-index", version = "0.2.5" }
 kopitiam-search = { path = "crates/kopitiam-search", version = "0.2.5" }

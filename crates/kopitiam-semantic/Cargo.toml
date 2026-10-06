@@ -1,6 +1,9 @@
 [package]
 name = "kopitiam-semantic"
-version.workspace = true
+# Pinned, not `version.workspace`: per CLAUDE.md "no new commits, no version bump",
+# only crates whose code moved get bumped. 0.2.6 = LSP code actions (gh-117):
+# range requests with diagnostics context, codeAction/resolve, executeCommand guard.
+version = "0.2.6"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

@@ -62,7 +62,7 @@ All parented under the kvim epic `kopitiam-cj0`. "Helix wiring to study" is the
 | **System clipboard + numbered/blackhole registers** — only unnamed/named/`"0` exist | `cj0.14` | P2 | Clipboard-provider abstraction (kvim adds an OSC-52 fallback for Android/SSH/tmux) |
 | **Search-match highlighting** — hlsearch/incsearch; `:noh` is a no-op | `cj0.15` | P2 | Highlight all matches of the search register in the viewport as a render pass under the selection |
 | **Diagnostics rendering + `]d`/`[d` + list** — `DiagnosticsStore` exists, nothing renders | `cj0.16` | P2 | Underline + gutter + end-of-line virtual text; diagnostics picker (document/workspace) |
-| **Interactive LSP popups** — completion menu, hover, code actions, signature help | `cj0.17` | P2 | Small popup/menu components fed by the LSP client; completion menu shows item docs |
+| **Interactive LSP popups** — completion menu, hover, code actions, signature help | `cj0.17` | P2 | Small popup/menu components fed by the LSP client; completion menu shows item docs. **Code actions landed 2026-10-06** (`<leader>ca`, gh-117 / `bd-0tr`: request with diagnostics context, `codeAction/resolve`, edit via rename's path, guarded `executeCommand`); signature help still open |
 | **Project search + quickfix/location lists** — `:grep`, `:vimgrep`, `:copen`, `:cnext`, `:cdo` | `cj0.18` | P2 | Global content search (ripgrep-style) into a picker; kvim reuses vendored `ignore`+`nucleo`, no external `rg` |
 | **Ex-command completeness** — `:v :sort :m/:t :>/:< :normal :ls/:b{name} :earlier/:later` | `cj0.19` | P2 | N/A (vim-specific; Helix has no ex line) |
 | **which-key popup** — `config::Keymap.desc` already exists, no popup renders it | `cj0.20` | P3 | Minor-mode infobox listing available continuations |

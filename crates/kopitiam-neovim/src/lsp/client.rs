@@ -63,6 +63,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use kopitiam_semantic::edit::FileEdit;
+pub use kopitiam_semantic::{AppliedCodeAction, CodeAction};
 use kopitiam_semantic::{self as semantic, AsyncRustAnalyzerSession, LspState, ProgressSnapshot, RequestError};
 
 use crate::core::{Position, Range};
@@ -297,6 +298,68 @@ impl LspClient {
         let session = self.session(filetype, file)?;
         session
             .rename(file, line, character, new_name)
+            .map_err(|e| map_request_error(filetype, session, e))
+    }
+
+    /// The code actions the server offers for `range` in `file` — LSP
+    /// `textDocument/codeAction`. `range` is kvim's grapheme [`Range`] (a
+    /// cursor point or a visual selection, either direction); `start_line_text`
+    /// and `end_line_text` are the text of its first and last lines, for the
+    /// grapheme→char conversion (pass the same line twice for a point).
+    ///
+    /// The server's pushed diagnostics on those lines ride along as the
+    /// request context, and lazily-sent actions (rust-analyzer only sends
+    /// `data` until asked) are fine to list as-is: [`Self::apply_code_action`]
+    /// resolves the one the user picks. See `kopitiam_semantic`'s
+    /// `code_action` module for the protocol rules and their provenance.
+    ///
+    /// **Disk, not buffer.** Like [`Self::rename`], the semantic layer
+    /// re-opens `file` from disk before asking, so the actions (and their
+    /// edits) are computed against the *saved* file. The UI refuses to offer
+    /// code actions on a modified buffer for exactly this reason.
+    pub fn code_actions(
+        &mut self,
+        filetype: &str,
+        file: &Path,
+        range: Range,
+        start_line_text: &str,
+        end_line_text: &str,
+    ) -> Result<Vec<CodeAction>, LspError> {
+        let (start, end) = range.normalized();
+        let start = query_position(start, start_line_text);
+        let end = query_position(end, end_line_text);
+        let session = self.session(filetype, file)?;
+        session
+            .code_actions_in_range(file, start, end)
+            .map_err(|e| map_request_error(filetype, session, e))
+    }
+
+    /// Applies one action from [`Self::code_actions`]: resolves it if the
+    /// server wants that, refuses it if the server marked it disabled, and
+    /// otherwise returns what happened (see [`AppliedCodeAction`]):
+    ///
+    /// * an **edit** comes back computed but **not written** — the caller
+    ///   writes it through the same path rename uses, then runs any
+    ///   `follow_up_command` with [`Self::execute_command`];
+    /// * a **command** was already executed on the server, which wrote its own
+    ///   edits to disk via `workspace/applyEdit` (`ran_command` is set) — the
+    ///   caller just reloads.
+    pub fn apply_code_action(&mut self, filetype: &str, file: &Path, action: &CodeAction) -> Result<AppliedCodeAction, LspError> {
+        let session = self.session(filetype, file)?;
+        session
+            .apply_code_action_detailed(action.clone())
+            .map_err(|e| map_request_error(filetype, session, e))
+    }
+
+    /// Runs `command` on `file`'s server via `workspace/executeCommand` — the
+    /// follow-up command of an action whose edit has just been written. A
+    /// command the server never advertised (a client-side UI command) is
+    /// refused rather than sent.
+    pub fn execute_command(&mut self, filetype: &str, file: &Path, command: &str, arguments: serde_json::Value) -> Result<(), LspError> {
+        let session = self.session(filetype, file)?;
+        session
+            .execute_command(command, arguments)
+            .map(|_| ())
             .map_err(|e| map_request_error(filetype, session, e))
     }
 
@@ -547,6 +610,111 @@ mod tests {
         assert_eq!(locs[0].range.anchor.line, 0, "greet is declared on line 0");
         assert_eq!(locs[0].range.anchor.col, 7, "the identifier starts after `pub fn ` (7 graphemes)");
 
+        client.shutdown_all();
+    }
+
+    /// Builds a throwaway cargo crate with `source` as `src/lib.rs`, returning
+    /// the tempdir guard and the lib path.
+    fn scratch_crate(name: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            format!("[package]\nname=\"{name}\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let lib = dir.path().join("src/lib.rs");
+        std::fs::write(&lib, source).unwrap();
+        (dir, lib)
+    }
+
+    /// Polls `code_actions` (as kvim's idle tick would) until the server is
+    /// ready and offers an action whose title contains `needle`, or panics
+    /// after 180 s. rust-analyzer can answer before its analysis has settled,
+    /// so an empty or partial list is retried, not trusted.
+    fn wait_for_action(client: &mut LspClient, lib: &Path, range: Range, line: &str, needle: &str) -> CodeAction {
+        let start = std::time::Instant::now();
+        let mut last_titles: Vec<String> = Vec::new();
+        loop {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(180),
+                "no code action containing {needle:?} within 180s; last offered: {last_titles:?}"
+            );
+            match client.code_actions("rust", lib, range, line, line) {
+                Ok(actions) => {
+                    last_titles = actions.iter().map(|a| a.title.clone()).collect();
+                    if let Some(a) = actions.into_iter().find(|a| a.title.contains(needle)) {
+                        return a;
+                    }
+                }
+                Err(e) if e.is_not_ready() => {}
+                Err(e) => panic!("code_actions failed: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// End to end through a live rust-analyzer: the missing-match-arms assist
+    /// ("Add N missing match arms", formerly "Fill match arms") on a
+    /// non-exhaustive `match` comes back unresolved (RA sends only `data`,
+    /// because the client advertised lazy `edit` resolution), and
+    /// [`LspClient::apply_code_action`] resolves it and returns an edit that
+    /// adds the missing arms. The edit is then written through the semantic
+    /// crate's writer — the same writer kvim's rename/code-action path uses.
+    ///
+    /// `#[ignore]`d like the definition test above: spawns a real server. Run
+    /// with `cargo test --release -p kopitiam-neovim -- --ignored code_action`.
+    #[test]
+    #[ignore = "spawns a real rust-analyzer and waits for indexing; run with `-- --ignored`"]
+    fn live_rust_analyzer_fills_match_arms_through_resolve() {
+        if registry::which("rust-analyzer").is_none() {
+            eprintln!("rust-analyzer not on PATH; skipping");
+            return;
+        }
+        let source = "pub enum Dir { North, South }\n\npub fn f(d: Dir) -> u8 {\n    match d {\n    }\n}\n";
+        let (_dir, lib) = scratch_crate("kvim_ca_match", source);
+        let mut client = LspClient::new();
+        // Cursor on `match` (line 3, grapheme col 4).
+        let line3 = source.lines().nth(3).unwrap();
+        // rust-analyzer 1.98 titles it "Add 2 missing match arms"; older releases
+        // said "Fill match arms". Match the shared phrase, not one release's wording.
+        let action = wait_for_action(&mut client, &lib, Range::point(Position::new(3, 4)), line3, "match arms");
+        assert!(!action.has_edit(), "RA should send the assist lazily (data only) when resolveSupport is advertised");
+
+        let applied = client.apply_code_action("rust", &lib, &action).expect("apply");
+        assert!(applied.ran_command.is_none());
+        assert_eq!(applied.edits.len(), 1, "one file touched");
+        let updated = &applied.edits[0].updated;
+        assert!(updated.contains("Dir::North") && updated.contains("Dir::South"), "arms added:\n{updated}");
+
+        kopitiam_semantic::edit::write_file_edits(&applied.edits).unwrap();
+        assert_eq!(std::fs::read_to_string(&lib).unwrap(), *updated);
+        client.shutdown_all();
+    }
+
+    /// The quick-fix the issue names: an unused import offers a removal action,
+    /// and applying it removes the `use` line. Also exercises a **range**
+    /// request (the whole `use` line selected, end before start to prove the
+    /// range is normalised).
+    #[test]
+    #[ignore = "spawns a real rust-analyzer and waits for indexing; run with `-- --ignored`"]
+    fn live_rust_analyzer_removes_an_unused_import() {
+        if registry::which("rust-analyzer").is_none() {
+            eprintln!("rust-analyzer not on PATH; skipping");
+            return;
+        }
+        let source = "use std::collections::HashMap;\n\npub fn g() -> u8 {\n    1\n}\n";
+        let (_dir, lib) = scratch_crate("kvim_ca_unused", source);
+        let mut client = LspClient::new();
+        let line0 = source.lines().next().unwrap();
+        // Selection over the whole `use` line, given head-before-anchor.
+        let range = Range::new(Position::new(0, line0.len()), Position::new(0, 4));
+        let action = wait_for_action(&mut client, &lib, range, line0, "unused");
+        let applied = client.apply_code_action("rust", &lib, &action).expect("apply");
+        assert_eq!(applied.edits.len(), 1);
+        let updated = &applied.edits[0].updated;
+        assert!(!updated.contains("HashMap"), "the unused import is gone:\n{updated}");
+        assert!(updated.contains("pub fn g()"), "the rest of the file survives:\n{updated}");
         client.shutdown_all();
     }
 }

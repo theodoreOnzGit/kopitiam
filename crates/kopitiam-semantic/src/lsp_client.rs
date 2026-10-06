@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+use crate::code_action;
 use crate::lsp_types::{self, CompletionItem, DiagnosticsStore, Hover, Location};
 use crate::position::PositionEncoding;
 
@@ -230,6 +231,15 @@ pub struct LspClient {
     /// version; `didOpen` is version 1 (see [`Self::did_open_as`]), so
     /// changes start at 2.
     doc_versions: HashMap<String, i64>,
+    /// Whether the server advertised `codeActionProvider.resolveProvider` in
+    /// its `initialize` result — i.e. whether `codeAction/resolve` may be sent
+    /// at all. See [`crate::code_action::CodeAction::needs_resolve`].
+    code_action_resolve: bool,
+    /// The command ids the server said it executes
+    /// (`executeCommandProvider.commands`). A command not in this list is a
+    /// *client-side* command (e.g. VS Code's `editor.action.triggerParameterHints`)
+    /// that `workspace/executeCommand` would only bounce back as an error.
+    server_commands: Vec<String>,
 }
 
 impl LspClient {
@@ -318,6 +328,8 @@ impl LspClient {
             position_encoding: PositionEncoding::Utf16,
             diagnostics: DiagnosticsStore::default(),
             doc_versions: HashMap::new(),
+            code_action_resolve: false,
+            server_commands: Vec::new(),
         };
         client.initialize(root)?;
         client.wait_for_indexing(index_timeout, program, observer);
@@ -473,6 +485,9 @@ impl LspClient {
                             "completionItem": { "snippetSupport": true, "documentationFormat": ["markdown", "plaintext"] },
                         },
                         "publishDiagnostics": { "relatedInformation": false },
+                        // Code-action literals + lazy `edit` resolution; see
+                        // `crate::code_action::client_capability` for each flag.
+                        "codeAction": crate::code_action::client_capability(),
                     },
                     // Advertise support for all three LSP 3.17 position
                     // encodings. Per spec, `"utf-8"` means byte offsets and
@@ -493,6 +508,17 @@ impl LspClient {
         self.position_encoding = PositionEncoding::from_capability(
             result.pointer("/capabilities/positionEncoding").and_then(Value::as_str),
         );
+        // `codeActionProvider` is `boolean | CodeActionOptions`; only the
+        // options form can say `resolveProvider: true`.
+        self.code_action_resolve = result
+            .pointer("/capabilities/codeActionProvider/resolveProvider")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.server_commands = result
+            .pointer("/capabilities/executeCommandProvider/commands")
+            .and_then(Value::as_array)
+            .map(|cmds| cmds.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
         self.notify("initialized", json!({}))
     }
 
@@ -694,9 +720,17 @@ impl LspClient {
     /// The `*_character` arguments must already be expressed in this
     /// client's negotiated [`PositionEncoding`] (see
     /// [`Self::position_encoding`]) — see [`Self::rename`]'s docs for why.
-    /// Returns the raw `(Command | CodeAction)[]` JSON; each entry either
-    /// carries an `edit` directly or a `command` to run via
-    /// [`Self::execute_command`].
+    ///
+    /// The request's `context.diagnostics` is filled from the diagnostics the
+    /// server has *pushed* for `uri` that touch the requested lines (pumped
+    /// first so it is current), sent back raw — `code`, `data` and all — so a
+    /// server that keys its quick-fixes on them finds them. `triggerKind` is
+    /// `Invoked`. See [`crate::code_action`] for where each rule comes from.
+    ///
+    /// Returns the raw `(Command | CodeAction)[]` JSON; each entry carries an
+    /// `edit`, a `command` to run via [`Self::execute_command`], or (lazy
+    /// servers such as rust-analyzer) only `data`, to be filled in by
+    /// [`Self::resolve_code_action`].
     pub fn code_actions(
         &mut self,
         uri: &str,
@@ -705,23 +739,35 @@ impl LspClient {
         end_line: u32,
         end_character: u32,
     ) -> Result<Vec<Value>> {
+        self.pump_notifications()?;
+        let diagnostics = code_action::diagnostics_on_lines(self.diagnostics.raw_for(uri), start_line, end_line);
         let result: Value = self.request(
             "textDocument/codeAction",
-            json!({
-                "textDocument": { "uri": uri },
-                "range": {
-                    "start": { "line": start_line, "character": start_character },
-                    "end": { "line": end_line, "character": end_character },
-                },
-                "context": { "diagnostics": [] },
-            }),
+            code_action::request_params(uri, (start_line, start_character), (end_line, end_character), diagnostics),
             Duration::from_secs(60),
         )?;
-        match result {
-            Value::Array(items) => Ok(items),
-            Value::Null => Ok(Vec::new()),
-            other => bail!("unexpected textDocument/codeAction response shape: {other}"),
-        }
+        code_action::parse_response(result)
+    }
+
+    /// Sends one raw `CodeAction` back through `codeAction/resolve` and
+    /// returns the completed action (typically now carrying its `edit`). The
+    /// action must go back exactly as received — its `data` field is how the
+    /// server finds it again. Only valid when
+    /// [`Self::supports_code_action_resolve`]; callers check first.
+    pub fn resolve_code_action(&mut self, action: &Value) -> Result<Value> {
+        self.request("codeAction/resolve", action.clone(), Duration::from_secs(60))
+    }
+
+    /// Whether the server advertised `codeActionProvider.resolveProvider`.
+    pub fn supports_code_action_resolve(&self) -> bool {
+        self.code_action_resolve
+    }
+
+    /// Whether `command` is one the server said it executes
+    /// (`executeCommandProvider.commands`). A command outside that list is a
+    /// client-side UI command; sending it to the server only earns an error.
+    pub fn supports_command(&self, command: &str) -> bool {
+        self.server_commands.iter().any(|c| c == command)
     }
 
     /// Executes a `Command` returned by [`Self::code_actions`] (used for

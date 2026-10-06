@@ -51,12 +51,17 @@ CRATES=(
     kopitiam-neovim      # depends on: config, lua, semantic, snippet, syntax
 )
 
-# All crates share one version via [workspace.package] in the root Cargo.toml.
-WORKSPACE_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-if [[ -z "$WORKSPACE_VERSION" ]]; then
-    echo "error: could not read [workspace.package].version from Cargo.toml" >&2
-    exit 1
-fi
+# Versions are PER CRATE, not one workspace number: CLAUDE.md's "no new commits,
+# no version bump" rule means a crate that moved pins its own `version =` (e.g.
+# kopitiam-neovim 0.3.0, kopitiam-semantic 0.2.6 for gh-117) while untouched ones
+# hold at the workspace version. So, exactly like publish.sh, each crate's own
+# version is resolved from Cargo's own view of its manifest. (The old single
+# WORKSPACE_VERSION read here would have checked `kopitiam-neovim@0.2.5`, found
+# it already live, and silently SKIPPED the new release.)
+crate_version() {
+    local name="$1"
+    cargo pkgid -p "$name" 2>/dev/null | sed -E 's/.*[#@]//'
+}
 
 CRATES_IO_USER_AGENT="kopitiam-publish-script (https://github.com/theodoreOnzGit/kopitiam)"
 
@@ -119,7 +124,11 @@ publish_with_retry() {
 }
 
 for crate in "${CRATES[@]}"; do
-    version="$WORKSPACE_VERSION"
+    version="$(crate_version "$crate")"
+    if [[ -z "$version" ]]; then
+        echo "error: could not resolve the version of $crate via cargo pkgid" >&2
+        exit 1
+    fi
 
     if already_published "$crate" "$version"; then
         echo "== $crate@$version already published, skipping =="

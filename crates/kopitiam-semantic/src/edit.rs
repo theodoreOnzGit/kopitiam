@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::position::{self, PositionEncoding};
 
 /// One file's content before and after applying the edits addressed to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEdit {
     pub path: PathBuf,
     pub original: String,

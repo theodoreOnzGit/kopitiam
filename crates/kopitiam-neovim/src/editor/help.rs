@@ -249,6 +249,7 @@ pub const TOPICS: &[HelpTopic] = &[
             "  <leader>gd    LSP go-to-definition (see `:help lsp`)",
             "  <leader>gr    LSP find references",
             "  <leader>rn    LSP rename the symbol",
+            "  <leader>ca    LSP code actions (quick-fix, refactor)",
             "  <leader>b     Harpoon: mark this file (see `:help harpoon`)",
             "  <leader><Esc> Harpoon: toggle the quick menu",
             "  <leader>q     Harpoon: fuzzy-find your marks",
@@ -337,7 +338,7 @@ pub const TOPICS: &[HelpTopic] = &[
     HelpTopic {
         id: "lsp",
         aliases: &["language-server", "diagnostics", "code"],
-        title: "LSP — go-to-definition, hover, rename",
+        title: "LSP — go-to-definition, hover, rename, code actions",
         body: &[
             "kvim talks to language servers (rust-analyzer and friends) for the",
             "smart code stuff. The maintainer's LSP maps:",
@@ -345,10 +346,15 @@ pub const TOPICS: &[HelpTopic] = &[
             "  <leader>gd    go to definition",
             "  <leader>gr    find references",
             "  <leader>rn    rename the symbol everywhere",
+            "  <leader>ca    code actions: quick-fixes and refactors at the cursor",
             "  K             hover docs (type / signature / docs under the cursor)",
             "",
             "K follows Neovim's built-in default (vim.lsp.buf.hover). For the",
             "autocomplete menu that the LSP feeds, see `:help completion`.",
+            "",
+            "<leader>ca opens a numbered menu: j/k move, Enter or 1-9 apply, Esc",
+            "close. Save the file first hor — the actions are worked out on the",
+            "file on disk, and applying one writes it and reloads the buffer.",
         ],
     },
     HelpTopic {
@@ -569,7 +575,7 @@ mod tests {
         // Singlish prose is fine, but the actual keys must survive verbatim.
         let text = render().text;
         for needle in [
-            "<leader>e", "<leader>gd", "<leader>gr", "<leader>rn", "<leader>b",
+            "<leader>e", "<leader>gd", "<leader>gr", "<leader>rn", "<leader>ca", "<leader>b",
             "<leader><Esc>", "<leader>q", "\\ff", "\\fb", "\\fh", "K",
             "<C-Space>", "<Tab>", "<C-w>", "<C-h>", ":qa", ":wqa", "ga",
         ] {

@@ -209,6 +209,11 @@ pub enum Action {
     LspReferences,
     /// LSP: rename the symbol under the cursor.
     LspRename,
+    /// LSP: list the code actions (quick-fixes, refactors) at the cursor and
+    /// apply the one picked — `textDocument/codeAction`, resolved and applied
+    /// through the same edit path as rename. Bound to `<leader>ca`, the
+    /// maintainer's Neovim muscle memory (`vim.lsp.buf.code_action`).
+    LspCodeAction,
     /// LSP: show hover documentation for the symbol under the cursor. Bound to
     /// `K`, matching Neovim's built-in default (`vim.lsp.buf.hover`).
     LspHover,
@@ -387,6 +392,7 @@ fn default_keymaps() -> Vec<Keymap> {
         n("<leader>gd", Action::LspDefinition, "Go to definition"),
         n("<leader>gr", Action::LspReferences, "Go to references"),
         n("<leader>rn", Action::LspRename, "Rename symbol"),
+        n("<leader>ca", Action::LspCodeAction, "Code actions"),
         // Neovim's built-in default hover binding (`K` → `vim.lsp.buf.hover`).
         // Not in the maintainer's explicit keymaps, but it *is* Neovim's own
         // default, so a Neovim user's muscle memory finds it here too.
@@ -554,6 +560,7 @@ mod tests {
             "<leader>gd",
             "<leader>gr",
             "<leader>rn",
+            "<leader>ca",
             "<leader>e",
             "f",
             "\\ff",

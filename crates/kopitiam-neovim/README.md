@@ -117,6 +117,8 @@ rather than hand-copied, so they can't drift:
 | `<leader>gd` | LSP: go to definition |
 | `<leader>gr` | LSP: list references |
 | `<leader>rn` | LSP: rename symbol |
+| `<leader>ca` | LSP: code actions — quick-fixes and refactors at the cursor, in a numbered menu (`j`/`k` move, `Enter` or `1`–`9` apply, `Esc` close) |
+| `K` | LSP: hover documentation (Neovim's own default) |
 | `<leader>e` | Toggle the file-tree sidebar |
 | `<C-h>` / `<C-j>` / `<C-k>` / `<C-l>` | Move window focus left / down / up / right (also crosses into the file tree, and hands off to the adjacent tmux pane at the layout edge — see [tmux integration](#tmux-integration)). In Insert mode `<C-h>` stays backspace and `<C-w>` stays delete-word, so these never shadow editing. |
 | `<C-w>h` / `<C-w>j` / `<C-w>k` / `<C-w>l` | The same window-focus moves, vim's classic prefixed form (no tmux hand-off) |
@@ -226,8 +228,28 @@ Roughly, as of this writing:
 - **Working:** the Vim editing grammar (modes, motions, operators, text
   objects, registers, macros, ex commands), the file-tree sidebar
   (`<leader>e`), devicons and font installation, config loading/validation.
+- **LSP client (working, tested against a live rust-analyzer):**
+  go-to-definition, references, hover, rename, completion, diagnostics, and
+  **code actions** (`<leader>ca`). Code actions honestly, lah:
+  - Lazy servers are handled: rust-analyzer sends its assists with only
+    `data`, and kvim fetches the edit through `codeAction/resolve` for just
+    the one you pick. The edit is written through the **same path rename
+    uses**, then the buffer reloads from disk.
+  - **Save first.** Actions and their edits are worked out against the file
+    on *disk*, so `<leader>ca` refuses on a modified buffer instead of
+    mis-placing an edit or throwing away unsaved text.
+  - The keymap asks at the **cursor point**. `LspClient::code_actions` takes
+    a full range (a visual selection), but kvim does not compile
+    visual-mode keymaps yet, so `<leader>ca` cannot pass one today.
+  - Only the **active** buffer is reloaded after an edit; another open
+    buffer the action touched keeps its old text until you `:e` it (rename
+    has the same limit).
+  - Command-only actions run via `workspace/executeCommand` only when the
+    server advertised that command; a client-side command (VS Code UI
+    commands, which rust-analyzer attaches to some actions) is reported as
+    skipped, not faked.
 - **In progress:** the fuzzy finder (files/buffers/help), harpoon's UI, hop's
-  label-jump UI, an LSP client, window splits and navigation, and more —
+  label-jump UI, window splits and navigation, and more —
   this list changes quickly. See the project's issue tracker
   ([beads](https://github.com/theodoreOnzGit/kopitiam), search for
   `kopitiam-nvim` and `kopitiam-cj0`) for the current phase plan, and

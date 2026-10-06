@@ -20,13 +20,7 @@ use crate::lsp_client::LspClient;
 use crate::lsp_types::{CompletionItem, Diagnostic, Hover, Location};
 use crate::position;
 
-/// One entry from a `textDocument/codeAction` response: either a `Command`
-/// or a `CodeAction` per the LSP spec, kept as its raw JSON so
-/// [`RustAnalyzerSession::apply_code_action`] can dispatch on its shape.
-pub struct CodeAction {
-    pub title: String,
-    raw: Value,
-}
+use crate::code_action::{self, AppliedCodeAction, CodeAction, CodeActionPlan};
 
 /// A live rust-analyzer process, ready to answer rename and code-action
 /// requests for the project rooted at the path given to [`Self::connect`].
@@ -113,49 +107,116 @@ impl RustAnalyzerSession {
 
     /// Lists the code actions available at `file:line:character`, in the
     /// same `char`-offset units as [`Self::rename`] — see that method's
-    /// docs for what that means and why.
+    /// docs for what that means and why. A zero-width range at that point;
+    /// [`Self::code_actions_in_range`] is the general form.
     pub fn code_actions(&mut self, file: &Path, line: u32, character: u32) -> Result<Vec<CodeAction>> {
-        let (uri, text) = self.open(file)?;
-        let encoding = self.client.position_encoding();
-        let line_text = text.lines().nth(line as usize).unwrap_or("");
-        let wire_character = position::char_col_to_unit(line_text, character, encoding);
-        let raw_actions = self.client.code_actions(&uri, line, wire_character, line, wire_character)?;
-        Ok(raw_actions
-            .into_iter()
-            .map(|raw| CodeAction {
-                title: raw.get("title").and_then(Value::as_str).unwrap_or("(untitled)").to_string(),
-                raw,
-            })
-            .collect())
+        self.code_actions_in_range(file, (line, character), (line, character))
     }
 
-    /// Applies a [`CodeAction`] returned by [`Self::code_actions`].
+    /// Lists the code actions available for the `char`-offset range
+    /// `start..end` (each a 0-indexed `(line, character)`) in `file` — a
+    /// visual selection, or a zero-width cursor point.
     ///
-    /// A `CodeAction` (or bare `Command`) carries its change one of two
-    /// ways: an `edit` field with a `WorkspaceEdit` already computed, or a
-    /// `command` to run via `workspace/executeCommand` — in which case the
-    /// server computes the edit lazily and pushes it back to us as a
-    /// `workspace/applyEdit` request, which [`LspClient`] answers (and thus
-    /// writes to disk) as part of running the command. In that second case
-    /// this method returns an empty list: there is nothing left to preview,
-    /// the write already happened.
+    /// Opens the document from disk first, like every request here, then
+    /// converts both ends to the server's wire encoding using the file's own
+    /// line text. The request carries the server's pushed diagnostics on those
+    /// lines as its context and `triggerKind: Invoked` (see
+    /// the private `code_action` module). The returned actions may be *unresolved*
+    /// (rust-analyzer sends only `data` until asked) —
+    /// [`Self::apply_code_action`] resolves them on demand, so a caller never
+    /// has to.
+    pub fn code_actions_in_range(&mut self, file: &Path, start: (u32, u32), end: (u32, u32)) -> Result<Vec<CodeAction>> {
+        let (uri, text) = self.open(file)?;
+        let encoding = self.client.position_encoding();
+        let wire = |(line, character): (u32, u32)| {
+            let line_text = text.lines().nth(line as usize).unwrap_or("");
+            (line, position::char_col_to_unit(line_text, character, encoding))
+        };
+        let ((sl, sc), (el, ec)) = (wire(start), wire(end));
+        let raw_actions = self.client.code_actions(&uri, sl, sc, el, ec)?;
+        Ok(raw_actions.into_iter().map(CodeAction::from_raw).collect())
+    }
+
+    /// Fills in a lazily-sent action through `codeAction/resolve` when it
+    /// needs it and the server supports it (see
+    /// [`CodeAction::needs_resolve`]); otherwise hands back a clone unchanged.
+    /// [`Self::apply_code_action`] calls this itself — it is public for a
+    /// caller that wants to *preview* an action before applying it.
+    pub fn resolve_code_action(&mut self, action: &CodeAction) -> Result<CodeAction> {
+        if !action.needs_resolve(self.client.supports_code_action_resolve()) {
+            return Ok(action.clone());
+        }
+        let resolved = self.client.resolve_code_action(action.raw())?;
+        Ok(CodeAction::from_resolved(resolved))
+    }
+
+    /// Applies a [`CodeAction`] returned by [`Self::code_actions`] /
+    /// [`Self::code_actions_in_range`], **computing but not writing** its edit.
+    ///
+    /// The dispatch (see the private `code_action` module for provenance):
+    ///
+    /// 1. Resolve it first if it needs it ([`Self::resolve_code_action`]). If
+    ///    the resolve itself fails but the original already carried an edit or
+    ///    a command, fall back to that — Neovim's behaviour too.
+    /// 2. A **disabled** action is refused with the server's reason.
+    /// 3. An action with an `edit` returns that `WorkspaceEdit` as
+    ///    [`FileEdit`]s for the caller to write (rename's path exactly). If it
+    ///    *also* has a command, that command is **not** run here: the spec says
+    ///    edit first, then command, and the edit is not written until the
+    ///    caller writes it. Run it afterwards with [`Self::execute_command`]
+    ///    (see [`CodeAction::command`]).
+    /// 4. A command-only action runs via `workspace/executeCommand`; the
+    ///    server computes the edit lazily and pushes it back as a
+    ///    `workspace/applyEdit` request, which the client answers by writing
+    ///    it to disk as part of running the command. In that case this returns
+    ///    an empty list — there is nothing left to preview, the write already
+    ///    happened.
     pub fn apply_code_action(&mut self, action: &CodeAction) -> Result<Vec<FileEdit>> {
-        if let Some(edit_value) = action.raw.get("edit") {
-            return edit::compute_workspace_edit(edit_value, self.client.position_encoding());
+        Ok(self.apply_code_action_detailed(action)?.edits)
+    }
+
+    /// [`Self::apply_code_action`] with the full story: besides the computed
+    /// edits, whether a follow-up command must run after the caller writes
+    /// them, and whether the action was a command the server already executed
+    /// (its edits already on disk). An editor needs both facts — the first to
+    /// finish the action, the second to know it must reload from disk.
+    pub fn apply_code_action_detailed(&mut self, action: &CodeAction) -> Result<AppliedCodeAction> {
+        let resolved = match self.resolve_code_action(action) {
+            Ok(resolved) => resolved,
+            Err(_) if action.has_edit() || action.command().is_some() => action.clone(),
+            Err(err) => return Err(err.context(format!("resolving code action `{}`", action.title))),
+        };
+        match code_action::plan(&resolved) {
+            CodeActionPlan::Refuse(reason) => bail!("code action `{}` is disabled: {reason}", resolved.title),
+            CodeActionPlan::Edit(edit_value) => Ok(AppliedCodeAction {
+                edits: edit::compute_workspace_edit(&edit_value, self.client.position_encoding())?,
+                follow_up_command: resolved.command(),
+                ran_command: None,
+            }),
+            CodeActionPlan::Command { command, arguments } => {
+                self.execute_command(&command, arguments)?;
+                Ok(AppliedCodeAction { ran_command: Some(command), ..AppliedCodeAction::default() })
+            }
+            CodeActionPlan::Nothing => bail!("code action `{}` has neither `edit` nor `command`", resolved.title),
         }
-        if let Some(command_value) = action.raw.get("command") {
-            let (command, arguments) = match command_value {
-                Value::String(id) => (id.clone(), Value::Null),
-                Value::Object(_) => (
-                    command_value.get("command").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    command_value.get("arguments").cloned().unwrap_or(Value::Null),
-                ),
-                other => bail!("unexpected `command` shape in code action: {other}"),
-            };
-            self.client.execute_command(&command, arguments)?;
-            return Ok(Vec::new());
+    }
+
+    /// Runs `command` through `workspace/executeCommand`, refusing up front a
+    /// command the server never said it executes (a client-side UI command —
+    /// see [`Self::supports_command`]) instead of letting the server bounce it.
+    /// Any edit the command makes arrives as `workspace/applyEdit` and is
+    /// written to disk before this returns.
+    pub fn execute_command(&mut self, command: &str, arguments: Value) -> Result<Value> {
+        if !self.client.supports_command(command) {
+            bail!("the language server does not execute `{command}` (a client-side command, not supported here)");
         }
-        bail!("code action `{}` has neither `edit` nor `command`", action.title)
+        self.client.execute_command(command, arguments)
+    }
+
+    /// Whether the server advertised `command` in
+    /// `executeCommandProvider.commands`.
+    pub fn supports_command(&self, command: &str) -> bool {
+        self.client.supports_command(command)
     }
 
     /// Resolves the definition(s) of the symbol at `file:line:character`, in

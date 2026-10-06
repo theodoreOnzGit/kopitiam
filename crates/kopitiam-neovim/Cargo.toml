@@ -1,6 +1,10 @@
 [package]
 name = "kopitiam-neovim"
-version.workspace = true
+# Pinned, not `version.workspace`: per CLAUDE.md "no new commits, no version bump",
+# only crates whose code moved get bumped. 0.3.0, not 0.2.6: gh-117 adds a variant
+# to the public, exhaustive `config::Action` enum (`LspCodeAction`), which is a
+# breaking change under Cargo's SemVer rules. See AID-0059.
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

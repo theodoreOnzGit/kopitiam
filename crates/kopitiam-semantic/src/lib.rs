@@ -7,6 +7,7 @@
 //! under [`providers`], each emitting the same semantic representation.
 
 mod async_session;
+mod code_action;
 pub mod edit;
 mod lsp_client;
 mod lsp_types;
@@ -24,4 +25,5 @@ pub use lsp_types::{
 };
 pub use provider::{KnowledgeProvider, ProviderOutput};
 pub use providers::{CargoMetadataProvider, RustAnalyzerProvider, RustdocProvider};
-pub use session::{CodeAction, RustAnalyzerSession};
+pub use code_action::{AppliedCodeAction, CodeAction};
+pub use session::RustAnalyzerSession;
